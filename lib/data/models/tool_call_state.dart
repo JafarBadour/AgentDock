@@ -44,7 +44,13 @@ class ToolCallState {
   /// row reading just "Tool", which tells the user nothing.
   String get displayTitle {
     final given = title.trim();
-    if (given.isNotEmpty && given.toLowerCase() != 'tool') return given;
+    // Agents sometimes dump a JSON fragment as the title; treat that as missing.
+    if (given.isNotEmpty &&
+        given.toLowerCase() != 'tool' &&
+        !given.startsWith('{') &&
+        !given.startsWith('[')) {
+      return given;
+    }
     final k = (kind ?? '').toLowerCase();
     if (k.contains('exec') || k.contains('shell') || k.contains('terminal')) {
       return 'Ran a command';
@@ -55,21 +61,6 @@ class ToolCallState {
     if (k.contains('fetch') || k.contains('http')) return 'Fetched a URL';
     if (k.contains('delete')) return 'Deleted a file';
     return 'Tool call';
-  }
-
-  /// One-line detail shown next to the title.
-  String? get preview {
-    if (locations.isNotEmpty) return _short(locations.first);
-    final input = rawInput?.trim();
-    if (input == null || input.isEmpty) return null;
-    // Tool input is usually pretty-printed JSON, whose first line is just "{".
-    final fromJson = _previewFromJson(input);
-    if (fromJson != null) return _short(fromJson);
-    final line = input.split('\n').firstWhere(
-          (l) => l.trim().isNotEmpty,
-          orElse: () => input,
-        );
-    return _short(line);
   }
 
   /// Keys worth surfacing, most specific first.
@@ -101,7 +92,29 @@ class ToolCallState {
       if (value is String && value.trim().isNotEmpty) return value.trim();
       if (value is List && value.isNotEmpty) return value.join(' ');
     }
-    return null;
+    // Parsed JSON with nothing useful — don't fall through to a brace line.
+    return '';
+  }
+
+  /// One-line detail shown next to the title.
+  String? get preview {
+    if (locations.isNotEmpty) return _short(locations.first);
+    final input = rawInput?.trim();
+    if (input == null || input.isEmpty) return null;
+    // Tool input is usually pretty-printed JSON, whose first line is just "{".
+    final fromJson = _previewFromJson(input);
+    if (fromJson != null) {
+      return fromJson.isEmpty ? null : _short(fromJson);
+    }
+    final line = input.split('\n').firstWhere(
+          (l) {
+            final t = l.trim();
+            return t.isNotEmpty && t != '{' && t != '}' && t != '[' && t != ']';
+          },
+          orElse: () => '',
+        );
+    if (line.isEmpty) return null;
+    return _short(line);
   }
 
   static String _short(String value) {

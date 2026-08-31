@@ -45,8 +45,12 @@ void main() {
       expect(_tool(input: '\n\n  npm test  \nmore output').preview, 'npm test');
     });
 
-    test('unparseable JSON does not throw', () {
-      expect(_tool(input: '{"command": broken').preview, isNotNull);
+    test('unparseable JSON falls back without a bare brace', () {
+      expect(_tool(input: '{"command": broken').preview, '{"command": broken');
+    });
+
+    test('pretty-printed JSON with no useful keys yields no preview', () {
+      expect(_tool(input: '{\n  "foo": 1\n}').preview, isNull);
     });
 
     test('long previews are clipped', () {

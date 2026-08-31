@@ -187,6 +187,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     return [for (final e in indexed) e.$2];
   }
 
+  /// Collapse runs of more than two consecutive tools into one expandable row.
+  static List<_ChatBlock> _blocksFor(List<TranscriptEntry> entries) {
+    final blocks = <_ChatBlock>[];
+    var i = 0;
+    while (i < entries.length) {
+      final entry = entries[i];
+      if (entry.tool == null) {
+        blocks.add(_ChatBlock.single(entry));
+        i++;
+        continue;
+      }
+      final run = <TranscriptEntry>[entry];
+      var j = i + 1;
+      while (j < entries.length && entries[j].tool != null) {
+        run.add(entries[j]);
+        j++;
+      }
+      if (run.length > 2) {
+        blocks.add(_ChatBlock.tools(run));
+      } else {
+        for (final e in run) {
+          blocks.add(_ChatBlock.single(e));
+        }
+      }
+      i = j;
+    }
+    return blocks;
+  }
+
   /// While the transcript is on screen the user is by definition seeing it, so
   /// keep the read watermark moving. Debounced: a streaming turn notifies far
   /// too often to write on every tick.
@@ -740,6 +769,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // Late flushes can append an older assistant row after a newer user row.
     // Paint in clock order so the thread reads like a normal chat.
     final entries = _entriesByTime(visible);
+    final blocks = _blocksFor(entries);
     final thoughtBuffer = runtime?.thoughtBuffer ?? '';
     final assistantBuffer = runtime?.assistantBuffer ?? '';
     // Composer no longer locks for the whole turn — only the live buffer
@@ -954,26 +984,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             child: ListView.builder(
               controller: _scroll,
               padding: const EdgeInsets.all(12),
-              itemCount: entries.length + extra.length,
+              itemCount: blocks.length + extra.length,
               itemBuilder: (context, index) {
-                if (index >= entries.length) {
-                  return extra[index - entries.length];
+                if (index >= blocks.length) {
+                  return extra[index - blocks.length];
                 }
-                final entry = entries[index];
+                final block = blocks[index];
                 final prevAt =
-                    index > 0 ? entries[index - 1].createdAt : null;
-                final at = entry.createdAt;
+                    index > 0 ? blocks[index - 1].createdAt : null;
+                final at = block.createdAt;
                 final showDate = at != null &&
                     (prevAt == null ||
                         prevAt.year != at.year ||
                         prevAt.month != at.month ||
                         prevAt.day != at.day);
 
-                Widget body;
-                if (entry.tool != null) {
-                  body = ToolCallCard(tool: entry.tool!);
+                final Widget body;
+                final tools = block.tools;
+                if (tools != null) {
+                  body = ToolCallGroupCard(
+                    tools: [for (final e in tools) e.tool!],
+                  );
+                } else if (block.entry!.tool != null) {
+                  body = ToolCallCard(tool: block.entry!.tool!);
                 } else {
-                  final m = entry.message!;
+                  final m = block.entry!.message!;
                   body = _Bubble(
                     role: m.role,
                     text: m.content,
@@ -1054,6 +1089,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ),
     );
   }
+}
+
+/// One paint unit in the transcript list: a message, a lone tool, or a
+/// collapsed run of consecutive tools.
+class _ChatBlock {
+  const _ChatBlock._({this.entry, this.tools});
+
+  factory _ChatBlock.single(TranscriptEntry entry) =>
+      _ChatBlock._(entry: entry);
+
+  factory _ChatBlock.tools(List<TranscriptEntry> tools) =>
+      _ChatBlock._(tools: tools);
+
+  final TranscriptEntry? entry;
+  final List<TranscriptEntry>? tools;
+
+  DateTime? get createdAt =>
+      tools?.first.createdAt ?? entry?.createdAt;
 }
 
 class _Bubble extends StatelessWidget {
