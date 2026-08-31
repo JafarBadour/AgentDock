@@ -26,6 +26,7 @@ class SecureStore {
   static const _sshPrivateKey = 'ssh_private_key';
   static const _sshPassphrase = 'ssh_key_passphrase';
   static const _cursorApiKey = 'cursor_api_key';
+  static const _anthropicApiKey = 'anthropic_api_key';
 
   final FlutterSecureStorage _storage;
 
@@ -71,6 +72,21 @@ class SecureStore {
 
   Future<bool> hasCursorApiKey() async {
     final value = await readCursorApiKey();
+    return value != null && value.trim().isNotEmpty;
+  }
+
+  Future<void> saveAnthropicApiKey(String? key) async {
+    if (key == null || key.trim().isEmpty) {
+      await _delete(_anthropicApiKey);
+      return;
+    }
+    await _write(_anthropicApiKey, key.trim());
+  }
+
+  Future<String?> readAnthropicApiKey() => _read(_anthropicApiKey);
+
+  Future<bool> hasAnthropicApiKey() async {
+    final value = await readAnthropicApiKey();
     return value != null && value.trim().isNotEmpty;
   }
 

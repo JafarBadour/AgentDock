@@ -15,8 +15,10 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
   final _keyController = TextEditingController();
   final _passphraseController = TextEditingController();
   final _cursorKeyController = TextEditingController();
+  final _anthropicKeyController = TextEditingController();
   bool _hasKey = false;
   bool _hasCursorKey = false;
+  bool _hasAnthropicKey = false;
   bool _saving = false;
   String? _status;
 
@@ -30,10 +32,12 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     final store = ref.read(secureStoreProvider);
     final hasKey = await store.hasSshPrivateKey();
     final hasCursor = await store.hasCursorApiKey();
+    final hasAnthropic = await store.hasAnthropicApiKey();
     if (!mounted) return;
     setState(() {
       _hasKey = hasKey;
       _hasCursorKey = hasCursor;
+      _hasAnthropicKey = hasAnthropic;
     });
   }
 
@@ -93,11 +97,35 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     }
   }
 
+  Future<void> _saveAnthropicKey() async {
+    setState(() {
+      _saving = true;
+      _status = null;
+    });
+    try {
+      await ref
+          .read(secureStoreProvider)
+          .saveAnthropicApiKey(_anthropicKeyController.text);
+      _anthropicKeyController.clear();
+      await _load();
+      setState(
+        () => _status =
+            'Anthropic API key saved. Prefer `claude login` on the remote when possible.',
+      );
+    } catch (e) {
+      SafeLog.d('save anthropic key failed', e);
+      setState(() => _status = 'Failed to save Anthropic key: $e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   void dispose() {
     _keyController.dispose();
     _passphraseController.dispose();
     _cursorKeyController.dispose();
+    _anthropicKeyController.dispose();
     super.dispose();
   }
 
@@ -183,6 +211,36 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
           FilledButton.tonal(
             onPressed: _saving ? null : _saveCursorKey,
             child: const Text('Save Cursor key'),
+          ),
+          const Divider(height: 40),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(
+              _hasAnthropicKey ? Icons.check_circle : Icons.info_outline,
+              color: _hasAnthropicKey ? Colors.green : null,
+            ),
+            title: Text(
+              _hasAnthropicKey
+                  ? 'Anthropic API key stored'
+                  : 'Anthropic API key (optional)',
+            ),
+            subtitle: const Text(
+              'For Claude agents. Prefer `claude login` on the remote. '
+              'If set, the key is injected only into that agent process environment.',
+            ),
+          ),
+          TextField(
+            controller: _anthropicKeyController,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: 'ANTHROPIC_API_KEY',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          FilledButton.tonal(
+            onPressed: _saving ? null : _saveAnthropicKey,
+            child: const Text('Save Anthropic key'),
           ),
           if (_status != null) ...[
             const SizedBox(height: 20),

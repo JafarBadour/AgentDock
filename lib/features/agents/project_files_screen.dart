@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
@@ -108,31 +109,90 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     await _load(next);
   }
 
-  Future<Directory> _downloadsDir() async {
+  /// Public Downloads folder when we can write there, otherwise null.
+  Future<Directory?> _publicDownloadsDir() async {
+    if (Platform.isAndroid) {
+      // Shared Downloads the Files app shows — not the app-private one.
+      final public = Directory('/storage/emulated/0/Download');
+      try {
+        if (!await public.exists()) {
+          await public.create(recursive: true);
+        }
+        // Probe write access before claiming this is usable.
+        final probe = File(
+          p.join(
+            public.path,
+            '.agentdock_write_probe_${DateTime.now().microsecondsSinceEpoch}',
+          ),
+        );
+        await probe.writeAsString('ok');
+        await probe.delete();
+        return public;
+      } catch (e) {
+        SafeLog.d('public Downloads unavailable', e);
+      }
+    }
     try {
       final d = await getDownloadsDirectory();
-      if (d != null) return d;
-    } catch (_) {}
-    return getApplicationDocumentsDirectory();
+      if (d != null) {
+        if (!await d.exists()) await d.create(recursive: true);
+        return d;
+      }
+    } catch (e) {
+      SafeLog.d('getDownloadsDirectory failed', e);
+    }
+    return null;
   }
 
-  Future<void> _download(RemoteFileEntry entry) async {
+  Future<String> _uniquePathIn(Directory dir, String fileName) async {
+    var localPath = p.join(dir.path, fileName);
+    if (!await File(localPath).exists()) return localPath;
+    final stem = p.basenameWithoutExtension(fileName);
+    final ext = p.extension(fileName);
+    return p.join(
+      dir.path,
+      '$stem-${DateTime.now().millisecondsSinceEpoch}$ext',
+    );
+  }
+
+  Future<String?> _pickSavePath(String fileName) async {
+    return FilePicker.saveFile(
+      dialogTitle: 'Save $fileName',
+      fileName: fileName,
+    );
+  }
+
+  Future<void> _download(
+    RemoteFileEntry entry, {
+    bool askWhere = false,
+  }) async {
     if (entry.isDirectory) return;
     final remote = SshService.joinRemotePath(_path ?? _root, entry.name);
+
+    String? localPath;
+    if (askWhere) {
+      localPath = await _pickSavePath(entry.name);
+      if (localPath == null || localPath.isEmpty) return;
+    } else {
+      final dir = await _publicDownloadsDir();
+      if (dir != null) {
+        localPath = await _uniquePathIn(dir, entry.name);
+      } else {
+        // No public Downloads — let the user pick via the system save sheet
+        // (usually opens in Downloads on Android).
+        localPath = await _pickSavePath(entry.name);
+        if (localPath == null || localPath.isEmpty) return;
+      }
+    }
+
     setState(() {
       _busy = true;
       _status = 'Downloading ${entry.name}…';
     });
     try {
-      final dir = await _downloadsDir();
-      var localPath = p.join(dir.path, entry.name);
-      if (await File(localPath).exists()) {
-        final stem = p.basenameWithoutExtension(entry.name);
-        final ext = p.extension(entry.name);
-        localPath = p.join(
-          dir.path,
-          '$stem-${DateTime.now().millisecondsSinceEpoch}$ext',
-        );
+      final parent = Directory(p.dirname(localPath));
+      if (!await parent.exists()) {
+        await parent.create(recursive: true);
       }
       final bytes = await ref.read(sshServiceProvider).downloadRemoteFile(
             widget.host,
@@ -141,12 +201,25 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
           );
       if (!mounted) return;
       setState(() => _status = 'Saved $bytes bytes → $localPath');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Downloaded ${entry.name}')),
-      );
+      _showDownloadedSnack(entry.name, localPath);
     } catch (e) {
       SafeLog.d('download failed', e);
       if (!mounted) return;
+      // Direct write to public Downloads can fail on locked-down Android —
+      // offer the system saver as a fallback once.
+      if (!askWhere) {
+        setState(() => _busy = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not write Downloads — pick a location'),
+            action: SnackBarAction(
+              label: 'Save as',
+              onPressed: () => _download(entry, askWhere: true),
+            ),
+          ),
+        );
+        return;
+      }
       setState(() => _status = 'Download failed: $e');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Download failed: $e')),
@@ -154,6 +227,63 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  Future<void> _share(RemoteFileEntry entry) async {
+    if (entry.isDirectory) return;
+    final remote = SshService.joinRemotePath(_path ?? _root, entry.name);
+    setState(() {
+      _busy = true;
+      _status = 'Preparing ${entry.name}…';
+    });
+    try {
+      final cache = await getTemporaryDirectory();
+      final localPath = await _uniquePathIn(cache, entry.name);
+      await ref.read(sshServiceProvider).downloadRemoteFile(
+            widget.host,
+            remote,
+            localPath,
+          );
+      if (!mounted) return;
+      setState(() => _status = 'Sharing ${entry.name}…');
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(localPath, name: entry.name)],
+          subject: entry.name,
+        ),
+      );
+      if (!mounted) return;
+      setState(() => _status = 'Shared ${entry.name}');
+    } catch (e) {
+      SafeLog.d('share failed', e);
+      if (!mounted) return;
+      setState(() => _status = 'Share failed: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Share failed: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _showDownloadedSnack(String name, String localPath) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Saved $name'),
+        action: SnackBarAction(
+          label: 'Share',
+          onPressed: () {
+            SharePlus.instance.share(
+              ShareParams(
+                files: [XFile(localPath, name: name)],
+                subject: name,
+              ),
+            );
+          },
+        ),
+        duration: const Duration(seconds: 6),
+      ),
+    );
   }
 
   Future<void> _upload() async {
@@ -305,15 +435,35 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                 ].join(' · '),
               ),
             ),
-            if (!entry.isDirectory)
+            if (!entry.isDirectory) ...[
               ListTile(
                 leading: const Icon(Icons.download),
                 title: const Text('Download'),
+                subtitle: const Text('Save to Downloads'),
                 onTap: () {
                   Navigator.pop(context);
                   _download(entry);
                 },
               ),
+              ListTile(
+                leading: const Icon(Icons.folder_open),
+                title: const Text('Save as…'),
+                subtitle: const Text('Choose where to save'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _download(entry, askWhere: true);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.ios_share),
+                title: const Text('Share…'),
+                subtitle: const Text('Send via another app'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _share(entry);
+                },
+              ),
+            ],
             if (entry.isDirectory)
               ListTile(
                 leading: const Icon(Icons.folder_open),
@@ -470,9 +620,10 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                             trailing: entry.isDirectory
                                 ? const Icon(Icons.chevron_right)
                                 : IconButton(
-                                    tooltip: 'Download',
+                                    tooltip: 'Download to Downloads',
                                     icon: const Icon(Icons.download),
-                                    onPressed: _busy ? null : () => _download(entry),
+                                    onPressed:
+                                        _busy ? null : () => _download(entry),
                                   ),
                             onTap: entry.isDirectory
                                 ? () => _openDir(entry.name)

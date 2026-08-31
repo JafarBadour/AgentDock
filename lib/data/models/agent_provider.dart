@@ -12,8 +12,8 @@ extension AgentProviderX on AgentProvider {
         AgentProvider.claude => 'Claude',
       };
 
-  /// Claude is beta and cannot start sessions yet.
-  bool get isAvailable => this == AgentProvider.cursor;
+  /// Both Cursor and Claude run as remote ACP agents.
+  bool get isAvailable => true;
 
   static AgentProvider fromId(String id) =>
       AgentProvider.values.firstWhere((p) => p.id == id, orElse: () => AgentProvider.cursor);

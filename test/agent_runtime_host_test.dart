@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:agent_dock/data/models/agent_provider.dart';
 import 'package:agent_dock/services/agent_runtime_host.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -91,6 +92,42 @@ void main() {
       );
     });
 
+    test('run script starts ACP with full-access flags by default', () {
+      final script = AgentRuntimeHost.runScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/cursor-agent',
+      );
+      expect(script, contains('--force'));
+      expect(script, contains('--approve-mcps'));
+      expect(script, contains('--trust'));
+      expect(script, contains('acp'));
+    });
+
+    test('run script omits force flags in Ask mode', () {
+      final script = AgentRuntimeHost.runScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/cursor-agent',
+        fullAccess: false,
+      );
+      expect(script, isNot(contains('--force')));
+      expect(script, contains('acp'));
+    });
+
+    test('bootstrap script restarts when full-access marker mismatches', () {
+      final script = AgentRuntimeHost.ensureScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        tmuxSession: 'ad-abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/cursor-agent',
+        fullAccess: false,
+      );
+      expect(script, contains('full_access'));
+      expect(script, contains('RESTARTED'));
+      expect(script, contains('WANT=0'));
+    });
+
     test('bootstrap script parses with a secret present', () {
       expectParses(
         AgentRuntimeHost.ensureScript(
@@ -98,7 +135,7 @@ void main() {
           tmuxSession: 'ad-abc',
           cwd: "/home/me/it's a repo",
           binary: '/home/me/.local/bin/cursor-agent',
-          cursorApiKey: "key-with-'quote",
+          apiKey: "key-with-'quote",
         ),
         'ensure-with-key.sh',
       );
@@ -132,13 +169,53 @@ void main() {
         tmuxSession: 'ad-abc',
         cwd: '/home/me/proj',
         binary: '/home/me/.local/bin/cursor-agent',
-        cursorApiKey: secret,
+        apiKey: secret,
       );
       final tmuxLine = script
           .split('\n')
           .firstWhere((l) => l.contains('tmux new-session'));
       expect(tmuxLine, isNot(contains(secret)));
       expect(script, contains('rm -f'));
+    });
+
+    test('Claude run script uses adapter binary without Cursor force flags', () {
+      final script = AgentRuntimeHost.runScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/claude-code-acp',
+        provider: AgentProvider.claude,
+        fullAccess: true,
+      );
+      expect(script, isNot(contains('--force')));
+      expect(script, isNot(contains(' acp')));
+      expect(script, contains('claude-code-acp'));
+      expect(script, contains('CLAUDE_ACP_SKIP_PERMISSIONS=true'));
+    });
+
+    test('Claude Ask mode omits skip-permissions env', () {
+      final script = AgentRuntimeHost.runScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/claude-code-acp',
+        provider: AgentProvider.claude,
+        fullAccess: false,
+      );
+      expect(script, isNot(contains('CLAUDE_ACP_SKIP_PERMISSIONS')));
+    });
+
+    test('Claude bootstrap writes Anthropic key env', () {
+      const secret = 'sk-ant-test';
+      final script = AgentRuntimeHost.ensureScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        tmuxSession: 'ad-abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/claude-code-acp',
+        provider: AgentProvider.claude,
+        apiKey: secret,
+      );
+      expect(script, contains('ANTHROPIC_API_KEY'));
+      expect(script, isNot(contains('CURSOR_API_KEY')));
+      expectParses(script, 'ensure-claude.sh');
     });
   });
 }

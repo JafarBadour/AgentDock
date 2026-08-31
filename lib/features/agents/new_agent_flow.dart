@@ -46,7 +46,6 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
   }
 
   void _submit() {
-    if (!_provider.isAvailable) return;
     final text = _title.text.trim();
     Navigator.pop(
       context,
@@ -77,21 +76,15 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
               for (final p in AgentProvider.values)
                 DropdownMenuItem(
                   value: p,
-                  enabled: p.isAvailable,
-                  child: Text(p.isAvailable ? p.label : '${p.label} (beta)'),
+                  child: Text(p.label),
                 ),
             ],
             onChanged: (value) {
-              if (value == null || !value.isAvailable) return;
+              if (value == null) return;
               setState(() => _provider = value);
             },
             decoration: const InputDecoration(labelText: 'Provider'),
           ),
-          if (!_provider.isAvailable)
-            const Padding(
-              padding: EdgeInsets.only(top: 8),
-              child: Text('Claude support is beta and not available yet.'),
-            ),
         ],
       ),
       actions: [
@@ -100,7 +93,7 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
           child: const Text('Cancel'),
         ),
         FilledButton(
-          onPressed: _provider.isAvailable ? _submit : null,
+          onPressed: _submit,
           child: const Text('Create'),
         ),
       ],

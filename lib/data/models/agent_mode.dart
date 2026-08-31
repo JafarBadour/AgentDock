@@ -27,15 +27,24 @@ enum AgentSessionMode {
   }
 }
 
-/// How the client answers `session/request_permission`.
+/// How tool permissions are handled for this chat.
 enum PermissionPolicy {
-  /// Prompt / allow once (default).
+  /// Prompt on the phone for each tool that needs approval.
   ask,
-  /// Auto-approve with allow-always.
+  /// Shift+Tab "full access": host agent runs with --force and auto-approves.
   allowAll;
 
   String get label => switch (this) {
         PermissionPolicy.ask => 'Ask',
         PermissionPolicy.allowAll => 'Allow all',
       };
+
+  String get subtitle => switch (this) {
+        PermissionPolicy.ask => 'Approve each tool on this device',
+        PermissionPolicy.allowAll =>
+          'Full access on the host — no prompts (works with the app closed)',
+      };
+
+  /// Whether the durable host process should start with --force / --yolo.
+  bool get fullAccess => this == PermissionPolicy.allowAll;
 }

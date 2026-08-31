@@ -397,7 +397,7 @@ class _RepoSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final chats = section.chats;
-    final busy = chats.any((c) => runtimes[c.id]?.promptInFlight ?? false);
+    final busy = chats.any((c) => runtimes[c.id]?.isWorking ?? false);
     final unreadHere = chats.fold<int>(0, (sum, c) => sum + (unread[c.id] ?? 0));
 
     return Column(
@@ -657,7 +657,7 @@ class _AgentRow extends StatelessWidget {
 
   Widget _build(BuildContext context) {
     final theme = Theme.of(context);
-    final working = runtime?.promptInFlight ?? false;
+    final working = runtime?.isWorking ?? false;
     final hasUnread = unread > 0;
 
     return InkWell(

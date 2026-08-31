@@ -54,7 +54,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   bool _resumedInPlace = false;
 
   AgentSessionMode _mode = AgentSessionMode.agent;
-  PermissionPolicy _permission = PermissionPolicy.ask;
+  PermissionPolicy _permission = PermissionPolicy.allowAll;
 
   ChatSessionRuntime? _runtime;
   VoidCallback? _runtimeListener;
@@ -97,19 +97,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     _landAtBottom();
 
     final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
-    if (existing != null && !existing.closed) {
+    if (existing != null) {
       _bindRuntime(existing);
+      // Closed runtimes reconnect in the background — do not leave the UI
+      // stuck on a stale DB-only transcript until the user taps Connect.
+      unawaited(existing.syncTranscriptFromDb());
+      if (existing.closed) {
+        existing.resume();
+      }
     }
-    // Don't auto-connect on open — reconnect when you send or tap Connect.
-    // Auto-connect was blocking messaging when SSH hung.
-
-    if (chat.provider == AgentProvider.claude) {
-      setState(() {
-        _showSdkInstallGuide = true;
-        _error =
-            'Claude is beta in Agent Dock. Install Claude Code on the remote if you want to try it later; Cursor is the supported provider for now.';
-      });
-    }
+    // Don't auto-connect a brand-new chat — reconnect when you send or tap
+    // Connect. Auto-connect was blocking messaging when SSH hung.
 
     unawaited(_syncFromRemote());
   }
@@ -187,6 +185,51 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     return [for (final e in indexed) e.$2];
   }
 
+  /// Collapse tool spam between user messages into one expandable row.
+  ///
+  /// Assistant text between tools used to break consecutive runs, so a turn
+  /// with 20 tools rendered as 20 separate cards. Group every tool that sits
+  /// between two user bubbles when there are more than two.
+  static List<_ChatBlock> _blocksFor(List<TranscriptEntry> entries) {
+    final blocks = <_ChatBlock>[];
+    var i = 0;
+    while (i < entries.length) {
+      final entry = entries[i];
+      if (entry.message?.role == MessageRole.user) {
+        blocks.add(_ChatBlock.single(entry));
+        i++;
+        continue;
+      }
+
+      final segment = <TranscriptEntry>[];
+      while (i < entries.length &&
+          entries[i].message?.role != MessageRole.user) {
+        segment.add(entries[i]);
+        i++;
+      }
+
+      final tools = [for (final e in segment) if (e.tool != null) e];
+      if (tools.length > 2) {
+        var emittedTools = false;
+        for (final e in segment) {
+          if (e.tool != null) {
+            if (!emittedTools) {
+              blocks.add(_ChatBlock.tools(tools));
+              emittedTools = true;
+            }
+          } else {
+            blocks.add(_ChatBlock.single(e));
+          }
+        }
+      } else {
+        for (final e in segment) {
+          blocks.add(_ChatBlock.single(e));
+        }
+      }
+    }
+    return blocks;
+  }
+
   /// While the transcript is on screen the user is by definition seeing it, so
   /// keep the read watermark moving. Debounced: a streaming turn notifies far
   /// too often to write on every tick.
@@ -217,6 +260,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _chat = runtime.chatMeta;
       }
       _mode = runtime.mode;
+      _permission = runtime.permissionPolicy;
       if (runtime.lastError != null && runtime.closed) {
         _error = runtime.lastError;
       }
@@ -235,7 +279,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Future<void> _prefetchModelCatalogIfNeeded(ChatSessionRuntime runtime) async {
     if (runtime.closed ||
         runtime.availableModels.isNotEmpty ||
-        runtime.promptInFlight) {
+        runtime.isWorking) {
       return;
     }
     final host = _host;
@@ -273,16 +317,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final runtimeHost = ref.read(agentRuntimeHostProvider);
     final sessions = ref.read(activeAcpSessionsProvider.notifier);
     final host = _host!;
-    final mode = _mode;
-    final permission = _permission;
+    final provider = _chat?.provider ?? AgentProvider.cursor;
+    // Fallbacks for the first connect, before a runtime exists.
+    final fallbackMode = _mode;
+    final fallbackPermission = _permission;
 
     return () async {
-      final binary = await ssh.ensureCursorCli(host).timeout(
-            const Duration(seconds: 20),
-            onTimeout: () => throw TimeoutException(
-              'Timed out looking for Cursor CLI. Check Terminal SSH, then retry.',
+      final live = sessions.get(chatId);
+      final mode = live?.preferredMode ?? fallbackMode;
+      final permission =
+          live?.preferredPermissionPolicy ?? fallbackPermission;
+
+      final binary = switch (provider) {
+        AgentProvider.cursor => await ssh.ensureCursorCli(host).timeout(
+              const Duration(seconds: 20),
+              onTimeout: () => throw TimeoutException(
+                'Timed out looking for Cursor CLI. Check Terminal SSH, then retry.',
+              ),
             ),
-          );
+        AgentProvider.claude => await ssh.ensureClaudeAcpBinary(host).timeout(
+              const Duration(seconds: 120),
+              onTimeout: () => throw TimeoutException(
+                'Timed out looking for claude-code-acp. Install it on the remote '
+                '(see setup guide), then retry.',
+              ),
+            ),
+      };
       // Without tmux we can still run, just not durably.
       final durable = await ssh.hasTmux(host);
       final mcps = await db.listEnabledMcpsForHost(host.id);
@@ -296,6 +356,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         binary: binary,
         chatId: chatId,
         runtimeHost: runtimeHost,
+        provider: provider,
         mcpServers: mcps.map((m) => m.toAcpConfig()).toList(),
         initialMode: mode,
         permissionPolicy: permission,
@@ -307,8 +368,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ).timeout(
         const Duration(seconds: 45),
         onTimeout: () => throw TimeoutException(
-          'Connect timed out. Try `agent login` on the remote in the Terminal '
-          'tab, then Connect again.',
+          provider == AgentProvider.claude
+              ? 'Connect timed out. Set ANTHROPIC_API_KEY in Connect or run '
+                  '`claude login` on the remote, then Connect again.'
+              : 'Connect timed out. Try `agent login` on the remote in the Terminal '
+                  'tab, then Connect again.',
         ),
       );
     };
@@ -319,14 +383,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final host = _host;
     if (_chat == null || repo == null || host == null) return;
     var chat = _chat!;
-    if (chat.provider != AgentProvider.cursor) {
-      setState(() {
-        _showSdkInstallGuide = true;
-        _error =
-            'Claude is beta. Switch to a Cursor chat, or install Claude Code on the remote for later.';
-      });
-      return;
-    }
 
     final hasKey = await ref.read(secureStoreProvider).hasSshPrivateKey();
     if (!hasKey) {
@@ -344,8 +400,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (existing != null && !existing.closed) {
-      existing.setPermissionPolicy(_permission);
+      existing.sessionFactory = _buildSessionFactory(
+        chatId: chat.id,
+        cwd: repo.remotePath,
+      );
       _bindRuntime(existing);
+      if (existing.permissionPolicy != _permission) {
+        try {
+          await existing.applyPermissionPolicy(_permission);
+        } catch (e) {
+          SafeLog.d('applyPermissionPolicy on existing session failed', e);
+        }
+      }
       if (existing.mode != _mode) {
         try {
           await existing.setMode(_mode);
@@ -571,8 +637,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   void _setPermission(PermissionPolicy policy) {
     setState(() => _permission = policy);
-    (_runtime ?? ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId))
-        ?.setPermissionPolicy(policy);
+    final runtime = _runtime ??
+        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+    if (runtime == null) return;
+    // Keep reconnect factory current even before apply finishes.
+    final repo = _repo;
+    if (repo != null) {
+      runtime.sessionFactory = _buildSessionFactory(
+        chatId: widget.chatId,
+        cwd: repo.remotePath,
+      );
+    }
+    unawaited(() async {
+      try {
+        await runtime.applyPermissionPolicy(policy);
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not switch permission: $e')),
+        );
+      }
+      if (mounted) setState(() => _permission = runtime.permissionPolicy);
+    }());
   }
 
   Future<void> _send() async {
@@ -726,11 +812,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // Queued messages live in the DB but stay out of [entries] until promoted,
     // so filter defensively in case a stale row is still present.
     final rawEntries = runtime?.entries ?? _dbEntries;
-    final filtered = queuedIds.isEmpty
-        ? rawEntries
-        : rawEntries
-            .where((e) => e.messageId == null || !queuedIds.contains(e.messageId))
-            .toList(growable: false);
+    final liveAssistantId = runtime?.liveAssistantMessageId;
+    final filtered = [
+      for (final e in rawEntries)
+        if (e.messageId == null ||
+            (!queuedIds.contains(e.messageId) &&
+                e.messageId != liveAssistantId))
+          e,
+    ];
     // Hide persisted thought/system crumbs from the main thread — they still
     // stream live above the agent bubble while a turn is open.
     final visible = [
@@ -740,24 +829,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // Late flushes can append an older assistant row after a newer user row.
     // Paint in clock order so the thread reads like a normal chat.
     final entries = _entriesByTime(visible);
+    final blocks = _blocksFor(entries);
     final thoughtBuffer = runtime?.thoughtBuffer ?? '';
     final assistantBuffer = runtime?.assistantBuffer ?? '';
     // Composer no longer locks for the whole turn — only the live buffer
     // counts as "working" for the agent bubble.
-    final streaming = runtime?.promptInFlight ?? false;
+    final streaming = runtime?.isWorking ?? false;
     final liveError = runtime?.lastError;
     final displayError = _error ?? liveError;
     final connected = runtime != null && !runtime.closed;
     final reconnecting = runtime?.reconnecting ?? false;
+    final remoteRunning = runtime?.remoteTurnActive == true;
+    final activeTools = runtime == null
+        ? 0
+        : runtime.entries.where((e) => e.tool?.isActive ?? false).length;
     final statusLabel = switch (true) {
       _ when reconnecting => ' · reconnecting…',
+      _ when remoteRunning && !connected => ' · running on host',
+      _ when streaming && activeTools > 0 =>
+        ' · working · $activeTools tool${activeTools == 1 ? '' : 's'}',
+      _ when streaming => ' · working',
       _ when connected && _resumedInPlace => ' · live · resumed',
       _ when connected => ' · live',
       _ => '',
     };
 
     final extra = <Widget>[];
-    if (streaming) {
+    // Keep live text visible even if isWorking cleared a tick before flush —
+    // that race used to make the answer vanish until reopen.
+    if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
       if (thoughtBuffer.isNotEmpty) {
         extra.add(_Bubble(
           role: MessageRole.system,
@@ -767,13 +867,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       }
       // Live answer stays above queued user bubbles so the current turn can
       // finish without burying what the user just scheduled.
-      extra.add(
-        _Bubble(
-          role: MessageRole.assistant,
-          text: assistantBuffer,
-          streaming: true,
-        ),
-      );
+      if (assistantBuffer.isNotEmpty) {
+        extra.add(
+          _Bubble(
+            role: MessageRole.assistant,
+            text: assistantBuffer,
+            streaming: true,
+          ),
+        );
+      }
     }
     for (final m in queue) {
       extra.add(
@@ -873,9 +975,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     icon: _permission == PermissionPolicy.allowAll
                         ? Icons.verified_user_outlined
                         : Icons.privacy_tip_outlined,
-                    label: _permission == PermissionPolicy.allowAll
-                        ? 'Allow all'
-                        : 'Ask',
+                    label: _permission.label,
                     selected: _permission == PermissionPolicy.allowAll,
                     onTap: () => _setPermission(
                       _permission == PermissionPolicy.allowAll
@@ -954,26 +1054,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             child: ListView.builder(
               controller: _scroll,
               padding: const EdgeInsets.all(12),
-              itemCount: entries.length + extra.length,
+              itemCount: blocks.length + extra.length,
               itemBuilder: (context, index) {
-                if (index >= entries.length) {
-                  return extra[index - entries.length];
+                if (index >= blocks.length) {
+                  return extra[index - blocks.length];
                 }
-                final entry = entries[index];
+                final block = blocks[index];
                 final prevAt =
-                    index > 0 ? entries[index - 1].createdAt : null;
-                final at = entry.createdAt;
+                    index > 0 ? blocks[index - 1].createdAt : null;
+                final at = block.createdAt;
                 final showDate = at != null &&
                     (prevAt == null ||
                         prevAt.year != at.year ||
                         prevAt.month != at.month ||
                         prevAt.day != at.day);
 
-                Widget body;
-                if (entry.tool != null) {
-                  body = ToolCallCard(tool: entry.tool!);
+                final Widget body;
+                final tools = block.tools;
+                if (tools != null) {
+                  body = ToolCallGroupCard(
+                    tools: [for (final e in tools) e.tool!],
+                  );
+                } else if (block.entry!.tool != null) {
+                  body = ToolCallCard(tool: block.entry!.tool!);
                 } else {
-                  final m = entry.message!;
+                  final m = block.entry!.message!;
                   body = _Bubble(
                     role: m.role,
                     text: m.content,
@@ -1000,6 +1105,47 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               onRemove: (id) =>
                   unawaited(runtime?.removeFromQueue(id) ?? Future<void>.value()),
             ),
+          if (runtime?.pendingPermission != null)
+            _PermissionPromptBar(
+              request: runtime!.pendingPermission!,
+              onSelect: (optionId) {
+                runtime.resolvePermission(
+                  runtime.pendingPermission!.requestId,
+                  optionId,
+                );
+              },
+            ),
+          if (streaming)
+            Material(
+              color: theme.colorScheme.errorContainer.withValues(alpha: 0.35),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        activeTools > 0
+                            ? 'Agent is working · $activeTools tool${activeTools == 1 ? '' : 's'} running'
+                            : assistantBuffer.isEmpty && thoughtBuffer.isEmpty
+                                ? 'Waiting on agent…'
+                                : 'Agent is working',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        try {
+                          await runtime?.unstick();
+                        } catch (e) {
+                          SafeLog.d('unstick failed', e);
+                        }
+                      },
+                      child: const Text('Unstick'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           SafeArea(
             top: false,
             child: Padding(
@@ -1013,15 +1159,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                       maxLines: 5,
                       enabled: _chat!.provider.isAvailable && !_connecting,
                       decoration: InputDecoration(
-                        hintText: _chat!.provider.isAvailable
-                            ? (_connecting
-                                ? 'Connecting agent…'
-                                : streaming
-                                    ? 'Message (queued until Force run)…'
-                                    : connected
-                                        ? 'Message Cursor agent…'
-                                        : 'Message agent…')
-                            : 'Claude is beta',
+                        hintText: _connecting
+                            ? 'Connecting agent…'
+                            : streaming
+                                ? 'Message (queued until Force run)…'
+                                : connected
+                                    ? 'Message ${_chat!.provider.label} agent…'
+                                    : 'Message agent…',
                         border: const OutlineInputBorder(),
                       ),
                       onSubmitted: (_) {
@@ -1054,6 +1198,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ),
     );
   }
+}
+
+/// One paint unit in the transcript list: a message, a lone tool, or a
+/// collapsed run of consecutive tools.
+class _ChatBlock {
+  const _ChatBlock._({this.entry, this.tools});
+
+  factory _ChatBlock.single(TranscriptEntry entry) =>
+      _ChatBlock._(entry: entry);
+
+  factory _ChatBlock.tools(List<TranscriptEntry> tools) =>
+      _ChatBlock._(tools: tools);
+
+  final TranscriptEntry? entry;
+  final List<TranscriptEntry>? tools;
+
+  DateTime? get createdAt =>
+      tools?.first.createdAt ?? entry?.createdAt;
 }
 
 class _Bubble extends StatelessWidget {
@@ -1346,6 +1508,92 @@ class _OutboundQueueBar extends StatelessWidget {
                   ],
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Ask-mode approval strip — one action the agent is blocked on.
+class _PermissionPromptBar extends StatelessWidget {
+  const _PermissionPromptBar({
+    required this.request,
+    required this.onSelect,
+  });
+
+  final PendingPermissionRequest request;
+  final void Function(String optionId) onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final options = request.options.isNotEmpty
+        ? request.options
+        : const [
+            PermissionOption(
+              optionId: 'allow-once',
+              name: 'Allow once',
+              kind: 'allow_once',
+            ),
+            PermissionOption(
+              optionId: 'reject-once',
+              name: 'Reject',
+              kind: 'reject_once',
+            ),
+          ];
+
+    return Material(
+      color: scheme.tertiaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.privacy_tip_outlined,
+                    size: 18, color: scheme.onTertiaryContainer),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    request.title,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      color: scheme.onTertiaryContainer,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            if (request.description != null &&
+                request.description!.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                request.description!,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: scheme.onTertiaryContainer,
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: [
+                for (final o in options)
+                  o.isReject
+                      ? OutlinedButton(
+                          onPressed: () => onSelect(o.optionId),
+                          child: Text(o.name),
+                        )
+                      : FilledButton(
+                          onPressed: () => onSelect(o.optionId),
+                          child: Text(o.name),
+                        ),
+              ],
+            ),
           ],
         ),
       ),

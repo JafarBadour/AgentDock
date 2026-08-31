@@ -5,6 +5,108 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../data/models/tool_call_state.dart';
 import 'agent_status_indicators.dart';
 
+/// Collapsed summary for a run of consecutive tool calls.
+///
+/// More than two tools in a row would flood the transcript, so they collapse
+/// into one line that expands into the individual [ToolCallCard]s on tap.
+class ToolCallGroupCard extends StatefulWidget {
+  const ToolCallGroupCard({super.key, required this.tools});
+
+  final List<ToolCallState> tools;
+
+  @override
+  State<ToolCallGroupCard> createState() => _ToolCallGroupCardState();
+}
+
+class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
+  bool _expanded = false;
+
+  bool get _anyActive => widget.tools.any((t) => t.isActive);
+  bool get _anyFailed => widget.tools.any((t) => t.isFailed);
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final count = widget.tools.length;
+    final labelColor = _anyFailed
+        ? scheme.error
+        : scheme.onSurfaceVariant.withValues(alpha: 0.85);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Material(
+        color: Colors.transparent,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+                child: Row(
+                  children: [
+                    Icon(
+                      _anyFailed
+                          ? Icons.error_outline
+                          : Icons.auto_awesome_outlined,
+                      size: 14,
+                      color: _anyFailed
+                          ? scheme.error
+                          : _anyActive
+                              ? scheme.primary
+                              : scheme.outline,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Shimmer(
+                        enabled: _anyActive,
+                        child: Text(
+                          '$count tool calls',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: labelColor,
+                            fontWeight: FontWeight.w500,
+                            height: 1.3,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (_anyFailed) ...[
+                      Text(
+                        'Failed',
+                        style: theme.textTheme.labelSmall
+                            ?.copyWith(color: scheme.error),
+                      ),
+                      const SizedBox(width: 4),
+                    ],
+                    Icon(
+                      _expanded
+                          ? Icons.keyboard_arrow_up_rounded
+                          : Icons.keyboard_arrow_down_rounded,
+                      size: 16,
+                      color: scheme.outline,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_expanded)
+              Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: Column(
+                  children: [
+                    for (final tool in widget.tools) ToolCallCard(tool: tool),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// One line of agent activity, expandable into the raw input/output.
 ///
 /// Deliberately understated: during a turn there may be a dozen of these

@@ -110,7 +110,7 @@ void main() {
 
   test('AgentProvider availability', () {
     expect(AgentProvider.cursor.isAvailable, isTrue);
-    expect(AgentProvider.claude.isAvailable, isFalse);
+    expect(AgentProvider.claude.isAvailable, isTrue);
   });
 
   test('SafeLog redacts private keys', () {

@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -25,6 +28,34 @@ class SettingsScreen extends ConsumerStatefulWidget {
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   bool _busy = false;
   String? _status;
+  bool? _runInBackground;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadBackgroundPref());
+  }
+
+  Future<void> _loadBackgroundPref() async {
+    final enabled =
+        await ref.read(backgroundKeepAliveProvider).isEnabled();
+    if (mounted) setState(() => _runInBackground = enabled);
+  }
+
+  Future<void> _setRunInBackground(bool value) async {
+    setState(() => _runInBackground = value);
+    await ref.read(backgroundKeepAliveProvider).setEnabled(value);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          value
+              ? 'Background mode on — like a pedometer, Agent Dock keeps running'
+              : 'Background mode off — connections drop when you leave the app',
+        ),
+      ),
+    );
+  }
 
   Future<void> _exportAg() async {
     setState(() {
@@ -155,6 +186,29 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 88),
         children: [
+          if (!kIsWeb &&
+              (defaultTargetPlatform == TargetPlatform.android ||
+                  defaultTargetPlatform == TargetPlatform.iOS)) ...[
+            Text('Background', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'Stay running when you switch apps (same idea as a pedometer). '
+              'Shows a persistent notification and keeps agent connections warm.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Run in background'),
+              subtitle: Text(
+                _runInBackground == true
+                    ? 'On — notification stays up'
+                    : 'Off — reconnect after leaving the app',
+              ),
+              value: _runInBackground ?? true,
+              onChanged: _runInBackground == null ? null : _setRunInBackground,
+            ),
+            const SizedBox(height: 28),
+          ],
           Text('Backup', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 4),
           Text(
