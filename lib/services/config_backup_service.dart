@@ -13,7 +13,8 @@ class ConfigBackupService {
 
   final AppDatabase _db;
 
-  static const formatId = 'agentic-phone';
+  static const formatId = 'agent-dock';
+  static const legacyFormatId = 'agentic-phone';
   static const formatVersion = 1;
 
   Future<Map<String, dynamic>> buildExportMap() async {
@@ -78,7 +79,7 @@ class ConfigBackupService {
     }
 
     final format = root['format']?.toString();
-    if (format != null && format != formatId) {
+    if (format != null && format != formatId && format != legacyFormatId) {
       throw FormatException('Unknown format "$format" (expected $formatId)');
     }
 

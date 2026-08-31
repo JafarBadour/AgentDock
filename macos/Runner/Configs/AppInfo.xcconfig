@@ -5,7 +5,7 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = agentic_phone
+PRODUCT_NAME = Agent Dock
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = com.agenticphone.agenticPhone

@@ -1,13 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_linkify/flutter_linkify.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:uuid/uuid.dart';
 
 import '../../app/providers.dart';
 import '../../data/models/agent_mode.dart';
+import '../../data/models/agent_model.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/chat_message.dart';
@@ -19,6 +17,9 @@ import '../../services/chat_session_runtime.dart';
 import '../../services/cursor_acp_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
+import 'agent_status_indicators.dart';
+import 'message_body.dart';
+import 'model_picker_sheet.dart';
 import 'project_files_screen.dart';
 import 'tool_call_card.dart';
 
@@ -48,12 +49,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String? _error;
   bool _showSdkInstallGuide = false;
 
+  /// True when the last connect attached to an agent that was still running,
+  /// so the conversation carried over untouched.
+  bool _resumedInPlace = false;
+
   AgentSessionMode _mode = AgentSessionMode.agent;
   PermissionPolicy _permission = PermissionPolicy.ask;
 
   ChatSessionRuntime? _runtime;
   VoidCallback? _runtimeListener;
   Future<void>? _ensureAcpInFlight;
+  Timer? _markReadTimer;
+  bool _landedAtBottom = false;
 
   @override
   void initState() {
@@ -61,6 +68,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     _bootstrap();
   }
 
+  /// Paint from SQLite immediately; the network only ever upgrades what is
+  /// already on screen.
   Future<void> _bootstrap() async {
     final db = ref.read(appDatabaseProvider);
     final chat = await db.getChat(widget.chatId);
@@ -73,24 +82,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
     final repo = await db.getRepo(chat.repoId);
     final host = repo == null ? null : await db.getHost(repo.hostId);
-
-    if (host != null) {
-      try {
-        final hasKey = await ref.read(secureStoreProvider).hasSshPrivateKey();
-        if (hasKey) {
-          final pulled = await ref.read(agentDockServiceProvider).syncChatMessages(
-                host: host,
-                chatId: chat.id,
-              );
-          if (pulled) {
-            SafeLog.d('agentdock pulled messages for ${chat.id}');
-          }
-        }
-      } catch (e) {
-        SafeLog.d('agentdock message sync failed', e);
-      }
-    }
-
     final messages = await db.listMessages(chat.id);
 
     _dbEntries
@@ -103,6 +94,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       _host = host;
       _loading = false;
     });
+    _landAtBottom();
 
     final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (existing != null && !existing.closed) {
@@ -115,8 +107,51 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       setState(() {
         _showSdkInstallGuide = true;
         _error =
-            'Claude is beta in Agentic Phone. Install Claude Code on the remote if you want to try it later; Cursor is the supported provider for now.';
+            'Claude is beta in Agent Dock. Install Claude Code on the remote if you want to try it later; Cursor is the supported provider for now.';
       });
+    }
+
+    unawaited(_syncFromRemote());
+  }
+
+  Future<void> _syncFromRemote() async {
+    final host = _host;
+    if (host == null) return;
+    try {
+      if (!await ref.read(secureStoreProvider).hasSshPrivateKey()) return;
+      final dock = ref.read(agentDockServiceProvider);
+      final recordChanged = await dock.syncChatRecord(
+        host: host,
+        chatId: widget.chatId,
+      );
+      if (recordChanged && mounted) {
+        final refreshed =
+            await ref.read(appDatabaseProvider).getChat(widget.chatId);
+        if (refreshed != null) _chat = refreshed;
+      }
+      final changed = await dock.syncChatMessages(
+            host: host,
+            chatId: widget.chatId,
+          );
+      if (!mounted) return;
+      final runtime = _runtime;
+      if (runtime != null) {
+        if (changed) {
+          await runtime.syncTranscriptFromDb();
+        }
+        return;
+      }
+      if (!changed) return;
+      final messages =
+          await ref.read(appDatabaseProvider).listMessages(widget.chatId);
+      if (!mounted || _runtime != null) return;
+      setState(() {
+        _dbEntries
+          ..clear()
+          ..addAll(_entriesFromMessages(messages));
+      });
+    } catch (e) {
+      SafeLog.d('agentdock message sync failed', e);
     }
   }
 
@@ -133,6 +168,39 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       out.add(TranscriptEntry.message(m));
     }
     return out;
+  }
+
+  /// Stable chronological order for the transcript list.
+  static List<TranscriptEntry> _entriesByTime(List<TranscriptEntry> input) {
+    if (input.length < 2) return input;
+    final indexed = [for (var i = 0; i < input.length; i++) (i, input[i])];
+    indexed.sort((a, b) {
+      final at = a.$2.createdAt;
+      final bt = b.$2.createdAt;
+      if (at == null && bt == null) return a.$1.compareTo(b.$1);
+      if (at == null) return 1;
+      if (bt == null) return -1;
+      final byTime = at.compareTo(bt);
+      if (byTime != 0) return byTime;
+      return a.$1.compareTo(b.$1);
+    });
+    return [for (final e in indexed) e.$2];
+  }
+
+  /// While the transcript is on screen the user is by definition seeing it, so
+  /// keep the read watermark moving. Debounced: a streaming turn notifies far
+  /// too often to write on every tick.
+  void _scheduleMarkRead() {
+    _markReadTimer ??= Timer(const Duration(milliseconds: 600), () {
+      _markReadTimer = null;
+      if (!mounted) return;
+      unawaited(
+        ref.read(appDatabaseProvider).markChatRead(widget.chatId).then((_) {
+          if (!mounted) return;
+          ref.read(agentDockServiceProvider).schedulePushChat(widget.chatId);
+        }),
+      );
+    });
   }
 
   void _bindRuntime(ChatSessionRuntime runtime) {
@@ -154,10 +222,34 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       }
       setState(() {});
       _scrollToEnd();
+      _scheduleMarkRead();
     };
     runtime.addListener(_runtimeListener!);
     setState(() {});
     _scrollToEnd();
+    // Coming back to a chat whose turn already finished should drain the queue.
+    runtime.resumeOutboundQueue();
+    unawaited(_prefetchModelCatalogIfNeeded(runtime));
+  }
+
+  Future<void> _prefetchModelCatalogIfNeeded(ChatSessionRuntime runtime) async {
+    if (runtime.closed ||
+        runtime.availableModels.isNotEmpty ||
+        runtime.promptInFlight) {
+      return;
+    }
+    final host = _host;
+    if (host == null) return;
+    try {
+      final mcps =
+          await ref.read(appDatabaseProvider).listEnabledMcpsForHost(host.id);
+      await runtime.ensureModelCatalog(
+        mcps.map((m) => m.toAcpConfig()).toList(growable: false),
+      );
+      if (mounted) setState(() {});
+    } catch (e) {
+      SafeLog.d('prefetch model catalog failed', e);
+    }
   }
 
   Future<void> _ensureAcp() {
@@ -167,11 +259,66 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     return _ensureAcpInFlight!;
   }
 
+  /// A closure that can open a transport for this chat at any later time.
+  ///
+  /// It captures the services directly instead of `ref`, because the runtime
+  /// keeps reconnecting in the background after this screen is disposed.
+  Future<AcpSession> Function() _buildSessionFactory({
+    required String chatId,
+    required String cwd,
+  }) {
+    final ssh = ref.read(sshServiceProvider);
+    final secureStore = ref.read(secureStoreProvider);
+    final db = ref.read(appDatabaseProvider);
+    final runtimeHost = ref.read(agentRuntimeHostProvider);
+    final sessions = ref.read(activeAcpSessionsProvider.notifier);
+    final host = _host!;
+    final mode = _mode;
+    final permission = _permission;
+
+    return () async {
+      final binary = await ssh.ensureCursorCli(host).timeout(
+            const Duration(seconds: 20),
+            onTimeout: () => throw TimeoutException(
+              'Timed out looking for Cursor CLI. Check Terminal SSH, then retry.',
+            ),
+          );
+      // Without tmux we can still run, just not durably.
+      final durable = await ssh.hasTmux(host);
+      final mcps = await db.listEnabledMcpsForHost(host.id);
+      final latest = await db.getChat(chatId);
+
+      return AcpSession.start(
+        ssh: ssh,
+        secureStore: secureStore,
+        host: host,
+        cwd: cwd,
+        binary: binary,
+        chatId: chatId,
+        runtimeHost: runtimeHost,
+        mcpServers: mcps.map((m) => m.toAcpConfig()).toList(),
+        initialMode: mode,
+        permissionPolicy: permission,
+        resumeSessionId: latest?.acpSessionId,
+        preferredModelId: latest?.modelId,
+        journalOffset: latest?.journalOffset ?? 0,
+        durable: durable,
+        onJournalAdvance: (bytes) => sessions.noteJournalOffset(chatId, bytes),
+      ).timeout(
+        const Duration(seconds: 45),
+        onTimeout: () => throw TimeoutException(
+          'Connect timed out. Try `agent login` on the remote in the Terminal '
+          'tab, then Connect again.',
+        ),
+      );
+    };
+  }
+
   Future<void> _ensureAcpBody() async {
-    final chat = _chat;
     final repo = _repo;
     final host = _host;
-    if (chat == null || repo == null || host == null) return;
+    if (_chat == null || repo == null || host == null) return;
+    var chat = _chat!;
     if (chat.provider != AgentProvider.cursor) {
       setState(() {
         _showSdkInstallGuide = true;
@@ -217,53 +364,48 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     });
 
     try {
-      final ssh = ref.read(sshServiceProvider);
-      final tmux = ref.read(tmuxServiceProvider);
-      String binary;
+      // Pull the live session id Mac wrote before we attach — without it the
+      // agent starts over and only sees messages sent on this device.
       try {
-        binary = await tmux
-            .resolveCursorBinary(host)
-            .timeout(const Duration(seconds: 20));
-      } on MissingToolException {
-        rethrow;
-      } on TimeoutException {
-        throw TimeoutException(
-          'Timed out looking for Cursor CLI. Check Terminal SSH, then try again.',
-        );
-      }
-      if (mounted) setState(() => _connectStatus = 'Starting agent ($binary)…');
-      try {
-        await ssh.ensureTmux(host);
+        final changed = await ref.read(agentDockServiceProvider).syncChatRecord(
+              host: host,
+              chatId: chat.id,
+            );
+        if (changed) {
+          final refreshed =
+              await ref.read(appDatabaseProvider).getChat(chat.id);
+          if (refreshed != null) {
+            chat = refreshed;
+            if (mounted) setState(() => _chat = refreshed);
+          }
+        }
       } catch (e) {
-        SafeLog.d('tmux missing; continuing with ACP over SSH', e);
+        SafeLog.d('sync chat record before connect failed', e);
       }
 
-      final mcps = await ref.read(appDatabaseProvider).listEnabledMcpsForHost(host.id);
-      final mcpConfigs = mcps.map((m) => m.toAcpConfig()).toList();
+      final factory = _buildSessionFactory(chatId: chat.id, cwd: repo.remotePath);
 
-      if (mounted) setState(() => _connectStatus = 'ACP handshake…');
-      final session = await AcpSession.start(
-        ssh: ssh,
-        secureStore: ref.read(secureStoreProvider),
-        host: host,
-        cwd: repo.remotePath,
-        binary: binary,
-        mcpServers: mcpConfigs,
-        initialMode: _mode,
-        permissionPolicy: _permission,
-      ).timeout(
-        const Duration(seconds: 45),
-        onTimeout: () => throw TimeoutException(
-          'Connect timed out. Try `agent login` on the remote in the Terminal tab, then Connect again.',
-        ),
-      );
+      if (mounted) setState(() => _connectStatus = 'Starting agent…');
+      final session = await factory();
 
       final runtime = await ref.read(activeAcpSessionsProvider.notifier).attach(
             chatId: chat.id,
             session: session,
+            sessionFactory: factory,
           );
       runtime.chatMeta = chat;
       _bindRuntime(runtime);
+
+      final sessionId = session.sessionId;
+      if (sessionId != null) {
+        unawaited(
+          ref.read(agentRuntimeHostProvider).writeSessionId(
+                host,
+                chat.id,
+                sessionId,
+              ),
+        );
+      }
 
       final updated = chat.copyWith(
         status: ChatStatus.running,
@@ -278,7 +420,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           _chat = updated;
           _showSdkInstallGuide = false;
           _error = null;
+          _resumedInPlace = session.resumedInPlace;
         });
+      }
+      if (session.resumedInPlace) {
+        unawaited(_prefetchModelCatalogIfNeeded(runtime));
       }
     } on MissingToolException catch (e) {
       if (mounted) {
@@ -336,6 +482,93 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
+  /// The live session's model when connected, otherwise the stored preference.
+  AgentModel? get _selectedModel {
+    final id = _runtime?.currentModelId ?? _chat?.modelId;
+    if (id == null || id.isEmpty) return null;
+    for (final model in _runtime?.availableModels ?? const <AgentModel>[]) {
+      if (model.modelId == id) return model;
+    }
+    // Not connected yet, so derive what we can from the id itself.
+    return AgentModel.parse(id);
+  }
+
+  Future<void> _pickMode() async {
+    final chosen = await showModalBottomSheet<AgentSessionMode>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final m in AgentSessionMode.values)
+              ListTile(
+                leading: Icon(
+                  m == _mode
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                  color: m == _mode ? Theme.of(context).colorScheme.primary : null,
+                ),
+                title: Text(m.label),
+                subtitle: Text(m.subtitle),
+                onTap: () => Navigator.pop(context, m),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (chosen != null && chosen != _mode) await _setMode(chosen);
+  }
+
+  Future<void> _pickModel() async {
+    // The model list only exists on a live session, so connect first rather
+    // than showing an empty picker.
+    if ((_runtime?.availableModels ?? const []).isEmpty && !_connecting) {
+      await _ensureAcp();
+    }
+    if (!mounted) return;
+
+    final runtime = _runtime ??
+        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+
+    if ((runtime?.availableModels ?? const []).isEmpty &&
+        runtime != null &&
+        !runtime.closed) {
+      await _prefetchModelCatalogIfNeeded(runtime);
+    }
+    if (!mounted) return;
+
+    final chosen = await ModelPickerSheet.show(
+      context,
+      models: runtime?.availableModels ?? const [],
+      selectedId: _selectedModel?.modelId,
+    );
+    if (chosen == null || !mounted) return;
+
+    try {
+      if (runtime != null && !runtime.closed) {
+        await runtime.setModel(chosen);
+      } else {
+        // Offline: remember it so the next connect applies it.
+        final chat = _chat;
+        if (chat != null) {
+          final updated = chat.copyWith(modelId: chosen, updatedAt: DateTime.now());
+          await ref.read(appDatabaseProvider).upsertChat(updated);
+          ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
+        }
+      }
+      if (!mounted) return;
+      setState(() => _chat = _chat?.copyWith(modelId: chosen));
+    } catch (e) {
+      SafeLog.d('setModel failed', e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not switch model: $e')),
+        );
+      }
+    }
+  }
+
   void _setPermission(PermissionPolicy policy) {
     setState(() => _permission = policy);
     (_runtime ?? ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId))
@@ -344,20 +577,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   Future<void> _send() async {
     final text = _composer.text.trim();
-    if (text.isEmpty || _chat == null || _sending) return;
+    if (text.isEmpty || _chat == null) return;
     if (!_chat!.provider.isAvailable) return;
 
-    // Keep text until the agent actually accepts the prompt.
+    // Composer stays usable while a turn runs — messages go on the outbound
+    // queue. Only block the button briefly while we ensure the transport.
+    _composer.clear();
     setState(() => _sending = true);
     try {
       await _ensureAcp();
-      final runtime = ref.read(activeAcpSessionsProvider.notifier).get(_chat!.id);
+      final runtime =
+          ref.read(activeAcpSessionsProvider.notifier).get(_chat!.id);
       if (runtime == null || runtime.closed) {
+        // Put the text back so the user does not lose it.
+        _composer.text = text;
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(
-                _error ?? 'Could not connect to agent. Check Connect / SSH, then try again.',
+                _error ??
+                    'Could not connect to agent. Check Connect / SSH, then try again.',
               ),
             ),
           );
@@ -365,24 +604,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         return;
       }
       _bindRuntime(runtime);
-
-      final userMessage = ChatMessage(
-        id: const Uuid().v4(),
-        chatId: _chat!.id,
-        role: MessageRole.user,
-        content: text,
-        createdAt: DateTime.now(),
-      );
-
-      _composer.clear();
-      await runtime.appendUserMessage(userMessage);
-      _scrollToEnd();
-      await runtime.prompt(text).timeout(
-        const Duration(minutes: 10),
-        onTimeout: () => throw TimeoutException('Agent prompt timed out'),
-      );
+      // Returns as soon as the message is appended (and queued if busy).
+      // The turn itself runs in the background on the runtime.
+      await runtime.enqueueOrPrompt(text);
+      _scrollToEnd(force: true);
     } catch (e) {
-      SafeLog.d('prompt failed', e);
+      SafeLog.d('send failed', e);
       if (mounted) {
         setState(() {
           _showSdkInstallGuide = false;
@@ -393,15 +620,61 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         );
       }
     } finally {
-      // Always clear in-flight flags so the composer never stays locked.
-      _runtime?.promptInFlight = false;
       if (mounted) setState(() => _sending = false);
     }
   }
 
-  void _scrollToEnd() {
+  Future<void> _forceRun({String? messageId}) async {
+    final runtime = _runtime ??
+        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+    if (runtime == null) return;
+    try {
+      await runtime.forceRun(messageId: messageId);
+      _scrollToEnd(force: true);
+    } catch (e) {
+      SafeLog.d('force-run failed', e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Force run failed: $e')),
+        );
+      }
+    }
+  }
+
+  /// Open on the newest message rather than the top of the history.
+  ///
+  /// The list is lazy, so its scroll extent keeps growing for several frames as
+  /// rows are built and markdown lays out. Animating would chase a target that
+  /// is still moving and stop short, so pin to the end until it settles.
+  void _landAtBottom({int framesLeft = 10}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
+      if (!mounted) return;
+      if (_scroll.hasClients) {
+        final max = _scroll.position.maxScrollExtent;
+        if ((_scroll.position.pixels - max).abs() > 1) _scroll.jumpTo(max);
+      }
+      if (framesLeft > 1) {
+        _landAtBottom(framesLeft: framesLeft - 1);
+      } else {
+        _landedAtBottom = true;
+      }
+    });
+  }
+
+  /// Close enough to the end that the user is following the live turn rather
+  /// than reading back through history.
+  bool get _isNearBottom {
+    if (!_scroll.hasClients) return true;
+    final position = _scroll.position;
+    return position.maxScrollExtent - position.pixels < 160;
+  }
+
+  void _scrollToEnd({bool force = false}) {
+    // Don't fight the initial landing, and don't yank the view down while the
+    // user is scrolled up reading something.
+    if (!force && (!_landedAtBottom || !_isNearBottom)) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) return;
       _scroll.animateTo(
         _scroll.position.maxScrollExtent,
         duration: const Duration(milliseconds: 200),
@@ -416,6 +689,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (_runtimeListener != null && _runtime != null) {
       _runtime!.removeListener(_runtimeListener!);
     }
+    _markReadTimer?.cancel();
     _composer.dispose();
     _scroll.dispose();
     super.dispose();
@@ -447,25 +721,67 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         : kRemoteCursorSetupGuide;
 
     final runtime = _runtime;
-    final entries = runtime?.entries ?? _dbEntries;
+    final queue = runtime?.outboundQueue ?? const <ChatMessage>[];
+    final queuedIds = {for (final m in queue) m.id};
+    // Queued messages live in the DB but stay out of [entries] until promoted,
+    // so filter defensively in case a stale row is still present.
+    final rawEntries = runtime?.entries ?? _dbEntries;
+    final filtered = queuedIds.isEmpty
+        ? rawEntries
+        : rawEntries
+            .where((e) => e.messageId == null || !queuedIds.contains(e.messageId))
+            .toList(growable: false);
+    // Hide persisted thought/system crumbs from the main thread — they still
+    // stream live above the agent bubble while a turn is open.
+    final visible = [
+      for (final e in filtered)
+        if (e.message?.role != MessageRole.system) e,
+    ];
+    // Late flushes can append an older assistant row after a newer user row.
+    // Paint in clock order so the thread reads like a normal chat.
+    final entries = _entriesByTime(visible);
     final thoughtBuffer = runtime?.thoughtBuffer ?? '';
     final assistantBuffer = runtime?.assistantBuffer ?? '';
-    final sending = _sending;
-    final streaming = sending || (runtime?.promptInFlight ?? false);
+    // Composer no longer locks for the whole turn — only the live buffer
+    // counts as "working" for the agent bubble.
+    final streaming = runtime?.promptInFlight ?? false;
     final liveError = runtime?.lastError;
     final displayError = _error ?? liveError;
     final connected = runtime != null && !runtime.closed;
+    final reconnecting = runtime?.reconnecting ?? false;
+    final statusLabel = switch (true) {
+      _ when reconnecting => ' · reconnecting…',
+      _ when connected && _resumedInPlace => ' · live · resumed',
+      _ when connected => ' · live',
+      _ => '',
+    };
 
     final extra = <Widget>[];
-    if (thoughtBuffer.isNotEmpty) {
-      extra.add(_Bubble(role: MessageRole.system, text: thoughtBuffer, streaming: true));
-    }
-    if (assistantBuffer.isNotEmpty || streaming) {
+    if (streaming) {
+      if (thoughtBuffer.isNotEmpty) {
+        extra.add(_Bubble(
+          role: MessageRole.system,
+          text: thoughtBuffer,
+          streaming: true,
+        ));
+      }
+      // Live answer stays above queued user bubbles so the current turn can
+      // finish without burying what the user just scheduled.
       extra.add(
         _Bubble(
           role: MessageRole.assistant,
           text: assistantBuffer,
           streaming: true,
+        ),
+      );
+    }
+    for (final m in queue) {
+      extra.add(
+        _Bubble(
+          role: MessageRole.user,
+          text: m.content,
+          at: m.createdAt,
+          queued: true,
         ),
       );
     }
@@ -477,8 +793,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           children: [
             Text(_chat!.title),
             Text(
-              '${_repo?.name ?? ''} · ${_chat!.provider.label}'
-              '${connected ? ' · live' : ''}',
+              '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
               style: theme.textTheme.bodySmall,
             ),
           ],
@@ -497,17 +812,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               },
               icon: const Icon(Icons.folder_open_outlined),
             ),
-          if (_connecting)
+          if (_connecting || reconnecting)
             Padding(
               padding: const EdgeInsets.only(right: 12),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (_connectStatus != null)
+                  if (_connectStatus != null || reconnecting)
                     Padding(
                       padding: const EdgeInsets.only(right: 10),
                       child: Text(
-                        _connectStatus!,
+                        _connectStatus ??
+                            'Reconnecting (${runtime?.reconnectAttempts ?? 0})…',
                         style: theme.textTheme.bodySmall,
                       ),
                     ),
@@ -522,84 +838,49 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           else
             IconButton(
               tooltip: connected
-                  ? 'Agent live (stays connected in background)'
+                  ? 'Agent live — keeps running on the host if you disconnect'
                   : 'Reconnect ACP',
               onPressed: _connecting ? null : _ensureAcp,
               icon: Icon(connected ? Icons.sensors : Icons.link),
             ),
-          PopupMenuButton<String>(
-            tooltip: 'Mode & permissions',
-            icon: const Icon(Icons.tune),
-            onSelected: (value) {
-              if (value.startsWith('mode:')) {
-                unawaited(_setMode(AgentSessionMode.fromId(value.substring(5))));
-              } else if (value.startsWith('perm:')) {
-                _setPermission(
-                  value.endsWith('allowAll')
-                      ? PermissionPolicy.allowAll
-                      : PermissionPolicy.ask,
-                );
-              }
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(enabled: false, child: Text('Mode')),
-              for (final m in AgentSessionMode.values)
-                CheckedPopupMenuItem(
-                  value: 'mode:${m.id}',
-                  checked: _mode == m,
-                  child: Text('${m.label} — ${m.subtitle}'),
-                ),
-              const PopupMenuDivider(),
-              const PopupMenuItem(enabled: false, child: Text('Permissions')),
-              CheckedPopupMenuItem(
-                value: 'perm:ask',
-                checked: _permission == PermissionPolicy.ask,
-                child: const Text('Ask — approve each tool'),
-              ),
-              CheckedPopupMenuItem(
-                value: 'perm:allowAll',
-                checked: _permission == PermissionPolicy.allowAll,
-                child: const Text('Allow all — auto-approve'),
-              ),
-            ],
-          ),
         ],
       ),
       body: Column(
         children: [
           Material(
             color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
-            child: Padding(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
               padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
               child: Row(
                 children: [
-                  Expanded(
-                    child: SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: SegmentedButton<AgentSessionMode>(
-                        segments: [
-                          for (final m in AgentSessionMode.values)
-                            ButtonSegment(value: m, label: Text(m.label)),
-                        ],
-                        selected: {_mode},
-                        onSelectionChanged: (s) => unawaited(_setMode(s.first)),
-                      ),
-                    ),
+                  _ToolbarChip(
+                    icon: Icons.tune,
+                    label: _mode.label,
+                    opensMenu: true,
+                    onTap: _pickMode,
                   ),
                   const SizedBox(width: 8),
-                  FilterChip(
-                    label: Text(
-                      _permission == PermissionPolicy.allowAll ? 'Allow all' : 'Ask',
-                    ),
+                  _ToolbarChip(
+                    icon: Icons.auto_awesome_outlined,
+                    label: _selectedModel?.name ?? 'Model',
+                    detail: _selectedModel?.badges.join(' · '),
+                    opensMenu: true,
+                    onTap: _pickModel,
+                  ),
+                  const SizedBox(width: 8),
+                  _ToolbarChip(
+                    icon: _permission == PermissionPolicy.allowAll
+                        ? Icons.verified_user_outlined
+                        : Icons.privacy_tip_outlined,
+                    label: _permission == PermissionPolicy.allowAll
+                        ? 'Allow all'
+                        : 'Ask',
                     selected: _permission == PermissionPolicy.allowAll,
-                    onSelected: (v) => _setPermission(
-                      v ? PermissionPolicy.allowAll : PermissionPolicy.ask,
-                    ),
-                    avatar: Icon(
+                    onTap: () => _setPermission(
                       _permission == PermissionPolicy.allowAll
-                          ? Icons.verified_user_outlined
-                          : Icons.privacy_tip_outlined,
-                      size: 16,
+                          ? PermissionPolicy.ask
+                          : PermissionPolicy.allowAll,
                     ),
                   ),
                 ],
@@ -625,37 +906,47 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           else if (displayError != null)
             Material(
               color: theme.colorScheme.errorContainer,
-              child: ListTile(
-                dense: true,
-                title: SelectableText(
-                  displayError,
-                  style: TextStyle(color: theme.colorScheme.onErrorContainer),
-                ),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (!connected)
-                      TextButton(
-                        onPressed: _connecting
-                            ? null
-                            : () {
-                                setState(() {
-                                  _error = null;
-                                  _showSdkInstallGuide = false;
-                                });
-                                runtime?.lastError = null;
-                                unawaited(_ensureAcp());
-                              },
-                        child: const Text('Reconnect'),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 140),
+                child: ListTile(
+                  dense: true,
+                  title: SingleChildScrollView(
+                    child: SelectableText(
+                      displayError,
+                      style: TextStyle(
+                        color: theme.colorScheme.onErrorContainer,
                       ),
-                    IconButton(
-                      icon: const Icon(Icons.close),
-                      onPressed: () {
-                        setState(() => _error = null);
-                        runtime?.lastError = null;
-                      },
                     ),
-                  ],
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (!connected)
+                        TextButton(
+                          onPressed: _connecting
+                              ? null
+                              : () {
+                                  setState(() {
+                                    _error = null;
+                                    _showSdkInstallGuide = false;
+                                  });
+                                  runtime?.lastError = null;
+                                  unawaited(_ensureAcp());
+                                },
+                          child: const Text('Reconnect'),
+                        ),
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () {
+                          setState(() {
+                            _error = null;
+                            _showSdkInstallGuide = false;
+                          });
+                          runtime?.lastError = null;
+                        },
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -669,14 +960,46 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   return extra[index - entries.length];
                 }
                 final entry = entries[index];
+                final prevAt =
+                    index > 0 ? entries[index - 1].createdAt : null;
+                final at = entry.createdAt;
+                final showDate = at != null &&
+                    (prevAt == null ||
+                        prevAt.year != at.year ||
+                        prevAt.month != at.month ||
+                        prevAt.day != at.day);
+
+                Widget body;
                 if (entry.tool != null) {
-                  return ToolCallCard(tool: entry.tool!);
+                  body = ToolCallCard(tool: entry.tool!);
+                } else {
+                  final m = entry.message!;
+                  body = _Bubble(
+                    role: m.role,
+                    text: m.content,
+                    at: m.createdAt,
+                  );
                 }
-                final m = entry.message!;
-                return _Bubble(role: m.role, text: m.content);
+                if (!showDate) return body;
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _DateChip(at),
+                    body,
+                  ],
+                );
               },
             ),
           ),
+          if (queue.isNotEmpty)
+            _OutboundQueueBar(
+              queue: queue,
+              busy: streaming,
+              onForceRun: (id) => unawaited(_forceRun(messageId: id)),
+              onForceRunNext: () => unawaited(_forceRun()),
+              onRemove: (id) =>
+                  unawaited(runtime?.removeFromQueue(id) ?? Future<void>.value()),
+            ),
           SafeArea(
             top: false,
             child: Padding(
@@ -688,32 +1011,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                       controller: _composer,
                       minLines: 1,
                       maxLines: 5,
-                      enabled: _chat!.provider.isAvailable,
+                      enabled: _chat!.provider.isAvailable && !_connecting,
                       decoration: InputDecoration(
                         hintText: _chat!.provider.isAvailable
                             ? (_connecting
                                 ? 'Connecting agent…'
-                                : connected
-                                    ? 'Message Cursor agent…'
-                                    : 'Message agent…')
+                                : streaming
+                                    ? 'Message (queued until Force run)…'
+                                    : connected
+                                        ? 'Message Cursor agent…'
+                                        : 'Message agent…')
                             : 'Claude is beta',
                         border: const OutlineInputBorder(),
                       ),
                       onSubmitted: (_) {
-                        if (!_sending) _send();
+                        if (!_sending) unawaited(_send());
                       },
                     ),
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
-                    onPressed: _sending || !_chat!.provider.isAvailable ? null : _send,
-                    icon: _sending
+                    // Only block while connecting or during the brief enqueue
+                    // handshake — never for the whole agent turn.
+                    onPressed: _connecting ||
+                            _sending ||
+                            !_chat!.provider.isAvailable
+                        ? null
+                        : () => unawaited(_send()),
+                    icon: _connecting
                         ? const SizedBox(
                             width: 18,
                             height: 18,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(Icons.send),
+                        : Icon(streaming ? Icons.playlist_add : Icons.send),
                   ),
                 ],
               ),
@@ -730,11 +1061,15 @@ class _Bubble extends StatelessWidget {
     required this.role,
     required this.text,
     this.streaming = false,
+    this.queued = false,
+    this.at,
   });
 
   final MessageRole role;
   final String text;
   final bool streaming;
+  final bool queued;
+  final DateTime? at;
 
   @override
   Widget build(BuildContext context) {
@@ -750,19 +1085,13 @@ class _Bubble extends StatelessWidget {
             Icon(Icons.psychology_alt, size: 14, color: theme.colorScheme.outline),
             const SizedBox(width: 6),
             Expanded(
-              child: SelectableLinkify(
+              child: MessageBody(
                 text: text,
-                onOpen: _openLink,
-                options: const LinkifyOptions(humanize: false, looseUrl: true),
+                dense: true,
                 style: theme.textTheme.bodySmall?.copyWith(
                   fontStyle: FontStyle.italic,
                   color: theme.colorScheme.onSurfaceVariant,
                   height: 1.35,
-                ),
-                linkStyle: TextStyle(
-                  color: theme.colorScheme.primary,
-                  decoration: TextDecoration.underline,
-                  fontStyle: FontStyle.italic,
                 ),
               ),
             ),
@@ -779,7 +1108,7 @@ class _Bubble extends StatelessWidget {
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 6),
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
         constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.88),
         decoration: BoxDecoration(
           color: bg,
@@ -789,6 +1118,11 @@ class _Bubble extends StatelessWidget {
             bottomLeft: Radius.circular(isUser ? 16 : 4),
             bottomRight: Radius.circular(isUser ? 4 : 16),
           ),
+          border: queued
+              ? Border.all(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.45),
+                )
+              : null,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -801,37 +1135,86 @@ class _Bubble extends StatelessWidget {
                   children: [
                     Icon(Icons.smart_toy_outlined, size: 14, color: theme.colorScheme.primary),
                     const SizedBox(width: 6),
+                    Shimmer(
+                      enabled: streaming,
+                      child: Text(
+                        streaming ? 'Agent is working' : 'Agent',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: theme.colorScheme.primary,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (queued)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.schedule,
+                      size: 14,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 6),
                     Text(
-                      'Agent',
+                      'Queued',
                       style: theme.textTheme.labelSmall?.copyWith(
                         color: theme.colorScheme.primary,
                         fontWeight: FontWeight.w600,
                       ),
                     ),
-                    if (streaming) ...[
-                      const SizedBox(width: 8),
-                      SizedBox(
-                        width: 10,
-                        height: 10,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 1.5,
-                          color: theme.colorScheme.primary,
-                        ),
-                      ),
-                    ],
                   ],
                 ),
               ),
-            SelectableLinkify(
+            MessageBody(
               text: streaming && text.isEmpty ? '…' : text,
-              onOpen: _openLink,
-              options: const LinkifyOptions(humanize: false, looseUrl: true),
-              style: theme.textTheme.bodyMedium?.copyWith(height: 1.4),
-              linkStyle: TextStyle(
-                color: theme.colorScheme.primary,
-                decoration: TextDecoration.underline,
-                height: 1.4,
-              ),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                if (!streaming && !queued && text.trim().isNotEmpty) ...[
+                  IconButton(
+                    tooltip: 'Copy text for Teams',
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                    onPressed: () => copyMessageForTeams(context, text),
+                    icon: Icon(
+                      Icons.copy_rounded,
+                      size: 14,
+                      color: theme.colorScheme.outline,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Copy HTML for Teams',
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                    onPressed: () => copyMessageHtmlForTeams(context, text),
+                    icon: Icon(
+                      Icons.html,
+                      size: 16,
+                      color: theme.colorScheme.outline,
+                    ),
+                  ),
+                ],
+                if (at != null)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 4),
+                    child: Text(
+                      _formatClock(at!),
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.outline,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ],
         ),
@@ -840,19 +1223,208 @@ class _Bubble extends StatelessWidget {
   }
 }
 
-Future<void> _openLink(LinkableElement link) async {
-  var raw = link.url.trim();
-  if (!raw.contains('://')) {
-    raw = 'https://$raw';
+String _formatClock(DateTime at) {
+  final local = at.toLocal();
+  final h = local.hour.toString().padLeft(2, '0');
+  final m = local.minute.toString().padLeft(2, '0');
+  return '$h:$m';
+}
+
+class _DateChip extends StatelessWidget {
+  const _DateChip(this.day);
+
+  final DateTime day;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final that = DateTime(day.year, day.month, day.day);
+    final label = switch (today.difference(that).inDays) {
+      0 => 'Today',
+      1 => 'Yesterday',
+      _ => '${_month(that.month)} ${that.day}, ${that.year}',
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
+    );
   }
-  final uri = Uri.tryParse(raw);
-  if (uri == null) return;
-  try {
-    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (!ok) {
-      await launchUrl(uri, mode: LaunchMode.platformDefault);
-    }
-  } catch (_) {
-    // Ignore — bad URL or no handler.
+
+  static const _months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+  static String _month(int m) => _months[m - 1];
+}
+
+/// Pending outbound prompts while the agent is still on a turn.
+class _OutboundQueueBar extends StatelessWidget {
+  const _OutboundQueueBar({
+    required this.queue,
+    required this.busy,
+    required this.onForceRun,
+    required this.onForceRunNext,
+    required this.onRemove,
+  });
+
+  final List<ChatMessage> queue;
+  final bool busy;
+  final void Function(String id) onForceRun;
+  final VoidCallback onForceRunNext;
+  final void Function(String id) onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.55),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.schedule, size: 14, color: theme.colorScheme.primary),
+                const SizedBox(width: 6),
+                Text(
+                  busy
+                      ? 'Queued · agent is working'
+                      : 'Queued',
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: onForceRunNext,
+                  child: const Text('Force run'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            for (final m in queue)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        m.content,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => onForceRun(m.id),
+                      child: const Text('Run'),
+                    ),
+                    IconButton(
+                      tooltip: 'Remove from queue',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => onRemove(m.id),
+                      icon: const Icon(Icons.close, size: 16),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact toolbar control. Sized for a phone: icon, short label, and an
+/// optional detail line that is dropped when there is no room.
+class _ToolbarChip extends StatelessWidget {
+  const _ToolbarChip({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.detail,
+    this.selected = false,
+    this.opensMenu = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final String? detail;
+  final bool selected;
+  final bool opensMenu;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final foreground = selected ? scheme.onSecondaryContainer : scheme.onSurface;
+
+    return Material(
+      color: selected ? scheme.secondaryContainer : scheme.surface,
+      shape: StadiumBorder(
+        side: BorderSide(color: scheme.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 7, 10, 7),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: foreground),
+              const SizedBox(width: 7),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 180),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        color: foreground,
+                      ),
+                    ),
+                    if (detail != null && detail!.isNotEmpty)
+                      Text(
+                        detail!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              if (opensMenu)
+                Icon(Icons.expand_more, size: 16, color: scheme.onSurfaceVariant),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

@@ -32,8 +32,9 @@ class McpDeployService {
     await _db.upsertMcpHostLink(link);
 
     try {
+      // Pooled connection — shared with the rest of the app, do not close it.
       final client = await _ssh.connect(host);
-      try {
+      {
         final homeOut = await _run(client, r'printf %s "$HOME"');
         final home = homeOut.trim().isEmpty ? '.' : homeOut.trim();
         final dir = '$home/.cursor';
@@ -100,8 +101,6 @@ class McpDeployService {
         );
         await _db.upsertMcpHostLink(link);
         return link;
-      } finally {
-        client.close();
       }
     } catch (e) {
       SafeLog.d('MCP deploy failed', e);
@@ -128,8 +127,9 @@ class McpDeployService {
     await _db.upsertMcpHostLink(link);
 
     try {
+      // Pooled connection — shared with the rest of the app, do not close it.
       final client = await _ssh.connect(host);
-      try {
+      {
         final homeOut = await _run(client, r'printf %s "$HOME"');
         final home = homeOut.trim().isEmpty ? '.' : homeOut.trim();
         final path = '$home/.cursor/mcp.json';
@@ -180,8 +180,6 @@ class McpDeployService {
         );
         await _db.upsertMcpHostLink(link);
         return link;
-      } finally {
-        client.close();
       }
     } catch (e) {
       link = link.copyWith(

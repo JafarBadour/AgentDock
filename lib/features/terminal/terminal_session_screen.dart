@@ -24,7 +24,6 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   final _terminal = Terminal(maxLines: 10000);
   final _terminalController = TerminalController();
 
-  SSHClient? _client;
   SSHSession? _session;
   StreamSubscription<List<int>>? _stdoutSub;
   StreamSubscription<List<int>>? _stderrSub;
@@ -57,8 +56,6 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
         const Duration(seconds: 25),
         onTimeout: () => throw TimeoutException('SSH connect timed out'),
       );
-      _client = client;
-
       final session = await client
           .shell(
             pty: SSHPtyConfig(
@@ -125,11 +122,9 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
     try {
       _session?.close();
     } catch (_) {}
-    try {
-      _client?.close();
-    } catch (_) {}
+    // The client is pooled and shared with agent sessions; closing it here
+    // would drop them too. Releasing the shell channel is enough.
     _session = null;
-    _client = null;
   }
 
   void _sendKey(String seq) {
