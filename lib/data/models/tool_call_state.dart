@@ -38,15 +38,74 @@ class ToolCallState {
     return status;
   }
 
+  /// Human label for the row.
+  ///
+  /// Agents do not always send a title, and the bare fallback rendered as a
+  /// row reading just "Tool", which tells the user nothing.
+  String get displayTitle {
+    final given = title.trim();
+    if (given.isNotEmpty && given.toLowerCase() != 'tool') return given;
+    final k = (kind ?? '').toLowerCase();
+    if (k.contains('exec') || k.contains('shell') || k.contains('terminal')) {
+      return 'Ran a command';
+    }
+    if (k.contains('read')) return 'Read a file';
+    if (k.contains('edit') || k.contains('write')) return 'Edited a file';
+    if (k.contains('search') || k.contains('grep')) return 'Searched the code';
+    if (k.contains('fetch') || k.contains('http')) return 'Fetched a URL';
+    if (k.contains('delete')) return 'Deleted a file';
+    return 'Tool call';
+  }
+
+  /// One-line detail shown next to the title.
   String? get preview {
-    if (locations.isNotEmpty) return locations.first;
+    if (locations.isNotEmpty) return _short(locations.first);
     final input = rawInput?.trim();
     if (input == null || input.isEmpty) return null;
+    // Tool input is usually pretty-printed JSON, whose first line is just "{".
+    final fromJson = _previewFromJson(input);
+    if (fromJson != null) return _short(fromJson);
     final line = input.split('\n').firstWhere(
           (l) => l.trim().isNotEmpty,
           orElse: () => input,
         );
-    final compact = line.trim().replaceAll(RegExp(r'\s+'), ' ');
+    return _short(line);
+  }
+
+  /// Keys worth surfacing, most specific first.
+  static const _previewKeys = [
+    'command',
+    'cmd',
+    'query',
+    'pattern',
+    'path',
+    'file_path',
+    'filePath',
+    'url',
+    'name',
+    'description',
+  ];
+
+  static String? _previewFromJson(String input) {
+    if (!input.startsWith('{') && !input.startsWith('[')) return null;
+    Object? decoded;
+    try {
+      decoded = jsonDecode(input);
+    } catch (_) {
+      return null;
+    }
+    if (decoded is List) decoded = decoded.isEmpty ? null : decoded.first;
+    if (decoded is! Map) return null;
+    for (final key in _previewKeys) {
+      final value = decoded[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+      if (value is List && value.isNotEmpty) return value.join(' ');
+    }
+    return null;
+  }
+
+  static String _short(String value) {
+    final compact = value.trim().replaceAll(RegExp(r'\s+'), ' ');
     return compact.length <= 100 ? compact : '${compact.substring(0, 99)}…';
   }
 

@@ -11,8 +11,102 @@ import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/secure/safe_log.dart';
-import '../../services/tmux_service.dart';
+import '../../services/agent_runtime_host.dart';
 import 'agents_screen.dart';
+
+class _NewAgentRequest {
+  const _NewAgentRequest({required this.title, required this.provider});
+
+  final String title;
+  final AgentProvider provider;
+}
+
+/// Owns its own [TextEditingController].
+///
+/// The controller cannot live in the calling function: `showDialog` returns as
+/// soon as the route is popped, but the dialog keeps rebuilding through its
+/// dismissal animation, so disposing there is a use-after-dispose.
+class _NewAgentDialog extends StatefulWidget {
+  const _NewAgentDialog({required this.repoName});
+
+  final String repoName;
+
+  @override
+  State<_NewAgentDialog> createState() => _NewAgentDialogState();
+}
+
+class _NewAgentDialogState extends State<_NewAgentDialog> {
+  final _title = TextEditingController(text: 'New agent');
+  AgentProvider _provider = AgentProvider.cursor;
+
+  @override
+  void dispose() {
+    _title.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_provider.isAvailable) return;
+    final text = _title.text.trim();
+    Navigator.pop(
+      context,
+      _NewAgentRequest(
+        title: text.isEmpty ? 'New agent' : text,
+        provider: _provider,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('New agent · ${widget.repoName}'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _title,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Title'),
+            onSubmitted: (_) => _submit(),
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<AgentProvider>(
+            initialValue: _provider,
+            items: [
+              for (final p in AgentProvider.values)
+                DropdownMenuItem(
+                  value: p,
+                  enabled: p.isAvailable,
+                  child: Text(p.isAvailable ? p.label : '${p.label} (beta)'),
+                ),
+            ],
+            onChanged: (value) {
+              if (value == null || !value.isAvailable) return;
+              setState(() => _provider = value);
+            },
+            decoration: const InputDecoration(labelText: 'Provider'),
+          ),
+          if (!_provider.isAvailable)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text('Claude support is beta and not available yet.'),
+            ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _provider.isAvailable ? _submit : null,
+          child: const Text('Create'),
+        ),
+      ],
+    );
+  }
+}
 
 /// Dialog + create chat + navigate to `/agents/chat/:id`.
 Future<void> startNewAgentChat({
@@ -21,75 +115,14 @@ Future<void> startNewAgentChat({
   required Host host,
   required Repo repo,
 }) async {
-  AgentProvider provider = AgentProvider.cursor;
-  final titleController = TextEditingController(text: 'New agent');
-
-  final confirmed = await showDialog<bool>(
+  final request = await showDialog<_NewAgentRequest>(
     context: context,
-    builder: (context) {
-      return StatefulBuilder(
-        builder: (context, setLocal) {
-          return AlertDialog(
-            title: Text('New agent · ${repo.name}'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: titleController,
-                  autofocus: true,
-                  decoration: const InputDecoration(labelText: 'Title'),
-                  onSubmitted: (_) {
-                    if (provider.isAvailable) Navigator.pop(context, true);
-                  },
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<AgentProvider>(
-                  initialValue: provider,
-                  items: [
-                    for (final p in AgentProvider.values)
-                      DropdownMenuItem(
-                        value: p,
-                        enabled: p.isAvailable,
-                        child: Text(
-                          p.isAvailable ? p.label : '${p.label} (beta)',
-                        ),
-                      ),
-                  ],
-                  onChanged: (value) {
-                    if (value == null || !value.isAvailable) return;
-                    setLocal(() => provider = value);
-                  },
-                  decoration: const InputDecoration(labelText: 'Provider'),
-                ),
-                if (!provider.isAvailable)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 8),
-                    child: Text('Claude support is beta and not available yet.'),
-                  ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: provider.isAvailable ? () => Navigator.pop(context, true) : null,
-                child: const Text('Create'),
-              ),
-            ],
-          );
-        },
-      );
-    },
+    builder: (context) => _NewAgentDialog(repoName: repo.name),
   );
 
-  final title = titleController.text.trim().isEmpty
-      ? 'New agent'
-      : titleController.text.trim();
-  titleController.dispose();
-
-  if (confirmed != true || !context.mounted) return;
+  if (request == null || !context.mounted) return;
+  final title = request.title;
+  final provider = request.provider;
 
   showDialog<void>(
     context: context,
@@ -107,10 +140,11 @@ Future<void> startNewAgentChat({
 
   try {
     final db = ref.read(appDatabaseProvider);
-    final tmux = ref.read(tmuxServiceProvider);
 
     final chatId = const Uuid().v4();
-    final session = TmuxService.sessionNameForChat(chatId);
+    // The tmux session is created lazily by AgentRuntimeHost on first connect;
+    // record the name now so the agent list can show where it will live.
+    final session = AgentRuntimeHost.sessionNameForChat(chatId);
     final now = DateTime.now();
     final chat = Chat(
       id: chatId,
@@ -137,17 +171,6 @@ Future<void> startNewAgentChat({
         SafeLog.d('agentdock push on create failed', e);
       }
     }());
-
-    try {
-      await tmux.createSession(
-        host: host,
-        session: session,
-        cwd: repo.remotePath,
-        command: 'bash',
-      );
-    } catch (e) {
-      SafeLog.d('tmux create skipped/failed', e);
-    }
 
     ref.invalidate(agentsTreeProvider);
     if (context.mounted) {

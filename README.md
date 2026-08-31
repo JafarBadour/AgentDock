@@ -1,4 +1,4 @@
-# Agentic Phone
+# Agent Dock
 
 Flutter app (Android-first, iOS beta) for a Cursor-style **Agents** window over SSH.
 
@@ -6,6 +6,26 @@ Flutter app (Android-first, iOS beta) for a Cursor-style **Agents** window over 
 - **Hosts** — remotes like SSH config entries
 - **Repos** — remote directories under a host
 - **Agents** — many chats per repo; each chat talks to **Cursor Agent CLI** (`cursor-agent acp` / `agent acp`) on the remote via stock **tmux** + ACP
+
+Chats are local-first: the transcript is read from SQLite and painted before any
+network call, and remote state is merged in afterwards.
+
+### How a chat stays alive
+
+The agent runs detached under tmux in `~/.agentdock/sessions/<chatId>/`, not
+bound to the SSH connection:
+
+- **stdin** is a FIFO (`in`) held open by a parked `sleep`, so the phone
+  disconnecting never sends EOF to the agent
+- **stdout** is appended to a journal (`out.jsonl`), so output produced while
+  you were away is kept and replayed from the byte offset you last read
+
+Reconnecting therefore reattaches to the *same* process with its context intact.
+If the process is gone (host reboot), the app falls back to ACP `session/load`
+when the agent advertises that capability, and only then to a new session.
+
+One pooled SSH connection per host is shared by every feature, health-checked
+with a timeout, and dropped when the app backgrounds.
 
 This is a greenfield project. Patterns were studied from open-source tools (e.g. MonkeySSH); **no third-party app code or remote helper binaries are vendored**.
 
@@ -47,6 +67,6 @@ iOS builds are supported by the project but are secondary (beta).
 lib/
   features/   # Connect, Hosts, Repos, Agents UI
   data/       # models, sqflite metadata, secure store
-  services/   # SSH, tmux, Cursor ACP client
+  services/   # SSH pool, remote agent runtime, Cursor ACP client, sync
   app/        # router, providers
 ```

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
@@ -11,7 +13,11 @@ import '../models/repo.dart';
 
 /// Local metadata only — never stores secrets.
 class AppDatabase {
-  AppDatabase();
+  AppDatabase({this.overridePath});
+
+  /// Explicit database location. Used by tests; production resolves the app
+  /// documents directory instead.
+  final String? overridePath;
 
   Database? _db;
 
@@ -22,11 +28,11 @@ class AppDatabase {
   }
 
   Future<Database> _open() async {
-    final dir = await getApplicationDocumentsDirectory();
-    final path = p.join(dir.path, 'agentic_phone.db');
+    final path = overridePath ??
+        p.join((await getApplicationDocumentsDirectory()).path, 'agentic_phone.db');
     return openDatabase(
       path,
-      version: 4,
+      version: 8,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -61,6 +67,10 @@ CREATE TABLE chats (
   provider TEXT NOT NULL,
   tmux_session TEXT,
   acp_session_id TEXT,
+  journal_offset INTEGER NOT NULL DEFAULT 0,
+  model_id TEXT,
+  last_read_at TEXT,
+  outbound_queue TEXT,
   status TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
@@ -90,6 +100,23 @@ CREATE TABLE messages (
         }
         if (oldVersion < 4) {
           await _addSortOrderColumns(db);
+        }
+        if (oldVersion < 5) {
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN journal_offset INTEGER NOT NULL DEFAULT 0',
+          );
+        }
+        if (oldVersion < 6) {
+          await db.execute('ALTER TABLE chats ADD COLUMN model_id TEXT');
+        }
+        if (oldVersion < 7) {
+          await db.execute('ALTER TABLE chats ADD COLUMN last_read_at TEXT');
+          // Treat everything that already exists as seen, otherwise every old
+          // chat would light up unread on first launch after the update.
+          await db.execute('UPDATE chats SET last_read_at = updated_at');
+        }
+        if (oldVersion < 8) {
+          await db.execute('ALTER TABLE chats ADD COLUMN outbound_queue TEXT');
         }
       },
     );
@@ -334,6 +361,12 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     return rows.map(Chat.fromMap).toList();
   }
 
+  Future<List<Chat>> listAllChats() async {
+    final db = await database;
+    final rows = await db.query('chats', orderBy: 'updated_at DESC');
+    return rows.map(Chat.fromMap).toList();
+  }
+
   Future<int> nextChatSortOrder(String repoId) async {
     final db = await database;
     final rows = await db.rawQuery(
@@ -366,7 +399,66 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
 
   Future<void> upsertChat(Chat chat) async {
     final db = await database;
-    await db.insert('chats', chat.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    final row = chat.toMap();
+    // A full-row replace would otherwise let any caller carrying an older Chat
+    // snapshot rewind the read watermark or wipe the outbound queue.
+    final existing = await db.query(
+      'chats',
+      columns: ['last_read_at', 'outbound_queue'],
+      where: 'id = ?',
+      whereArgs: [chat.id],
+    );
+    if (existing.isNotEmpty) {
+      final current = existing.first['last_read_at'] as String?;
+      final incoming = row['last_read_at'] as String?;
+      if (current != null &&
+          (incoming == null || current.compareTo(incoming) > 0)) {
+        row['last_read_at'] = current;
+      }
+      row['outbound_queue'] = existing.first['outbound_queue'];
+    }
+    await db.insert('chats', row, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// Persist the in-memory outbound prompt queue for [chatId].
+  Future<void> setOutboundQueue(
+    String chatId,
+    List<ChatMessage> queue,
+  ) async {
+    final db = await database;
+    final payload = queue.isEmpty
+        ? null
+        : jsonEncode(queue.map((m) => m.toMap()).toList());
+    await db.update(
+      'chats',
+      {'outbound_queue': payload},
+      where: 'id = ?',
+      whereArgs: [chatId],
+    );
+  }
+
+  Future<List<ChatMessage>> getOutboundQueue(String chatId) async {
+    final db = await database;
+    final rows = await db.query(
+      'chats',
+      columns: ['outbound_queue'],
+      where: 'id = ?',
+      whereArgs: [chatId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return const [];
+    final raw = rows.first['outbound_queue'] as String?;
+    if (raw == null || raw.isEmpty) return const [];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      return decoded
+          .whereType<Map>()
+          .map((m) => ChatMessage.fromMap(Map<String, Object?>.from(m)))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
   }
 
   Future<void> deleteChat(String id) async {
@@ -390,6 +482,11 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     await db.insert('messages', message.toMap());
   }
 
+  Future<void> deleteMessage(String id) async {
+    final db = await database;
+    await db.delete('messages', where: 'id = ?', whereArgs: [id]);
+  }
+
   Future<void> updateMessage(ChatMessage message) async {
     final db = await database;
     await db.update(
@@ -400,7 +497,20 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     );
   }
 
-  /// Replace all messages for a chat (AgentDock pull).
+  /// Insert or overwrite a single message by id.
+  ///
+  /// Used to keep the row for an in-progress agent turn up to date as text
+  /// streams in, so the transcript on disk never lags far behind the screen.
+  Future<void> upsertMessage(ChatMessage message) async {
+    final db = await database;
+    await db.insert(
+      'messages',
+      message.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Replace all messages for a chat (destructive; only for an explicit reset).
   Future<void> replaceMessages(String chatId, List<ChatMessage> messages) async {
     final db = await database;
     await db.transaction((txn) async {
@@ -413,6 +523,96 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
         );
       }
     });
+  }
+
+  /// Union [incoming] into a chat's transcript, keyed by message id.
+  ///
+  /// New ids are inserted. For ids we already have, the longer body wins —
+  /// that covers assistant checkpoints growing on another device while this
+  /// one still holds the truncated copy.
+  Future<int> mergeMessages(String chatId, List<ChatMessage> incoming) async {
+    if (incoming.isEmpty) return 0;
+    final db = await database;
+    var changed = 0;
+    await db.transaction((txn) async {
+      final existing = await txn.query(
+        'messages',
+        where: 'chat_id = ?',
+        whereArgs: [chatId],
+      );
+      final byId = {
+        for (final row in existing) row['id']! as String: row,
+      };
+      for (final m in incoming) {
+        final prev = byId[m.id];
+        if (prev == null) {
+          await txn.insert(
+            'messages',
+            m.toMap(),
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+          changed++;
+          continue;
+        }
+        final prevContent = prev['content']! as String;
+        if (m.content.length > prevContent.length) {
+          await txn.update(
+            'messages',
+            m.toMap(),
+            where: 'id = ?',
+            whereArgs: [m.id],
+          );
+          changed++;
+        }
+      }
+    });
+    return changed;
+  }
+
+  /// Mark everything in [chatId] up to [at] (default now) as seen.
+  ///
+  /// The watermark only ever moves forward. Long-lived runtimes hold a [Chat]
+  /// snapshot from when the screen opened, and a stale write must not make
+  /// already-read replies unread again — nor may a lagging device undo a read
+  /// that another device already synced.
+  Future<void> markChatRead(String chatId, {DateTime? at}) async {
+    final stamp = (at ?? DateTime.now()).toIso8601String();
+    final db = await database;
+    await db.rawUpdate(
+      'UPDATE chats SET last_read_at = ? '
+      'WHERE id = ? AND (last_read_at IS NULL OR last_read_at < ?)',
+      [stamp, chatId, stamp],
+    );
+  }
+
+  /// Unseen agent replies per chat, for the unread badge.
+  ///
+  /// Only assistant messages count: the user's own messages and tool noise are
+  /// not something they need to be called back to.
+  Future<Map<String, int>> unreadCounts() async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+SELECT m.chat_id AS chat_id, COUNT(*) AS unread
+FROM messages m
+JOIN chats c ON c.id = m.chat_id
+WHERE m.role = 'assistant'
+  AND (c.last_read_at IS NULL OR m.created_at > c.last_read_at)
+GROUP BY m.chat_id
+''');
+    return {
+      for (final row in rows)
+        row['chat_id'] as String: (row['unread'] as int?) ?? 0,
+    };
+  }
+
+  Future<void> setJournalOffset(String chatId, int offset) async {
+    final db = await database;
+    await db.update(
+      'chats',
+      {'journal_offset': offset},
+      where: 'id = ?',
+      whereArgs: [chatId],
+    );
   }
 
   // --- MCP ---

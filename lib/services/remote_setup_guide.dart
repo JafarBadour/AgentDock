@@ -20,7 +20,7 @@ source ~/.bashrc
 ''';
 
 /// Shown when Claude is selected (beta) — install is not wired yet.
-const kRemoteClaudeSetupGuide = r'''# Claude Code (beta in Agentic Phone — not wired yet)
+const kRemoteClaudeSetupGuide = r'''# Claude Code (beta in Agent Dock — not wired yet)
 # On the remote host, typical install:
 curl -fsSL https://claude.ai/install.sh | bash
 # or: npm install -g @anthropic-ai/claude-code

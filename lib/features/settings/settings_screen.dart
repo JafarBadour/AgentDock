@@ -34,10 +34,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     try {
       final backup = ref.read(configBackupServiceProvider);
       final suggested =
-          'agentic-phone-${DateTime.now().toIso8601String().split('T').first}.ag';
+          'agent-dock-${DateTime.now().toIso8601String().split('T').first}.ag';
 
       String? path = await FilePicker.saveFile(
-        dialogTitle: 'Export Agentic Phone config',
+        dialogTitle: 'Export Agent Dock config',
         fileName: suggested,
         type: FileType.custom,
         allowedExtensions: const ['ag', 'json'],
@@ -71,7 +71,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         final dir = await getApplicationDocumentsDirectory();
         final fallback = p.join(
           dir.path,
-          'agentic-phone-${DateTime.now().millisecondsSinceEpoch}.ag',
+          'agent-dock-${DateTime.now().millisecondsSinceEpoch}.ag',
         );
         final saved =
             await ref.read(configBackupServiceProvider).exportToFile(fallback);
@@ -99,7 +99,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     });
     try {
       final result = await FilePicker.pickFiles(
-        dialogTitle: 'Import Agentic Phone config',
+        dialogTitle: 'Import Agent Dock config',
         type: FileType.custom,
         allowedExtensions: const ['ag', 'json'],
         withData: false,

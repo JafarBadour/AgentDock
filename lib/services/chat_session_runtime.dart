@@ -1,30 +1,52 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/agent_mode.dart';
+import '../data/models/agent_model.dart';
 import '../data/models/chat.dart';
 import '../data/models/chat_message.dart';
 import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
 import 'cursor_acp_service.dart';
+import 'ssh_service.dart';
 
 /// One transcript row — message and/or live tool.
 class TranscriptEntry {
-  const TranscriptEntry._({this.message, this.tool, this.messageId});
+  const TranscriptEntry._({
+    this.message,
+    this.tool,
+    this.messageId,
+    DateTime? createdAt,
+  }) : _createdAt = createdAt;
 
-  factory TranscriptEntry.message(ChatMessage message) =>
-      TranscriptEntry._(message: message, messageId: message.id);
+  factory TranscriptEntry.message(ChatMessage message) => TranscriptEntry._(
+        message: message,
+        messageId: message.id,
+        createdAt: message.createdAt,
+      );
 
-  factory TranscriptEntry.tool(ToolCallState tool, {String? messageId}) =>
-      TranscriptEntry._(tool: tool, messageId: messageId);
+  factory TranscriptEntry.tool(
+    ToolCallState tool, {
+    String? messageId,
+    DateTime? createdAt,
+  }) =>
+      TranscriptEntry._(
+        tool: tool,
+        messageId: messageId,
+        createdAt: createdAt ?? DateTime.now(),
+      );
 
   final ChatMessage? message;
   final ToolCallState? tool;
   final String? messageId;
+  final DateTime? _createdAt;
+
+  DateTime? get createdAt => _createdAt ?? message?.createdAt;
 }
 
 /// Long-lived ACP session + transcript for one chat.
@@ -37,33 +59,89 @@ class ChatSessionRuntime extends ChangeNotifier {
     required AcpSession session,
     required AppDatabase db,
     this.onLocalChange,
+    this.sessionFactory,
   })  : _session = session,
         _db = db;
+
+  /// Maximum automatic attempts before we stop and wait for the user.
+  static const maxReconnectAttempts = 10;
+  static const _maxBackoff = Duration(seconds: 30);
 
   final String chatId;
   final AppDatabase _db;
   final void Function(String chatId)? onLocalChange;
+
+  /// Opens a fresh transport for this chat. Set by the owner so the runtime can
+  /// recover on its own after a drop, even with no chat screen mounted.
+  Future<AcpSession> Function()? sessionFactory;
+
   AcpSession _session;
   StreamSubscription<AcpUpdate>? _sub;
 
   final List<TranscriptEntry> entries = [];
   final Map<String, String> _toolMessageIds = {};
+  final _random = Random();
 
   String assistantBuffer = '';
   String thoughtBuffer = '';
+
+  /// Row id for the agent turn currently streaming, so progressive writes
+  /// update one message instead of appending fragments.
+  String? _assistantMessageId;
+  DateTime? _assistantStartedAt;
+  Timer? _assistantPersistTimer;
+  int _writesInFlight = 0;
+
+  /// True while decoded output exists that SQLite has not caught up with.
+  ///
+  /// The remote journal offset must not advance past this point: the next
+  /// connection resumes from that offset, so committing it early means the
+  /// tail of the turn is read, never stored, and never replayed.
+  bool get hasUnpersistedOutput =>
+      _assistantPersistTimer != null ||
+      thoughtBuffer.isNotEmpty ||
+      _writesInFlight > 0;
   String? lastError;
   bool closed = false;
   bool promptInFlight = false;
   Chat? chatMeta;
 
+  /// User messages waiting for the current turn to finish (or for Force run).
+  ///
+  /// Persisted to the DB and to [AppDatabase.setOutboundQueue]. Not in
+  /// [entries] until promoted — the chat paints them after the live agent turn.
+  final List<ChatMessage> outboundQueue = [];
+
+  /// Serialises prompt turns so a force-run cannot interleave with an old one.
+  Future<void> _promptTail = Future<void>.value();
+
+  /// Bumped when a hung prompt chain is broken so a stale turn's `finally`
+  /// cannot clear [promptInFlight] or drain the queue under a newer turn.
+  int _promptEpoch = 0;
+
+  /// When true, a cancelled turn's `finally` must not auto-start the next
+  /// queued message — [forceRun] is about to pick one explicitly.
+  bool _skipAutoDrain = false;
+
+  /// True while a silent reconnect is pending or running.
+  bool reconnecting = false;
+  int reconnectAttempts = 0;
+  Timer? _retryTimer;
+  bool _disposed = false;
+  bool _suspended = false;
+
   AcpSession get session => _session;
   AgentSessionMode get mode => _session.mode;
   PermissionPolicy get permissionPolicy => _session.permissionPolicy;
+  List<AgentModel> get availableModels => _session.availableModels;
+  String? get currentModelId => _session.currentModelId;
 
   void hydrateFromMessages(List<ChatMessage> messages) {
     entries.clear();
     _toolMessageIds.clear();
+    final queuedIds = {for (final m in outboundQueue) m.id};
     for (final m in messages) {
+      if (queuedIds.contains(m.id)) continue;
       if (m.role == MessageRole.tool) {
         final tool = ToolCallState.tryParseContent(m.content);
         if (tool != null) {
@@ -77,6 +155,100 @@ class ChatSessionRuntime extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Merge remote/local DB rows into the live transcript without clearing
+  /// in-flight assistant or thought buffers.
+  void absorbMessages(List<ChatMessage> messages) {
+    final queuedIds = {for (final m in outboundQueue) m.id};
+    for (final m in messages) {
+      if (queuedIds.contains(m.id)) continue;
+      if (m.role == MessageRole.tool) {
+        final tool = ToolCallState.tryParseContent(m.content);
+        if (tool == null) continue;
+        final index =
+            entries.indexWhere((e) => e.tool?.toolCallId == tool.toolCallId);
+        if (index >= 0) {
+          final prev = entries[index].tool!;
+          entries[index] = TranscriptEntry.tool(
+            prev.merge(
+              title: tool.title,
+              kind: tool.kind,
+              status: tool.status,
+              locations: tool.locations.isEmpty ? null : tool.locations,
+              rawInput: tool.rawInput,
+              rawOutput: tool.rawOutput,
+            ),
+            messageId: entries[index].messageId ?? m.id,
+            createdAt: entries[index].createdAt ?? m.createdAt,
+          );
+        } else {
+          entries.add(
+            TranscriptEntry.tool(tool, messageId: m.id, createdAt: m.createdAt),
+          );
+          _toolMessageIds[tool.toolCallId] = m.id;
+        }
+        continue;
+      }
+      final index = entries.indexWhere((e) => e.messageId == m.id);
+      if (index >= 0) {
+        final prev = entries[index].message;
+        if (prev != null && m.content.length > prev.content.length) {
+          entries[index] = TranscriptEntry.message(m);
+        }
+      } else {
+        entries.add(TranscriptEntry.message(m));
+      }
+    }
+    notifyListeners();
+  }
+
+  /// Pull the on-disk transcript (and queue) into memory after a remote sync.
+  Future<void> syncTranscriptFromDb() async {
+    await restoreOutboundQueue();
+    absorbMessages(await _db.listMessages(chatId));
+  }
+
+  /// Reload the durable outbound queue and drop those rows from [entries].
+  Future<void> restoreOutboundQueue() async {
+    final queued = await _db.getOutboundQueue(chatId);
+    outboundQueue
+      ..clear()
+      ..addAll(queued);
+    if (queued.isEmpty) {
+      notifyListeners();
+      return;
+    }
+    final ids = {for (final m in queued) m.id};
+    entries.removeWhere((e) => e.messageId != null && ids.contains(e.messageId));
+    notifyListeners();
+  }
+
+  /// If the agent is idle and work is waiting, start the next queued prompt.
+  void resumeOutboundQueue() {
+    if (_disposed || closed || promptInFlight || outboundQueue.isEmpty) return;
+    final next = outboundQueue.removeAt(0);
+    unawaited(_persistOutboundQueue());
+    notifyListeners();
+    unawaited(() async {
+      await _promoteQueuedMessage(next);
+      await _runPrompt(next.content);
+    }());
+  }
+
+  Future<void> _persistOutboundQueue() async {
+    try {
+      await _db.setOutboundQueue(chatId, List.unmodifiable(outboundQueue));
+    } catch (e) {
+      SafeLog.d('persist outbound queue failed', e);
+    }
+  }
+
+  /// Drop a hung prompt chain so Force run / send can make progress again.
+  void _breakPromptChain() {
+    _promptEpoch++;
+    promptInFlight = false;
+    _promptTail = Future<void>.value();
+  }
+
   void startListening() {
     _sub?.cancel();
     _sub = _session.updates.listen(_onUpdate, onError: (Object e) {
@@ -87,11 +259,117 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   void replaceSession(AcpSession session) {
     _sub?.cancel();
+    _retryTimer?.cancel();
+    _retryTimer = null;
     _session = session;
     closed = false;
     lastError = null;
+    reconnecting = false;
+    reconnectAttempts = 0;
+    // A reconnect must not inherit a hung prompt chain from the dead socket.
+    _breakPromptChain();
     startListening();
+    unawaited(rememberSessionId());
     notifyListeners();
+    // Pick up anything that was waiting while the socket was down.
+    resumeOutboundQueue();
+  }
+
+  /// Store the live ACP session id so the next launch can resume this
+  /// conversation instead of starting a fresh one.
+  ///
+  /// Reconnects can mint a new id (the agent process may have been restarted
+  /// under it), and an id that only ever lived in memory is the difference
+  /// between resuming with full context and the agent acting like it has never
+  /// met you.
+  Future<void> rememberSessionId() async {
+    final id = _session.sessionId;
+    if (id == null) return;
+    final current = chatMeta ?? await _db.getChat(chatId);
+    if (current == null || current.acpSessionId == id) return;
+    chatMeta = current.copyWith(acpSessionId: id, updatedAt: DateTime.now());
+    try {
+      await _db.upsertChat(chatMeta!);
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('persist acp session id failed', e);
+    }
+  }
+
+  /// The app is going into the background — stop fighting for a socket the OS
+  /// is about to kill.
+  void suspend() {
+    _suspended = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    reconnecting = false;
+    // The OS may never let us run again, so get the streaming turn on disk now
+    // rather than waiting out the checkpoint debounce.
+    _assistantPersistTimer?.cancel();
+    _assistantPersistTimer = null;
+    unawaited(_writeAssistantProgress());
+    notifyListeners();
+  }
+
+  /// Back in the foreground — recover immediately rather than on next tap.
+  void resume() {
+    _suspended = false;
+    if (closed && sessionFactory != null) {
+      reconnectAttempts = 0;
+      // Drop the "tap Reconnect" notice; we are about to do it automatically.
+      lastError = null;
+      _scheduleReconnect(immediate: true);
+    }
+  }
+
+  Duration _backoffFor(int attempt) {
+    final seconds = min(1 << attempt, _maxBackoff.inSeconds);
+    // Jitter keeps several chats on the same host from retrying in lockstep.
+    final jitterMs = _random.nextInt(400);
+    return Duration(milliseconds: seconds * 1000 + jitterMs);
+  }
+
+  void _scheduleReconnect({bool immediate = false}) {
+    if (_disposed || _suspended) return;
+    final factory = sessionFactory;
+    if (factory == null) return;
+    if (_retryTimer != null) return;
+
+    if (reconnectAttempts >= maxReconnectAttempts) {
+      reconnecting = false;
+      lastError = 'Could not reconnect after $maxReconnectAttempts attempts. '
+          'Tap Reconnect to try again — your chat history is kept.';
+      notifyListeners();
+      return;
+    }
+
+    final delay = immediate ? Duration.zero : _backoffFor(reconnectAttempts);
+    reconnectAttempts++;
+    reconnecting = true;
+    notifyListeners();
+
+    _retryTimer = Timer(delay, () async {
+      _retryTimer = null;
+      if (_disposed || _suspended) return;
+      try {
+        final session = await factory();
+        replaceSession(session);
+        SafeLog.d('reconnected chat $chatId');
+      } catch (e) {
+        SafeLog.d('reconnect attempt $reconnectAttempts failed', e);
+        if (classifySshFailure(e).isFatal) {
+          reconnecting = false;
+          // Keep this short — MissingToolException used to dump the whole
+          // install script into lastError and overflow the chat screen.
+          lastError = e is MissingToolException
+              ? 'Cannot reconnect: ${e.tool} is not installed on the remote.'
+              : 'Cannot reconnect: $e';
+          notifyListeners();
+          return;
+        }
+        _scheduleReconnect();
+      }
+    });
   }
 
   void setPermissionPolicy(PermissionPolicy policy) {
@@ -104,17 +382,220 @@ class ChatSessionRuntime extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> prompt(String text) async {
+  /// Load the model catalogue when we resumed an agent that was already running.
+  Future<void> ensureModelCatalog(List<Map<String, dynamic>> mcpServers) async {
+    await _session.ensureModelCatalog(mcpServers: mcpServers);
+    notifyListeners();
+  }
+
+  /// Switch model and remember it, so reconnects and restarts keep the choice.
+  Future<void> setModel(String modelId) async {
+    await _session.setModel(modelId);
+    final meta = chatMeta;
+    if (meta != null) {
+      chatMeta = meta.copyWith(modelId: modelId, updatedAt: DateTime.now());
+      await _db.upsertChat(chatMeta!);
+      onLocalChange?.call(chatId);
+    } else {
+      final stored = await _db.getChat(chatId);
+      if (stored != null) {
+        chatMeta = stored.copyWith(modelId: modelId, updatedAt: DateTime.now());
+        await _db.upsertChat(chatMeta!);
+        onLocalChange?.call(chatId);
+      }
+    }
+    notifyListeners();
+  }
+
+  Future<void> prompt(String text) => enqueueOrPrompt(text);
+
+  /// Append the user message, then either start a turn or queue it.
+  ///
+  /// While a turn is in flight the new message is persisted and kept in
+  /// [outboundQueue] only — it is *not* spliced into [entries] mid-turn, so
+  /// continuing agent output cannot bury it. The chat UI paints queued bubbles
+  /// after the live agent bubble. When the turn finishes (or Force run fires)
+  /// the message is promoted into [entries] and then sent.
+  Future<void> enqueueOrPrompt(String text) async {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return;
+
+    final message = ChatMessage(
+      id: const Uuid().v4(),
+      chatId: chatId,
+      role: MessageRole.user,
+      content: trimmed,
+      createdAt: DateTime.now(),
+    );
+
+    if (promptInFlight) {
+      outboundQueue.add(message);
+      _writesInFlight++;
+      try {
+        await _db.insertMessage(message);
+        await _persistOutboundQueue();
+        onLocalChange?.call(chatId);
+      } catch (e) {
+        SafeLog.d('persist queued message failed', e);
+      } finally {
+        _writesInFlight--;
+      }
+      notifyListeners();
+      return;
+    }
+
+    // A previous Force run / cancel may have left the chain wedged. Never park
+    // a fresh send behind a future that will never complete.
+    await _promptTail.timeout(
+      const Duration(seconds: 2),
+      onTimeout: _breakPromptChain,
+    );
+
+    // Finish any leftover text from the previous turn before the new user
+    // bubble, otherwise a late flush lands *under* the question with an older
+    // clock and the thread looks scrambled.
+    await flushAssistantBuffer();
+    await commitThought();
+
+    await appendUserMessage(message);
+    // Do not await the turn — the composer must unlock as soon as the
+    // message is accepted. The runtime keeps driving the prompt.
+    unawaited(_runPrompt(trimmed));
+  }
+
+  /// Interrupt the current turn and run the next queued message immediately.
+  ///
+  /// If [messageId] is set, that queued item is preferred; otherwise the head
+  /// of the queue. The cancelled turn's partial answer is kept in the
+  /// transcript.
+  Future<void> forceRun({String? messageId}) async {
+    ChatMessage? target;
+    if (messageId != null) {
+      final idx = outboundQueue.indexWhere((m) => m.id == messageId);
+      if (idx >= 0) target = outboundQueue.removeAt(idx);
+    } else if (outboundQueue.isNotEmpty) {
+      target = outboundQueue.removeAt(0);
+    }
+    if (target == null) {
+      notifyListeners();
+      return;
+    }
+
+    // Promote first so the bubble never vanishes if cancel/prompt hangs.
+    await _persistOutboundQueue();
+    await _promoteQueuedMessage(target);
+    notifyListeners();
+
+    _skipAutoDrain = true;
+    try {
+      if (promptInFlight) {
+        try {
+          await _session.cancel().timeout(const Duration(seconds: 4));
+        } catch (e) {
+          SafeLog.d('cancel before force-run failed', e);
+        }
+        await flushAssistantBuffer();
+        await commitThought();
+        _breakPromptChain();
+        notifyListeners();
+      } else {
+        await _promptTail.timeout(
+          const Duration(seconds: 2),
+          onTimeout: _breakPromptChain,
+        );
+      }
+    } finally {
+      _skipAutoDrain = false;
+    }
+
+    await _runPrompt(target.content);
+  }
+
+  Future<void> removeFromQueue(String messageId) async {
+    final before = outboundQueue.length;
+    outboundQueue.removeWhere((m) => m.id == messageId);
+    if (outboundQueue.length == before) return;
+    notifyListeners();
+    try {
+      await _persistOutboundQueue();
+      await _db.deleteMessage(messageId);
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('delete queued message failed', e);
+    }
+  }
+
+  /// Move a queued message into the visible transcript, stamped *now* so it
+  /// sorts after the turn that just finished.
+  Future<void> _promoteQueuedMessage(ChatMessage message) async {
+    if (entries.any((e) => e.messageId == message.id)) return;
+    final stamped = ChatMessage(
+      id: message.id,
+      chatId: message.chatId,
+      role: message.role,
+      content: message.content,
+      createdAt: DateTime.now(),
+    );
+    entries.add(TranscriptEntry.message(stamped));
+    _writesInFlight++;
+    try {
+      await _db.upsertMessage(stamped);
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('promote queued message failed', e);
+    } finally {
+      _writesInFlight--;
+    }
+    notifyListeners();
+  }
+
+  Future<void> _runPrompt(String text) {
+    // Chain onto the previous turn so cancel+force-run cannot start a second
+    // session/prompt while the first await is still unwinding.
+    final epoch = _promptEpoch;
+    final run = _promptTail.then((_) {
+      if (epoch != _promptEpoch) return Future<void>.value();
+      return _runPromptBody(text);
+    });
+    _promptTail = run.catchError((Object _) {});
+    return run;
+  }
+
+  Future<void> _runPromptBody(String text) async {
+    if (_disposed || closed) return;
+    final epoch = _promptEpoch;
     promptInFlight = true;
     notifyListeners();
     try {
       await flushAssistantBuffer();
       await _session.prompt(text);
+      // If the model only wrote to the thought channel, surface that as the
+      // answer instead of leaving a blank agent turn with orphaned notes.
+      if (assistantBuffer.trim().isEmpty && thoughtBuffer.trim().isNotEmpty) {
+        assistantBuffer = thoughtBuffer;
+        thoughtBuffer = '';
+      }
       await flushAssistantBuffer();
       await commitThought();
     } finally {
-      promptInFlight = false;
-      notifyListeners();
+      // Superseded by Force run / reconnect — do not touch shared state.
+      final superseded = epoch != _promptEpoch;
+      if (!superseded) {
+        promptInFlight = false;
+        notifyListeners();
+        if (!_skipAutoDrain &&
+            !_disposed &&
+            !closed &&
+            outboundQueue.isNotEmpty) {
+          final next = outboundQueue.removeAt(0);
+          unawaited(_persistOutboundQueue());
+          notifyListeners();
+          unawaited(() async {
+            await _promoteQueuedMessage(next);
+            await _runPrompt(next.content);
+          }());
+        }
+      }
     }
   }
 
@@ -141,6 +622,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           unawaited(commitThought());
         }
         assistantBuffer += update.text;
+        _scheduleAssistantPersist();
         notifyListeners();
       case AcpUpdateKind.thought:
         if (assistantBuffer.isNotEmpty) {
@@ -164,13 +646,26 @@ class ChatSessionRuntime extends ChangeNotifier {
         lastError = update.text;
         notifyListeners();
       case AcpUpdateKind.closed:
+        // Unlock the composer immediately — a hanging prompt would otherwise
+        // keep the spinner up while reconnect runs underneath.
+        if (promptInFlight) {
+          promptInFlight = false;
+        }
         unawaited(flushAssistantBuffer());
         unawaited(commitThought());
         closed = true;
-        lastError = lastError ??
-            'Agent connection dropped (app restart or SSH disconnect). '
-            'Tap Reconnect — your chat history is kept.';
+        if (sessionFactory != null) {
+          // Recover quietly. A suspended runtime reconnects from resume()
+          // instead, so in neither case is there anything for the user to do.
+          if (!_suspended) _scheduleReconnect();
+        }
+        // No "tap Reconnect" nag — auto-reconnect handles it when possible.
         notifyListeners();
+      case AcpUpdateKind.turnComplete:
+        // Flush is awaited in _runPromptBody after session/prompt returns.
+        // Clearing promptInFlight here lets a new send race ahead of those
+        // writes and scramble transcript order.
+        break;
     }
   }
 
@@ -189,35 +684,81 @@ class ChatSessionRuntime extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
     entries.add(TranscriptEntry.message(message));
+    _writesInFlight++;
     try {
       await _db.insertMessage(message);
       onLocalChange?.call(chatId);
     } catch (e) {
       SafeLog.d('persist thought failed', e);
+    } finally {
+      _writesInFlight--;
     }
     notifyListeners();
   }
 
-  Future<void> flushAssistantBuffer() async {
+  /// Checkpoint the streaming turn to disk shortly after output stops arriving.
+  ///
+  /// Without this the whole answer lives only in memory until the turn ends, so
+  /// a crash, a prompt timeout, or the process being killed loses everything
+  /// the user could already read on screen.
+  void _scheduleAssistantPersist() {
+    _assistantPersistTimer?.cancel();
+    _assistantPersistTimer = Timer(const Duration(milliseconds: 700), () {
+      _assistantPersistTimer = null;
+      unawaited(_writeAssistantProgress());
+    });
+  }
+
+  Future<void> _writeAssistantProgress() async {
     final text = assistantBuffer.trim();
-    assistantBuffer = '';
-    if (text.isEmpty) {
-      notifyListeners();
-      return;
+    if (text.isEmpty) return;
+    _writesInFlight++;
+    try {
+      await _db.upsertMessage(_assistantSnapshot(text));
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('checkpoint assistant failed', e);
+    } finally {
+      _writesInFlight--;
     }
-    final message = ChatMessage(
-      id: const Uuid().v4(),
+  }
+
+  /// The in-progress turn as a row. Id and timestamp are stable for the whole
+  /// turn so repeated writes land on the same message.
+  ChatMessage _assistantSnapshot(String text) {
+    return ChatMessage(
+      id: _assistantMessageId ??= const Uuid().v4(),
       chatId: chatId,
       role: MessageRole.assistant,
       content: text,
-      createdAt: DateTime.now(),
+      createdAt: _assistantStartedAt ??= DateTime.now(),
     );
+  }
+
+  Future<void> flushAssistantBuffer() async {
+    _assistantPersistTimer?.cancel();
+    _assistantPersistTimer = null;
+    final text = assistantBuffer.trim();
+    assistantBuffer = '';
+    if (text.isEmpty) {
+      // A checkpointed row with no final text would be an empty bubble.
+      _assistantMessageId = null;
+      _assistantStartedAt = null;
+      notifyListeners();
+      return;
+    }
+    final message = _assistantSnapshot(text);
+    _assistantMessageId = null;
+    _assistantStartedAt = null;
     entries.add(TranscriptEntry.message(message));
+    _writesInFlight++;
     try {
-      await _db.insertMessage(message);
+      await _db.upsertMessage(message);
       onLocalChange?.call(chatId);
     } catch (e) {
       SafeLog.d('persist assistant failed', e);
+    } finally {
+      _writesInFlight--;
     }
     notifyListeners();
   }
@@ -235,7 +776,11 @@ class ChatSessionRuntime extends ChangeNotifier {
         rawOutput: tool.rawOutput,
       );
       final msgId = entries[index].messageId ?? _toolMessageIds[tool.toolCallId];
-      entries[index] = TranscriptEntry.tool(merged, messageId: msgId);
+      entries[index] = TranscriptEntry.tool(
+        merged,
+        messageId: msgId,
+        createdAt: entries[index].createdAt,
+      );
       if (msgId != null) {
         final message = ChatMessage(
           id: msgId,
@@ -280,6 +825,11 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   Future<void> disposeRuntime() async {
+    _disposed = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _assistantPersistTimer?.cancel();
+    _assistantPersistTimer = null;
     await _sub?.cancel();
     _sub = null;
     try {
