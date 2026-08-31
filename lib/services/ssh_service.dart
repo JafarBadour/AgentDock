@@ -414,6 +414,87 @@ class SshService {
     return path;
   }
 
+  /// Resolves the Claude ACP adapter (`claude-code-acp`) to an absolute path.
+  ///
+  /// Tries known install locations, then `command -v`, then a one-shot
+  /// `npm install -g @zed-industries/claude-code-acp` before failing.
+  Future<String> ensureClaudeAcpBinary(Host host) async {
+    final client = await connect(host);
+    var path = await _resolveClaudeAcpPath(client, host.id);
+    if (path != null) return path;
+
+    // Best-effort global install — needs network + npm on the host.
+    try {
+      await _run(
+        client,
+        r'export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
+        r'npm install -g @zed-industries/claude-code-acp 2>/dev/null || true',
+        hostId: host.id,
+        timeout: const Duration(seconds: 120),
+      );
+    } catch (e) {
+      SafeLog.d('claude-code-acp npm install failed', e);
+    }
+
+    path = await _resolveClaudeAcpPath(client, host.id);
+    if (path == null) {
+      throw MissingToolException(
+        'Claude Code ACP adapter',
+        kRemoteClaudeSetupGuide.trim(),
+      );
+    }
+    return path;
+  }
+
+  Future<String?> _resolveClaudeAcpPath(SSHClient client, String hostId) async {
+    try {
+      final homeOut = await _run(
+        client,
+        r'printf %s "$HOME"',
+        hostId: hostId,
+        timeout: const Duration(seconds: 8),
+      );
+      final home = homeOut.trim();
+      if (home.isNotEmpty) {
+        final sftp = await client.sftp();
+        for (final rel in [
+          '.local/bin/claude-code-acp',
+          '.npm-global/bin/claude-code-acp',
+        ]) {
+          final full = '$home/$rel';
+          try {
+            await sftp.stat(full);
+            return full;
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      SafeLog.d('SFTP Claude ACP probe failed, trying which', e);
+    }
+
+    const script =
+        r'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:'
+        r'/usr/local/bin:/opt/homebrew/bin:$PATH"; '
+        r'command -v claude-code-acp 2>/dev/null || '
+        r'for p in "$HOME/.local/bin/claude-code-acp" '
+        r'"$HOME/.npm-global/bin/claude-code-acp" '
+        r'/usr/local/bin/claude-code-acp; '
+        r'do [ -x "$p" ] && printf %s "$p" && exit 0; done; exit 1';
+    try {
+      final out = await _run(
+        client,
+        'sh -c ${shellQuote(script)}',
+        hostId: hostId,
+        timeout: const Duration(seconds: 12),
+      );
+      final path = out.trim();
+      return path.isEmpty ? null : path;
+    } catch (e) {
+      SafeLog.d('resolve Claude ACP path failed', e);
+      rethrow;
+    }
+  }
+
   Future<String?> _resolveCursorCliPath(SSHClient client, String hostId) async {
     // Fast path: SFTP stat known install locations (no bash).
     try {

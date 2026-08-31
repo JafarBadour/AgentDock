@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:xterm/xterm.dart';
 
@@ -28,13 +28,71 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   StreamSubscription<List<int>>? _stdoutSub;
   StreamSubscription<List<int>>? _stderrSub;
   bool _connecting = true;
+  bool _hasSelection = false;
   String? _error;
   String _title = 'Terminal';
 
   @override
   void initState() {
     super.initState();
+    _terminalController.addListener(_onSelectionChanged);
     _connect();
+  }
+
+  void _onSelectionChanged() {
+    final has = _terminalController.selection != null;
+    if (has == _hasSelection) return;
+    if (has) {
+      HapticFeedback.selectionClick();
+    }
+    setState(() => _hasSelection = has);
+  }
+
+  String? _selectedText() {
+    final selection = _terminalController.selection;
+    if (selection == null) return null;
+    final text = _terminal.buffer.getText(selection);
+    return text.isEmpty ? null : text;
+  }
+
+  Future<void> _copySelection() async {
+    final text = _selectedText();
+    if (text == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Long-press text to select, then Copy.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: text));
+    _terminalController.clearSelection();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Copied'),
+        duration: Duration(seconds: 1),
+      ),
+    );
+  }
+
+  Future<void> _pasteClipboard() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text;
+    if (text == null || text.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Clipboard is empty'),
+          duration: Duration(seconds: 1),
+        ),
+      );
+      return;
+    }
+    _terminal.paste(text);
+    _terminalController.clearSelection();
   }
 
   Future<void> _connect() async {
@@ -135,6 +193,7 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
 
   @override
   void dispose() {
+    _terminalController.removeListener(_onSelectionChanged);
     unawaited(_disconnect());
     super.dispose();
   }
@@ -146,6 +205,19 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
       appBar: AppBar(
         title: Text(_title),
         actions: [
+          IconButton(
+            tooltip: 'Copy selection',
+            onPressed: () => unawaited(_copySelection()),
+            icon: Icon(
+              Icons.copy,
+              color: _hasSelection ? Colors.white : Colors.white54,
+            ),
+          ),
+          IconButton(
+            tooltip: 'Paste',
+            onPressed: () => unawaited(_pasteClipboard()),
+            icon: const Icon(Icons.paste),
+          ),
           if (_connecting)
             const Padding(
               padding: EdgeInsets.all(16),
@@ -186,9 +258,18 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
               autofocus: true,
               backgroundOpacity: 1,
               theme: TerminalThemes.whiteOnBlack,
+              // Soft keyboards often omit hardware delete events.
+              deleteDetection: true,
             ),
           ),
-          _SpecialKeysBar(onSend: _sendKey),
+          _SpecialKeysBar(
+            onSend: _sendKey,
+            onCopy: () => unawaited(_copySelection()),
+            onPaste: () => unawaited(_pasteClipboard()),
+            onClearSelection:
+                _hasSelection ? _terminalController.clearSelection : null,
+            hasSelection: _hasSelection,
+          ),
         ],
       ),
     );
@@ -196,9 +277,19 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
 }
 
 class _SpecialKeysBar extends StatelessWidget {
-  const _SpecialKeysBar({required this.onSend});
+  const _SpecialKeysBar({
+    required this.onSend,
+    required this.onCopy,
+    required this.onPaste,
+    required this.hasSelection,
+    this.onClearSelection,
+  });
 
   final void Function(String seq) onSend;
+  final VoidCallback onCopy;
+  final VoidCallback onPaste;
+  final VoidCallback? onClearSelection;
+  final bool hasSelection;
 
   @override
   Widget build(BuildContext context) {
@@ -224,6 +315,48 @@ class _SpecialKeysBar extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           child: Row(
             children: [
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: FilledButton.tonal(
+                  style: FilledButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    backgroundColor: hasSelection
+                        ? const Color(0xFF3D5AFE)
+                        : const Color(0xFF333333),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    minimumSize: const Size(0, 36),
+                  ),
+                  onPressed: onCopy,
+                  child: const Text('Copy', style: TextStyle(fontSize: 12)),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                    side: const BorderSide(color: Colors.white24),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    minimumSize: const Size(0, 36),
+                  ),
+                  onPressed: onPaste,
+                  child: const Text('Paste', style: TextStyle(fontSize: 12)),
+                ),
+              ),
+              if (hasSelection && onClearSelection != null)
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white70,
+                      side: const BorderSide(color: Colors.white24),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      minimumSize: const Size(0, 36),
+                    ),
+                    onPressed: onClearSelection,
+                    child: const Text('Clear', style: TextStyle(fontSize: 12)),
+                  ),
+                ),
               for (final key in keys)
                 Padding(
                   padding: const EdgeInsets.only(right: 6),

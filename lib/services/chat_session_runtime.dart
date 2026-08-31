@@ -59,9 +59,12 @@ class ChatSessionRuntime extends ChangeNotifier {
     required AcpSession session,
     required AppDatabase db,
     this.onLocalChange,
+    this.onTransportReady,
     this.sessionFactory,
   })  : _session = session,
-        _db = db;
+        _db = db,
+        preferredMode = session.mode,
+        preferredPermissionPolicy = session.permissionPolicy;
 
   /// Maximum automatic attempts before we stop and wait for the user.
   static const maxReconnectAttempts = 10;
@@ -70,6 +73,9 @@ class ChatSessionRuntime extends ChangeNotifier {
   final String chatId;
   final AppDatabase _db;
   final void Function(String chatId)? onLocalChange;
+
+  /// Fired after a successful [replaceSession] so owners can bump UI state.
+  final void Function(String chatId)? onTransportReady;
 
   /// Opens a fresh transport for this chat. Set by the owner so the runtime can
   /// recover on its own after a drop, even with no chat screen mounted.
@@ -92,6 +98,10 @@ class ChatSessionRuntime extends ChangeNotifier {
   Timer? _assistantPersistTimer;
   int _writesInFlight = 0;
 
+  /// Id of the assistant row currently mirrored from [assistantBuffer], if any.
+  String? get liveAssistantMessageId =>
+      assistantBuffer.trim().isEmpty ? null : _assistantMessageId;
+
   /// True while decoded output exists that SQLite has not caught up with.
   ///
   /// The remote journal offset must not advance past this point: the next
@@ -104,6 +114,19 @@ class ChatSessionRuntime extends ChangeNotifier {
   String? lastError;
   bool closed = false;
   bool promptInFlight = false;
+
+  /// Turn was handed to the durable host after the phone disconnected.
+  bool remoteTurnActive = false;
+
+  /// True while a local prompt is in flight, the host is still producing, or
+  /// any tool call is still pending/running — so the UI stays on "working"
+  /// through long tool chains, not only while text is streaming.
+  bool get hasActiveTools =>
+      entries.any((e) => e.tool?.isActive ?? false);
+
+  bool get isWorking =>
+      promptInFlight || remoteTurnActive || hasActiveTools;
+
   Chat? chatMeta;
 
   /// User messages waiting for the current turn to finish (or for Force run).
@@ -123,18 +146,32 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// queued message — [forceRun] is about to pick one explicitly.
   bool _skipAutoDrain = false;
 
+  /// True while we intentionally recycle the host for Ask ↔ Full access.
+  bool _restartingForPolicy = false;
+
   /// True while a silent reconnect is pending or running.
   bool reconnecting = false;
   int reconnectAttempts = 0;
   Timer? _retryTimer;
+  /// Clears stale "working" after reconnect when the host already went idle
+  /// while we were away (we miss that `turnComplete` in the journal gap).
+  Timer? _hostBusyWatchdog;
   bool _disposed = false;
   bool _suspended = false;
 
   AcpSession get session => _session;
   AgentSessionMode get mode => _session.mode;
-  PermissionPolicy get permissionPolicy => _session.permissionPolicy;
+  PermissionPolicy get permissionPolicy => preferredPermissionPolicy;
   List<AgentModel> get availableModels => _session.availableModels;
   String? get currentModelId => _session.currentModelId;
+
+  /// Toolbar preference — also used by [sessionFactory] on reconnect so toggles
+  /// are not frozen at the value captured when the factory was first built.
+  AgentSessionMode preferredMode;
+  PermissionPolicy preferredPermissionPolicy;
+
+  /// Ask-mode tool approval waiting for the user on this device.
+  PendingPermissionRequest? pendingPermission;
 
   void hydrateFromMessages(List<ChatMessage> messages) {
     entries.clear();
@@ -262,17 +299,29 @@ class ChatSessionRuntime extends ChangeNotifier {
     _retryTimer?.cancel();
     _retryTimer = null;
     _session = session;
+    session.mode = preferredMode;
+    session.permissionPolicy = preferredPermissionPolicy;
+    pendingPermission = null;
     closed = false;
     lastError = null;
     reconnecting = false;
     reconnectAttempts = 0;
     // A reconnect must not inherit a hung prompt chain from the dead socket.
     _breakPromptChain();
+    // A turn handed off to the host may still be running — show working until
+    // we see idle/turn-complete in the journal stream.
+    if (remoteTurnActive) {
+      promptInFlight = true;
+      _armHostBusyWatchdog();
+    }
     startListening();
     unawaited(rememberSessionId());
     notifyListeners();
+    onTransportReady?.call(chatId);
     // Pick up anything that was waiting while the socket was down.
-    resumeOutboundQueue();
+    if (!remoteTurnActive) {
+      resumeOutboundQueue();
+    }
   }
 
   /// Store the live ACP session id so the next launch can resume this
@@ -297,7 +346,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   /// The app is going into the background — stop fighting for a socket the OS
-  /// is about to kill.
+  /// is about to kill. For durable sessions the host agent keeps the turn.
   void suspend() {
     _suspended = true;
     _retryTimer?.cancel();
@@ -308,6 +357,21 @@ class ChatSessionRuntime extends ChangeNotifier {
     _assistantPersistTimer?.cancel();
     _assistantPersistTimer = null;
     unawaited(_writeAssistantProgress());
+
+    final durable = _session.transport == AcpTransport.durable;
+    if (durable && (promptInFlight || _session.isPromptActive)) {
+      // Hand the turn to the host: complete the local await so the UI unlocks,
+      // then tear down only the SSH bridge. tmux + FIFO keep the agent alive.
+      remoteTurnActive = true;
+      _session.handOffPrompt();
+      promptInFlight = false;
+      closed = true;
+      unawaited(_session.close());
+    } else if (durable && !closed) {
+      // Idle durable session — drop the bridge; reconnect on resume.
+      closed = true;
+      unawaited(_session.close());
+    }
     notifyListeners();
   }
 
@@ -373,17 +437,69 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   void setPermissionPolicy(PermissionPolicy policy) {
+    preferredPermissionPolicy = policy;
     _session.setPermissionPolicy(policy);
+    if (policy.fullAccess) pendingPermission = null;
     notifyListeners();
   }
 
+  /// Apply Ask ↔ Full access. Restarts the durable host process when the
+  /// `--force` flag must change, so the toolbar choice matches the agent.
+  Future<void> applyPermissionPolicy(PermissionPolicy policy) async {
+    final needsHostRestart =
+        preferredPermissionPolicy.fullAccess != policy.fullAccess;
+    setPermissionPolicy(policy);
+    if (!needsHostRestart) return;
+
+    final factory = sessionFactory;
+    if (factory == null) return;
+
+    _restartingForPolicy = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    reconnecting = true;
+    notifyListeners();
+    try {
+      await _session.close();
+      closed = true;
+      final session = await factory();
+      replaceSession(session);
+      // After a policy restart the process is fresh — re-apply session mode.
+      if (preferredMode != AgentSessionMode.agent) {
+        try {
+          await session.setMode(preferredMode);
+        } catch (e) {
+          SafeLog.d('setMode after permission restart failed', e);
+        }
+      }
+    } catch (e) {
+      SafeLog.d('permission policy restart failed', e);
+      lastError = 'Could not switch to ${policy.label}: $e';
+      reconnecting = false;
+      notifyListeners();
+      rethrow;
+    } finally {
+      _restartingForPolicy = false;
+    }
+  }
+
   Future<void> setMode(AgentSessionMode mode) async {
+    preferredMode = mode;
     await _session.setMode(mode);
     notifyListeners();
   }
 
+  void resolvePermission(Object requestId, String optionId) {
+    _session.resolvePermission(requestId, optionId);
+    if (pendingPermission?.requestId == requestId) {
+      pendingPermission = null;
+      notifyListeners();
+    }
+  }
+
   /// Load the model catalogue when we resumed an agent that was already running.
   Future<void> ensureModelCatalog(List<Map<String, dynamic>> mcpServers) async {
+    if (isWorking) return;
     await _session.ensureModelCatalog(mcpServers: mcpServers);
     notifyListeners();
   }
@@ -428,7 +544,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
 
-    if (promptInFlight) {
+    if (promptInFlight || (closed && sessionFactory != null)) {
       outboundQueue.add(message);
       _writesInFlight++;
       try {
@@ -441,7 +557,17 @@ class ChatSessionRuntime extends ChangeNotifier {
         _writesInFlight--;
       }
       notifyListeners();
+      // Bridge is down — wake it when we can so the queue drains.
+      if (closed && !_suspended && sessionFactory != null) {
+        _scheduleReconnect(immediate: true);
+      }
       return;
+    }
+
+    // Stale "running on host" after reconnect — user is starting a new turn.
+    if (remoteTurnActive) {
+      remoteTurnActive = false;
+      _clearHostBusyWatchdog();
     }
 
     // A previous Force run / cancel may have left the chain wedged. Never park
@@ -564,8 +690,11 @@ class ChatSessionRuntime extends ChangeNotifier {
   Future<void> _runPromptBody(String text) async {
     if (_disposed || closed) return;
     final epoch = _promptEpoch;
+    remoteTurnActive = false;
+    _clearHostBusyWatchdog();
     promptInFlight = true;
     notifyListeners();
+    var transportFailed = false;
     try {
       await flushAssistantBuffer();
       await _session.prompt(text);
@@ -577,25 +706,129 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
       await flushAssistantBuffer();
       await commitThought();
+    } catch (e) {
+      SafeLog.d('prompt failed', e);
+      lastError = e.toString();
+      transportFailed = true;
+      // Dead bridge / silence timeout — recover so the next send is not wedged.
+      if (!closed && sessionFactory != null) {
+        closed = true;
+        _scheduleReconnect(immediate: true);
+      }
     } finally {
       // Superseded by Force run / reconnect — do not touch shared state.
       final superseded = epoch != _promptEpoch;
       if (!superseded) {
-        promptInFlight = false;
-        notifyListeners();
-        if (!_skipAutoDrain &&
-            !_disposed &&
-            !closed &&
-            outboundQueue.isNotEmpty) {
-          final next = outboundQueue.removeAt(0);
-          unawaited(_persistOutboundQueue());
+        if (closed && !transportFailed) {
+          // Bridge dropped via background handoff. Durable host may still be
+          // mid-turn — keep the working indicator until idle arrives.
+          remoteTurnActive = true;
+          promptInFlight = false;
+          _armHostBusyWatchdog();
           notifyListeners();
-          unawaited(() async {
-            await _promoteQueuedMessage(next);
-            await _runPrompt(next.content);
-          }());
+        } else {
+          promptInFlight = false;
+          remoteTurnActive = false;
+          _clearHostBusyWatchdog();
+          notifyListeners();
+          if (!closed) _drainOutboundQueue();
         }
       }
+    }
+  }
+
+  /// Live journal output means the host is still on a turn — even when we did
+  /// not send this prompt from the phone (reconnect mid-run, cold attach).
+  void _noteHostActivity() {
+    if (!promptInFlight) {
+      promptInFlight = true;
+      remoteTurnActive = true;
+    }
+    if (!_session.isPromptActive) {
+      _armHostBusyWatchdog();
+    }
+  }
+
+  void _armHostBusyWatchdog() {
+    _hostBusyWatchdog?.cancel();
+    _hostBusyWatchdog = Timer(const Duration(seconds: 20), () {
+      if (_disposed) return;
+      if (!isWorking) return;
+      // Local prompt still awaiting a real ACP result — leave it alone.
+      if (_session.isPromptActive) {
+        _armHostBusyWatchdog();
+        return;
+      }
+      // Turn already ended (or bridge is idle) but tool rows never got a final
+      // status — that used to re-arm forever and choke the chat.
+      if (hasActiveTools) {
+        unawaited(_finalizeStaleTools(reason: 'watchdog'));
+        return;
+      }
+      // Silence after reconnect: host likely finished while we were away.
+      remoteTurnActive = false;
+      promptInFlight = false;
+      notifyListeners();
+      if (!closed) _drainOutboundQueue();
+    });
+  }
+
+  /// Mark leftover pending/running tools finished so [isWorking] can clear.
+  Future<void> _finalizeStaleTools({required String reason}) async {
+    final active = [
+      for (final e in entries)
+        if (e.tool?.isActive ?? false) e.tool!,
+    ];
+    if (active.isEmpty) {
+      remoteTurnActive = false;
+      if (!_session.isPromptActive) promptInFlight = false;
+      notifyListeners();
+      if (!closed) _drainOutboundQueue();
+      return;
+    }
+    SafeLog.d('finalizing ${active.length} stale tool(s) ($reason) chat=$chatId');
+    for (final tool in active) {
+      await _upsertTool(
+        tool.merge(status: 'completed', rawOutput: tool.rawOutput ?? ''),
+      );
+    }
+    remoteTurnActive = false;
+    if (!_session.isPromptActive) {
+      promptInFlight = false;
+    }
+    notifyListeners();
+    if (!closed && !promptInFlight) _drainOutboundQueue();
+  }
+
+  void _clearHostBusyWatchdog() {
+    _hostBusyWatchdog?.cancel();
+    _hostBusyWatchdog = null;
+  }
+
+  /// User-facing unblock when the UI is stuck on "Agent is working".
+  Future<void> unstick() async {
+    _clearHostBusyWatchdog();
+    remoteTurnActive = false;
+    try {
+      if (_session.isPromptActive) {
+        await _session.cancel().timeout(const Duration(seconds: 3));
+      }
+    } catch (e) {
+      SafeLog.d('unstick cancel failed', e);
+    }
+    if (hasActiveTools) {
+      await _finalizeStaleTools(reason: 'unstick');
+    }
+    await flushAssistantBuffer();
+    await commitThought();
+    _breakPromptChain();
+    promptInFlight = false;
+    lastError = null;
+    notifyListeners();
+    if (closed && sessionFactory != null && !_suspended) {
+      _scheduleReconnect(immediate: true);
+    } else {
+      _drainOutboundQueue();
     }
   }
 
@@ -618,6 +851,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       case AcpUpdateKind.mode:
         notifyListeners();
       case AcpUpdateKind.delta:
+        _noteHostActivity();
         if (thoughtBuffer.isNotEmpty) {
           unawaited(commitThought());
         }
@@ -625,6 +859,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         _scheduleAssistantPersist();
         notifyListeners();
       case AcpUpdateKind.thought:
+        _noteHostActivity();
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
         }
@@ -633,6 +868,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       case AcpUpdateKind.tool:
         final tool = update.tool;
         if (tool == null) break;
+        _noteHostActivity();
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
         }
@@ -641,14 +877,15 @@ class ChatSessionRuntime extends ChangeNotifier {
         }
         unawaited(_upsertTool(tool));
       case AcpUpdateKind.permission:
-        break;
+        pendingPermission = update.permissionRequest;
+        notifyListeners();
       case AcpUpdateKind.error:
         lastError = update.text;
         notifyListeners();
       case AcpUpdateKind.closed:
         // Unlock the composer immediately — a hanging prompt would otherwise
         // keep the spinner up while reconnect runs underneath.
-        if (promptInFlight) {
+        if (promptInFlight && !remoteTurnActive) {
           promptInFlight = false;
         }
         unawaited(flushAssistantBuffer());
@@ -657,16 +894,47 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (sessionFactory != null) {
           // Recover quietly. A suspended runtime reconnects from resume()
           // instead, so in neither case is there anything for the user to do.
-          if (!_suspended) _scheduleReconnect();
+          // Intentional Ask ↔ Full access recycle handles its own reconnect.
+          if (!_suspended && !_restartingForPolicy) _scheduleReconnect();
         }
         // No "tap Reconnect" nag — auto-reconnect handles it when possible.
         notifyListeners();
       case AcpUpdateKind.turnComplete:
         // Flush is awaited in _runPromptBody after session/prompt returns.
-        // Clearing promptInFlight here lets a new send race ahead of those
-        // writes and scramble transcript order.
+        // Clearing promptInFlight here while a local await is open lets a new
+        // send race ahead — only clear UI busy when nothing owns the prompt.
+        _clearHostBusyWatchdog();
+        remoteTurnActive = false;
+        if (hasActiveTools) {
+          // end_turn with rows still "in_progress" — agent will not send more
+          // updates for them. Finalize so the UI does not choke forever.
+          unawaited(_finalizeStaleTools(reason: 'turnComplete'));
+        } else if (!_session.isPromptActive) {
+          promptInFlight = false;
+          notifyListeners();
+          if (!closed) _drainOutboundQueue();
+        } else {
+          notifyListeners();
+        }
         break;
     }
+  }
+
+  void _drainOutboundQueue() {
+    if (_skipAutoDrain ||
+        _disposed ||
+        closed ||
+        promptInFlight ||
+        outboundQueue.isEmpty) {
+      return;
+    }
+    final next = outboundQueue.removeAt(0);
+    unawaited(_persistOutboundQueue());
+    notifyListeners();
+    unawaited(() async {
+      await _promoteQueuedMessage(next);
+      await _runPrompt(next.content);
+    }());
   }
 
   Future<void> commitThought() async {
@@ -709,32 +977,6 @@ class ChatSessionRuntime extends ChangeNotifier {
     });
   }
 
-  Future<void> _writeAssistantProgress() async {
-    final text = assistantBuffer.trim();
-    if (text.isEmpty) return;
-    _writesInFlight++;
-    try {
-      await _db.upsertMessage(_assistantSnapshot(text));
-      onLocalChange?.call(chatId);
-    } catch (e) {
-      SafeLog.d('checkpoint assistant failed', e);
-    } finally {
-      _writesInFlight--;
-    }
-  }
-
-  /// The in-progress turn as a row. Id and timestamp are stable for the whole
-  /// turn so repeated writes land on the same message.
-  ChatMessage _assistantSnapshot(String text) {
-    return ChatMessage(
-      id: _assistantMessageId ??= const Uuid().v4(),
-      chatId: chatId,
-      role: MessageRole.assistant,
-      content: text,
-      createdAt: _assistantStartedAt ??= DateTime.now(),
-    );
-  }
-
   Future<void> flushAssistantBuffer() async {
     _assistantPersistTimer?.cancel();
     _assistantPersistTimer = null;
@@ -750,7 +992,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     final message = _assistantSnapshot(text);
     _assistantMessageId = null;
     _assistantStartedAt = null;
-    entries.add(TranscriptEntry.message(message));
+    _upsertAssistantEntry(message);
     _writesInFlight++;
     try {
       await _db.upsertMessage(message);
@@ -761,6 +1003,46 @@ class ChatSessionRuntime extends ChangeNotifier {
       _writesInFlight--;
     }
     notifyListeners();
+  }
+
+  /// Keep the live answer in [entries] as it grows so the bubble does not
+  /// vanish when [isWorking] clears a tick before [flushAssistantBuffer].
+  void _upsertAssistantEntry(ChatMessage message) {
+    final index = entries.indexWhere((e) => e.messageId == message.id);
+    if (index >= 0) {
+      entries[index] = TranscriptEntry.message(message);
+    } else {
+      entries.add(TranscriptEntry.message(message));
+    }
+  }
+
+  /// The in-progress turn as a row. Id and timestamp are stable for the whole
+  /// turn so repeated writes land on the same message.
+  ChatMessage _assistantSnapshot(String text) {
+    return ChatMessage(
+      id: _assistantMessageId ??= const Uuid().v4(),
+      chatId: chatId,
+      role: MessageRole.assistant,
+      content: text,
+      createdAt: _assistantStartedAt ??= DateTime.now(),
+    );
+  }
+
+  Future<void> _writeAssistantProgress() async {
+    final text = assistantBuffer.trim();
+    if (text.isEmpty) return;
+    final message = _assistantSnapshot(text);
+    _upsertAssistantEntry(message);
+    notifyListeners();
+    _writesInFlight++;
+    try {
+      await _db.upsertMessage(message);
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('checkpoint assistant failed', e);
+    } finally {
+      _writesInFlight--;
+    }
   }
 
   Future<void> _upsertTool(ToolCallState tool) async {
@@ -828,6 +1110,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     _disposed = true;
     _retryTimer?.cancel();
     _retryTimer = null;
+    _clearHostBusyWatchdog();
     _assistantPersistTimer?.cancel();
     _assistantPersistTimer = null;
     await _sub?.cancel();

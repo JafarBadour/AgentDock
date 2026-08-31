@@ -7,6 +7,7 @@ import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import '../services/agent_runtime_host.dart';
 import '../services/agentdock_service.dart';
+import '../services/background_keep_alive.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
 import '../services/cursor_acp_service.dart';
@@ -16,6 +17,10 @@ import '../services/ssh_service.dart';
 final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
 
 final appDatabaseProvider = Provider<AppDatabase>((ref) => AppDatabase());
+
+final backgroundKeepAliveProvider = Provider<BackgroundKeepAlive>((ref) {
+  return BackgroundKeepAlive();
+});
 
 final sshServiceProvider = Provider<SshService>((ref) {
   final service = SshService(
@@ -66,6 +71,7 @@ final activeAcpSessionsProvider =
     ref.onDispose(() => tick?.cancel());
     return ActiveAcpSessions(
       ref.watch(appDatabaseProvider),
+      keepAlive: ref.watch(backgroundKeepAliveProvider),
       onLocalChange: (chatId) {
         ref.read(agentDockServiceProvider).schedulePushChat(chatId);
         tick ??= Timer(const Duration(milliseconds: 700), () {
@@ -80,10 +86,13 @@ final activeAcpSessionsProvider =
 class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
   ActiveAcpSessions(
     this._db, {
+    required BackgroundKeepAlive keepAlive,
     this.onLocalChange,
-  }) : super({});
+  })  : _keepAlive = keepAlive,
+        super({});
 
   final AppDatabase _db;
+  final BackgroundKeepAlive _keepAlive;
   final void Function(String chatId)? onLocalChange;
 
   final Map<String, Timer> _offsetTimers = {};
@@ -102,7 +111,10 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     if (existing != null) {
       if (sessionFactory != null) existing.sessionFactory = sessionFactory;
       existing.replaceSession(session);
+      // Host/DB may have advanced while the bridge was down.
+      unawaited(existing.syncTranscriptFromDb());
       state = {...state};
+      _syncKeepAlive();
       return existing;
     }
 
@@ -111,6 +123,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       session: session,
       db: _db,
       onLocalChange: onLocalChange,
+      onTransportReady: _onTransportReady,
       sessionFactory: sessionFactory,
     );
     await runtime.restoreOutboundQueue();
@@ -120,7 +133,22 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     await runtime.rememberSessionId();
     state = {...state, chatId: runtime};
     runtime.resumeOutboundQueue();
+    _syncKeepAlive();
     return runtime;
+  }
+
+  void _onTransportReady(String chatId) {
+    if (!state.containsKey(chatId)) return;
+    // Auto-reconnect calls replaceSession without attach — bump map identity
+    // so ChatScreen rebinds after a closed/reconnecting stretch.
+    state = {...state};
+    unawaited(state[chatId]?.syncTranscriptFromDb());
+    _syncKeepAlive();
+  }
+
+  void _syncKeepAlive() {
+    // Pedometer-style: stay running even with zero open sessions.
+    unawaited(_keepAlive.sync(sessionCount: state.length));
   }
 
   /// Remember how far into the remote journal we have read, so the next
@@ -174,6 +202,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     await runtime.disposeRuntime();
     final next = Map<String, ChatSessionRuntime>.from(state)..remove(chatId);
     state = next;
+    _syncKeepAlive();
   }
 
   Future<void> closeAll() async {
@@ -186,6 +215,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       await runtime.disposeRuntime();
     }
     state = {};
+    _syncKeepAlive();
   }
 
   @override

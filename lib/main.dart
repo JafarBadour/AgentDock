@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app/app_theme.dart';
@@ -21,6 +22,15 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // Start the pedometer-style foreground service immediately — do not wait
+      // for an agent connect. That is what keeps SSH alive across app switches.
+      unawaited(() async {
+        final keep = ref.read(backgroundKeepAliveProvider);
+        await keep.init();
+        await keep.ensureRunning();
+      }());
+    });
   }
 
   @override
@@ -29,8 +39,6 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
     super.dispose();
   }
 
-  /// Sockets do not survive suspension. Rather than discover that on the user's
-  /// next tap, drop them on the way out and re-verify on the way back in.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     switch (state) {
@@ -38,9 +46,18 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
         ref.read(sshServiceProvider).onAppResumed();
         ref.read(activeAcpSessionsProvider.notifier).resumeAll();
         unawaited(ref.read(agentDockServiceProvider).syncAllHostsCatalog());
+        // Re-assert FGS in case the OEM killed the notification.
+        unawaited(ref.read(backgroundKeepAliveProvider).ensureRunning());
       case AppLifecycleState.paused:
-      case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
+        unawaited(ref.read(agentDockServiceProvider).flushPendingPushes());
+        if (!ref.read(backgroundKeepAliveProvider).canSurviveBackground) {
+          ref.read(activeAcpSessionsProvider.notifier).suspendAll();
+          ref.read(sshServiceProvider).onAppPaused();
+        }
+      case AppLifecycleState.detached:
+        // Hand durable turns to the host, but leave the foreground service up
+        // (stopWithTask=false) so the process can survive like a pedometer.
         unawaited(ref.read(agentDockServiceProvider).flushPendingPushes());
         ref.read(activeAcpSessionsProvider.notifier).suspendAll();
         ref.read(sshServiceProvider).onAppPaused();
@@ -52,20 +69,23 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
   @override
   Widget build(BuildContext context) {
     final router = ref.watch(goRouterProvider);
-    return MaterialApp.router(
-      title: 'Agent Dock',
-      debugShowCheckedModeBanner: false,
-      theme: buildAppTheme(),
-      darkTheme: buildAppTheme(),
-      themeMode: ThemeMode.dark,
-      builder: (context, child) =>
-          WavyBackground(child: child ?? const SizedBox.shrink()),
-      routerConfig: router,
+    return WithForegroundTask(
+      child: MaterialApp.router(
+        title: 'Agent Dock',
+        debugShowCheckedModeBanner: false,
+        theme: buildAppTheme(),
+        darkTheme: buildAppTheme(),
+        themeMode: ThemeMode.dark,
+        builder: (context, child) =>
+            WavyBackground(child: child ?? const SizedBox.shrink()),
+        routerConfig: router,
+      ),
     );
   }
 }
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  FlutterForegroundTask.initCommunicationPort();
   runApp(const ProviderScope(child: AgentDockApp()));
 }

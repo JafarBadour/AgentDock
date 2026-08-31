@@ -6,6 +6,7 @@ import 'package:dartssh2/dartssh2.dart';
 
 import '../data/models/agent_mode.dart';
 import '../data/models/agent_model.dart';
+import '../data/models/agent_provider.dart';
 import '../data/models/host.dart';
 import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
@@ -107,6 +108,7 @@ class AcpSession {
 
   int _consumed = 0;
   bool _replaying = false;
+  bool _stdinOpen = true;
 
   /// Last time the agent sent anything, used as the liveness signal for a
   /// running turn.
@@ -120,12 +122,17 @@ class AcpSession {
   /// applies after that — otherwise a slow first token would look like "done".
   bool _promptSawOutput = false;
 
+  /// True once this turn used a tool. Soft-settle must not fire between tools —
+  /// agents often go quiet for >25s mid-investigation, which used to mark the
+  /// turn done and leave the UI on a half-finished answer.
+  bool _promptHadTools = false;
+
   String? sessionId;
   bool _started = false;
   StreamSubscription<Uint8List>? _stdoutSub;
 
   AgentSessionMode mode = AgentSessionMode.agent;
-  PermissionPolicy permissionPolicy = PermissionPolicy.ask;
+  PermissionPolicy permissionPolicy = PermissionPolicy.allowAll;
   List<String> availableModeIds = const ['ask', 'agent', 'plan'];
   AcpAgentCapabilities capabilities = const AcpAgentCapabilities();
 
@@ -137,6 +144,9 @@ class AcpSession {
   bool resumedInPlace = false;
 
   bool _clientInitialized = false;
+
+  /// Unanswered Ask-mode `session/request_permission` RPCs keyed by JSON-RPC id.
+  final Map<Object, PendingPermissionRequest> _openPermissions = {};
 
   bool get isPromptActive => _promptRequestKey != null;
 
@@ -152,16 +162,20 @@ class AcpSession {
     required String binary,
     required String chatId,
     AgentRuntimeHost? runtimeHost,
+    AgentProvider provider = AgentProvider.cursor,
     List<Map<String, dynamic>> mcpServers = const [],
     AgentSessionMode initialMode = AgentSessionMode.agent,
-    PermissionPolicy permissionPolicy = PermissionPolicy.ask,
+    PermissionPolicy permissionPolicy = PermissionPolicy.allowAll,
     String? resumeSessionId,
     String? preferredModelId,
     int journalOffset = 0,
     bool durable = true,
     void Function(int consumedBytes)? onJournalAdvance,
   }) async {
-    final cursorKey = await secureStore.readCursorApiKey();
+    final apiKey = switch (provider) {
+      AgentProvider.cursor => await secureStore.readCursorApiKey(),
+      AgentProvider.claude => await secureStore.readAnthropicApiKey(),
+    };
 
     if (durable && runtimeHost != null) {
       try {
@@ -172,7 +186,8 @@ class AcpSession {
           cwd: cwd,
           binary: binary,
           chatId: chatId,
-          cursorKey: cursorKey,
+          provider: provider,
+          apiKey: apiKey,
           mcpServers: mcpServers,
           initialMode: initialMode,
           permissionPolicy: permissionPolicy,
@@ -191,7 +206,8 @@ class AcpSession {
       host: host,
       cwd: cwd,
       binary: binary,
-      cursorKey: cursorKey,
+      provider: provider,
+      apiKey: apiKey,
       mcpServers: mcpServers,
       initialMode: initialMode,
       permissionPolicy: permissionPolicy,
@@ -207,7 +223,8 @@ class AcpSession {
     required String cwd,
     required String binary,
     required String chatId,
-    required String? cursorKey,
+    required AgentProvider provider,
+    required String? apiKey,
     required List<Map<String, dynamic>> mcpServers,
     required AgentSessionMode initialMode,
     required PermissionPolicy permissionPolicy,
@@ -221,13 +238,13 @@ class AcpSession {
       chatId: chatId,
       cwd: cwd,
       binary: binary,
-      cursorApiKey: cursorKey,
+      provider: provider,
+      apiKey: apiKey,
+      fullAccess: permissionPolicy.fullAccess,
     );
 
     var effectiveSessionId = resumeSessionId;
-    if (!remote.freshlyStarted && effectiveSessionId == null) {
-      effectiveSessionId = await runtimeHost.readSessionId(host, chatId);
-    }
+    effectiveSessionId ??= await runtimeHost.readSessionId(host, chatId);
 
     if (!remote.freshlyStarted && effectiveSessionId == null) {
       // The process is alive but we have no id to address its conversation
@@ -240,14 +257,18 @@ class AcpSession {
         chatId: chatId,
         cwd: cwd,
         binary: binary,
-        cursorApiKey: cursorKey,
+        provider: provider,
+        apiKey: apiKey,
+        fullAccess: permissionPolicy.fullAccess,
       );
       effectiveSessionId = null;
     }
 
     int offset;
     if (remote.freshlyStarted) {
-      offset = 0;
+      // New process (STARTED) or policy recycle (RESTARTED). Skip prior journal
+      // lines — session/load restores context; replaying old RPC confuses us.
+      offset = remote.journalSize;
     } else if (journalOffset <= 0 && remote.journalSize > 0) {
       // Attaching to a live agent with no local offset (fresh install, cleared
       // data). Replaying the journal would re-import history the transcript
@@ -277,7 +298,12 @@ class AcpSession {
 
     if (remote.freshlyStarted) {
       await acp._initialize();
-      await acp._newSession(mcpServers: mcpServers);
+      // Prefer session/load when we already have an id (policy restart or
+      // reconnect after a crash) so context survives Full access ↔ Ask.
+      await acp._openSession(
+        mcpServers: mcpServers,
+        resumeSessionId: effectiveSessionId,
+      );
       await acp._applyInitialMode(initialMode);
       await acp._applyPreferredModel(preferredModelId);
     } else {
@@ -298,7 +324,8 @@ class AcpSession {
     required Host host,
     required String cwd,
     required String binary,
-    required String? cursorKey,
+    required AgentProvider provider,
+    required String? apiKey,
     required List<Map<String, dynamic>> mcpServers,
     required AgentSessionMode initialMode,
     required PermissionPolicy permissionPolicy,
@@ -311,12 +338,33 @@ class AcpSession {
     envExports.write(
       'export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"; ',
     );
-    if (cursorKey != null && cursorKey.isNotEmpty) {
-      envExports.write('export CURSOR_API_KEY=${SshService.shellQuote(cursorKey)}; ');
+    if (apiKey != null && apiKey.isNotEmpty) {
+      switch (provider) {
+        case AgentProvider.cursor:
+          envExports.write(
+            'export CURSOR_API_KEY=${SshService.shellQuote(apiKey)}; ',
+          );
+        case AgentProvider.claude:
+          envExports.write(
+            'export ANTHROPIC_API_KEY=${SshService.shellQuote(apiKey)}; ',
+          );
+      }
+    }
+    if (provider == AgentProvider.claude && permissionPolicy.fullAccess) {
+      envExports.write('export CLAUDE_ACP_SKIP_PERMISSIONS=true; ');
     }
 
-    final command =
-        '${envExports}cd ${SshService.shellQuote(cwd)} && exec ${SshService.shellQuote(binary)} acp';
+    final agentArgs = switch (provider) {
+      AgentProvider.cursor => permissionPolicy.fullAccess
+          ? '--force --approve-mcps --trust acp'
+          : 'acp',
+      AgentProvider.claude => '',
+    };
+    final command = agentArgs.isEmpty
+        ? '${envExports}cd ${SshService.shellQuote(cwd)} && '
+            'exec ${SshService.shellQuote(binary)}'
+        : '${envExports}cd ${SshService.shellQuote(cwd)} && '
+            'exec ${SshService.shellQuote(binary)} $agentArgs';
 
     final session = await client.execute(command);
     final acp = AcpSession._(
@@ -340,22 +388,62 @@ class AcpSession {
   }
 
   void _listen() {
+    _stdinOpen = true;
     _stdoutSub = _session.stdout.listen(
       _onStdout,
       onError: (Object e, StackTrace st) {
         SafeLog.d('ACP stdout error', e, st);
-        _updates.add(AcpUpdate.error(e.toString()));
+        _handleTransportDead(StateError('ACP connection error: $e'));
       },
       onDone: () {
-        _updates.add(const AcpUpdate.closed());
+        // SSH drop / app background closes the bridge without calling close().
+        // Pending session/prompt must not hang for minutes with promptInFlight.
+        _handleTransportDead(StateError('ACP connection closed'));
       },
     );
+    // Half-open SSH: stdout can stall while stdin is already dead. Without this
+    // a send hangs on "Agent is working" forever.
+    unawaited(_session.stdin.done.then((_) {
+      _handleTransportDead(StateError('ACP stdin closed'));
+    }).catchError((Object e) {
+      _handleTransportDead(e);
+    }));
     _session.stderr.listen((data) {
       final text = utf8.decode(data, allowMalformed: true);
       if (text.trim().isNotEmpty) {
         SafeLog.d('ACP stderr: ${SafeLog.redact(text)}');
       }
     });
+  }
+
+  void _handleTransportDead(Object error) {
+    if (!_stdinOpen && _pending.isEmpty) return;
+    _stdinOpen = false;
+    SafeLog.d('ACP transport dead', error);
+    _failPending(error);
+    if (!_updates.isClosed) {
+      try {
+        _updates.add(AcpUpdate.error(error.toString()));
+        _updates.add(const AcpUpdate.closed());
+      } catch (_) {}
+    }
+  }
+
+  void _failPending(Object error) {
+    _promptRequestKey = null;
+    final pending = Map<String, Completer<Map<String, dynamic>>>.from(_pending);
+    _pending.clear();
+    for (final c in pending.values) {
+      if (!c.isCompleted) c.completeError(error);
+    }
+  }
+
+  /// Finish an in-flight prompt so the client can detach while the durable
+  /// host process keeps working. Used when the app backgrounds.
+  void handOffPrompt() {
+    // Unanswered Ask prompts would hang the host turn after we disconnect.
+    cancelOpenPermissions();
+    _finishPromptEarly(reason: 'detached');
   }
 
   Future<void> _applyInitialMode(AgentSessionMode initialMode) async {
@@ -427,6 +515,11 @@ class AcpSession {
       SafeLog.d('agent does not support session/load for model catalog');
       return;
     }
+
+    // session/load replays the conversation as session/update. While
+    // [_replaying] is true we drop those updates — so never do this if a turn
+    // might still be streaming (soft-settle can clear isPromptActive early).
+    if (_promptRequestKey != null || _promptHadTools) return;
 
     _replaying = true;
     try {
@@ -554,6 +647,56 @@ class AcpSession {
 
   void setPermissionPolicy(PermissionPolicy policy) {
     permissionPolicy = policy;
+    // Switching into Full access: clear any Ask prompts still waiting.
+    if (policy.fullAccess) {
+      _autoAnswerOpenPermissions();
+    }
+  }
+
+  /// Answer a pending Ask prompt with one of the optionIds from the request.
+  void resolvePermission(Object requestId, String optionId) {
+    final pending = _openPermissions.remove(requestId);
+    if (pending == null) return;
+    _write({
+      'jsonrpc': '2.0',
+      'id': requestId,
+      'result': {
+        'outcome': {'outcome': 'selected', 'optionId': optionId},
+      },
+    });
+    final label = pending.options
+        .where((o) => o.optionId == optionId)
+        .map((o) => o.name)
+        .firstOrNull;
+    _updates.add(
+      AcpUpdate.permission(label ?? optionId, request: null),
+    );
+  }
+
+  /// Cancel every unanswered permission (disconnect / cancel turn).
+  void cancelOpenPermissions() {
+    final ids = _openPermissions.keys.toList(growable: false);
+    _openPermissions.clear();
+    for (final id in ids) {
+      _write({
+        'jsonrpc': '2.0',
+        'id': id,
+        'result': {
+          'outcome': {'outcome': 'cancelled'},
+        },
+      });
+    }
+    if (ids.isNotEmpty) {
+      _updates.add(const AcpUpdate.permission('Permission cancelled'));
+    }
+  }
+
+  void _autoAnswerOpenPermissions() {
+    final pending = Map<Object, PendingPermissionRequest>.from(_openPermissions);
+    _openPermissions.clear();
+    for (final entry in pending.entries) {
+      _writePermissionSelected(entry.key, entry.value, preferAlways: true);
+    }
   }
 
   Future<void> prompt(String text) async {
@@ -589,6 +732,7 @@ class AcpSession {
     if (method == 'session/prompt') {
       _promptRequestKey = key;
       _promptSawOutput = false;
+      _promptHadTools = false;
     }
     _write({
       'jsonrpc': '2.0',
@@ -632,17 +776,27 @@ class AcpSession {
   ) async {
     // Soft settle only after output: if the agent streamed an answer and then
     // goes silent without closing the turn, treat it as done.
+    // Never soft-settle a turn that used tools — long gaps between tool calls
+    // are normal and were prematurely unlocking the composer.
     const softSettle = Duration(seconds: 25);
-    // Hard ceiling when the agent never produces anything (login hang, etc.).
-    const hardIdle = Duration(minutes: 5);
+    // No first token: bridge is probably dead or the agent never saw the prompt.
+    const hardIdle = Duration(seconds: 45);
+    // After tools, wait much longer for a real end_turn before giving up.
+    const hardIdleAfterTools = Duration(minutes: 10);
     final promptStarted = DateTime.now();
 
     while (true) {
+      if (!_stdinOpen) {
+        throw StateError('ACP connection closed');
+      }
       final now = DateTime.now();
       final sinceActivity = now.difference(_lastActivityAt);
       final sinceStart = now.difference(promptStarted);
+      final idleCap = _promptHadTools ? hardIdleAfterTools : hardIdle;
 
-      if (_promptSawOutput && sinceActivity >= softSettle) {
+      if (_promptSawOutput &&
+          !_promptHadTools &&
+          sinceActivity >= softSettle) {
         _finishPromptEarly(reason: 'end_turn');
         try {
           return await future.timeout(Duration.zero);
@@ -652,14 +806,22 @@ class AcpSession {
       }
       if (!_promptSawOutput && sinceStart >= hardIdle) {
         throw TimeoutException(
-          'ACP "session/prompt" produced no output for ${hardIdle.inMinutes} min. '
-          'The remote agent may be waiting for login (`agent login`) or stuck.',
+          'No response from the agent for ${hardIdle.inSeconds}s. '
+          'Connection may have dropped — try sending again.',
+        );
+      }
+      if (_promptHadTools && sinceActivity >= idleCap) {
+        throw TimeoutException(
+          'Agent went quiet for ${idleCap.inMinutes} min after tool use. '
+          'Tap Unstick and retry if it is still stuck.',
         );
       }
 
-      final wait = _promptSawOutput
-          ? softSettle - sinceActivity
-          : hardIdle - sinceStart;
+      final wait = _promptHadTools
+          ? idleCap - sinceActivity
+          : _promptSawOutput
+              ? softSettle - sinceActivity
+              : hardIdle - sinceStart;
       try {
         return await future.timeout(wait < const Duration(milliseconds: 50)
             ? const Duration(milliseconds: 50)
@@ -690,8 +852,16 @@ class AcpSession {
   }
 
   void _write(Map<String, dynamic> message) {
+    if (!_stdinOpen) {
+      _handleTransportDead(StateError('ACP stdin closed'));
+      return;
+    }
     final line = '${jsonEncode(message)}\n';
-    _session.stdin.add(utf8.encode(line));
+    try {
+      _session.stdin.add(utf8.encode(line));
+    } catch (e) {
+      _handleTransportDead(e);
+    }
   }
 
   void _onStdout(Uint8List data) {
@@ -745,6 +915,9 @@ class AcpSession {
             update.kind == AcpUpdateKind.tool) {
           _promptSawOutput = true;
         }
+        if (update.kind == AcpUpdateKind.tool) {
+          _promptHadTools = true;
+        }
         if (update.kind == AcpUpdateKind.turnComplete) {
           _finishPromptEarly(reason: update.text);
         }
@@ -766,40 +939,46 @@ class AcpSession {
   void _answerPermission(Object? id, Map<String, dynamic> params) {
     if (id == null) return;
 
-    final options = params['options'];
-    String? optionId;
-    if (options is List) {
-      final ids = options
-          .map((o) {
-            if (o is Map) return (o['optionId'] ?? o['id'])?.toString();
-            return null;
-          })
-          .whereType<String>()
-          .toList();
-      if (permissionPolicy == PermissionPolicy.allowAll) {
-        for (final o in ids) {
-          if (o == 'allow-always' ||
-              o == 'allow_always' ||
-              o == 'allow-all' ||
-              o == 'allow_all') {
-            optionId = o;
-            break;
-          }
-        }
+    final request = PendingPermissionRequest.fromParams(id, params);
+
+    if (permissionPolicy == PermissionPolicy.ask) {
+      if (request.options.isEmpty) {
+        // Nothing to present — fall back to a one-shot allow.
+        _writePermissionSelected(id, request, preferAlways: false);
+        return;
       }
-      if (optionId == null) {
-        for (final o in ids) {
-          if (o == 'allow-once' || o == 'allow_once') {
-            optionId = o;
-            break;
-          }
-        }
-      }
-      optionId ??= ids.isNotEmpty ? ids.first : null;
+      _openPermissions[id] = request;
+      _updates.add(AcpUpdate.permission(request.title, request: request));
+      return;
     }
-    optionId ??= permissionPolicy == PermissionPolicy.allowAll
-        ? 'allow-always'
-        : 'allow-once';
+
+    _writePermissionSelected(id, request, preferAlways: true);
+  }
+
+  void _writePermissionSelected(
+    Object id,
+    PendingPermissionRequest request, {
+    required bool preferAlways,
+  }) {
+    String? optionId;
+    final ids = request.options.map((o) => o.optionId).toList();
+    if (preferAlways) {
+      for (final o in request.options) {
+        if (o.isAllowAlways) {
+          optionId = o.optionId;
+          break;
+        }
+      }
+    }
+    if (optionId == null) {
+      for (final o in request.options) {
+        if (o.isAllowOnce) {
+          optionId = o.optionId;
+          break;
+        }
+      }
+    }
+    optionId ??= ids.isNotEmpty ? ids.first : (preferAlways ? 'allow-always' : 'allow-once');
 
     _write({
       'jsonrpc': '2.0',
@@ -810,9 +989,7 @@ class AcpSession {
     });
     _updates.add(
       AcpUpdate.permission(
-        permissionPolicy == PermissionPolicy.allowAll
-            ? 'Auto-allowed ($optionId)'
-            : 'Allowed once ($optionId)',
+        preferAlways ? 'Auto-allowed ($optionId)' : 'Allowed once ($optionId)',
       ),
     );
   }
@@ -948,19 +1125,131 @@ class AcpSession {
   /// Only the SSH channel is torn down. The client is pooled and shared, and a
   /// durable agent keeps running on the host so the conversation survives.
   Future<void> close() async {
+    cancelOpenPermissions();
     await _stdoutSub?.cancel();
+    _stdoutSub = null;
     try {
       await _session.stdin.close();
     } catch (_) {}
-    _session.close();
-    await _updates.close();
-    _promptRequestKey = null;
-    for (final c in _pending.values) {
-      if (!c.isCompleted) {
-        c.completeError(StateError('ACP session closed'));
+    try {
+      _session.close();
+    } catch (_) {}
+    _failPending(StateError('ACP session closed'));
+    if (!_updates.isClosed) {
+      try {
+        _updates.add(const AcpUpdate.closed());
+      } catch (_) {}
+      await _updates.close();
+    }
+  }
+}
+
+/// One choice on a `session/request_permission` prompt.
+class PermissionOption {
+  const PermissionOption({
+    required this.optionId,
+    required this.name,
+    required this.kind,
+  });
+
+  final String optionId;
+  final String name;
+  final String kind;
+
+  bool get isAllowAlways {
+    final k = kind.toLowerCase();
+    final id = optionId.toLowerCase();
+    return k.contains('always') ||
+        id.contains('allow-always') ||
+        id.contains('allow_always') ||
+        id.contains('allow-all') ||
+        id.contains('allow_all');
+  }
+
+  bool get isAllowOnce {
+    final k = kind.toLowerCase();
+    final id = optionId.toLowerCase();
+    if (isAllowAlways) return false;
+    return k.contains('allow') ||
+        id.contains('allow-once') ||
+        id.contains('allow_once') ||
+        id == 'allow';
+  }
+
+  bool get isReject {
+    final k = kind.toLowerCase();
+    final id = optionId.toLowerCase();
+    return k.contains('reject') ||
+        id.contains('reject') ||
+        id.contains('deny');
+  }
+}
+
+/// An Ask-mode permission prompt waiting for the user on this device.
+class PendingPermissionRequest {
+  const PendingPermissionRequest({
+    required this.requestId,
+    required this.title,
+    this.description,
+    required this.options,
+  });
+
+  final Object requestId;
+  final String title;
+  final String? description;
+  final List<PermissionOption> options;
+
+  factory PendingPermissionRequest.fromParams(
+    Object requestId,
+    Map<String, dynamic> params,
+  ) {
+    final options = <PermissionOption>[];
+    final raw = params['options'];
+    if (raw is List) {
+      for (final o in raw) {
+        if (o is! Map) continue;
+        final id = (o['optionId'] ?? o['id'])?.toString();
+        if (id == null || id.isEmpty) continue;
+        final name = (o['name'] ?? o['label'] ?? id).toString();
+        final kind = (o['kind'] ?? '').toString();
+        options.add(PermissionOption(optionId: id, name: name, kind: kind));
       }
     }
-    _pending.clear();
+
+    String? title = params['title']?.toString();
+    String? description = params['description']?.toString();
+
+    final toolCall = params['toolCall'] ?? params['tool_call'];
+    Map? toolMap = toolCall is Map ? toolCall : null;
+    final subject = params['subject'];
+    if (toolMap == null && subject is Map) {
+      final nested = subject['toolCall'] ?? subject['tool_call'];
+      if (nested is Map) toolMap = nested;
+    }
+    if (toolMap != null) {
+      final toolTitle = toolMap['title']?.toString();
+      if ((title == null || title.isEmpty) &&
+          toolTitle != null &&
+          toolTitle.isNotEmpty) {
+        title = toolTitle;
+      }
+      final kind = toolMap['kind']?.toString();
+      if ((description == null || description.isEmpty) &&
+          kind != null &&
+          kind.isNotEmpty) {
+        description = 'Tool: $kind';
+      }
+    }
+
+    title = (title == null || title.isEmpty) ? 'Allow this action?' : title;
+    if (description != null && description.isEmpty) description = null;
+
+    return PendingPermissionRequest(
+      requestId: requestId,
+      title: title,
+      description: description,
+      options: options,
+    );
   }
 }
 
@@ -971,11 +1260,13 @@ class AcpUpdate {
     this.title,
     this.tool,
     this.mode,
+    this.permissionRequest,
   });
 
   const AcpUpdate.delta(String text) : this._(AcpUpdateKind.delta, text);
   const AcpUpdate.thought(String text) : this._(AcpUpdateKind.thought, text);
-  const AcpUpdate.permission(String text) : this._(AcpUpdateKind.permission, text);
+  const AcpUpdate.permission(String text, {PendingPermissionRequest? request})
+      : this._(AcpUpdateKind.permission, text, permissionRequest: request);
   const AcpUpdate.error(String text) : this._(AcpUpdateKind.error, text);
   const AcpUpdate.closed() : this._(AcpUpdateKind.closed, '');
   const AcpUpdate.ignored() : this._(AcpUpdateKind.ignored, '');
@@ -1185,6 +1476,7 @@ class AcpUpdate {
   final String? title;
   final ToolCallState? tool;
   final AgentSessionMode? mode;
+  final PendingPermissionRequest? permissionRequest;
 }
 
 enum AcpUpdateKind {

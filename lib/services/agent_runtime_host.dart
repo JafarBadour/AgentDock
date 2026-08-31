@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import '../data/models/agent_provider.dart';
 import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
 import 'ssh_service.dart';
@@ -54,13 +55,16 @@ class AgentRuntimeHost {
     return '$home/.agentdock/sessions/$safe';
   }
 
-  /// Start the agent for [chatId] if it isn't already running.
+  /// Start the agent for [chatId] if it isn't already running with the same
+  /// [fullAccess] mode. A mode mismatch restarts the process (journal kept).
   Future<RemoteAgentSession> ensure({
     required Host host,
     required String chatId,
     required String cwd,
     required String binary,
-    String? cursorApiKey,
+    AgentProvider provider = AgentProvider.cursor,
+    String? apiKey,
+    bool fullAccess = true,
   }) async {
     final home = await _ssh.remoteHomeDirectory(host);
     final dir = dirForChat(home, chatId);
@@ -71,7 +75,9 @@ class AgentRuntimeHost {
       tmuxSession: tmux,
       cwd: cwd,
       binary: binary,
-      cursorApiKey: cursorApiKey,
+      provider: provider,
+      apiKey: apiKey,
+      fullAccess: fullAccess,
     );
 
     final out = await _ssh.exec(host, 'sh -c ${SshService.shellQuote(script)}');
@@ -79,7 +85,10 @@ class AgentRuntimeHost {
     final state = parts.isNotEmpty ? parts.first : '';
     final size = parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
 
-    SafeLog.d('agent runtime $tmux state=$state journal=$size');
+    SafeLog.d(
+      'agent runtime $tmux state=$state journal=$size '
+      'provider=${provider.id} fullAccess=$fullAccess',
+    );
     return RemoteAgentSession(
       dir: dir,
       tmuxSession: tmux,
@@ -167,17 +176,31 @@ class AgentRuntimeHost {
 
   /// Idempotent bootstrap run on the host. Pure, so its quoting is testable.
   ///
-  /// Prints either `RUNNING` or `STARTED`, then the journal's byte size.
+  /// Prints `RUNNING`, `STARTED`, or `RESTARTED`, then the journal's byte size.
   static String ensureScript({
     required String dir,
     required String tmuxSession,
     required String cwd,
     required String binary,
-    String? cursorApiKey,
+    AgentProvider provider = AgentProvider.cursor,
+    String? apiKey,
+    bool fullAccess = true,
   }) {
     final q = SshService.shellQuote;
-    final scriptB64 =
-        base64Encode(utf8.encode(runScript(dir: dir, cwd: cwd, binary: binary)));
+    final scriptB64 = base64Encode(
+      utf8.encode(
+        runScript(
+          dir: dir,
+          cwd: cwd,
+          binary: binary,
+          provider: provider,
+          fullAccess: fullAccess,
+        ),
+      ),
+    );
+    final want = fullAccess ? '1' : '0';
+    final marker = '$dir/full_access';
+    final envBody = _envFileContents(provider: provider, apiKey: apiKey);
 
     return <String>[
       'set -e',
@@ -186,32 +209,57 @@ class AgentRuntimeHost {
       'printf %s ${q(scriptB64)} | base64 -d > ${q('$dir/run.sh')}',
       '[ -p ${q('$dir/in')} ] || mkfifo ${q('$dir/in')}',
       'touch ${q('$dir/out.jsonl')}',
+      'WANT=$want',
+      'HAVE=\$(cat ${q(marker)} 2>/dev/null || true)',
       'if tmux has-session -t ${q(tmuxSession)} 2>/dev/null; then',
-      '  printf RUNNING',
-      'else',
-      // A stale journal belongs to a dead process; the new one starts clean.
-      '  : > ${q('$dir/out.jsonl')}',
-      if (cursorApiKey != null && cursorApiKey.isNotEmpty) ...[
-        // Written 0600 and unlinked by run.sh the moment it is sourced, so the
-        // key never lands in `ps` output and does not linger on disk.
-        '  umask 077',
-        '  printf %s ${q(_envFileContents(cursorApiKey))} > ${q('$dir/env')}',
+      '  if [ "\$HAVE" = "\$WANT" ]; then',
+      '    printf RUNNING',
+      '  else',
+      // Full access ↔ Ask changed: recycle the process, keep journal + session id.
+      '    tmux kill-session -t ${q(tmuxSession)} 2>/dev/null || true',
+      '    printf %s "\$WANT" > ${q(marker)}',
+      if (envBody != null) ...[
+        '    umask 077',
+        '    printf %s ${q(envBody)} > ${q('$dir/env')}',
       ],
-      // If tmux never starts, run.sh will not be there to consume the key file,
-      // so remove it rather than leaving a secret behind.
+      '    tmux new-session -d -s ${q(tmuxSession)} -c ${q(cwd)} '
+          '${q('sh $dir/run.sh')} || { rm -f ${q('$dir/env')}; exit 1; }',
+      '    printf RESTARTED',
+      '  fi',
+      'else',
+      '  : > ${q('$dir/out.jsonl')}',
+      '  printf %s "\$WANT" > ${q(marker)}',
+      if (envBody != null) ...[
+        '  umask 077',
+        '  printf %s ${q(envBody)} > ${q('$dir/env')}',
+      ],
       '  tmux new-session -d -s ${q(tmuxSession)} -c ${q(cwd)} '
           '${q('sh $dir/run.sh')} || { rm -f ${q('$dir/env')}; exit 1; }',
       '  printf STARTED',
       'fi',
-      // Report journal size so the client can validate any stored offset.
       'printf " "',
       'wc -c < ${q('$dir/out.jsonl')} | tr -d ${q(' ')}',
     ].join('\n');
   }
 
-  static String _envFileContents(String cursorApiKey) {
-    return 'CURSOR_API_KEY=${SshService.shellQuote(cursorApiKey)}\n'
-        'export CURSOR_API_KEY\n';
+  /// Env exports written to a 0600 file and sourced by [runScript].
+  static String? _envFileContents({
+    required AgentProvider provider,
+    String? apiKey,
+  }) {
+    final lines = <String>[];
+    if (apiKey != null && apiKey.isNotEmpty) {
+      switch (provider) {
+        case AgentProvider.cursor:
+          lines.add('CURSOR_API_KEY=${SshService.shellQuote(apiKey)}');
+          lines.add('export CURSOR_API_KEY');
+        case AgentProvider.claude:
+          lines.add('ANTHROPIC_API_KEY=${SshService.shellQuote(apiKey)}');
+          lines.add('export ANTHROPIC_API_KEY');
+      }
+    }
+    if (lines.isEmpty) return null;
+    return '${lines.join('\n')}\n';
   }
 
   /// The supervised process wrapper that tmux launches.
@@ -219,8 +267,21 @@ class AgentRuntimeHost {
     required String dir,
     required String cwd,
     required String binary,
+    AgentProvider provider = AgentProvider.cursor,
+    bool fullAccess = true,
   }) {
     final q = SshService.shellQuote;
+    final agentArgs = switch (provider) {
+      // Shift+Tab "full access" in the interactive Cursor CLI.
+      AgentProvider.cursor =>
+        fullAccess ? '--force --approve-mcps --trust acp' : 'acp',
+      // Zed's claude-code-acp speaks ACP on stdio with no subcommand.
+      AgentProvider.claude => '',
+    };
+    final skipPerms = provider == AgentProvider.claude && fullAccess
+        ? 'export CLAUDE_ACP_SKIP_PERMISSIONS=true\n'
+        : '';
+    final execLine = agentArgs.isEmpty ? q(binary) : '${q(binary)} $agentArgs';
     return '''#!/bin/sh
 DIR=${q(dir)}
 
@@ -231,6 +292,7 @@ if [ -f "\$DIR/env" ]; then
   rm -f "\$DIR/env"
 fi
 
+$skipPerms
 export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"
 cd ${q(cwd)} || exit 1
 
@@ -246,9 +308,9 @@ exec 2>> "\$DIR/err.log"
 # stdout is a file, so libc would normally switch to 4KB block buffering and
 # stall streaming. Force line buffering when stdbuf is available.
 if command -v stdbuf >/dev/null 2>&1; then
-  exec stdbuf -oL -eL ${q(binary)} acp
+  exec stdbuf -oL -eL $execLine
 fi
-exec ${q(binary)} acp
+exec $execLine
 ''';
   }
 }
