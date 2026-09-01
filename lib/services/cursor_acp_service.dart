@@ -335,6 +335,11 @@ class AcpSession {
     final client = await ssh.connect(host);
 
     final envExports = StringBuffer();
+    // Prefer nvm node bins so #!/usr/bin/env node adapters (Claude ACP) start.
+    envExports.write(
+      r'for d in "$HOME"/.nvm/versions/node/*/bin; do '
+      r'[ -d "$d" ] && PATH="$d:$PATH"; done; ',
+    );
     envExports.write(
       'export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"; ',
     );

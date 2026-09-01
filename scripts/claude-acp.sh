@@ -75,32 +75,44 @@ npm install -g @agentclientprotocol/claude-agent-acp \
 
 NODE_BIN="$(dirname "$(command -v node)")"
 PREFIX_BIN="$(npm prefix -g 2>/dev/null)/bin"
-linked=
-for dir in "$HOME/.local/bin" "$NODE_BIN" "$PREFIX_BIN"; do
+
+# Locate the real npm-global binary — never link ~/.local/bin to itself.
+REAL=
+for dir in "$NODE_BIN" "$PREFIX_BIN"; do
   [ -d "$dir" ] || continue
+  # Skip if this dir is ~/.local/bin (would create a self-symlink).
+  [ "$(cd "$dir" && pwd -P)" = "$(cd "$HOME/.local/bin" && pwd -P)" ] && continue
   for name in claude-agent-acp claude-code-acp; do
     if [ -x "$dir/$name" ]; then
-      ln -sfn "$dir/$name" "$HOME/.local/bin/claude-code-acp"
-      ln -sfn "$dir/$name" "$HOME/.local/bin/$name"
-      linked="$dir/$name"
+      REAL="$dir/$name"
       break 2
     fi
   done
 done
 
-ensure_path_line
-
-if [ -z "$linked" ] && ! have claude-code-acp && ! have claude-agent-acp; then
+if [ -z "$REAL" ]; then
   warn "ACP adapter binary not found after npm install"
   exit 1
 fi
 
-ADAPTER="$(command -v claude-code-acp 2>/dev/null || command -v claude-agent-acp)"
-ok "adapter → $ADAPTER"
-# Resolve through symlink for clarity
-if [ -L "$HOME/.local/bin/claude-code-acp" ]; then
-  ok "symlink ~/.local/bin/claude-code-acp → $(readlink -f "$HOME/.local/bin/claude-code-acp")"
-fi
+# Wrapper so non-login shells (tmux) still find `node` via nvm.
+cat >"$HOME/.local/bin/claude-code-acp" <<EOF
+#!/usr/bin/env bash
+# Agent Dock wrapper — ensure nvm node is on PATH for #!/usr/bin/env node.
+export NVM_DIR="\${NVM_DIR:-\$HOME/.nvm}"
+[ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+for d in "\$HOME"/.nvm/versions/node/*/bin; do
+  [ -d "\$d" ] && PATH="\$d:\$PATH"
+done
+export PATH="\$HOME/.local/bin:\$PATH"
+exec $(printf %q "$REAL") "\$@"
+EOF
+chmod +x "$HOME/.local/bin/claude-code-acp"
+ln -sfn "$HOME/.local/bin/claude-code-acp" "$HOME/.local/bin/claude-agent-acp"
+
+ensure_path_line
+ok "adapter → $REAL"
+ok "wrapper → $HOME/.local/bin/claude-code-acp"
 
 # --- tmux -------------------------------------------------------------------
 say "tmux (durable sessions)"

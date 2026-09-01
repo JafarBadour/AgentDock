@@ -328,18 +328,42 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       final permission =
           live?.preferredPermissionPolicy ?? fallbackPermission;
 
+      void status(String message) {
+        // Factory outlives the screen; only paint when this chat is open.
+        if (!mounted) return;
+        setState(() => _connectStatus = message);
+      }
+
+      status(
+        provider == AgentProvider.claude
+            ? 'Checking Claude on the remote…'
+            : 'Checking Cursor CLI on the remote…',
+      );
+
+      // Install tmux first so durable sessions work once the agent binary is up.
+      try {
+        await ssh.ensureTmux(host, onProgress: status);
+      } catch (e) {
+        SafeLog.d('tmux ensure failed (will run without durable session)', e);
+      }
+
       final binary = switch (provider) {
-        AgentProvider.cursor => await ssh.ensureCursorCli(host).timeout(
-              const Duration(seconds: 20),
+        AgentProvider.cursor => await ssh.ensureCursorCli(
+              host,
+              onProgress: status,
+            ).timeout(
+              const Duration(minutes: 8),
               onTimeout: () => throw TimeoutException(
-                'Timed out looking for Cursor CLI. Check Terminal SSH, then retry.',
+                'Timed out installing/finding Cursor CLI on the remote.',
               ),
             ),
-        AgentProvider.claude => await ssh.ensureClaudeAcpBinary(host).timeout(
-              const Duration(seconds: 120),
+        AgentProvider.claude => await ssh.ensureClaudeAcpBinary(
+              host,
+              onProgress: status,
+            ).timeout(
+              const Duration(minutes: 12),
               onTimeout: () => throw TimeoutException(
-                'Timed out looking for claude-code-acp. Install it on the remote '
-                '(see setup guide), then retry.',
+                'Timed out installing/finding Claude ACP on the remote.',
               ),
             ),
       };
@@ -347,6 +371,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       final durable = await ssh.hasTmux(host);
       final mcps = await db.listEnabledMcpsForHost(host.id);
       final latest = await db.getChat(chatId);
+
+      status('Starting agent…');
 
       return AcpSession.start(
         ssh: ssh,
@@ -424,7 +450,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     setState(() {
       _connecting = true;
-      _connectStatus = 'Resolving Cursor CLI…';
+      _connectStatus = chat.provider == AgentProvider.claude
+          ? 'Preparing Claude on the remote…'
+          : 'Preparing Cursor on the remote…';
       _error = null;
       _showSdkInstallGuide = false;
     });
@@ -451,7 +479,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
       final factory = _buildSessionFactory(chatId: chat.id, cwd: repo.remotePath);
 
-      if (mounted) setState(() => _connectStatus = 'Starting agent…');
       final session = await factory();
 
       final runtime = await ref.read(activeAcpSessionsProvider.notifier).attach(
@@ -498,13 +525,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         setState(() {
           _showSdkInstallGuide = true;
           _error = isClaude
-              ? 'Claude ACP adapter not found on ${host.displayLabel}.\n'
-                  'Install Claude Code + @zed-industries/claude-code-acp '
-                  'on the remote (npm via nvm is fine), then Connect again.\n\n'
-                  '${e.tool} missing.'
-              : 'Cursor CLI / SDK not found on ${host.displayLabel}.\n'
-                  'Install it on the remote, then try Connect again.\n\n'
-                  '${e.tool} missing.';
+              ? 'Could not install Claude on ${host.displayLabel}.\n'
+                  'Agent Dock tried automatically — run the setup below on the '
+                  'remote (or fix network/sudo), then Connect again.\n\n'
+                  '${e.tool} still missing.'
+              : 'Could not install Cursor CLI on ${host.displayLabel}.\n'
+                  'Agent Dock tried automatically — run the setup below on the '
+                  'remote, then Connect again.\n\n'
+                  '${e.tool} still missing.';
         });
       }
     } catch (e) {
@@ -516,16 +544,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           lower.contains('claude-code-acp') ||
           lower.contains('agent') ||
           lower.contains('not found') ||
-          lower.contains('no such file');
+          lower.contains('no such file') ||
+          lower.contains('install');
       if (mounted) {
         setState(() {
           _showSdkInstallGuide = looksLikeMissingSdk;
           _error = looksLikeMissingSdk
               ? (isClaude
-                  ? 'Could not start Claude agent — ACP adapter may be missing '
-                      'on the remote.\n$e'
-                  : 'Could not start Cursor agent — CLI/SDK may be missing '
-                      'on the remote.\n$e')
+                  ? 'Could not start Claude — install may have failed on the remote.\n$e'
+                  : 'Could not start Cursor — install may have failed on the remote.\n$e')
               : 'Could not start ${isClaude ? 'Claude' : 'Cursor'} ACP: $e';
         });
       }
