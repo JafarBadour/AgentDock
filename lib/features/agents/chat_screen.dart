@@ -494,18 +494,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       }
     } on MissingToolException catch (e) {
       if (mounted) {
+        final isClaude = chat.provider == AgentProvider.claude;
         setState(() {
           _showSdkInstallGuide = true;
-          _error =
-              'Cursor CLI / SDK not found on ${host.displayLabel}.\n'
-              'Install it on the remote, then try Connect again.\n\n'
-              '${e.tool} missing.';
+          _error = isClaude
+              ? 'Claude ACP adapter not found on ${host.displayLabel}.\n'
+                  'Install Claude Code + @zed-industries/claude-code-acp '
+                  'on the remote (npm via nvm is fine), then Connect again.\n\n'
+                  '${e.tool} missing.'
+              : 'Cursor CLI / SDK not found on ${host.displayLabel}.\n'
+                  'Install it on the remote, then try Connect again.\n\n'
+                  '${e.tool} missing.';
         });
       }
     } catch (e) {
       SafeLog.d('ACP connect failed', e);
       final lower = e.toString().toLowerCase();
+      final isClaude = chat.provider == AgentProvider.claude;
       final looksLikeMissingSdk = lower.contains('cursor') ||
+          lower.contains('claude') ||
+          lower.contains('claude-code-acp') ||
           lower.contains('agent') ||
           lower.contains('not found') ||
           lower.contains('no such file');
@@ -513,8 +521,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         setState(() {
           _showSdkInstallGuide = looksLikeMissingSdk;
           _error = looksLikeMissingSdk
-              ? 'Could not start Cursor agent — CLI/SDK may be missing on the remote.\n$e'
-              : 'Could not start Cursor ACP: $e';
+              ? (isClaude
+                  ? 'Could not start Claude agent — ACP adapter may be missing '
+                      'on the remote.\n$e'
+                  : 'Could not start Cursor agent — CLI/SDK may be missing '
+                      'on the remote.\n$e')
+              : 'Could not start ${isClaude ? 'Claude' : 'Cursor'} ACP: $e';
         });
       }
       final updated = chat.copyWith(status: ChatStatus.error, updatedAt: DateTime.now());

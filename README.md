@@ -29,6 +29,20 @@ with a timeout, and dropped when the app backgrounds.
 
 This is a greenfield project. Patterns were studied from open-source tools (e.g. MonkeySSH); **no third-party app code or remote helper binaries are vendored**.
 
+## Remote setup (SSH host)
+
+On the machine Agent Dock SSHs into:
+
+```bash
+# Cursor agents
+curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/cursor-acp.sh | bash
+
+# Claude agents
+curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/claude-acp.sh | bash
+```
+
+Details: [`scripts/README.md`](scripts/README.md).
+
 ## Security
 
 - Secrets only in `flutter_secure_storage` (Android Keystore / iOS Keychain)
