@@ -1,47 +1,36 @@
-/// Commands to install on the remote when Cursor agent runtime is missing.
-const kRemoteCursorSetupGuide = r'''# 1. Cursor CLI (the SDK's local runtime depends on this binary)
-curl https://cursor.com/install -fsS | bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-agent --version
+/// One-liner installers for the remote host Agent Dock SSH-connects to.
+///
+/// Scripts live in the AgentDock GitHub repo under `scripts/`.
+const kAgentDockScriptsBase =
+    'https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts';
 
-# 2. Node, if it isn't there
-node --version || curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
+/// Commands to install Cursor agent runtime on the remote.
+const kRemoteCursorSetupGuide = '''
+# Agent Dock · Cursor on this host (copy-paste)
+curl -fsSL $kAgentDockScriptsBase/cursor-acp.sh | bash
 
-# 3. Project + SDK
-mkdir -p ~/agent-sdk && cd ~/agent-sdk
-npm init -y
-npm pkg set type=module
-npm install @cursor/sdk
+# Then authenticate:
+agent login
+# or save CURSOR_API_KEY in the Agent Dock Connect tab
 
-# 4. Key
-echo 'export CURSOR_API_KEY=your_key_here' >> ~/.bashrc
-source ~/.bashrc
+# Smoke:
+cursor-agent --version || agent --version
+tmux -V
 ''';
 
-/// Install Claude Code + Zed's ACP adapter on the remote host.
-const kRemoteClaudeSetupGuide = r'''# 1. Claude Code CLI
-curl -fsSL https://claude.ai/install.sh | bash
-# or: npm install -g @anthropic-ai/claude-code
-claude --version
+/// Commands to install Claude Code + ACP adapter on the remote.
+const kRemoteClaudeSetupGuide = '''
+# Agent Dock · Claude on this host (copy-paste)
+curl -fsSL $kAgentDockScriptsBase/claude-acp.sh | bash
 
-# 2. Node (needed for the ACP adapter)
-node --version || curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
-
-# 3. Zed Claude Code ACP adapter (stdio ACP bridge)
-npm install -g @zed-industries/claude-code-acp
-# Ensure the binary is on PATH (npm prefix bin):
-echo 'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-command -v claude-code-acp
-# Smoke: start briefly then Ctrl-C (Agent Dock launches this for you)
-# claude-code-acp
-
-# 4. Auth — either works with Agent Dock:
-#    a) Save ANTHROPIC_API_KEY in the app Connect tab, or:
-export ANTHROPIC_API_KEY=your_key_here
-#    b) Or interactive login on the host:
+# Then authenticate (pick one):
 claude login
+# or save ANTHROPIC_API_KEY in the Agent Dock Connect tab
+
+# Smoke:
+claude --version
+command -v claude-code-acp
+tmux -V
 ''';
 
 const kRemoteTmuxSetupGuide = r'''# Install tmux on the remote
