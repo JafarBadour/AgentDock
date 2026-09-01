@@ -62,6 +62,7 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
       title: Text('New agent · ${widget.repoName}'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           TextField(
             controller: _title,
@@ -69,21 +70,33 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
             decoration: const InputDecoration(labelText: 'Title'),
             onSubmitted: (_) => _submit(),
           ),
-          const SizedBox(height: 12),
-          DropdownButtonFormField<AgentProvider>(
-            initialValue: _provider,
-            items: [
+          const SizedBox(height: 16),
+          Text(
+            'Provider',
+            style: Theme.of(context).textTheme.labelLarge,
+          ),
+          const SizedBox(height: 8),
+          // Segmented control — not a Dropdown — so the menu never paints
+          // through the dialog / wavy background as a broken overlay.
+          SegmentedButton<AgentProvider>(
+            segments: [
               for (final p in AgentProvider.values)
-                DropdownMenuItem(
+                ButtonSegment(
                   value: p,
-                  child: Text(p.label),
+                  label: Text(p.label),
+                  icon: Icon(
+                    p == AgentProvider.cursor
+                        ? Icons.terminal
+                        : Icons.smart_toy_outlined,
+                    size: 16,
+                  ),
                 ),
             ],
-            onChanged: (value) {
-              if (value == null) return;
-              setState(() => _provider = value);
+            selected: {_provider},
+            onSelectionChanged: (next) {
+              if (next.isEmpty) return;
+              setState(() => _provider = next.first);
             },
-            decoration: const InputDecoration(labelText: 'Provider'),
           ),
         ],
       ),

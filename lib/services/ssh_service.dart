@@ -414,10 +414,10 @@ class SshService {
     return path;
   }
 
-  /// Resolves the Claude ACP adapter (`claude-code-acp`) to an absolute path.
+  /// Resolves the Claude ACP adapter (`claude-code-acp` / `claude-agent-acp`).
   ///
-  /// Tries known install locations, then `command -v`, then a one-shot
-  /// `npm install -g @zed-industries/claude-code-acp` before failing.
+  /// Tries known install locations (including nvm), then installs
+  /// `@agentclientprotocol/claude-agent-acp` via npm when missing.
   Future<String> ensureClaudeAcpBinary(Host host) async {
     final client = await connect(host);
     var path = await _resolveClaudeAcpPath(client, host.id);
@@ -427,13 +427,37 @@ class SshService {
     try {
       await _run(
         client,
-        r'export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; '
-        r'npm install -g @zed-industries/claude-code-acp 2>/dev/null || true',
+        r'''
+set +e
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm not found" >&2
+  exit 1
+fi
+mkdir -p "$HOME/.local/bin"
+npm install -g @agentclientprotocol/claude-agent-acp \
+  || npm install -g @zed-industries/claude-code-acp
+PREFIX="$(npm prefix -g 2>/dev/null)"
+NVM_BIN="$(command -v node 2>/dev/null | xargs dirname 2>/dev/null)"
+for dir in "$PREFIX/bin" "$NVM_BIN"; do
+  [ -n "$dir" ] || continue
+  for name in claude-agent-acp claude-code-acp; do
+    if [ -x "$dir/$name" ]; then
+      ln -sfn "$dir/$name" "$HOME/.local/bin/claude-code-acp"
+      ln -sfn "$dir/$name" "$HOME/.local/bin/$name"
+    fi
+  done
+done
+test -x "$HOME/.local/bin/claude-code-acp" \
+  || command -v claude-code-acp >/dev/null \
+  || command -v claude-agent-acp >/dev/null
+''',
         hostId: host.id,
-        timeout: const Duration(seconds: 120),
+        timeout: const Duration(seconds: 180),
       );
     } catch (e) {
-      SafeLog.d('claude-code-acp npm install failed', e);
+      SafeLog.d('claude ACP adapter npm install failed', e);
     }
 
     path = await _resolveClaudeAcpPath(client, host.id);
@@ -459,7 +483,9 @@ class SshService {
         final sftp = await client.sftp();
         for (final rel in [
           '.local/bin/claude-code-acp',
+          '.local/bin/claude-agent-acp',
           '.npm-global/bin/claude-code-acp',
+          '.npm-global/bin/claude-agent-acp',
         ]) {
           final full = '$home/$rel';
           try {
@@ -472,26 +498,42 @@ class SshService {
       SafeLog.d('SFTP Claude ACP probe failed, trying which', e);
     }
 
-    const script =
-        r'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:'
-        r'/usr/local/bin:/opt/homebrew/bin:$PATH"; '
-        r'command -v claude-code-acp 2>/dev/null || '
-        r'for p in "$HOME/.local/bin/claude-code-acp" '
-        r'"$HOME/.npm-global/bin/claude-code-acp" '
-        r'/usr/local/bin/claude-code-acp; '
-        r'do [ -x "$p" ] && printf %s "$p" && exit 0; done; exit 1';
+    const script = r'''
+set +e
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
+for name in claude-code-acp claude-agent-acp; do
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    exit 0
+  fi
+done
+for p in "$HOME/.local/bin/claude-code-acp" \
+         "$HOME/.local/bin/claude-agent-acp" \
+         "$HOME/.npm-global/bin/claude-code-acp" \
+         "$HOME/.npm-global/bin/claude-agent-acp" \
+         /usr/local/bin/claude-code-acp \
+         /usr/local/bin/claude-agent-acp; do
+  if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
+done
+for p in "$HOME"/.nvm/versions/node/*/bin/claude-code-acp \
+         "$HOME"/.nvm/versions/node/*/bin/claude-agent-acp; do
+  if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
+done
+exit 1
+''';
     try {
       final out = await _run(
         client,
-        'sh -c ${shellQuote(script)}',
+        'bash -lc ${shellQuote(script)}',
         hostId: hostId,
-        timeout: const Duration(seconds: 12),
+        timeout: const Duration(seconds: 20),
       );
-      final path = out.trim();
+      final path = out.trim().split('\n').last.trim();
       return path.isEmpty ? null : path;
     } catch (e) {
       SafeLog.d('resolve Claude ACP path failed', e);
-      rethrow;
+      return null;
     }
   }
 
