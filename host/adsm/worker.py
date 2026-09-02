@@ -256,6 +256,7 @@ class Worker:
             await self._set_status(
                 self.chat_id, protocol.STATUS_STARTING, None
             )
+            await self._emit_event("activity", label="Connecting")
 
             state, _size = await asyncio.to_thread(
                 ensure_tmux_worker,
@@ -302,6 +303,7 @@ class Worker:
                     self.mode = mode
 
             await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+            await self._emit_event("activity", label="")
             await self._emit_event(
                 "session",
                 acpSessionId=self.acp_session_id,
@@ -566,6 +568,7 @@ class Worker:
             raise RuntimeError("ACP session not ready")
         await self._set_status(self.chat_id, protocol.STATUS_RUNNING, None)
         await self._emit_event("status", status=protocol.STATUS_RUNNING)
+        await self._emit_event("activity", label="Thinking")
         try:
             result = await self._request(
                 "session/prompt",
@@ -581,6 +584,7 @@ class Worker:
                 else "end_turn"
             )
             await self._emit_event("turn_complete", reason=stop or "end_turn")
+            await self._emit_event("activity", label="")
             await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
             await self._emit_event("status", status=protocol.STATUS_IDLE)
             return result if isinstance(result, dict) else {"stopReason": "end_turn"}
@@ -609,6 +613,7 @@ class Worker:
             if not fut.done():
                 fut.set_result({"stopReason": "cancelled"})
         await self._emit_event("turn_complete", reason="cancelled")
+        await self._emit_event("activity", label="")
         await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
 
     async def respond_permission(self, request_id: str, option_id: str) -> None:
@@ -732,6 +737,7 @@ class Worker:
                 await self._emit_event(
                     "turn_complete", reason=stop or "end_turn"
                 )
+                await self._emit_event("activity", label="")
                 await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
                 key = self._prompt_key
                 if key and key in self._pending:
@@ -760,12 +766,14 @@ class Worker:
         ):
             text = _extract_text(update)
             if text:
+                await self._emit_event("activity", label="Writing")
                 await self._emit_event("text", text=text)
             return
 
         if "thought" in typ.lower() or "reasoning" in typ.lower():
             text = _extract_text(update)
             if text:
+                await self._emit_event("activity", label="Thinking")
                 await self._emit_event("thought", text=text)
             return
 
@@ -777,11 +785,20 @@ class Worker:
                     if typ in ("tool_call", "toolCall")
                     else "tool_update"
                 )
+                title = str(tool.get("title") or "Running tool")
+                status = str(tool.get("status") or "").lower()
+                if kind == "tool_start" or status in (
+                    "pending",
+                    "in_progress",
+                    "running",
+                ):
+                    await self._emit_event("activity", label=title)
                 await self._emit_event(kind, tool=tool)
             return
 
         text = _extract_text(update)
         if text:
+            await self._emit_event("activity", label="Writing")
             await self._emit_event("text", text=text)
 
     async def _handle_permission(
@@ -840,6 +857,7 @@ class Worker:
         await self._set_status(
             self.chat_id, protocol.STATUS_WAITING_PERMISSION, None
         )
+        await self._emit_event("activity", label="Waiting for permission")
         await self._emit_event(
             "permission",
             requestId=rid,

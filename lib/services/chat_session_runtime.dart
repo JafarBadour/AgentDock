@@ -116,6 +116,9 @@ class ChatSessionRuntime extends ChangeNotifier {
   bool closed = false;
   bool promptInFlight = false;
 
+  /// Cursor-style activity label from ADSM (`Thinking`, tool name, …).
+  String? activityLabel;
+
   /// Turn was handed to the durable host after the phone disconnected.
   bool remoteTurnActive = false;
 
@@ -694,6 +697,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     remoteTurnActive = false;
     _clearHostBusyWatchdog();
     promptInFlight = true;
+    activityLabel = 'Thinking';
     notifyListeners();
     var transportFailed = false;
     try {
@@ -707,10 +711,12 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
       await flushAssistantBuffer();
       await commitThought();
+      activityLabel = null;
     } catch (e) {
       SafeLog.d('prompt failed', e);
       lastError = e.toString();
       transportFailed = true;
+      activityLabel = null;
       // Dead bridge / silence timeout — recover so the next send is not wedged.
       if (!closed && sessionFactory != null) {
         closed = true;
@@ -730,6 +736,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         } else {
           promptInFlight = false;
           remoteTurnActive = false;
+          if (!isWorking) activityLabel = null;
           _clearHostBusyWatchdog();
           notifyListeners();
           if (!closed) _drainOutboundQueue();
@@ -849,10 +856,16 @@ class ChatSessionRuntime extends ChangeNotifier {
           onLocalChange?.call(chatId);
         }
         notifyListeners();
+      case AcpUpdateKind.activity:
+        final label = update.text.trim();
+        activityLabel = label.isEmpty ? null : label;
+        if (activityLabel != null) _noteHostActivity();
+        notifyListeners();
       case AcpUpdateKind.mode:
         notifyListeners();
       case AcpUpdateKind.delta:
         _noteHostActivity();
+        activityLabel ??= 'Writing';
         if (thoughtBuffer.isNotEmpty) {
           unawaited(commitThought());
         }
@@ -861,6 +874,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         notifyListeners();
       case AcpUpdateKind.thought:
         _noteHostActivity();
+        activityLabel ??= 'Thinking';
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
         }
@@ -870,6 +884,9 @@ class ChatSessionRuntime extends ChangeNotifier {
         final tool = update.tool;
         if (tool == null) break;
         _noteHostActivity();
+        if (tool.isActive) {
+          activityLabel = tool.displayTitle;
+        }
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
         }
@@ -879,6 +896,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         unawaited(_upsertTool(tool));
       case AcpUpdateKind.permission:
         pendingPermission = update.permissionRequest;
+        activityLabel = 'Waiting for permission';
         notifyListeners();
       case AcpUpdateKind.error:
         lastError = update.text;
@@ -889,6 +907,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (promptInFlight && !remoteTurnActive) {
           promptInFlight = false;
         }
+        activityLabel = null;
         unawaited(flushAssistantBuffer());
         unawaited(commitThought());
         closed = true;
@@ -906,6 +925,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         // send race ahead — only clear UI busy when nothing owns the prompt.
         _clearHostBusyWatchdog();
         remoteTurnActive = false;
+        activityLabel = null;
         if (hasActiveTools) {
           // end_turn with rows still "in_progress" — agent will not send more
           // updates for them. Finalize so the UI does not choke forever.

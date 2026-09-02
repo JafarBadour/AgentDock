@@ -889,12 +889,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final activeTools = runtime == null
         ? 0
         : runtime.entries.where((e) => e.tool?.isActive ?? false).length;
+    final activityLabel = runtime?.activityLabel;
     final statusLabel = switch (true) {
       _ when reconnecting => ' · reconnecting…',
       _ when remoteRunning && !connected => ' · running on host',
+      _ when streaming && activityLabel != null && activityLabel.isNotEmpty =>
+        ' · $activityLabel',
       _ when streaming && activeTools > 0 =>
         ' · working · $activeTools tool${activeTools == 1 ? '' : 's'}',
-      _ when streaming => ' · working',
+      _ when streaming => ' · Thinking',
       _ when connected && _resumedInPlace => ' · live · resumed',
       _ when connected => ' · live',
       _ => '',
@@ -905,6 +908,23 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // that race used to make the answer vanish until reopen.
     if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
       if (thoughtBuffer.isNotEmpty) {
+        extra.add(
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Shimmer(
+                child: Text(
+                  'Thinking',
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
         extra.add(_Bubble(
           role: MessageRole.system,
           text: thoughtBuffer,
@@ -1163,30 +1183,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             ),
           if (streaming)
             Material(
-              color: theme.colorScheme.errorContainer.withValues(alpha: 0.35),
+              color: theme.colorScheme.surfaceContainerHighest
+                  .withValues(alpha: 0.55),
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                 child: Row(
                   children: [
+                    const WorkingDots(size: 5),
+                    const SizedBox(width: 10),
                     Expanded(
-                      child: Text(
-                        activeTools > 0
-                            ? 'Agent is working · $activeTools tool${activeTools == 1 ? '' : 's'} running'
-                            : assistantBuffer.isEmpty && thoughtBuffer.isEmpty
-                                ? 'Waiting on agent…'
-                                : 'Agent is working',
-                        style: theme.textTheme.bodySmall,
+                      child: Shimmer(
+                        child: Text(
+                          () {
+                            final label = (activityLabel != null &&
+                                    activityLabel.isNotEmpty)
+                                ? activityLabel
+                                : activeTools > 0
+                                    ? 'Working · $activeTools tool${activeTools == 1 ? '' : 's'}'
+                                    : 'Thinking';
+                            return label.endsWith('…') || label.endsWith('...')
+                                ? label
+                                : '$label…';
+                          }(),
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
                       ),
-                    ),
-                    TextButton(
-                      onPressed: () async {
-                        try {
-                          await runtime?.unstick();
-                        } catch (e) {
-                          SafeLog.d('unstick failed', e);
-                        }
-                      },
-                      child: const Text('Unstick'),
                     ),
                   ],
                 ),

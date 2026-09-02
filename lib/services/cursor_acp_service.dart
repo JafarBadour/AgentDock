@@ -1282,6 +1282,9 @@ class AcpUpdate {
       : this._(AcpUpdateKind.turnComplete, reason);
   const AcpUpdate.status(String text, {String? title})
       : this._(AcpUpdateKind.status, text, title: title);
+  /// Host/daemon activity label for the UI (Thinking, Connecting, tool name…).
+  const AcpUpdate.activity(String label)
+      : this._(AcpUpdateKind.activity, label);
   AcpUpdate.toolCall(ToolCallState tool)
       : this._(AcpUpdateKind.tool, tool.title, tool: tool);
   AcpUpdate.mode(AgentSessionMode mode)
@@ -1496,4 +1499,5 @@ enum AcpUpdateKind {
   status,
   mode,
   turnComplete,
+  activity,
 }
