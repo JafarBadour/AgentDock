@@ -12,6 +12,7 @@ import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'agent_runtime_host.dart';
+import 'agent_session.dart';
 import 'ssh_service.dart';
 
 /// What the remote agent told us it can do, from the `initialize` response.
@@ -73,7 +74,7 @@ Future<T> awaitWithIdleTimeout<T>({
 }
 
 /// Minimal ACP (Agent Client Protocol) JSON-RPC client.
-class AcpSession {
+class AcpSession implements AgentSession {
   AcpSession._({
     required this.host,
     required this.cwd,
@@ -335,6 +336,11 @@ class AcpSession {
     final client = await ssh.connect(host);
 
     final envExports = StringBuffer();
+    // Prefer nvm node bins so #!/usr/bin/env node adapters (Claude ACP) start.
+    envExports.write(
+      r'for d in "$HOME"/.nvm/versions/node/*/bin; do '
+      r'[ -d "$d" ] && PATH="$d:$PATH"; done; ',
+    );
     envExports.write(
       'export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"; ',
     );

@@ -375,14 +375,50 @@ class SshService {
   }
 
   /// Probe remote tools; throws [MissingToolException] with install hints.
-  Future<void> ensureRemoteTools(Host host) async {
-    await ensureTmux(host);
-    await ensureCursorCli(host);
+  Future<void> ensureRemoteTools(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    await ensureTmux(host, onProgress: onProgress);
+    await ensureCursorCli(host, onProgress: onProgress);
   }
 
-  Future<void> ensureTmux(Host host) async {
+  Future<void> ensureTmux(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
     final client = await connect(host);
-    final tmux = await _whichLogin(client, 'tmux', host.id);
+    var tmux = await _whichLogin(client, 'tmux', host.id);
+    if (tmux != null) return;
+
+    onProgress?.call('Installing tmux on the remote…');
+    try {
+      await _run(
+        client,
+        r'''
+set -e
+if command -v tmux >/dev/null 2>&1; then exit 0; fi
+if command -v apt-get >/dev/null 2>&1; then
+  sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y tmux
+elif command -v brew >/dev/null 2>&1; then
+  brew install tmux
+else
+  echo "no package manager for tmux" >&2
+  exit 1
+fi
+command -v tmux
+''',
+        hostId: host.id,
+        timeout: const Duration(minutes: 5),
+      );
+    } catch (e) {
+      SafeLog.d('tmux auto-install failed', e);
+    }
+
+    tmux = await _whichLogin(client, 'tmux', host.id);
     if (tmux == null) {
       throw MissingToolException('tmux', kRemoteTmuxSetupGuide.trim());
     }
@@ -391,73 +427,140 @@ class SshService {
   /// True when tmux exists, without throwing.
   Future<bool> hasTmux(Host host) async {
     try {
-      await ensureTmux(host);
-      return true;
+      final client = await connect(host);
+      return await _whichLogin(client, 'tmux', host.id) != null;
     } catch (_) {
       return false;
     }
   }
 
-  /// Resolves Cursor CLI to an **absolute** path.
-  ///
-  /// Prefers SFTP existence checks (fast, no shell). Falls back to a short
-  /// non-login `test -x` command.
-  Future<String> ensureCursorCli(Host host) async {
+  /// Resolves Cursor CLI to an absolute path, installing on the host if needed.
+  Future<String> ensureCursorCli(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
     final client = await connect(host);
-    final path = await _resolveCursorCliPath(client, host.id);
+    var path = await _resolveCursorCliPath(client, host.id);
+    if (path != null) return path;
+
+    onProgress?.call('Installing Cursor CLI on the remote (this can take a few minutes)…');
+    final installed = await _runAgentDockInstallScript(
+      client,
+      hostId: host.id,
+      scriptName: 'cursor-acp.sh',
+      onProgress: onProgress,
+    );
+    if (!installed) {
+      onProgress?.call('Trying Cursor official installer…');
+      try {
+        await _run(
+          client,
+          r'''
+set -e
+export PATH="$HOME/.local/bin:$HOME/.cursor/bin:$PATH"
+curl -fsSL https://cursor.com/install | bash
+mkdir -p "$HOME/.local/bin"
+if command -v agent >/dev/null 2>&1 && ! command -v cursor-agent >/dev/null 2>&1; then
+  ln -sfn "$(command -v agent)" "$HOME/.local/bin/cursor-agent"
+fi
+command -v cursor-agent >/dev/null || command -v agent >/dev/null
+''',
+          hostId: host.id,
+          timeout: const Duration(minutes: 5),
+        );
+      } catch (e) {
+        SafeLog.d('Cursor official installer failed', e);
+      }
+    }
+
+    path = await _resolveCursorCliPath(client, host.id);
     if (path == null) {
       throw MissingToolException(
         'Cursor Agent CLI / SDK',
         kRemoteCursorSetupGuide.trim(),
       );
     }
+    onProgress?.call('Cursor CLI ready');
     return path;
   }
 
-  /// Resolves the Claude ACP adapter (`claude-code-acp` / `claude-agent-acp`).
-  ///
-  /// Tries known install locations (including nvm), then installs
-  /// `@agentclientprotocol/claude-agent-acp` via npm when missing.
-  Future<String> ensureClaudeAcpBinary(Host host) async {
+  /// Resolves the Claude ACP adapter, installing Claude Code + adapter if needed.
+  Future<String> ensureClaudeAcpBinary(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
     final client = await connect(host);
     var path = await _resolveClaudeAcpPath(client, host.id);
     if (path != null) return path;
 
-    // Best-effort global install — needs network + npm on the host.
-    try {
-      await _run(
-        client,
-        r'''
-set +e
+    onProgress?.call(
+      'Installing Claude Code + ACP adapter on the remote (this can take a few minutes)…',
+    );
+    final installed = await _runAgentDockInstallScript(
+      client,
+      hostId: host.id,
+      scriptName: 'claude-acp.sh',
+      onProgress: onProgress,
+    );
+    if (!installed) {
+      onProgress?.call('Trying local npm/nvm install…');
+      try {
+        await _run(
+          client,
+          r'''
+set -e
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 [ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
-if ! command -v npm >/dev/null 2>&1; then
-  echo "npm not found" >&2
-  exit 1
-fi
 mkdir -p "$HOME/.local/bin"
+
+if ! command -v claude >/dev/null 2>&1; then
+  curl -fsSL https://claude.ai/install.sh | bash
+fi
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+  fi
+  . "$HOME/.nvm/nvm.sh"
+  nvm install --lts
+fi
+. "$HOME/.nvm/nvm.sh" 2>/dev/null || true
+
 npm install -g @agentclientprotocol/claude-agent-acp \
   || npm install -g @zed-industries/claude-code-acp
-PREFIX="$(npm prefix -g 2>/dev/null)"
-NVM_BIN="$(command -v node 2>/dev/null | xargs dirname 2>/dev/null)"
-for dir in "$PREFIX/bin" "$NVM_BIN"; do
-  [ -n "$dir" ] || continue
+
+NODE_BIN="$(dirname "$(command -v node)")"
+PREFIX_BIN="$(npm prefix -g 2>/dev/null)/bin"
+REAL=
+for dir in "$NODE_BIN" "$PREFIX_BIN"; do
+  [ -d "$dir" ] || continue
+  [ "$(cd "$dir" && pwd -P)" = "$(cd "$HOME/.local/bin" && pwd -P)" ] && continue
   for name in claude-agent-acp claude-code-acp; do
-    if [ -x "$dir/$name" ]; then
-      ln -sfn "$dir/$name" "$HOME/.local/bin/claude-code-acp"
-      ln -sfn "$dir/$name" "$HOME/.local/bin/$name"
-    fi
+    if [ -x "$dir/$name" ]; then REAL="$dir/$name"; break 2; fi
   done
 done
-test -x "$HOME/.local/bin/claude-code-acp" \
-  || command -v claude-code-acp >/dev/null \
-  || command -v claude-agent-acp >/dev/null
+[ -n "$REAL" ]
+
+cat > "$HOME/.local/bin/claude-code-acp" <<EOF
+#!/usr/bin/env bash
+export NVM_DIR="\${NVM_DIR:-\$HOME/.nvm}"
+[ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+for d in "\$HOME"/.nvm/versions/node/*/bin; do
+  [ -d "\$d" ] && PATH="\$d:\$PATH"
+done
+export PATH="\$HOME/.local/bin:\$PATH"
+exec $REAL "\$@"
+EOF
+chmod +x "$HOME/.local/bin/claude-code-acp"
+ln -sfn "$HOME/.local/bin/claude-code-acp" "$HOME/.local/bin/claude-agent-acp"
+test -x "$HOME/.local/bin/claude-code-acp"
 ''',
-        hostId: host.id,
-        timeout: const Duration(seconds: 180),
-      );
-    } catch (e) {
-      SafeLog.d('claude ACP adapter npm install failed', e);
+          hostId: host.id,
+          timeout: const Duration(minutes: 8),
+        );
+      } catch (e) {
+        SafeLog.d('claude ACP inline install failed', e);
+      }
     }
 
     path = await _resolveClaudeAcpPath(client, host.id);
@@ -467,7 +570,120 @@ test -x "$HOME/.local/bin/claude-code-acp" \
         kRemoteClaudeSetupGuide.trim(),
       );
     }
+    onProgress?.call('Claude ACP ready');
     return path;
+  }
+
+  /// Installs/starts ADSM on the host and verifies it responds.
+  ///
+  /// Uses the GitHub `install-adsm.sh` installer (same pattern as Cursor/Claude).
+  Future<void> ensureAdsm(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    final client = await connect(host);
+
+    Future<bool> ping() async {
+      try {
+        final out = await _run(
+          client,
+          r'''
+export PATH="$HOME/.local/bin:$PATH"
+agentdock-adsm status 2>/dev/null | head -1
+''',
+          hostId: host.id,
+          timeout: const Duration(seconds: 8),
+        );
+        return out.contains('"pid"') || out.contains('result');
+      } catch (_) {
+        return false;
+      }
+    }
+
+    if (await ping()) {
+      onProgress?.call('ADSM ready');
+      return;
+    }
+
+    onProgress?.call('Installing ADSM on the remote…');
+    final installed = await _runAgentDockInstallScript(
+      client,
+      hostId: host.id,
+      scriptName: 'install-adsm.sh',
+      onProgress: onProgress,
+    );
+
+    if (!installed) {
+      onProgress?.call('Starting ADSM…');
+      try {
+        await _run(
+          client,
+          r'''
+set -e
+export PATH="$HOME/.local/bin:$PATH"
+command -v agentdock-adsm >/dev/null
+agentdock-adsm ensure-running
+''',
+          hostId: host.id,
+          timeout: const Duration(seconds: 45),
+        );
+      } catch (e) {
+        SafeLog.d('ADSM ensure-running failed', e);
+      }
+    }
+
+    if (!await ping()) {
+      // One more ensure-running after a successful script install.
+      try {
+        await _run(
+          client,
+          r'''
+export PATH="$HOME/.local/bin:$PATH"
+agentdock-adsm ensure-running
+''',
+          hostId: host.id,
+          timeout: const Duration(seconds: 45),
+        );
+      } catch (e) {
+        SafeLog.d('ADSM post-install start failed', e);
+      }
+    }
+
+    if (!await ping()) {
+      throw MissingToolException('ADSM', kRemoteAdsmSetupGuide.trim());
+    }
+    onProgress?.call('ADSM ready');
+  }
+
+  /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.
+  ///
+  /// Returns false when the download/run failed so callers can try a fallback.
+  Future<bool> _runAgentDockInstallScript(
+    SSHClient client, {
+    required String hostId,
+    required String scriptName,
+    void Function(String status)? onProgress,
+  }) async {
+    final url = '$kAgentDockScriptsBase/$scriptName';
+    onProgress?.call('Downloading $scriptName…');
+    try {
+      await _run(
+        client,
+        '''
+set -e
+export PATH="\$HOME/.local/bin:\$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"
+[ -s "\$HOME/.nvm/nvm.sh" ] && . "\$HOME/.nvm/nvm.sh"
+curl -fsSL ${shellQuote(url)} | bash
+''',
+        hostId: hostId,
+        timeout: const Duration(minutes: 10),
+      );
+      return true;
+    } catch (e) {
+      SafeLog.d('Agent Dock install script $scriptName failed', e);
+      onProgress?.call('Install script failed — trying fallback…');
+      return false;
+    }
   }
 
   Future<String?> _resolveClaudeAcpPath(SSHClient client, String hostId) async {

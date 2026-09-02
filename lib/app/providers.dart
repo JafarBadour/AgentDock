@@ -6,11 +6,11 @@ import '../data/local/app_database.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import '../services/agent_runtime_host.dart';
+import '../services/agent_session.dart';
 import '../services/agentdock_service.dart';
 import '../services/background_keep_alive.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
-import '../services/cursor_acp_service.dart';
 import '../services/mcp_deploy_service.dart';
 import '../services/ssh_service.dart';
 
@@ -100,12 +100,12 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
 
   ChatSessionRuntime? get(String chatId) => state[chatId];
 
-  AcpSession? sessionFor(String chatId) => state[chatId]?.session;
+  AgentSession? sessionFor(String chatId) => state[chatId]?.session;
 
   Future<ChatSessionRuntime> attach({
     required String chatId,
-    required AcpSession session,
-    Future<AcpSession> Function()? sessionFactory,
+    required AgentSession session,
+    Future<AgentSession> Function()? sessionFactory,
   }) async {
     final existing = state[chatId];
     if (existing != null) {

@@ -1,0 +1,389 @@
+"""ADSM asyncio daemon — Unix socket control plane."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import sys
+from typing import Any, Optional
+
+from . import paths, protocol
+from .worker import Worker
+
+
+class Daemon:
+    def __init__(self) -> None:
+        self.workers: dict[str, Worker] = {}
+        self._seq = 0
+        self._subscribers: dict[str, set[asyncio.StreamWriter]] = {}
+        self._global_subscribers: set[asyncio.StreamWriter] = set()
+        self._event_log: dict[str, list[dict[str, Any]]] = {}
+        self._server: Optional[asyncio.AbstractServer] = None
+
+    async def start(self) -> None:
+        paths.ensure_layout()
+        sock = paths.socket_path()
+        if sock.exists():
+            try:
+                sock.unlink()
+            except OSError:
+                pass
+
+        self._server = await asyncio.start_unix_server(
+            self._on_client, path=str(sock)
+        )
+        try:
+            os.chmod(sock, 0o600)
+        except OSError:
+            pass
+
+        pid = paths.pid_path()
+        pid.write_text(str(os.getpid()), encoding="utf-8")
+
+        # Adopt existing session dirs (status only until ensure attaches).
+        for d in paths.sessions_dir().iterdir():
+            if d.is_dir():
+                chat_id = d.name
+                if chat_id not in self.workers:
+                    w = Worker(
+                        chat_id,
+                        emit=self._worker_emit,
+                        set_status=self._set_status,
+                    )
+                    self.workers[chat_id] = w
+                    import subprocess
+
+                    alive = await asyncio.to_thread(
+                        lambda cid=chat_id: subprocess.run(
+                            [
+                                "tmux",
+                                "has-session",
+                                "-t",
+                                paths.tmux_session_name(cid),
+                            ],
+                            capture_output=True,
+                        ).returncode
+                        == 0
+                    )
+                    w.status = (
+                        protocol.STATUS_IDLE if alive else protocol.STATUS_DEAD
+                    )
+
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def _set_status(
+        self, chat_id: str, status: str, error: Optional[str]
+    ) -> None:
+        w = self.workers.get(chat_id)
+        if w:
+            w.status = status
+            if error is not None:
+                w.last_error = error
+        await self._patch_agent_record(chat_id, status=status, error=error)
+
+    async def _patch_agent_record(
+        self,
+        chat_id: str,
+        *,
+        status: Optional[str] = None,
+        error: Optional[str] = None,
+        acp_session_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> None:
+        path = paths.agent_record_path(chat_id)
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = {"id": chat_id}
+        else:
+            data = {"id": chat_id}
+        if status is not None:
+            data["status"] = status
+        if acp_session_id is not None:
+            data["acp_session_id"] = acp_session_id
+        if model_id is not None:
+            data["model_id"] = model_id
+        if error is not None:
+            data["last_error"] = error
+        from datetime import datetime, timezone
+
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    async def _worker_emit(self, payload: dict[str, Any]) -> None:
+        chat_id = str(payload.get("chatId") or "")
+        kind = str(payload.get("kind") or "status")
+        self._seq += 1
+        seq = self._seq
+        event = protocol.event(chat_id, seq, kind, **{
+            k: v for k, v in payload.items() if k not in ("chatId", "kind")
+        })
+        log = self._event_log.setdefault(chat_id, [])
+        log.append(event)
+        if len(log) > 5000:
+            del log[:1000]
+
+        dead: list[asyncio.StreamWriter] = []
+        targets = set(self._global_subscribers)
+        targets |= self._subscribers.get(chat_id, set())
+        raw = protocol.encode(event)
+        for w in targets:
+            try:
+                w.write(raw)
+                await w.drain()
+            except Exception:  # noqa: BLE001
+                dead.append(w)
+        for w in dead:
+            self._drop_writer(w)
+
+        # Keep agent json in sync for acp session id.
+        if kind == "session":
+            sid = payload.get("acpSessionId")
+            if sid:
+                await self._patch_agent_record(
+                    chat_id, acp_session_id=str(sid)
+                )
+
+    def _drop_writer(self, writer: asyncio.StreamWriter) -> None:
+        self._global_subscribers.discard(writer)
+        for s in self._subscribers.values():
+            s.discard(writer)
+
+    async def _on_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    msg = protocol.decode_line(line.decode("utf-8", "replace"))
+                except Exception as e:  # noqa: BLE001
+                    writer.write(
+                        protocol.encode(
+                            protocol.err(None, -32700, f"parse error: {e}")
+                        )
+                    )
+                    await writer.drain()
+                    continue
+                if msg is None:
+                    continue
+                await self._dispatch(msg, writer)
+        finally:
+            self._drop_writer(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _dispatch(
+        self, msg: dict[str, Any], writer: asyncio.StreamWriter
+    ) -> None:
+        req_id = msg.get("id")
+        method = msg.get("method")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+        try:
+            if method == "ping":
+                result: Any = {"ok": True, "version": "0.1.0"}
+            elif method == "daemon.status":
+                result = {
+                    "pid": os.getpid(),
+                    "workers": len(self.workers),
+                    "seq": self._seq,
+                }
+            elif method == "agents.list":
+                result = {
+                    "agents": [w.snapshot() for w in self.workers.values()]
+                }
+            elif method == "agents.ensure":
+                result = await self._ensure(params)
+            elif method == "agents.stop":
+                result = await self._stop(params, delete=False)
+            elif method == "agents.delete":
+                result = await self._stop(params, delete=True)
+            elif method == "session.subscribe":
+                result = await self._subscribe(params, writer)
+            elif method == "session.prompt":
+                result = await self._prompt(params)
+            elif method == "session.cancel":
+                result = await self._cancel(params)
+            elif method == "session.respond_permission":
+                result = await self._respond_permission(params)
+            elif method == "session.set_mode":
+                result = await self._set_mode(params)
+            elif method == "session.set_model":
+                result = await self._set_model(params)
+            else:
+                writer.write(
+                    protocol.encode(
+                        protocol.err(
+                            req_id, -32601, f"Method not found: {method}"
+                        )
+                    )
+                )
+                await writer.drain()
+                return
+
+            writer.write(protocol.encode(protocol.ok(req_id, result)))
+            await writer.drain()
+        except Exception as e:  # noqa: BLE001
+            writer.write(
+                protocol.encode(protocol.err(req_id, -32000, str(e)))
+            )
+            await writer.drain()
+
+    def _worker(self, chat_id: str) -> Worker:
+        w = self.workers.get(chat_id)
+        if w is None:
+            w = Worker(
+                chat_id, emit=self._worker_emit, set_status=self._set_status
+            )
+            self.workers[chat_id] = w
+        return w
+
+    async def _ensure(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        if not chat_id:
+            raise ValueError("chatId required")
+        w = self._worker(chat_id)
+        snap = await w.ensure(
+            cwd=str(params.get("cwd") or ""),
+            binary=str(params.get("binary") or ""),
+            provider=str(params.get("provider") or "cursor"),
+            api_key=params.get("apiKey"),
+            full_access=bool(params.get("fullAccess", True)),
+            resume_session_id=params.get("resumeSessionId"),
+            mcp_servers=params.get("mcpServers") or [],
+            mode=params.get("mode"),
+            model_id=params.get("modelId"),
+            permission_ask=bool(params.get("permissionAsk", False)),
+        )
+        return snap
+
+    async def _stop(
+        self, params: dict[str, Any], *, delete: bool
+    ) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        w = self.workers.get(chat_id)
+        if w:
+            await w.stop(delete_files=delete)
+            if delete:
+                self.workers.pop(chat_id, None)
+                rec = paths.agent_record_path(chat_id)
+                if rec.exists():
+                    rec.unlink(missing_ok=True)
+        return {"ok": True}
+
+    async def _subscribe(
+        self, params: dict[str, Any], writer: asyncio.StreamWriter
+    ) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        after = int(params.get("afterSeq") or 0)
+        if chat_id:
+            self._subscribers.setdefault(chat_id, set()).add(writer)
+            log = self._event_log.get(chat_id, [])
+            for ev in log:
+                seq = (ev.get("params") or {}).get("seq", 0)
+                if seq > after:
+                    writer.write(protocol.encode(ev))
+            await writer.drain()
+        else:
+            self._global_subscribers.add(writer)
+        w = self.workers.get(chat_id) if chat_id else None
+        return {
+            "subscribed": True,
+            "seq": self._seq,
+            "agent": w.snapshot() if w else None,
+        }
+
+    async def _prompt(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        text = str(params.get("text") or "")
+        w = self.workers.get(chat_id)
+        if not w:
+            raise RuntimeError("unknown chatId — call agents.ensure first")
+        return await w.prompt(text)
+
+    async def _cancel(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        w = self.workers.get(chat_id)
+        if w:
+            await w.cancel()
+        return {"ok": True}
+
+    async def _respond_permission(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        request_id = str(params.get("requestId") or "")
+        option_id = str(params.get("optionId") or "")
+        w = self.workers.get(chat_id)
+        if not w:
+            raise RuntimeError("unknown chatId")
+        await w.respond_permission(request_id, option_id)
+        return {"ok": True}
+
+    async def _set_mode(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        mode = str(params.get("mode") or params.get("modeId") or "")
+        w = self.workers.get(chat_id)
+        if not w:
+            raise RuntimeError("unknown chatId")
+        await w.set_mode(mode)
+        return w.snapshot()
+
+    async def _set_model(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        model_id = str(params.get("modelId") or "")
+        w = self.workers.get(chat_id)
+        if not w:
+            raise RuntimeError("unknown chatId")
+        await w.set_model(model_id)
+        await self._patch_agent_record(chat_id, model_id=model_id)
+        return w.snapshot()
+
+
+async def run_serve() -> None:
+    paths.ensure_layout()
+    # Redirect logs
+    log = paths.log_path()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Keep stderr for nohup redirect from installer.
+
+    daemon = Daemon()
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+
+    def _stop(*_args: Any) -> None:
+        stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            pass
+
+    serve_task = asyncio.create_task(daemon.start())
+    await stop.wait()
+    serve_task.cancel()
+    try:
+        await serve_task
+    except asyncio.CancelledError:
+        pass
+    sock = paths.socket_path()
+    if sock.exists():
+        sock.unlink(missing_ok=True)
+    pid = paths.pid_path()
+    if pid.exists():
+        pid.unlink(missing_ok=True)

@@ -293,6 +293,11 @@ if [ -f "\$DIR/env" ]; then
 fi
 
 $skipPerms
+# claude-code-acp is a #!/usr/bin/env node script — nvm's node must be on PATH
+# when tmux starts a non-login shell (otherwise: "env: node: No such file").
+for d in "\$HOME"/.nvm/versions/node/*/bin; do
+  [ -d "\$d" ] && PATH="\$d:\$PATH"
+done
 export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"
 cd ${q(cwd)} || exit 1
 
