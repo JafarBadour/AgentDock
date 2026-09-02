@@ -45,3 +45,12 @@ sudo apt update && sudo apt install -y tmux
 
 tmux -V
 ''';
+
+/// Shown only if the app’s automatic ADSM install somehow fails.
+const kRemoteAdsmSetupGuide = '''
+# Agent Dock installs ADSM automatically on Connect (curl install-adsm.sh).
+# If that failed, run once on the remote:
+
+curl -fsSL $kAgentDockScriptsBase/install-adsm.sh | bash
+agentdock-adsm status
+''';

@@ -12,6 +12,7 @@ import '../data/models/chat.dart';
 import '../data/models/chat_message.dart';
 import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
+import 'agent_session.dart';
 import 'cursor_acp_service.dart';
 import 'ssh_service.dart';
 
@@ -56,7 +57,7 @@ class TranscriptEntry {
 class ChatSessionRuntime extends ChangeNotifier {
   ChatSessionRuntime({
     required this.chatId,
-    required AcpSession session,
+    required AgentSession session,
     required AppDatabase db,
     this.onLocalChange,
     this.onTransportReady,
@@ -79,9 +80,9 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   /// Opens a fresh transport for this chat. Set by the owner so the runtime can
   /// recover on its own after a drop, even with no chat screen mounted.
-  Future<AcpSession> Function()? sessionFactory;
+  Future<AgentSession> Function()? sessionFactory;
 
-  AcpSession _session;
+  AgentSession _session;
   StreamSubscription<AcpUpdate>? _sub;
 
   final List<TranscriptEntry> entries = [];
@@ -159,7 +160,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   bool _disposed = false;
   bool _suspended = false;
 
-  AcpSession get session => _session;
+  AgentSession get session => _session;
   AgentSessionMode get mode => _session.mode;
   PermissionPolicy get permissionPolicy => preferredPermissionPolicy;
   List<AgentModel> get availableModels => _session.availableModels;
@@ -294,7 +295,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     });
   }
 
-  void replaceSession(AcpSession session) {
+  void replaceSession(AgentSession session) {
     _sub?.cancel();
     _retryTimer?.cancel();
     _retryTimer = null;
@@ -361,7 +362,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     final durable = _session.transport == AcpTransport.durable;
     if (durable && (promptInFlight || _session.isPromptActive)) {
       // Hand the turn to the host: complete the local await so the UI unlocks,
-      // then tear down only the SSH bridge. tmux + FIFO keep the agent alive.
+      // then tear down only the SSH ADSM client channel. Daemon + tmux keep working.
       remoteTurnActive = true;
       _session.handOffPrompt();
       promptInFlight = false;

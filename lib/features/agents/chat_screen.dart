@@ -13,6 +13,8 @@ import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/models/tool_call_state.dart';
 import '../../data/secure/safe_log.dart';
+import '../../services/adsm_client.dart';
+import '../../services/agent_session.dart';
 import '../../services/chat_session_runtime.dart';
 import '../../services/cursor_acp_service.dart';
 import '../../services/ssh_service.dart';
@@ -307,14 +309,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   ///
   /// It captures the services directly instead of `ref`, because the runtime
   /// keeps reconnecting in the background after this screen is disposed.
-  Future<AcpSession> Function() _buildSessionFactory({
+  Future<AgentSession> Function() _buildSessionFactory({
     required String chatId,
     required String cwd,
   }) {
     final ssh = ref.read(sshServiceProvider);
     final secureStore = ref.read(secureStoreProvider);
     final db = ref.read(appDatabaseProvider);
-    final runtimeHost = ref.read(agentRuntimeHostProvider);
     final sessions = ref.read(activeAcpSessionsProvider.notifier);
     final host = _host!;
     final provider = _chat?.provider ?? AgentProvider.cursor;
@@ -340,12 +341,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             : 'Checking Cursor CLI on the remote…',
       );
 
-      // Install tmux first so durable sessions work once the agent binary is up.
-      try {
-        await ssh.ensureTmux(host, onProgress: status);
-      } catch (e) {
-        SafeLog.d('tmux ensure failed (will run without durable session)', e);
-      }
+      // tmux is required for ADSM workers.
+      await ssh.ensureTmux(host, onProgress: status);
 
       final binary = switch (provider) {
         AgentProvider.cursor => await ssh.ensureCursorCli(
@@ -367,32 +364,34 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               ),
             ),
       };
-      // Without tmux we can still run, just not durably.
-      final durable = await ssh.hasTmux(host);
+
+      await ssh.ensureAdsm(host, onProgress: status).timeout(
+        const Duration(minutes: 5),
+        onTimeout: () => throw TimeoutException(
+          'Timed out installing/starting ADSM on the remote.',
+        ),
+      );
+
       final mcps = await db.listEnabledMcpsForHost(host.id);
       final latest = await db.getChat(chatId);
 
-      status('Starting agent…');
+      status('Starting agent via ADSM…');
 
-      return AcpSession.start(
+      return AdsmSession.start(
         ssh: ssh,
         secureStore: secureStore,
         host: host,
         cwd: cwd,
         binary: binary,
         chatId: chatId,
-        runtimeHost: runtimeHost,
         provider: provider,
         mcpServers: mcps.map((m) => m.toAcpConfig()).toList(),
         initialMode: mode,
         permissionPolicy: permission,
         resumeSessionId: latest?.acpSessionId,
         preferredModelId: latest?.modelId,
-        journalOffset: latest?.journalOffset ?? 0,
-        durable: durable,
-        onJournalAdvance: (bytes) => sessions.noteJournalOffset(chatId, bytes),
       ).timeout(
-        const Duration(seconds: 45),
+        const Duration(seconds: 90),
         onTimeout: () => throw TimeoutException(
           provider == AgentProvider.claude
               ? 'Connect timed out. Set ANTHROPIC_API_KEY in Connect or run '
@@ -522,17 +521,23 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     } on MissingToolException catch (e) {
       if (mounted) {
         final isClaude = chat.provider == AgentProvider.claude;
+        final isAdsm = e.tool.toUpperCase().contains('ADSM');
         setState(() {
           _showSdkInstallGuide = true;
-          _error = isClaude
-              ? 'Could not install Claude on ${host.displayLabel}.\n'
-                  'Agent Dock tried automatically — run the setup below on the '
-                  'remote (or fix network/sudo), then Connect again.\n\n'
-                  '${e.tool} still missing.'
-              : 'Could not install Cursor CLI on ${host.displayLabel}.\n'
+          _error = isAdsm
+              ? 'Could not install ADSM on ${host.displayLabel}.\n'
                   'Agent Dock tried automatically — run the setup below on the '
                   'remote, then Connect again.\n\n'
-                  '${e.tool} still missing.';
+                  '${e.tool} still missing.'
+              : isClaude
+                  ? 'Could not install Claude on ${host.displayLabel}.\n'
+                      'Agent Dock tried automatically — run the setup below on the '
+                      'remote (or fix network/sudo), then Connect again.\n\n'
+                      '${e.tool} still missing.'
+                  : 'Could not install Cursor CLI on ${host.displayLabel}.\n'
+                      'Agent Dock tried automatically — run the setup below on the '
+                      'remote, then Connect again.\n\n'
+                      '${e.tool} still missing.';
         });
       }
     } catch (e) {
@@ -841,9 +846,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
 
     final theme = Theme.of(context);
-    final guide = _chat!.provider == AgentProvider.claude
-        ? kRemoteClaudeSetupGuide
-        : kRemoteCursorSetupGuide;
+    final guide = (_error ?? '').toUpperCase().contains('ADSM')
+        ? kRemoteAdsmSetupGuide
+        : _chat!.provider == AgentProvider.claude
+            ? kRemoteClaudeSetupGuide
+            : kRemoteCursorSetupGuide;
 
     final runtime = _runtime;
     final queue = runtime?.outboundQueue ?? const <ChatMessage>[];

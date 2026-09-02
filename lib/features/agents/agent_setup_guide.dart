@@ -25,11 +25,13 @@ class AgentSetupErrorBanner extends StatelessWidget {
     VoidCallback? onDismiss,
   }) {
     final lower = message.toLowerCase();
-    final guide = lower.contains('tmux')
-        ? kRemoteTmuxSetupGuide
-        : lower.contains('claude')
-            ? kRemoteClaudeSetupGuide
-            : kRemoteCursorSetupGuide;
+    final guide = lower.contains('adsm')
+        ? kRemoteAdsmSetupGuide
+        : lower.contains('tmux')
+            ? kRemoteTmuxSetupGuide
+            : lower.contains('claude')
+                ? kRemoteClaudeSetupGuide
+                : kRemoteCursorSetupGuide;
     return AgentSetupErrorBanner(
       key: key,
       message: message,

@@ -91,13 +91,22 @@ else
   ok "node $(node --version)"
 fi
 
+# --- ADSM (session manager) -------------------------------------------------
+say "ADSM (Agent Dock Session Manager)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/install-adsm.sh" ]; then
+  bash "${SCRIPT_DIR}/install-adsm.sh"
+else
+  curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash
+fi
+
 say "Done"
 cat <<'EOF'
 
 Next:
   1. Log in on this host:  agent login
      (or set CURSOR_API_KEY in the Agent Dock Connect tab)
-  2. Smoke test:           cursor-agent --version
+  2. Smoke test:           cursor-agent --version && agentdock-adsm status
   3. In Agent Dock: create a Cursor agent and Connect
 
 EOF

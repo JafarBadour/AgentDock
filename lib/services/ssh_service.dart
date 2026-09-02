@@ -574,6 +574,87 @@ test -x "$HOME/.local/bin/claude-code-acp"
     return path;
   }
 
+  /// Installs/starts ADSM on the host and verifies it responds.
+  ///
+  /// Uses the GitHub `install-adsm.sh` installer (same pattern as Cursor/Claude).
+  Future<void> ensureAdsm(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    final client = await connect(host);
+
+    Future<bool> ping() async {
+      try {
+        final out = await _run(
+          client,
+          r'''
+export PATH="$HOME/.local/bin:$PATH"
+agentdock-adsm status 2>/dev/null | head -1
+''',
+          hostId: host.id,
+          timeout: const Duration(seconds: 8),
+        );
+        return out.contains('"pid"') || out.contains('result');
+      } catch (_) {
+        return false;
+      }
+    }
+
+    if (await ping()) {
+      onProgress?.call('ADSM ready');
+      return;
+    }
+
+    onProgress?.call('Installing ADSM on the remote…');
+    final installed = await _runAgentDockInstallScript(
+      client,
+      hostId: host.id,
+      scriptName: 'install-adsm.sh',
+      onProgress: onProgress,
+    );
+
+    if (!installed) {
+      onProgress?.call('Starting ADSM…');
+      try {
+        await _run(
+          client,
+          r'''
+set -e
+export PATH="$HOME/.local/bin:$PATH"
+command -v agentdock-adsm >/dev/null
+agentdock-adsm ensure-running
+''',
+          hostId: host.id,
+          timeout: const Duration(seconds: 45),
+        );
+      } catch (e) {
+        SafeLog.d('ADSM ensure-running failed', e);
+      }
+    }
+
+    if (!await ping()) {
+      // One more ensure-running after a successful script install.
+      try {
+        await _run(
+          client,
+          r'''
+export PATH="$HOME/.local/bin:$PATH"
+agentdock-adsm ensure-running
+''',
+          hostId: host.id,
+          timeout: const Duration(seconds: 45),
+        );
+      } catch (e) {
+        SafeLog.d('ADSM post-install start failed', e);
+      }
+    }
+
+    if (!await ping()) {
+      throw MissingToolException('ADSM', kRemoteAdsmSetupGuide.trim());
+    }
+    onProgress?.call('ADSM ready');
+  }
+
   /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.
   ///
   /// Returns false when the download/run failed so callers can try a fallback.

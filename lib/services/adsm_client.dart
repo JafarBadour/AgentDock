@@ -1,0 +1,581 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:dartssh2/dartssh2.dart';
+
+import '../data/models/agent_mode.dart';
+import '../data/models/agent_model.dart';
+import '../data/models/agent_provider.dart';
+import '../data/models/host.dart';
+import '../data/models/tool_call_state.dart';
+import '../data/secure/safe_log.dart';
+import '../data/secure/secure_store.dart';
+import 'agent_session.dart';
+import 'cursor_acp_service.dart';
+import 'ssh_service.dart';
+
+/// NDJSON control client for the host ADSM daemon (`agentdock-adsm client`).
+class AdsmClient {
+  AdsmClient._(this._session);
+
+  final SSHSession _session;
+  final _pending = <Object, Completer<Map<String, dynamic>>>{};
+  final _events = StreamController<Map<String, dynamic>>.broadcast();
+  final _buffer = StringBuffer();
+  StreamSubscription<Uint8List>? _sub;
+  bool _open = true;
+  int _nextId = 1;
+
+  Stream<Map<String, dynamic>> get events => _events.stream;
+
+  static Future<AdsmClient> connect(SshService ssh, Host host) async {
+    final client = await ssh.connect(host);
+    final session = await client.execute(
+      r'export PATH="$HOME/.local/bin:$PATH"; exec agentdock-adsm client',
+    );
+    final adsm = AdsmClient._(session);
+    adsm._listen();
+    // Warm ping.
+    await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    return adsm;
+  }
+
+  void _listen() {
+    _sub = _session.stdout.listen(
+      (data) {
+        _buffer.write(utf8.decode(data, allowMalformed: true));
+        var content = _buffer.toString();
+        var index = content.indexOf('\n');
+        while (index >= 0) {
+          final line = content.substring(0, index).trim();
+          content = content.substring(index + 1);
+          if (line.isNotEmpty) _onLine(line);
+          index = content.indexOf('\n');
+        }
+        _buffer
+          ..clear()
+          ..write(content);
+      },
+      onError: (Object e) {
+        SafeLog.d('ADSM stdout error', e);
+        _failAll(e);
+      },
+      onDone: () {
+        _open = false;
+        _failAll(StateError('ADSM channel closed'));
+        if (!_events.isClosed) {
+          _events.add({'method': 'closed'});
+        }
+      },
+    );
+    _session.stderr.listen((data) {
+      final text = utf8.decode(data, allowMalformed: true).trim();
+      if (text.isNotEmpty) SafeLog.d('ADSM stderr: $text');
+    });
+  }
+
+  void _onLine(String line) {
+    try {
+      final msg = jsonDecode(line) as Map<String, dynamic>;
+      if (msg.containsKey('id') &&
+          (msg.containsKey('result') || msg.containsKey('error'))) {
+        final id = msg['id'];
+        final c = _pending.remove(id);
+        if (c == null || c.isCompleted) return;
+        if (msg['error'] != null) {
+          c.completeError(Exception(msg['error'].toString()));
+        } else {
+          final result = msg['result'];
+          c.complete(
+            result is Map<String, dynamic>
+                ? result
+                : <String, dynamic>{'value': result},
+          );
+        }
+        return;
+      }
+      if (msg['method'] == 'event') {
+        final params = msg['params'];
+        if (params is Map<String, dynamic>) {
+          _events.add(params);
+        } else if (params is Map) {
+          _events.add(Map<String, dynamic>.from(params));
+        }
+        return;
+      }
+      if (msg['method'] == 'closed') {
+        _events.add({'method': 'closed'});
+      }
+    } catch (e) {
+      SafeLog.d('ADSM parse error', e);
+    }
+  }
+
+  Future<Map<String, dynamic>> request(
+    String method,
+    Map<String, dynamic> params, {
+    Duration timeout = const Duration(seconds: 60),
+  }) async {
+    if (!_open) throw StateError('ADSM channel closed');
+    final id = _nextId++;
+    final c = Completer<Map<String, dynamic>>();
+    _pending[id] = c;
+    final line = '${jsonEncode({
+          'id': id,
+          'method': method,
+          'params': params,
+        })}\n';
+    try {
+      _session.stdin.add(utf8.encode(line));
+    } catch (e) {
+      _pending.remove(id);
+      throw StateError('ADSM write failed: $e');
+    }
+    try {
+      return await c.future.timeout(
+        timeout,
+        onTimeout: () {
+          _pending.remove(id);
+          throw TimeoutException('ADSM "$method" timed out');
+        },
+      );
+    } finally {
+      _pending.remove(id);
+    }
+  }
+
+  void _failAll(Object e) {
+    final pending = Map<Object, Completer<Map<String, dynamic>>>.from(_pending);
+    _pending.clear();
+    for (final c in pending.values) {
+      if (!c.isCompleted) c.completeError(e);
+    }
+  }
+
+  Future<void> close() async {
+    _open = false;
+    await _sub?.cancel();
+    _sub = null;
+    try {
+      await _session.stdin.close();
+    } catch (_) {}
+    try {
+      _session.close();
+    } catch (_) {}
+    _failAll(StateError('ADSM closed'));
+    await _events.close();
+  }
+}
+
+/// Durable agent session mediated by ADSM (not a raw ACP journal bridge).
+class AdsmSession implements AgentSession {
+  AdsmSession._({
+    required this.host,
+    required this.chatId,
+    required AdsmClient client,
+  }) : _client = client;
+
+  final Host host;
+  final String chatId;
+  final AdsmClient _client;
+
+  final _updates = StreamController<AcpUpdate>.broadcast();
+  StreamSubscription<Map<String, dynamic>>? _eventSub;
+
+  @override
+  String? sessionId;
+
+  @override
+  AcpTransport get transport => AcpTransport.durable;
+
+  @override
+  AgentSessionMode mode = AgentSessionMode.agent;
+
+  @override
+  PermissionPolicy permissionPolicy = PermissionPolicy.allowAll;
+
+  @override
+  List<AgentModel> availableModels = const [];
+
+  @override
+  String? currentModelId;
+
+  @override
+  List<String> availableModeIds = const ['ask', 'agent', 'plan'];
+
+  @override
+  AcpAgentCapabilities capabilities = const AcpAgentCapabilities();
+
+  @override
+  bool resumedInPlace = false;
+
+  @override
+  bool get isPromptActive => _promptInFlight;
+
+  bool _promptInFlight = false;
+  Completer<void>? _promptCompleter;
+  String? _daemonStatus;
+
+  @override
+  Stream<AcpUpdate> get updates => _updates.stream;
+
+  /// Host-authoritative status when known (`idle` / `running` / …).
+  String? get daemonStatus => _daemonStatus;
+
+  static Future<AdsmSession> start({
+    required SshService ssh,
+    required SecureStore secureStore,
+    required Host host,
+    required String cwd,
+    required String binary,
+    required String chatId,
+    required AgentProvider provider,
+    required List<Map<String, dynamic>> mcpServers,
+    AgentSessionMode initialMode = AgentSessionMode.agent,
+    PermissionPolicy permissionPolicy = PermissionPolicy.allowAll,
+    String? resumeSessionId,
+    String? preferredModelId,
+  }) async {
+    final apiKey = switch (provider) {
+      AgentProvider.cursor => await secureStore.readCursorApiKey(),
+      AgentProvider.claude => await secureStore.readAnthropicApiKey(),
+    };
+
+    final client = await AdsmClient.connect(ssh, host);
+    final session = AdsmSession._(host: host, chatId: chatId, client: client);
+    session.mode = initialMode;
+    session.permissionPolicy = permissionPolicy;
+    session._eventSub = client.events.listen(session._onEvent);
+
+    await client.request('session.subscribe', {
+      'chatId': chatId,
+      'afterSeq': 0,
+    });
+
+    final snap = await client.request(
+      'agents.ensure',
+      {
+        'chatId': chatId,
+        'cwd': cwd,
+        'binary': binary,
+        'provider': provider.id,
+        if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+        'fullAccess': permissionPolicy.fullAccess,
+        'permissionAsk': !permissionPolicy.fullAccess,
+        if (resumeSessionId != null) 'resumeSessionId': resumeSessionId,
+        'mcpServers': mcpServers,
+        'mode': initialMode.id,
+        if (preferredModelId != null && preferredModelId.isNotEmpty)
+          'modelId': preferredModelId,
+      },
+      timeout: const Duration(seconds: 90),
+    );
+
+    session._applySnapshot(snap);
+    // If ensure returned RUNNING attach without re-init, treat as resume.
+    final state = snap['status']?.toString();
+    if (state == 'idle' && (resumeSessionId != null || session.sessionId != null)) {
+      session.resumedInPlace = snap['acpSessionId'] == resumeSessionId;
+    }
+    return session;
+  }
+
+  void _applySnapshot(Map<String, dynamic> snap) {
+    sessionId = snap['acpSessionId'] as String? ?? sessionId;
+    _daemonStatus = snap['status']?.toString();
+    final modeId = snap['mode']?.toString();
+    if (modeId != null && modeId.isNotEmpty) {
+      mode = AgentSessionMode.fromId(modeId);
+    }
+    currentModelId = snap['modelId'] as String? ?? currentModelId;
+    final models = snap['availableModels'];
+    if (models is List) {
+      availableModels = models
+          .whereType<Map>()
+          .map((e) => AgentModel.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+    }
+    final modes = snap['availableModes'];
+    if (modes is List) {
+      availableModeIds = modes.map((e) => e.toString()).toList();
+    }
+    final load = snap['loadSession'];
+    if (load is bool) {
+      capabilities = AcpAgentCapabilities(loadSession: load);
+    }
+  }
+
+  void _onEvent(Map<String, dynamic> params) {
+    if (params['method'] == 'closed') {
+      if (!_updates.isClosed) _updates.add(const AcpUpdate.closed());
+      return;
+    }
+    final chat = params['chatId']?.toString();
+    if (chat != null && chat.isNotEmpty && chat != chatId) return;
+
+    final kind = params['kind']?.toString() ?? '';
+    switch (kind) {
+      case 'text':
+        final t = params['text']?.toString() ?? '';
+        if (t.isNotEmpty) _updates.add(AcpUpdate.delta(t));
+      case 'thought':
+        final t = params['text']?.toString() ?? '';
+        if (t.isNotEmpty) _updates.add(AcpUpdate.thought(t));
+      case 'tool_start':
+      case 'tool_update':
+        final tool = _toolFrom(params['tool']);
+        if (tool != null) _updates.add(AcpUpdate.toolCall(tool));
+      case 'permission':
+        if (params['resolved'] == true) {
+          _updates.add(
+            AcpUpdate.permission(params['text']?.toString() ?? 'Permission'),
+          );
+          break;
+        }
+        final reqId = params['requestId'];
+        final options = <PermissionOption>[];
+        final rawOpts = params['options'];
+        if (rawOpts is List) {
+          for (final o in rawOpts) {
+            if (o is Map) {
+              options.add(
+                PermissionOption(
+                  optionId: (o['optionId'] ?? o['id'] ?? '').toString(),
+                  name: (o['name'] ?? o['label'] ?? '').toString(),
+                  kind: (o['kind'] ?? '').toString(),
+                ),
+              );
+            }
+          }
+        }
+        final title = params['title']?.toString() ??
+            params['text']?.toString() ??
+            'Allow this action?';
+        if (reqId != null) {
+          _updates.add(
+            AcpUpdate.permission(
+              title,
+              request: PendingPermissionRequest(
+                requestId: reqId,
+                title: title,
+                description: null,
+                options: options,
+              ),
+            ),
+          );
+        } else {
+          _updates.add(AcpUpdate.permission(title));
+        }
+      case 'turn_complete':
+        _finishPrompt();
+        _updates.add(
+          AcpUpdate.turnComplete(params['reason']?.toString() ?? 'end_turn'),
+        );
+      case 'status':
+        _daemonStatus = params['status']?.toString() ?? _daemonStatus;
+        final title = params['title']?.toString();
+        if (title != null && title.isNotEmpty) {
+          _updates.add(AcpUpdate.status('Session', title: title));
+        }
+      case 'mode':
+        final mid = params['mode']?.toString();
+        if (mid != null && mid.isNotEmpty) {
+          mode = AgentSessionMode.fromId(mid);
+          _updates.add(AcpUpdate.mode(mode));
+        }
+      case 'session':
+        _applySnapshot({
+          'acpSessionId': params['acpSessionId'],
+          'models': params['models'] is List
+              ? {
+                  'availableModels': params['models'],
+                  'currentModelId': params['modelId'],
+                }
+              : null,
+          'availableModels': params['models'],
+          'availableModes': params['modes'],
+          'mode': params['mode'],
+          'modelId': params['modelId'],
+          'loadSession': params['loadSession'],
+          'status': _daemonStatus,
+        });
+        if (params['models'] is Map) {
+          _applySnapshot({
+            ...params,
+            'availableModels':
+                (params['models'] as Map)['availableModels'],
+            'modelId': (params['models'] as Map)['currentModelId'] ??
+                params['modelId'],
+          });
+        }
+      case 'error':
+        _finishPrompt();
+        final t = params['text']?.toString() ?? 'ADSM error';
+        _updates.add(AcpUpdate.error(t));
+      default:
+        break;
+    }
+  }
+
+  static ToolCallState? _toolFrom(Object? raw) {
+    if (raw is! Map) return null;
+    final m = Map<String, dynamic>.from(raw);
+    final id = (m['toolCallId'] ?? m['id'] ?? '').toString();
+    final title = (m['title'] ?? 'Tool').toString();
+    if (id.isEmpty && title == 'Tool') return null;
+    final locations = <String>[];
+    final locs = m['locations'];
+    if (locs is List) {
+      for (final loc in locs) {
+        locations.add(loc.toString());
+      }
+    }
+    return ToolCallState(
+      toolCallId: id.isEmpty ? title : id,
+      title: title,
+      kind: m['kind']?.toString(),
+      status: (m['status'] ?? 'pending').toString(),
+      locations: locations,
+      rawInput: ToolCallState.formatOpaque(m['rawInput']),
+      rawOutput: ToolCallState.formatOpaque(m['rawOutput']),
+    );
+  }
+
+  void _finishPrompt() {
+    _promptInFlight = false;
+    final c = _promptCompleter;
+    _promptCompleter = null;
+    if (c != null && !c.isCompleted) c.complete();
+  }
+
+  @override
+  Future<void> prompt(String text) async {
+    _promptInFlight = true;
+    final c = Completer<void>();
+    _promptCompleter = c;
+    try {
+      await _client.request(
+        'session.prompt',
+        {'chatId': chatId, 'text': text},
+        timeout: const Duration(minutes: 15),
+      );
+      // Daemon may have already emitted turn_complete; still finish.
+      _finishPrompt();
+    } catch (e) {
+      _finishPrompt();
+      rethrow;
+    }
+    // If turn_complete arrived before RPC returned, completer already done.
+    if (!c.isCompleted) {
+      // Soft wait: events may still be draining.
+      try {
+        await c.future.timeout(const Duration(seconds: 2));
+      } on TimeoutException {
+        // RPC returned — treat as done.
+      }
+    }
+  }
+
+  @override
+  Future<void> cancel() async {
+    try {
+      await _client.request('session.cancel', {'chatId': chatId});
+    } catch (e) {
+      SafeLog.d('ADSM cancel failed', e);
+    }
+    _finishPrompt();
+  }
+
+  @override
+  Future<void> setMode(AgentSessionMode next) async {
+    final snap = await _client.request('session.set_mode', {
+      'chatId': chatId,
+      'modeId': next.id,
+    });
+    _applySnapshot(snap);
+    mode = next;
+    _updates.add(AcpUpdate.mode(next));
+  }
+
+  @override
+  Future<void> setModel(String modelId) async {
+    final snap = await _client.request('session.set_model', {
+      'chatId': chatId,
+      'modelId': modelId,
+    });
+    _applySnapshot(snap);
+    currentModelId = modelId;
+  }
+
+  @override
+  void setPermissionPolicy(PermissionPolicy policy) {
+    permissionPolicy = policy;
+  }
+
+  @override
+  void resolvePermission(Object requestId, String optionId) {
+    unawaited(
+      _client.request('session.respond_permission', {
+        'chatId': chatId,
+        'requestId': '$requestId',
+        'optionId': optionId,
+      }).catchError((Object e) {
+        SafeLog.d('ADSM respond_permission failed', e);
+        return <String, dynamic>{};
+      }),
+    );
+    _updates.add(AcpUpdate.permission(optionId));
+  }
+
+  @override
+  void cancelOpenPermissions() {
+    // Daemon auto-cancels on session.cancel; nothing local to clear.
+  }
+
+  @override
+  Future<void> ensureModelCatalog({
+    required List<Map<String, dynamic>> mcpServers,
+  }) async {
+    if (availableModels.isNotEmpty) return;
+    // Re-ensure to refresh catalogue without restarting if already idle.
+    try {
+      final snap = await _client.request('agents.list', {});
+      final agents = snap['agents'];
+      if (agents is List) {
+        for (final a in agents) {
+          if (a is Map && a['chatId'] == chatId) {
+            _applySnapshot(Map<String, dynamic>.from(a));
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      SafeLog.d('ADSM model catalog failed', e);
+    }
+  }
+
+  @override
+  void handOffPrompt() {
+    // SSH client channel will close; daemon continues the turn.
+    final c = _promptCompleter;
+    if (c != null && !c.isCompleted) c.complete();
+    _promptInFlight = false;
+  }
+
+  @override
+  Future<void> close() async {
+    await _eventSub?.cancel();
+    _eventSub = null;
+    _finishPrompt();
+    try {
+      await _client.close();
+    } catch (_) {}
+    if (!_updates.isClosed) {
+      try {
+        _updates.add(const AcpUpdate.closed());
+      } catch (_) {}
+      await _updates.close();
+    }
+  }
+}

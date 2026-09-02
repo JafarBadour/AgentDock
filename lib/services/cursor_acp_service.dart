@@ -12,6 +12,7 @@ import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'agent_runtime_host.dart';
+import 'agent_session.dart';
 import 'ssh_service.dart';
 
 /// What the remote agent told us it can do, from the `initialize` response.
@@ -73,7 +74,7 @@ Future<T> awaitWithIdleTimeout<T>({
 }
 
 /// Minimal ACP (Agent Client Protocol) JSON-RPC client.
-class AcpSession {
+class AcpSession implements AgentSession {
   AcpSession._({
     required this.host,
     required this.cwd,
