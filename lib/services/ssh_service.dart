@@ -86,7 +86,13 @@ SshFailureKind classifySshFailure(Object error) {
     }
   }
   final text = error.toString().toLowerCase();
-  if (text.contains('connection closed') ||
+  if (text.contains('adsm channel closed') ||
+      text.contains('adsm closed') ||
+      text.contains('adsm write failed') ||
+      text.contains('acp connection closed') ||
+      text.contains('acp connection error') ||
+      text.contains('acp stdin closed') ||
+      text.contains('connection closed') ||
       text.contains('transport is closed') ||
       text.contains('channel open') ||
       text.contains('broken pipe') ||
@@ -95,6 +101,27 @@ SshFailureKind classifySshFailure(Object error) {
     return SshFailureKind.network;
   }
   return SshFailureKind.unknown;
+}
+
+/// True when the ADSM/ACP/SSH bridge dropped and auto-reconnect should handle it
+/// without a sticky red banner.
+bool isTransientBridgeError(Object error) {
+  if (classifySshFailure(error) == SshFailureKind.network) return true;
+  return isTransientBridgeErrorText(error.toString());
+}
+
+bool isTransientBridgeErrorText(String text) {
+  final t = text.toLowerCase();
+  return t.contains('adsm channel closed') ||
+      t.contains('adsm closed') ||
+      t.contains('adsm write failed') ||
+      t.contains('acp connection closed') ||
+      t.contains('acp connection error') ||
+      t.contains('acp stdin closed') ||
+      t.contains('connection closed') ||
+      t.contains('transport is closed') ||
+      t.contains('broken pipe') ||
+      t.contains('connection reset');
 }
 
 /// Caps concurrent exec channels on one connection.

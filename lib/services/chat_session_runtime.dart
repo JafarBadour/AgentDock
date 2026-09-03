@@ -484,6 +484,10 @@ class ChatSessionRuntime extends ChangeNotifier {
     final delay = immediate ? Duration.zero : _backoffFor(reconnectAttempts);
     reconnectAttempts++;
     reconnecting = true;
+    // Drop sticky transport nags — reconnect is already underway.
+    if (lastError != null && isTransientBridgeErrorText(lastError!)) {
+      lastError = null;
+    }
     notifyListeners();
 
     _retryTimer = Timer(delay, () async {
@@ -822,12 +826,25 @@ class ChatSessionRuntime extends ChangeNotifier {
       await commitThought();
     } catch (e) {
       SafeLog.d('prompt failed', e);
-      lastError = e.toString();
-      transportFailed = true;
-      // Dead bridge / silence timeout — recover so the next send is not wedged.
-      if (!closed && sessionFactory != null) {
-        closed = true;
-        _scheduleReconnect(immediate: true);
+      // Late failure from a session that Force-run / reconnect already replaced.
+      if (epoch != _promptEpoch) {
+        transportFailed = true;
+      } else if (isTransientBridgeError(e)) {
+        // Quiet reconnect — do not leave "Bad state: ADSM channel closed" up.
+        lastError = null;
+        transportFailed = true;
+        if (!closed && sessionFactory != null) {
+          closed = true;
+          _scheduleReconnect(immediate: true);
+        }
+      } else {
+        lastError = e.toString();
+        transportFailed = true;
+        // Dead bridge / silence timeout — recover so the next send is not wedged.
+        if (!closed && sessionFactory != null) {
+          closed = true;
+          _scheduleReconnect(immediate: true);
+        }
       }
     } finally {
       // Superseded by Force run / reconnect — do not touch shared state.

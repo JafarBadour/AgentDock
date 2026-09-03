@@ -26,9 +26,9 @@ class CodeChangeStats {
         files: {...files, ...other.files},
       );
 
-  /// `Delta +4356 -265 | 45 φ`
+  /// `Δ +4356 -265 | 45 φ`
   String get label {
-    final parts = <String>['Delta'];
+    final parts = <String>['Δ'];
     parts.add('+$added');
     parts.add('-$removed');
     if (fileCount > 0) {

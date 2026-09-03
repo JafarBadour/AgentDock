@@ -414,7 +414,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
       _mode = runtime.mode;
       _permission = runtime.permissionPolicy;
-      if (runtime.lastError != null && runtime.closed) {
+      // Auto-reconnect clears runtime.lastError, but this screen used to copy
+      // "ADSM channel closed" into sticky [_error] and keep it after · live.
+      if (runtime.reconnecting || !runtime.closed) {
+        if (_error != null && isTransientBridgeErrorText(_error!)) {
+          _error = null;
+        }
+      } else if (runtime.lastError != null &&
+          !isTransientBridgeErrorText(runtime.lastError!)) {
         _error = runtime.lastError;
       }
       final n = runtime.entries.length;

@@ -250,7 +250,7 @@ class CodeDeltaLabel extends StatelessWidget {
           color: Theme.of(context).colorScheme.onSurfaceVariant,
         ),
         children: [
-          if (!compact) const TextSpan(text: 'Delta '),
+          if (!compact) const TextSpan(text: 'Δ '),
           TextSpan(
             text: '+$added',
             style: style?.copyWith(color: green),
