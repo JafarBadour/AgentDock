@@ -77,6 +77,8 @@
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach screenshots and photos to agent prompts.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Dictate chat messages. Audio is transcribed with Gemini.</string>
+	<string>Dictate chat messages using on-device speech recognition.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Dictate chat messages. Speech is converted to text on this device.</string>
 </dict>
 </plist>

@@ -11,6 +11,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../app/app_theme.dart';
 import '../../app/providers.dart';
 import '../../data/models/agent_mode.dart';
 import '../../data/models/agent_model.dart';
@@ -89,6 +90,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _composerHasText = false;
   bool _recordingVoice = false;
   bool _transcribingVoice = false;
+  /// Bumped when a new transcription starts or is abandoned so late results drop.
+  int _transcribeEpoch = 0;
   bool _showSlashMenu = false;
   bool _compressing = false;
 
@@ -1391,21 +1394,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _startVoiceHold() async {
-    if (_transcribingVoice ||
-        _sending ||
+    if (_sending ||
         _connecting ||
         _recordingVoice ||
         _voiceStarting ||
         !_chat!.provider.isAvailable) {
       return;
     }
+    // New recording abandons any in-flight transcription.
+    if (_transcribingVoice) {
+      _transcribeEpoch++;
+      setState(() => _transcribingVoice = false);
+    }
     final speech = ref.read(gcpSpeechServiceProvider);
-    final hasKey = await speech.hasApiKey();
+    final available = await speech.isAvailable();
     if (!mounted) return;
-    if (!hasKey) {
+    if (!available) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Add a Gemini API key in Connect to use the mic.'),
+          content: Text(
+            'Speech recognition unavailable — enable mic + speech permissions.',
+          ),
         ),
       );
       return;
@@ -1540,6 +1549,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _voiceTick?.cancel();
     _voicePulse.stop();
     _voicePulse.value = 0;
+    final epoch = ++_transcribeEpoch;
+    final baseline = _composer.text;
     setState(() {
       _recordingVoice = false;
       _voiceLocked = false;
@@ -1552,29 +1563,52 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     });
     HapticFeedback.lightImpact();
     try {
-      final text = await speech.stopAndTranscribe();
-      if (!mounted) return;
+      final text = await speech.stopAndTranscribe().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => throw TimeoutException('Speech-to-text timed out'),
+      );
+      if (!mounted || epoch != _transcribeEpoch) return;
+      // User typed while we waited — their text wins; drop the transcript.
+      if (_composer.text != baseline) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Kept your typed text (skipped late transcript).'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+        return;
+      }
       if (text.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('No speech detected — try again.')),
         );
       } else {
-        final existing = _composer.text;
         _composer.text =
-            existing.trim().isEmpty ? text : '${existing.trim()} $text';
+            baseline.trim().isEmpty ? text : '${baseline.trim()} $text';
         _composer.selection = TextSelection.collapsed(
           offset: _composer.text.length,
         );
       }
+    } on TimeoutException {
+      SafeLog.d('voice transcribe timed out (>3s)');
+      if (mounted && epoch == _transcribeEpoch) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Transcription took too long — type your message instead.',
+            ),
+          ),
+        );
+      }
     } catch (e) {
       SafeLog.d('voice transcribe failed', e);
-      if (mounted) {
+      if (mounted && epoch == _transcribeEpoch) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(GcpSpeechService.userFacingMessage(e))),
         );
       }
     } finally {
-      if (mounted) {
+      if (mounted && epoch == _transcribeEpoch) {
         setState(() {
           _transcribingVoice = false;
           _voiceElapsedSec = 0;
@@ -1605,7 +1639,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ),
             const SizedBox(width: 8),
             Text(
-              'Transcribing with Gemini…',
+              'Finishing speech…',
               style: theme.textTheme.labelMedium?.copyWith(
                 fontWeight: FontWeight.w600,
               ),
@@ -1711,7 +1745,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     required ThemeData theme,
     required bool streaming,
   }) {
-    final busy = _connecting || _sending || _compressing || _transcribingVoice;
+    final busy = _connecting || _sending || _compressing;
     final showSend = !_recordingVoice &&
         (_composerHasText || _pendingImages.isNotEmpty);
 
@@ -2718,122 +2752,102 @@ class _Bubble extends StatelessWidget {
       );
     }
 
-    final bg = isUser
-        ? theme.colorScheme.primaryContainer
-        : theme.colorScheme.surfaceContainerHighest;
+    // Cursor-style: user = soft raised pill; agent = bare text on the canvas.
+    final onText = isUser ? AppColors.onBubbleUser : AppColors.chatAgentText;
+    final metaColor = AppColors.chatMeta;
 
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 6),
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-        constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.88),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(isUser ? 16 : 4),
-            bottomRight: Radius.circular(isUser ? 4 : 16),
+    final bodyStyle = theme.textTheme.bodyMedium?.copyWith(
+      color: onText,
+      height: 1.45,
+      fontSize: 15,
+    );
+
+    final column = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (!isUser && streaming)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Shimmer(
+              enabled: true,
+              child: Text(
+                'Thinking',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: metaColor,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
           ),
-          border: queued
-              ? Border.all(
-                  color: theme.colorScheme.primary.withValues(alpha: 0.45),
-                )
-              : null,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (!isUser)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.smart_toy_outlined, size: 14, color: theme.colorScheme.primary),
-                    const SizedBox(width: 6),
-                    Shimmer(
-                      enabled: streaming,
-                      child: Text(
-                        streaming ? 'Agent is working' : 'Agent',
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: theme.colorScheme.primary,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
+        if (autoNumber != null)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: AutoNumberBadge(number: autoNumber, compact: false),
+          ),
+        if (queued)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.schedule, size: 14, color: metaColor),
+                const SizedBox(width: 6),
+                Text(
+                  'Queued',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: metaColor,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
-            if (autoNumber != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: AutoNumberBadge(number: autoNumber, compact: false),
-              ),
-            if (queued)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.schedule,
-                      size: 14,
-                      color: theme.colorScheme.primary,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      'Queued',
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        color: theme.colorScheme.primary,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            if (imageRefs.isNotEmpty)
-              Padding(
-                padding: EdgeInsets.only(
-                  bottom: bodyText.trim().isEmpty ? 0 : 8,
-                ),
-                child: _BubbleImages(refs: imageRefs),
-              ),
-            if (streaming && bodyText.isEmpty && imageRefs.isEmpty)
-              const MessageBody(text: '…')
-            else if (bodyText.isNotEmpty || (streaming && bodyText.isEmpty))
-              MessageBody(
-                text: streaming && bodyText.isEmpty ? '…' : bodyText,
-              ),
-            const SizedBox(height: 4),
-            Row(
+              ],
+            ),
+          ),
+        if (imageRefs.isNotEmpty)
+          Padding(
+            padding: EdgeInsets.only(
+              bottom: bodyText.trim().isEmpty ? 0 : 8,
+            ),
+            child: _BubbleImages(refs: imageRefs),
+          ),
+        if (streaming && bodyText.isEmpty && imageRefs.isEmpty)
+          MessageBody(text: '…', style: bodyStyle)
+        else if (bodyText.isNotEmpty || (streaming && bodyText.isEmpty))
+          MessageBody(
+            text: streaming && bodyText.isEmpty ? '…' : bodyText,
+            style: bodyStyle,
+          ),
+        if (!streaming && (at != null || bodyText.trim().isNotEmpty))
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                if (!streaming && !queued && bodyText.trim().isNotEmpty) ...[
+                if (!queued && bodyText.trim().isNotEmpty) ...[
                   IconButton(
                     tooltip: 'Copy text for Teams',
                     visualDensity: VisualDensity.compact,
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                    constraints:
+                        const BoxConstraints(minWidth: 28, minHeight: 28),
                     onPressed: () => copyMessageForTeams(context, bodyText),
                     icon: Icon(
                       Icons.copy_rounded,
-                      size: 15,
-                      color: theme.colorScheme.onSurface.withValues(alpha: 0.82),
+                      size: 14,
+                      color: metaColor.withValues(alpha: 0.85),
                     ),
                   ),
                   IconButton(
                     tooltip: 'Copy HTML for Teams',
                     visualDensity: VisualDensity.compact,
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                    constraints:
+                        const BoxConstraints(minWidth: 28, minHeight: 28),
                     onPressed: () =>
                         copyMessageHtmlForTeams(context, bodyText),
                     icon: Icon(
                       Icons.html,
-                      size: 16,
-                      color: theme.colorScheme.onSurface.withValues(alpha: 0.82),
+                      size: 15,
+                      color: metaColor.withValues(alpha: 0.85),
                     ),
                   ),
                 ],
@@ -2843,17 +2857,42 @@ class _Bubble extends StatelessWidget {
                     child: Text(
                       _formatClock(at!),
                       style: theme.textTheme.labelSmall?.copyWith(
-                        color: theme.colorScheme.onSurface.withValues(alpha: 0.82),
-                        fontWeight: FontWeight.w600,
+                        color: metaColor,
+                        fontWeight: FontWeight.w500,
                         fontSize: 11,
                       ),
                     ),
                   ),
               ],
             ),
-          ],
+          ),
+      ],
+    );
+
+    if (isUser) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Container(
+          width: double.infinity,
+          margin: const EdgeInsets.only(top: 10, bottom: 6),
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+          decoration: BoxDecoration(
+            color: AppColors.bubbleUser,
+            borderRadius: BorderRadius.circular(14),
+            border: queued
+                ? Border.all(
+                    color: theme.colorScheme.primary.withValues(alpha: 0.45),
+                  )
+                : null,
+          ),
+          child: column,
         ),
-      ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8, bottom: 10),
+      child: column,
     );
   }
 }

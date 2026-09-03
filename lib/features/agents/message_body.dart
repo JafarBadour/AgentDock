@@ -5,6 +5,8 @@ import 'package:markdown/markdown.dart' as md;
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../app/app_theme.dart';
+
 /// A recognised link inside a chat message.
 enum RichLinkKind { githubPr, githubIssue, jira, generic }
 
@@ -380,8 +382,8 @@ class MessageBody extends StatelessWidget {
             ),
           ),
           codeBlock: CodeBlockStyle(
-            backgroundColor: scheme.surfaceContainerHighest,
-            borderColor: scheme.outlineVariant.withValues(alpha: 0.6),
+            backgroundColor: AppColors.chatInlineCodeBg,
+            borderColor: scheme.outlineVariant.withValues(alpha: 0.35),
             borderWidth: 0.5,
             borderRadius: const Radius.circular(8),
             padding: EdgeInsets.all(dense ? 10 : 12),

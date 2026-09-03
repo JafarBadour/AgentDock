@@ -11,6 +11,13 @@ abstract final class AppColors {
   static const surface = Color(0xFF122236);
   static const surfaceHigh = Color(0xFF1A2F4A);
   static const outline = Color(0xFF2E4A6E);
+
+  /// Cursor-style chat chrome: user in a soft raised pill; agent bare on the canvas.
+  static const bubbleUser = Color(0xFF243447);
+  static const onBubbleUser = Color(0xFFE8F1FA);
+  static const chatAgentText = Color(0xFFE6EEF8);
+  static const chatMeta = Color(0xFF8FA6BF);
+  static const chatInlineCodeBg = Color(0xFF1C2B3D);
 }
 
 /// Dark blue Material 3 theme tuned for a translucent shell over waves.
