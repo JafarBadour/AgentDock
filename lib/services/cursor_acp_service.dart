@@ -8,6 +8,7 @@ import '../data/models/agent_mode.dart';
 import '../data/models/agent_model.dart';
 import '../data/models/agent_provider.dart';
 import '../data/models/host.dart';
+import '../data/models/prompt_image.dart';
 import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
@@ -705,15 +706,23 @@ class AcpSession implements AgentSession {
     }
   }
 
-  Future<void> prompt(String text) async {
+  @override
+  Future<void> prompt(
+    String text, {
+    List<PromptImage> images = const [],
+    String? userMessageId,
+    DateTime? userCreatedAt,
+  }) async {
     if (!_started || sessionId == null) {
       throw StateError('ACP session not ready');
     }
+    final blocks = ChatImageCodec.buildAcpBlocks(text: text, images: images);
+    if (blocks.isEmpty) {
+      throw StateError('Empty prompt');
+    }
     await _request('session/prompt', {
       'sessionId': sessionId,
-      'prompt': [
-        {'type': 'text', 'text': text},
-      ],
+      'prompt': blocks,
     });
   }
 
@@ -1450,6 +1459,7 @@ class AcpUpdate {
       locations: locations,
       rawInput: ToolCallState.formatOpaque(nested['rawInput'] ?? update['rawInput']),
       rawOutput: ToolCallState.formatOpaque(nested['rawOutput'] ?? update['rawOutput']),
+      content: ToolCallState.formatOpaque(nested['content'] ?? update['content']),
     );
   }
 

@@ -4,6 +4,8 @@ import 'package:go_router/go_router.dart';
 
 import '../features/agents/agents_screen.dart';
 import '../features/agents/chat_screen.dart';
+import '../features/automations/automations_screen.dart';
+import '../features/automations/schedule_edit_screen.dart';
 import '../features/connect/connect_screen.dart';
 import '../features/hosts/host_edit_screen.dart';
 import '../features/hosts/hosts_screen.dart';
@@ -11,7 +13,6 @@ import '../features/repos/repo_edit_screen.dart';
 import '../features/repos/repos_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
-import '../features/terminal/terminal_hosts_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
 import 'shell_scaffold.dart';
 
@@ -44,13 +45,24 @@ final goRouterProvider = Provider<GoRouter>((ref) {
           StatefulShellBranch(
             routes: [
               GoRoute(
-                path: '/terminal',
-                builder: (context, state) => const TerminalHostsScreen(),
+                path: '/automate',
+                builder: (context, state) => const AutomationsScreen(),
                 routes: [
                   GoRoute(
-                    path: 'session/:hostId',
-                    builder: (context, state) => TerminalSessionScreen(
-                      hostId: state.pathParameters['hostId']!,
+                    path: 'new',
+                    builder: (context, state) {
+                      final q = state.uri.queryParameters;
+                      return ScheduleEditScreen(
+                        initialChatId: q['chatId'],
+                        initialPrompt: q['prompt'],
+                        useCompressedContext: q['useCtx'] == '1',
+                      );
+                    },
+                  ),
+                  GoRoute(
+                    path: 'edit/:jobId',
+                    builder: (context, state) => ScheduleEditScreen(
+                      jobId: state.pathParameters['jobId'],
                     ),
                   ),
                 ],
@@ -73,14 +85,21 @@ final goRouterProvider = Provider<GoRouter>((ref) {
                         HostEditScreen(hostId: state.pathParameters['hostId']),
                   ),
                   GoRoute(
+                    path: 'terminal/:hostId',
+                    builder: (context, state) => TerminalSessionScreen(
+                      hostId: state.pathParameters['hostId']!,
+                    ),
+                  ),
+                  GoRoute(
                     path: ':hostId/repos',
                     builder: (context, state) =>
                         ReposScreen(hostId: state.pathParameters['hostId']!),
                     routes: [
                       GoRoute(
                         path: 'new',
-                        builder: (context, state) =>
-                            RepoEditScreen(hostId: state.pathParameters['hostId']!),
+                        builder: (context, state) => RepoEditScreen(
+                          hostId: state.pathParameters['hostId']!,
+                        ),
                       ),
                       GoRoute(
                         path: 'edit/:repoId',
@@ -123,6 +142,12 @@ final goRouterProvider = Provider<GoRouter>((ref) {
             ],
           ),
         ],
+      ),
+      // Legacy deep link from older builds.
+      GoRoute(
+        path: '/terminal/session/:hostId',
+        redirect: (context, state) =>
+            '/hosts/terminal/${state.pathParameters['hostId']}',
       ),
     ],
   );

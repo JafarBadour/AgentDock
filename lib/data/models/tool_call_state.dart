@@ -10,6 +10,7 @@ class ToolCallState {
     this.locations = const [],
     this.rawInput,
     this.rawOutput,
+    this.content,
   });
 
   final String toolCallId;
@@ -19,6 +20,9 @@ class ToolCallState {
   final List<String> locations;
   final String? rawInput;
   final String? rawOutput;
+
+  /// ACP `content` blocks (often includes `type: diff` with old/new text).
+  final String? content;
 
   bool get isActive =>
       status == 'pending' || status == 'in_progress' || status == 'running';
@@ -52,13 +56,31 @@ class ToolCallState {
       return given;
     }
     final k = (kind ?? '').toLowerCase();
+    final blob = '$k ${title.toLowerCase()} ${rawInput ?? ''}'.toLowerCase();
+    if (blob.contains('websearch') ||
+        blob.contains('web_search') ||
+        blob.contains('web search') ||
+        (k.contains('web') && k.contains('search')) ||
+        k.contains('browser')) {
+      return 'Web search';
+    }
+    if (blob.contains('webfetch') ||
+        blob.contains('web_fetch') ||
+        k.contains('fetch') ||
+        k.contains('http') ||
+        k.contains('url')) {
+      return 'Fetched a URL';
+    }
     if (k.contains('exec') || k.contains('shell') || k.contains('terminal')) {
       return 'Ran a command';
     }
     if (k.contains('read')) return 'Read a file';
     if (k.contains('edit') || k.contains('write')) return 'Edited a file';
-    if (k.contains('search') || k.contains('grep')) return 'Searched the code';
-    if (k.contains('fetch') || k.contains('http')) return 'Fetched a URL';
+    if (k.contains('grep') ||
+        k.contains('glob') ||
+        (k.contains('search') && !k.contains('web'))) {
+      return 'Searched the code';
+    }
     if (k.contains('delete')) return 'Deleted a file';
     return 'Tool call';
   }
@@ -68,11 +90,14 @@ class ToolCallState {
     'command',
     'cmd',
     'query',
+    'search_term',
+    'searchTerm',
     'pattern',
     'path',
     'file_path',
     'filePath',
     'url',
+    'uri',
     'name',
     'description',
   ];
@@ -129,6 +154,7 @@ class ToolCallState {
     List<String>? locations,
     String? rawInput,
     String? rawOutput,
+    String? content,
   }) =>
       ToolCallState(
         toolCallId: toolCallId,
@@ -138,6 +164,7 @@ class ToolCallState {
         locations: locations ?? this.locations,
         rawInput: rawInput ?? this.rawInput,
         rawOutput: rawOutput ?? this.rawOutput,
+        content: content ?? this.content,
       );
 
   Map<String, dynamic> toJson() => {
@@ -148,6 +175,7 @@ class ToolCallState {
         'locations': locations,
         if (rawInput != null) 'rawInput': rawInput,
         if (rawOutput != null) 'rawOutput': rawOutput,
+        if (content != null) 'content': content,
       };
 
   factory ToolCallState.fromJson(Map<String, dynamic> json) => ToolCallState(
@@ -160,6 +188,7 @@ class ToolCallState {
             : const [],
         rawInput: json['rawInput']?.toString(),
         rawOutput: json['rawOutput']?.toString(),
+        content: ToolCallState.formatOpaque(json['content']),
       );
 
   static ToolCallState? tryParseContent(String content) {

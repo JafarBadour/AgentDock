@@ -576,33 +576,115 @@ test -x "$HOME/.local/bin/claude-code-acp"
 
   /// Installs/starts ADSM on the host and verifies it responds.
   ///
-  /// Uses the GitHub `install-adsm.sh` installer (same pattern as Cursor/Claude).
+  /// Uses the GitHub `install-adsm.sh` installer only when the binary is
+  /// missing. If `agentdock-adsm` already exists, we only call
+  /// `ensure-running` — never the install script (it `pkill`s the daemon and
+  /// can leave Connect falsely reporting "ADSM still missing").
   Future<void> ensureAdsm(
     Host host, {
     void Function(String status)? onProgress,
   }) async {
     final client = await connect(host);
+    var lastProbe = '';
 
-    Future<bool> ping() async {
+    Future<({bool ok, bool hasBin, String raw})> probe() async {
       try {
         final out = await _run(
           client,
           r'''
+set +e
 export PATH="$HOME/.local/bin:$PATH"
-agentdock-adsm status 2>/dev/null | head -1
+BIN="$(command -v agentdock-adsm 2>/dev/null)"
+[ -n "$BIN" ] || BIN="$HOME/.local/bin/agentdock-adsm"
+
+# Direct socket ping — works even when the wrapper is not on PATH.
+python3 - <<'PY' 2>/dev/null
+import os, socket, sys
+p = os.path.expanduser("~/.agentdock/adsm.sock")
+if not os.path.exists(p):
+    sys.exit(2)
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3)
+try:
+    s.connect(p)
+    s.sendall(b'{"id":1,"method":"ping","params":{}}\n')
+    data = s.recv(8192).decode("utf-8", "replace")
+    print(data.strip())
+    if '"ok"' in data or "version" in data:
+        print("ADSM_PROBE=ok")
+        sys.exit(0)
+except Exception as e:
+    print(f"ADSM_SOCK_ERR={e}")
+    sys.exit(1)
+finally:
+    try:
+        s.close()
+    except Exception:
+        pass
+sys.exit(1)
+PY
+SOCK_EC=$?
+if [ "$SOCK_EC" -eq 0 ]; then
+  exit 0
+fi
+
+if [ ! -x "$BIN" ]; then
+  echo "ADSM_PROBE=missing_bin"
+  exit 0
+fi
+echo "ADSM_BIN=$BIN"
+OUT="$("$BIN" ensure-running 2>&1)"
+EC=$?
+printf '%s\n' "$OUT"
+if [ "$EC" -eq 0 ]; then
+  echo "ADSM_PROBE=ok"
+else
+  echo "ADSM_PROBE=ensure_failed ec=$EC"
+fi
+"$BIN" status 2>/dev/null | head -1 || true
+exit 0
 ''',
           hostId: host.id,
-          timeout: const Duration(seconds: 8),
+          timeout: const Duration(seconds: 35),
         );
-        return out.contains('"pid"') || out.contains('result');
-      } catch (_) {
-        return false;
+        lastProbe = out.trim();
+        SafeLog.d('ADSM probe: $lastProbe');
+        return (
+          ok: out.contains('ADSM_PROBE=ok'),
+          hasBin: !out.contains('ADSM_PROBE=missing_bin'),
+          raw: out,
+        );
+      } catch (e) {
+        lastProbe = e.toString();
+        SafeLog.d('ADSM probe exception', e);
+        return (ok: false, hasBin: false, raw: lastProbe);
       }
     }
 
-    if (await ping()) {
+    onProgress?.call('Checking ADSM…');
+    var state = await probe();
+    if (state.ok) {
       onProgress?.call('ADSM ready');
       return;
+    }
+
+    // Binary is on the host — start/repair only. Do NOT curl install-adsm.sh
+    // (that script kills the live daemon and often races the next probe).
+    if (state.hasBin) {
+      onProgress?.call('Starting ADSM…');
+      for (var i = 0; i < 5; i++) {
+        await Future<void>.delayed(Duration(milliseconds: 400 + i * 250));
+        state = await probe();
+        if (state.ok) {
+          onProgress?.call('ADSM ready');
+          return;
+        }
+      }
+      throw MissingToolException(
+        'ADSM',
+        '${kRemoteAdsmSetupGuide.trim()}\n\n'
+        '# Probe (daemon binary found but not healthy):\n$lastProbe',
+      );
     }
 
     onProgress?.call('Installing ADSM on the remote…');
@@ -612,47 +694,39 @@ agentdock-adsm status 2>/dev/null | head -1
       scriptName: 'install-adsm.sh',
       onProgress: onProgress,
     );
-
     if (!installed) {
       onProgress?.call('Starting ADSM…');
       try {
         await _run(
           client,
           r'''
-set -e
+set +e
 export PATH="$HOME/.local/bin:$PATH"
-command -v agentdock-adsm >/dev/null
+command -v agentdock-adsm >/dev/null || exit 1
 agentdock-adsm ensure-running
+exit 0
 ''',
           hostId: host.id,
           timeout: const Duration(seconds: 45),
         );
       } catch (e) {
-        SafeLog.d('ADSM ensure-running failed', e);
+        SafeLog.d('ADSM ensure-running after failed install failed', e);
       }
     }
 
-    if (!await ping()) {
-      // One more ensure-running after a successful script install.
-      try {
-        await _run(
-          client,
-          r'''
-export PATH="$HOME/.local/bin:$PATH"
-agentdock-adsm ensure-running
-''',
-          hostId: host.id,
-          timeout: const Duration(seconds: 45),
-        );
-      } catch (e) {
-        SafeLog.d('ADSM post-install start failed', e);
+    for (var i = 0; i < 8; i++) {
+      state = await probe();
+      if (state.ok) {
+        onProgress?.call('ADSM ready');
+        return;
       }
+      await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
     }
 
-    if (!await ping()) {
-      throw MissingToolException('ADSM', kRemoteAdsmSetupGuide.trim());
-    }
-    onProgress?.call('ADSM ready');
+    throw MissingToolException(
+      'ADSM',
+      '${kRemoteAdsmSetupGuide.trim()}\n\n# Probe:\n$lastProbe',
+    );
   }
 
   /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.

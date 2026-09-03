@@ -5,18 +5,35 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../data/local/app_database.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
+import '../services/adsm_client.dart';
 import '../services/agent_runtime_host.dart';
 import '../services/agent_session.dart';
 import '../services/agentdock_service.dart';
 import '../services/background_keep_alive.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
+import '../services/gcp_speech_service.dart';
+import '../services/local_notification_service.dart';
 import '../services/mcp_deploy_service.dart';
+import '../services/schedule_runner.dart';
+import '../services/schedule_sync_service.dart';
 import '../services/ssh_service.dart';
 
 final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
 
+final localNotificationServiceProvider =
+    Provider<LocalNotificationService>((ref) => LocalNotificationService());
+
+final gcpSpeechServiceProvider = Provider<GcpSpeechService>((ref) {
+  final service = GcpSpeechService(ref.watch(secureStoreProvider));
+  ref.onDispose(service.dispose);
+  return service;
+});
+
 final appDatabaseProvider = Provider<AppDatabase>((ref) => AppDatabase());
+
+/// Bumped when schedules are created/edited/toggled/run so the list refreshes.
+final scheduledJobsTickProvider = StateProvider<int>((ref) => 0);
 
 final backgroundKeepAliveProvider = Provider<BackgroundKeepAlive>((ref) {
   return BackgroundKeepAlive();
@@ -72,6 +89,12 @@ final activeAcpSessionsProvider =
     return ActiveAcpSessions(
       ref.watch(appDatabaseProvider),
       keepAlive: ref.watch(backgroundKeepAliveProvider),
+      notifications: ref.watch(localNotificationServiceProvider),
+      isChatFocused: (chatId) {
+        final focused = ref.read(focusedChatIdProvider);
+        final foreground = ref.read(appInForegroundProvider);
+        return foreground && focused == chatId;
+      },
       onLocalChange: (chatId) {
         ref.read(agentDockServiceProvider).schedulePushChat(chatId);
         tick ??= Timer(const Duration(milliseconds: 700), () {
@@ -87,44 +110,86 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
   ActiveAcpSessions(
     this._db, {
     required BackgroundKeepAlive keepAlive,
+    required LocalNotificationService notifications,
+    required bool Function(String chatId) isChatFocused,
     this.onLocalChange,
   })  : _keepAlive = keepAlive,
+        _notifications = notifications,
+        _isChatFocused = isChatFocused,
         super({});
 
   final AppDatabase _db;
   final BackgroundKeepAlive _keepAlive;
+  final LocalNotificationService _notifications;
+  final bool Function(String chatId) _isChatFocused;
   final void Function(String chatId)? onLocalChange;
 
   final Map<String, Timer> _offsetTimers = {};
   final Map<String, int> _pendingOffsets = {};
+  final Map<String, Timer> _transcriptPushTimers = {};
 
   ChatSessionRuntime? get(String chatId) => state[chatId];
 
   AgentSession? sessionFor(String chatId) => state[chatId]?.session;
+
+  void _onRuntimeLocalChange(String chatId) {
+    onLocalChange?.call(chatId);
+    _scheduleTranscriptPush(chatId);
+  }
+
+  /// Debounced ADSM `transcript.sync` so host messages/*.jsonl stay complete.
+  void _scheduleTranscriptPush(String chatId) {
+    _transcriptPushTimers[chatId]?.cancel();
+    _transcriptPushTimers[chatId] = Timer(const Duration(seconds: 5), () {
+      _transcriptPushTimers.remove(chatId);
+      unawaited(state[chatId]?.pushTranscriptToHost());
+    });
+  }
 
   Future<ChatSessionRuntime> attach({
     required String chatId,
     required AgentSession session,
     Future<AgentSession> Function()? sessionFactory,
   }) async {
+    // Fold host-durable transcript into SQLite before the UI binds.
+    if (session is AdsmSession && session.hostTranscript.isNotEmpty) {
+      try {
+        await _db.mergeMessages(chatId, session.hostTranscript);
+      } catch (e) {
+        SafeLog.d('merge host transcript failed', e);
+      }
+    }
+
     final existing = state[chatId];
     if (existing != null) {
       if (sessionFactory != null) existing.sessionFactory = sessionFactory;
       existing.replaceSession(session);
       // Host/DB may have advanced while the bridge was down.
-      unawaited(existing.syncTranscriptFromDb());
+      unawaited(existing.pullHostTranscriptAndSync());
       state = {...state};
       _syncKeepAlive();
       return existing;
     }
 
-    final runtime = ChatSessionRuntime(
+    late final ChatSessionRuntime runtime;
+    runtime = ChatSessionRuntime(
       chatId: chatId,
       session: session,
       db: _db,
-      onLocalChange: onLocalChange,
+      onLocalChange: _onRuntimeLocalChange,
       onTransportReady: _onTransportReady,
       sessionFactory: sessionFactory,
+      onAssistantText: (snippet) {
+        final title = runtime.chatMeta?.title ?? 'Agent';
+        unawaited(
+          _notifications.notifyAssistantText(
+            chatId: chatId,
+            title: title,
+            snippet: snippet,
+            suppressBecauseFocused: _isChatFocused(chatId),
+          ),
+        );
+      },
     );
     await runtime.restoreOutboundQueue();
     final messages = await _db.listMessages(chatId);
@@ -133,6 +198,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     await runtime.rememberSessionId();
     state = {...state, chatId: runtime};
     runtime.resumeOutboundQueue();
+    // Push any local-only rows up so the host stays complete.
+    unawaited(runtime.pushTranscriptToHost());
     _syncKeepAlive();
     return runtime;
   }
@@ -199,6 +266,9 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     if (runtime == null) return;
     _offsetTimers.remove(chatId)?.cancel();
     _pendingOffsets.remove(chatId);
+    _transcriptPushTimers.remove(chatId)?.cancel();
+    // Final flush before tearing down the ADSM session.
+    unawaited(runtime.pushTranscriptToHost());
     await runtime.disposeRuntime();
     final next = Map<String, ChatSessionRuntime>.from(state)..remove(chatId);
     state = next;
@@ -211,6 +281,10 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     }
     _offsetTimers.clear();
     _pendingOffsets.clear();
+    for (final timer in _transcriptPushTimers.values) {
+      timer.cancel();
+    }
+    _transcriptPushTimers.clear();
     for (final runtime in state.values) {
       await runtime.disposeRuntime();
     }
@@ -224,6 +298,10 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       timer.cancel();
     }
     _offsetTimers.clear();
+    for (final timer in _transcriptPushTimers.values) {
+      timer.cancel();
+    }
+    _transcriptPushTimers.clear();
     super.dispose();
   }
 }
@@ -231,3 +309,30 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
 final hasSshKeyProvider = FutureProvider<bool>((ref) async {
   return ref.watch(secureStoreProvider).hasSshPrivateKey();
 });
+
+final scheduleSyncServiceProvider = Provider<ScheduleSyncService>((ref) {
+  return ScheduleSyncService(
+    db: ref.watch(appDatabaseProvider),
+    ssh: ref.watch(sshServiceProvider),
+    secureStore: ref.watch(secureStoreProvider),
+  );
+});
+
+final scheduleRunnerProvider = Provider<ScheduleRunner>((ref) {
+  final runner = ScheduleRunner(
+    db: ref.watch(appDatabaseProvider),
+    sync: ref.watch(scheduleSyncServiceProvider),
+    onJobsChanged: () {
+      ref.read(scheduledJobsTickProvider.notifier).state++;
+      ref.read(chatActivityTickProvider.notifier).state++;
+    },
+  );
+  ref.onDispose(runner.dispose);
+  return runner;
+});
+
+/// Chat currently open in the UI — used to suppress local notifications.
+final focusedChatIdProvider = StateProvider<String?>((ref) => null);
+
+/// True while the Flutter app is in the resumed lifecycle state.
+final appInForegroundProvider = StateProvider<bool>((ref) => true);

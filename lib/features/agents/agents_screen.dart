@@ -28,6 +28,7 @@ class AgentsTree {
 
 /// Local-only tree. Never touches the network, so the list paints immediately.
 final agentsTreeProvider = FutureProvider.autoDispose<AgentsTree>((ref) async {
+  ref.watch(chatActivityTickProvider);
   final db = ref.watch(appDatabaseProvider);
   final hosts = await db.listHosts();
   final repos = await db.listRepos();
@@ -212,6 +213,38 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     ref.invalidate(unreadCountsProvider);
   }
 
+  Future<void> _renameChat(Chat chat) async {
+    final controller = TextEditingController(text: chat.title);
+    final next = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rename agent'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Name'),
+          onSubmitted: (v) => Navigator.pop(context, v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    // Dialog disposed the field; copy before using.
+    if (next == null || next.isEmpty || next == chat.title) return;
+    final updated = chat.copyWith(title: next, updatedAt: DateTime.now());
+    await ref.read(appDatabaseProvider).upsertChat(updated);
+    ref.read(agentDockServiceProvider).schedulePushChat(chat.id);
+    ref.invalidate(agentsTreeProvider);
+  }
+
   Future<void> _openChat(Chat chat) async {
     await _markRead(chat);
     if (!mounted) return;
@@ -302,6 +335,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
                     repo: section.repo,
                   ),
                   onOpenChat: _openChat,
+                  onRenameChat: (chat) => unawaited(_renameChat(chat)),
                   onConfirmDeleteChat: (chat) =>
                       _confirmDeleteChat(section.host, chat),
                   onDeleteChat: (chat) =>
@@ -375,6 +409,7 @@ class _RepoSection extends StatelessWidget {
     required this.onToggle,
     required this.onNewAgent,
     required this.onOpenChat,
+    required this.onRenameChat,
     required this.onConfirmDeleteChat,
     required this.onDeleteChat,
     required this.onDismissChat,
@@ -389,6 +424,7 @@ class _RepoSection extends StatelessWidget {
   final VoidCallback onToggle;
   final VoidCallback onNewAgent;
   final void Function(Chat chat) onOpenChat;
+  final void Function(Chat chat) onRenameChat;
   final Future<bool> Function(Chat chat) onConfirmDeleteChat;
   final void Function(Chat chat) onDeleteChat;
   final void Function(Chat chat) onDismissChat;
@@ -446,6 +482,7 @@ class _RepoSection extends StatelessWidget {
                       runtime: runtimes[chat.id],
                       unread: unread[chat.id] ?? 0,
                       onTap: () => onOpenChat(chat),
+                      onRename: () => onRenameChat(chat),
                       onDelete: () async {
                         if (await onConfirmDeleteChat(chat)) {
                           onDeleteChat(chat);
@@ -612,6 +649,7 @@ class _AgentRow extends StatelessWidget {
     required this.unread,
     required this.onTap,
     required this.onDelete,
+    required this.onRename,
   });
 
   final Chat chat;
@@ -619,6 +657,7 @@ class _AgentRow extends StatelessWidget {
   final int unread;
   final VoidCallback onTap;
   final VoidCallback onDelete;
+  final VoidCallback onRename;
 
   @override
   Widget build(BuildContext context) {
@@ -642,6 +681,15 @@ class _AgentRow extends StatelessWidget {
       ),
       items: const [
         PopupMenuItem(
+          value: 'rename',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.edit_outlined),
+            title: Text('Rename'),
+          ),
+        ),
+        PopupMenuItem(
           value: 'delete',
           child: ListTile(
             dense: true,
@@ -652,6 +700,7 @@ class _AgentRow extends StatelessWidget {
         ),
       ],
     );
+    if (choice == 'rename') onRename();
     if (choice == 'delete') onDelete();
   }
 
@@ -691,20 +740,52 @@ class _AgentRow extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    chat.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight:
-                          hasUnread ? FontWeight.w600 : FontWeight.w400,
-                    ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          chat.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            fontWeight:
+                                hasUnread ? FontWeight.w600 : FontWeight.w400,
+                          ),
+                        ),
+                      ),
+                      if (chat.lastAutoNumber != null) ...[
+                        const SizedBox(width: 6),
+                        AutoNumberBadge(number: chat.lastAutoNumber!),
+                      ],
+                    ],
                   ),
-                  if (working)
-                    Text(
-                      'Working…',
-                      style: theme.textTheme.labelSmall
-                          ?.copyWith(color: theme.colorScheme.primary),
+                  if (working) ...[
+                    Builder(
+                      builder: (context) {
+                        final explore = runtime?.turnExploreStats;
+                        if (explore != null && explore.isNotEmpty) {
+                          return ExploreStatsLabel(
+                            files: explore.fileCount,
+                            searches: explore.searchCount,
+                          );
+                        }
+                        return Text(
+                          'Working…',
+                          style: theme.textTheme.labelSmall
+                              ?.copyWith(color: theme.colorScheme.primary),
+                        );
+                      },
+                    ),
+                  ],
+                  if ((runtime?.codeDelta.isNotEmpty ?? false) ||
+                      chat.linesAdded > 0 ||
+                      chat.linesRemoved > 0 ||
+                      chat.filesChanged > 0)
+                    CodeDeltaLabel(
+                      added: runtime?.codeDelta.added ?? chat.linesAdded,
+                      removed: runtime?.codeDelta.removed ?? chat.linesRemoved,
+                      files: runtime?.codeDelta.fileCount ?? chat.filesChanged,
+                      compact: true,
                     ),
                 ],
               ),

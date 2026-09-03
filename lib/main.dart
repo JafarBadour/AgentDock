@@ -30,6 +30,9 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
         await keep.init();
         await keep.ensureRunning();
       }());
+      unawaited(ref.read(localNotificationServiceProvider).init());
+      // Schedule runner polls due automated prompts while the app is alive.
+      ref.read(scheduleRunnerProvider).start();
     });
   }
 
@@ -43,19 +46,23 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     switch (state) {
       case AppLifecycleState.resumed:
+        ref.read(appInForegroundProvider.notifier).state = true;
         ref.read(sshServiceProvider).onAppResumed();
         ref.read(activeAcpSessionsProvider.notifier).resumeAll();
         unawaited(ref.read(agentDockServiceProvider).syncAllHostsCatalog());
         // Re-assert FGS in case the OEM killed the notification.
         unawaited(ref.read(backgroundKeepAliveProvider).ensureRunning());
+        unawaited(ref.read(scheduleRunnerProvider).tick());
       case AppLifecycleState.paused:
       case AppLifecycleState.hidden:
+        ref.read(appInForegroundProvider.notifier).state = false;
         unawaited(ref.read(agentDockServiceProvider).flushPendingPushes());
         if (!ref.read(backgroundKeepAliveProvider).canSurviveBackground) {
           ref.read(activeAcpSessionsProvider.notifier).suspendAll();
           ref.read(sshServiceProvider).onAppPaused();
         }
       case AppLifecycleState.detached:
+        ref.read(appInForegroundProvider.notifier).state = false;
         // Hand durable turns to the host, but leave the foreground service up
         // (stopWithTask=false) so the process can survive like a pedometer.
         unawaited(ref.read(agentDockServiceProvider).flushPendingPushes());

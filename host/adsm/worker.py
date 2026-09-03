@@ -8,10 +8,12 @@ import os
 import shlex
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from . import paths, protocol
+from . import transcript as transcript_store
 
 EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
 StatusFn = Callable[[str, str, Optional[str]], Awaitable[None]]
@@ -197,6 +199,10 @@ class Worker:
         self.load_session = False
         self.status = protocol.STATUS_DEAD
         self.last_error: Optional[str] = None
+        self.last_turn_text = ""
+        self._assistant_persisted = False
+        self._turn_user_id: Optional[str] = None
+        self._turn_assistant_id: Optional[str] = None
 
         self._fifo_write: Optional[asyncio.StreamWriter] = None
         self._fifo_fd: Optional[int] = None
@@ -294,12 +300,20 @@ class Worker:
                         await self.set_model(model_id)
                     except Exception as e:  # noqa: BLE001
                         self.last_error = f"set_model: {e}"
+                self._persist_catalog()
             else:
                 self.acp_session_id = effective
+                self._restore_catalog()
                 if model_id:
                     self.model_id = model_id
                 if mode:
                     self.mode = mode
+                # Re-attach after daemon restart leaves availableModels empty.
+                if not self.available_models and effective:
+                    try:
+                        await self._refresh_models_unlocked(mcp_servers or [])
+                    except Exception as e:  # noqa: BLE001
+                        self.last_error = f"refresh_models: {e}"
 
             await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
             await self._emit_event(
@@ -313,6 +327,103 @@ class Worker:
                 loadSession=self.load_session,
             )
             return self.snapshot()
+
+    async def refresh_models(
+        self, *, mcp_servers: Optional[list[Any]] = None
+    ) -> dict[str, Any]:
+        async with self._lock:
+            return await self._refresh_models_unlocked(mcp_servers or [])
+
+    async def _refresh_models_unlocked(
+        self, mcp_servers: list[Any]
+    ) -> dict[str, Any]:
+        """Populate availableModels via session/load (replay suppressed)."""
+        if self.available_models:
+            return self.snapshot()
+        self._restore_catalog()
+        if self.available_models:
+            return self.snapshot()
+
+        await self._attach_pipes()
+        sid = self.acp_session_id
+        if not sid:
+            sid_path = self.dir / "acp_session_id"
+            if sid_path.exists():
+                sid = sid_path.read_text(encoding="utf-8").strip() or None
+                self.acp_session_id = sid
+        if not sid:
+            return self.snapshot()
+
+        # session/load needs an initialized ACP peer; after a daemon restart
+        # the agent process is already up — initialize is usually a no-op /
+        # harmless, but ignore failures and still try load.
+        try:
+            await self._initialize()
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            await self._load_session(sid, mcp_servers)
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"refresh_models load: {e}"
+            # Last resort: some agents only advertise models on session/new.
+            # Do not call session/new here — that would wipe the conversation.
+
+        self._persist_catalog()
+        await self._emit_event(
+            "session",
+            acpSessionId=self.acp_session_id,
+            models=self.available_models,
+            modes=self.available_modes,
+            mode=self.mode,
+            modelId=self.model_id,
+            loadSession=self.load_session,
+        )
+        return self.snapshot()
+
+    def _catalog_path(self) -> Path:
+        return self.dir / "catalog.json"
+
+    def _persist_catalog(self) -> None:
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "availableModels": self.available_models,
+                "modelId": self.model_id,
+                "availableModes": self.available_modes,
+                "mode": self.mode,
+                "loadSession": self.load_session,
+            }
+            self._catalog_path().write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _restore_catalog(self) -> None:
+        path = self._catalog_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(data, dict):
+            return
+        models = data.get("availableModels")
+        if isinstance(models, list) and models:
+            self.available_models = [dict(m) for m in models if isinstance(m, dict)]
+        mid = data.get("modelId")
+        if mid:
+            self.model_id = str(mid)
+        modes = data.get("availableModes")
+        if isinstance(modes, list) and modes:
+            self.available_modes = [str(m) for m in modes]
+        mode = data.get("mode")
+        if mode:
+            self.mode = str(mode)
+        if "loadSession" in data:
+            self.load_session = bool(data.get("loadSession"))
 
     async def _attach_pipes(self) -> None:
         if self._attached and self._fifo_write is not None:
@@ -520,6 +631,7 @@ class Worker:
         cur = models.get("currentModelId") or models.get("current_model_id")
         if cur is not None:
             self.model_id = str(cur)
+        self._persist_catalog()
 
     def _apply_modes(self, modes: Any) -> None:
         if not isinstance(modes, dict):
@@ -561,9 +673,52 @@ class Worker:
         )
         self.model_id = model_id
 
-    async def prompt(self, text: str) -> dict[str, Any]:
+    async def prompt(
+        self,
+        text: str,
+        images: Optional[list] = None,
+        *,
+        user_message_id: Optional[str] = None,
+        user_created_at: Optional[str] = None,
+    ) -> dict[str, Any]:
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
+        blocks: list[dict[str, Any]] = []
+        for img in images or []:
+            if not isinstance(img, dict):
+                continue
+            data = img.get("data")
+            mime = img.get("mimeType") or img.get("mime_type") or "image/jpeg"
+            if not data:
+                continue
+            blocks.append(
+                {
+                    "type": "image",
+                    "mimeType": str(mime),
+                    "data": str(data),
+                }
+            )
+        if text:
+            blocks.append({"type": "text", "text": text})
+        if not blocks:
+            raise ValueError("empty prompt")
+        self.last_turn_text = ""
+        self._assistant_persisted = False
+        self._turn_assistant_id = str(uuid.uuid4())
+        self._turn_user_id = user_message_id or str(uuid.uuid4())
+        # Persist the user turn on the host so reconnects see it even if the
+        # phone never flushed SQLite / SSH push.
+        try:
+            if text.strip():
+                transcript_store.append_message(
+                    self.chat_id,
+                    role="user",
+                    content=text,
+                    message_id=self._turn_user_id,
+                    created_at=user_created_at,
+                )
+        except Exception:  # noqa: BLE001
+            pass
         await self._set_status(self.chat_id, protocol.STATUS_RUNNING, None)
         await self._emit_event("status", status=protocol.STATUS_RUNNING)
         try:
@@ -571,7 +726,7 @@ class Worker:
                 "session/prompt",
                 {
                     "sessionId": self.acp_session_id,
-                    "prompt": [{"type": "text", "text": text}],
+                    "prompt": blocks,
                 },
                 timeout=600.0,
             )
@@ -580,17 +735,36 @@ class Worker:
                 if isinstance(result, dict)
                 else "end_turn"
             )
+            self._persist_assistant_turn()
             await self._emit_event("turn_complete", reason=stop or "end_turn")
             await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
             await self._emit_event("status", status=protocol.STATUS_IDLE)
             return result if isinstance(result, dict) else {"stopReason": "end_turn"}
         except Exception as e:  # noqa: BLE001
             self.last_error = str(e)
+            self._persist_assistant_turn()
             await self._set_status(
                 self.chat_id, protocol.STATUS_ERROR, str(e)
             )
             await self._emit_event("error", text=str(e))
             raise
+
+    def _persist_assistant_turn(self) -> None:
+        if self._assistant_persisted:
+            return
+        text = (self.last_turn_text or "").strip()
+        if not text:
+            return
+        try:
+            transcript_store.append_message(
+                self.chat_id,
+                role="assistant",
+                content=text,
+                message_id=self._turn_assistant_id or str(uuid.uuid4()),
+            )
+            self._assistant_persisted = True
+        except Exception:  # noqa: BLE001
+            pass
 
     async def cancel(self) -> None:
         if not self.acp_session_id:
@@ -608,6 +782,7 @@ class Worker:
             fut = self._pending[key]
             if not fut.done():
                 fut.set_result({"stopReason": "cancelled"})
+        self._persist_assistant_turn()
         await self._emit_event("turn_complete", reason="cancelled")
         await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
 
@@ -729,6 +904,7 @@ class Worker:
             state = str(update.get("state") or "").lower()
             stop = str(update.get("stopReason") or update.get("stop_reason") or "")
             if state == "idle" or stop:
+                self._persist_assistant_turn()
                 await self._emit_event(
                     "turn_complete", reason=stop or "end_turn"
                 )
@@ -742,6 +918,7 @@ class Worker:
 
         bare = update.get("stopReason") or update.get("stop_reason")
         if bare:
+            self._persist_assistant_turn()
             await self._emit_event("turn_complete", reason=str(bare))
             return
 
@@ -760,6 +937,8 @@ class Worker:
         ):
             text = _extract_text(update)
             if text:
+                self.last_turn_text = (self.last_turn_text or "") + text
+                await self._emit_event("activity", label="Writing")
                 await self._emit_event("text", text=text)
             return
 
@@ -936,4 +1115,5 @@ def _parse_tool(update: dict[str, Any]) -> Optional[dict[str, Any]]:
         "locations": locations,
         "rawInput": nested.get("rawInput") or update.get("rawInput"),
         "rawOutput": nested.get("rawOutput") or update.get("rawOutput"),
+        "content": nested.get("content") or update.get("content"),
     }

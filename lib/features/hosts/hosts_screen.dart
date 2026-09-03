@@ -29,7 +29,9 @@ class HostsScreen extends ConsumerWidget {
             data: (ok) => ok
                 ? const SizedBox.shrink()
                 : MaterialBanner(
-                    content: const Text('Add an SSH private key in Connect before testing hosts.'),
+                    content: const Text(
+                      'Add an SSH private key in Connect before testing hosts.',
+                    ),
                     actions: [
                       TextButton(
                         onPressed: () => context.go('/connect'),
@@ -45,7 +47,9 @@ class HostsScreen extends ConsumerWidget {
               data: (hosts) {
                 if (hosts.isEmpty) {
                   return const Center(
-                    child: Text('No hosts yet. Add a remote like an SSH config entry.'),
+                    child: Text(
+                      'No hosts yet. Add a remote like an SSH config entry.',
+                    ),
                   );
                 }
                 final byId = {for (final h in hosts) h.id: h};
@@ -57,24 +61,37 @@ class HostsScreen extends ConsumerWidget {
                     final jump = host.jumpHostId == null
                         ? null
                         : byId[host.jumpHostId!];
-                    final via = jump == null ? null : ' via ${jump.displayLabel}';
+                    final via =
+                        jump == null ? null : ' via ${jump.displayLabel}';
                     return ListTile(
                       title: Text(host.displayLabel),
-                      subtitle: Text('${host.endpointLabel}${via ?? ''}'),
+                      subtitle: Text(
+                        '${host.endpointLabel}${via ?? ''}\n'
+                        'Tap repos · terminal opens SSH shell',
+                      ),
+                      isThreeLine: true,
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           IconButton(
                             tooltip: 'Open terminal',
                             icon: const Icon(Icons.terminal),
+                            onPressed: () => context.push(
+                              '/hosts/terminal/${host.id}',
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Edit host',
+                            icon: const Icon(Icons.edit_outlined),
                             onPressed: () =>
-                                context.push('/terminal/session/${host.id}'),
+                                context.push('/hosts/edit/${host.id}'),
                           ),
                           const Icon(Icons.chevron_right),
                         ],
                       ),
                       onTap: () => context.push('/hosts/${host.id}/repos'),
-                      onLongPress: () => context.push('/hosts/edit/${host.id}'),
+                      onLongPress: () =>
+                          context.push('/hosts/edit/${host.id}'),
                     );
                   },
                 );

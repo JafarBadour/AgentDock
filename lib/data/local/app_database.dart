@@ -10,6 +10,7 @@ import '../models/chat_message.dart';
 import '../models/host.dart';
 import '../models/mcp_server.dart';
 import '../models/repo.dart';
+import '../models/scheduled_job.dart';
 
 /// Local metadata only — never stores secrets.
 class AppDatabase {
@@ -32,7 +33,7 @@ class AppDatabase {
         p.join((await getApplicationDocumentsDirectory()).path, 'agentic_phone.db');
     return openDatabase(
       path,
-      version: 8,
+      version: 12,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -70,6 +71,10 @@ CREATE TABLE chats (
   journal_offset INTEGER NOT NULL DEFAULT 0,
   model_id TEXT,
   last_read_at TEXT,
+  last_auto_number INTEGER,
+  lines_added INTEGER NOT NULL DEFAULT 0,
+  lines_removed INTEGER NOT NULL DEFAULT 0,
+  files_changed INTEGER NOT NULL DEFAULT 0,
   outbound_queue TEXT,
   status TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +95,7 @@ CREATE TABLE messages (
         await db.execute('CREATE INDEX idx_chats_repo ON chats(repo_id)');
         await db.execute('CREATE INDEX idx_messages_chat ON messages(chat_id)');
         await _createMcpTables(db);
+        await _createScheduledJobsTable(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -118,8 +124,105 @@ CREATE TABLE messages (
         if (oldVersion < 8) {
           await db.execute('ALTER TABLE chats ADD COLUMN outbound_queue TEXT');
         }
+        if (oldVersion < 9) {
+          await _createScheduledJobsTable(db);
+        }
+        if (oldVersion < 10) {
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN last_auto_number INTEGER',
+          );
+          await _ensureScheduledJobNumbers(db);
+        }
+        if (oldVersion < 11) {
+          await _addScheduledJobHostFields(db);
+        }
+        if (oldVersion < 12) {
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN lines_added INTEGER NOT NULL DEFAULT 0',
+          );
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN lines_removed INTEGER NOT NULL DEFAULT 0',
+          );
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN files_changed INTEGER NOT NULL DEFAULT 0',
+          );
+        }
       },
     );
+  }
+
+  static Future<void> _createScheduledJobsTable(Database db) async {
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+  id TEXT PRIMARY KEY NOT NULL,
+  number INTEGER NOT NULL DEFAULT 0,
+  title TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  interval_minutes INTEGER,
+  hour INTEGER,
+  minute INTEGER,
+  weekdays TEXT,
+  next_run_at TEXT NOT NULL,
+  last_run_at TEXT,
+  last_error TEXT,
+  done_prompt TEXT,
+  context_summary TEXT,
+  repeat_until_done INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+)''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next '
+      'ON scheduled_jobs(enabled, next_run_at)',
+    );
+  }
+
+  static Future<void> _addScheduledJobHostFields(Database db) async {
+    final info = await db.rawQuery('PRAGMA table_info(scheduled_jobs)');
+    final names = {for (final c in info) c['name'] as String?};
+    if (!names.contains('done_prompt')) {
+      await db.execute('ALTER TABLE scheduled_jobs ADD COLUMN done_prompt TEXT');
+    }
+    if (!names.contains('context_summary')) {
+      await db.execute(
+        'ALTER TABLE scheduled_jobs ADD COLUMN context_summary TEXT',
+      );
+    }
+    if (!names.contains('repeat_until_done')) {
+      await db.execute(
+        'ALTER TABLE scheduled_jobs ADD COLUMN repeat_until_done '
+        'INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+  }
+
+  /// Adds [number] if missing (v9 installs) and backfills 1…N by created_at.
+  static Future<void> _ensureScheduledJobNumbers(Database db) async {
+    final info = await db.rawQuery('PRAGMA table_info(scheduled_jobs)');
+    final hasNumber = info.any((c) => c['name'] == 'number');
+    if (!hasNumber) {
+      await db.execute(
+        'ALTER TABLE scheduled_jobs ADD COLUMN number INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    final rows = await db.query(
+      'scheduled_jobs',
+      orderBy: 'created_at ASC',
+    );
+    for (var i = 0; i < rows.length; i++) {
+      final current = rows[i]['number'] as int? ?? 0;
+      if (current > 0) continue;
+      await db.update(
+        'scheduled_jobs',
+        {'number': i + 1},
+        where: 'id = ?',
+        whereArgs: [rows[i]['id']],
+      );
+    }
   }
 
   static Future<void> _addSortOrderColumns(Database db) async {
@@ -404,7 +507,7 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     // snapshot rewind the read watermark or wipe the outbound queue.
     final existing = await db.query(
       'chats',
-      columns: ['last_read_at', 'outbound_queue'],
+      columns: ['last_read_at', 'outbound_queue', 'last_auto_number'],
       where: 'id = ?',
       whereArgs: [chat.id],
     );
@@ -416,6 +519,10 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
         row['last_read_at'] = current;
       }
       row['outbound_queue'] = existing.first['outbound_queue'];
+      // Keep the automation badge unless this write explicitly sets one.
+      if (row['last_auto_number'] == null) {
+        row['last_auto_number'] = existing.first['last_auto_number'];
+      }
     }
     await db.insert('chats', row, conflictAlgorithm: ConflictAlgorithm.replace);
   }
@@ -477,6 +584,20 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     return rows.map(ChatMessage.fromMap).toList();
   }
 
+  Future<int> countMessages(String chatId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?',
+      [chatId],
+    );
+    return (rows.first['n'] as int?) ?? 0;
+  }
+
+  Future<void> clearMessages(String chatId) async {
+    final db = await database;
+    await db.delete('messages', where: 'chat_id = ?', whereArgs: [chatId]);
+  }
+
   Future<void> insertMessage(ChatMessage message) async {
     final db = await database;
     await db.insert('messages', message.toMap());
@@ -529,7 +650,8 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   ///
   /// New ids are inserted. For ids we already have, the longer body wins —
   /// that covers assistant checkpoints growing on another device while this
-  /// one still holds the truncated copy.
+  /// one still holds the truncated copy. Identical role+content with a
+  /// different id (phone vs ADSM) is skipped to avoid duplicate bubbles.
   Future<int> mergeMessages(String chatId, List<ChatMessage> incoming) async {
     if (incoming.isEmpty) return 0;
     final db = await database;
@@ -543,14 +665,25 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
       final byId = {
         for (final row in existing) row['id']! as String: row,
       };
+      final contentKeys = <String>{
+        for (final row in existing)
+          '${row['role']}|${row['content']}',
+      };
       for (final m in incoming) {
         final prev = byId[m.id];
         if (prev == null) {
+          final key = '${m.role.name}|${m.content}';
+          if (contentKeys.contains(key)) {
+            // Same bubble already present under another id.
+            continue;
+          }
           await txn.insert(
             'messages',
             m.toMap(),
             conflictAlgorithm: ConflictAlgorithm.ignore,
           );
+          byId[m.id] = m.toMap();
+          contentKeys.add(key);
           changed++;
           continue;
         }
@@ -562,6 +695,8 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
             where: 'id = ?',
             whereArgs: [m.id],
           );
+          contentKeys.remove('${m.role.name}|$prevContent');
+          contentKeys.add('${m.role.name}|${m.content}');
           changed++;
         }
       }
@@ -699,5 +834,58 @@ GROUP BY m.chat_id
     if (enabledIds.isEmpty) return const [];
     final all = await listMcpServers();
     return all.where((m) => enabledIds.contains(m.id)).toList();
+  }
+
+  Future<List<ScheduledJob>> listScheduledJobs() async {
+    final db = await database;
+    final rows = await db.query(
+      'scheduled_jobs',
+      orderBy: 'number ASC, created_at ASC',
+    );
+    return rows.map(ScheduledJob.fromMap).toList();
+  }
+
+  Future<List<ScheduledJob>> listDueScheduledJobs(DateTime now) async {
+    final db = await database;
+    final rows = await db.query(
+      'scheduled_jobs',
+      where: 'enabled = 1 AND next_run_at <= ?',
+      whereArgs: [now.toIso8601String()],
+      orderBy: 'next_run_at ASC',
+    );
+    return rows.map(ScheduledJob.fromMap).toList();
+  }
+
+  Future<ScheduledJob?> getScheduledJob(String id) async {
+    final db = await database;
+    final rows = await db.query(
+      'scheduled_jobs',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    if (rows.isEmpty) return null;
+    return ScheduledJob.fromMap(rows.first);
+  }
+
+  Future<int> nextScheduledJobNumber() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT COALESCE(MAX(number), 0) + 1 AS n FROM scheduled_jobs',
+    );
+    return (rows.first['n'] as int?) ?? 1;
+  }
+
+  Future<void> upsertScheduledJob(ScheduledJob job) async {
+    final db = await database;
+    await db.insert(
+      'scheduled_jobs',
+      job.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> deleteScheduledJob(String id) async {
+    final db = await database;
+    await db.delete('scheduled_jobs', where: 'id = ?', whereArgs: [id]);
   }
 }
