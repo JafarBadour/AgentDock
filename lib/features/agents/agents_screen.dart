@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
+import '../../data/models/code_change_stats.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/secure/safe_log.dart';
@@ -777,15 +778,30 @@ class _AgentRow extends StatelessWidget {
                       },
                     ),
                   ],
-                  if ((runtime?.codeDelta.isNotEmpty ?? false) ||
-                      chat.linesAdded > 0 ||
-                      chat.linesRemoved > 0 ||
-                      chat.filesChanged > 0)
-                    CodeDeltaLabel(
-                      added: runtime?.codeDelta.added ?? chat.linesAdded,
-                      removed: runtime?.codeDelta.removed ?? chat.linesRemoved,
-                      files: runtime?.codeDelta.fileCount ?? chat.filesChanged,
-                      compact: true,
+                  if (() {
+                    final d = CodeChangeStats.mergeDisplay(
+                      live: runtime?.codeDelta,
+                      persistedAdded: chat.linesAdded,
+                      persistedRemoved: chat.linesRemoved,
+                      persistedFiles: chat.filesChanged,
+                    );
+                    return d.added > 0 || d.removed > 0 || d.files > 0;
+                  }())
+                    Builder(
+                      builder: (context) {
+                        final d = CodeChangeStats.mergeDisplay(
+                          live: runtime?.codeDelta,
+                          persistedAdded: chat.linesAdded,
+                          persistedRemoved: chat.linesRemoved,
+                          persistedFiles: chat.filesChanged,
+                        );
+                        return CodeDeltaLabel(
+                          added: d.added,
+                          removed: d.removed,
+                          files: d.files,
+                          compact: true,
+                        );
+                      },
                     ),
                 ],
               ),

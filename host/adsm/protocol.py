@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Mapping, Optional
 
 # Bump when the wire protocol or daemon behaviour changes in a way the
 # phone must pick up (install script restarts the daemon on mismatch).
-VERSION = "0.4.0"
+VERSION = "0.4.2"
+
+# asyncio StreamReader.readline default is 64 KiB. Prompts with images and
+# transcript.sync payloads routinely exceed that and used to kill the client
+# with LimitOverrunError — which looks like the agent "dying" mid-send.
+STREAM_LIMIT = 16 * 1024 * 1024
+
+# Phone splits oversized RPCs into `rpc.chunk` lines under this size so SSH /
+# stdio bridges and older readers never see a giant single line.
+CHUNK_SOFT_LIMIT = 48 * 1024
+CHUNK_METHOD = "rpc.chunk"
 
 
 def encode(obj: Mapping[str, Any]) -> bytes:
@@ -24,6 +35,22 @@ def decode_line(line: str) -> Optional[dict[str, Any]]:
     if not isinstance(data, dict):
         raise ValueError("ADSM message must be a JSON object")
     return data
+
+
+def assemble_chunk_payload(parts: list[str], encoding: str = "base64") -> dict[str, Any]:
+    """Join `rpc.chunk` data parts back into the original request object."""
+    blob = "".join(parts)
+    if encoding == "base64":
+        raw = base64.b64decode(blob.encode("ascii"))
+        text = raw.decode("utf-8")
+    elif encoding in ("utf-8", "plain", ""):
+        text = blob
+    else:
+        raise ValueError(f"unsupported rpc.chunk encoding: {encoding}")
+    msg = decode_line(text)
+    if msg is None:
+        raise ValueError("empty reassembled rpc.chunk payload")
+    return msg
 
 
 def ok(req_id: Any, result: Any = None) -> dict[str, Any]:

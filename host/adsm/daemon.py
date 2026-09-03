@@ -21,6 +21,8 @@ class Daemon:
         self._subscribers: dict[str, set[asyncio.StreamWriter]] = {}
         self._global_subscribers: set[asyncio.StreamWriter] = set()
         self._event_log: dict[str, list[dict[str, Any]]] = {}
+        # In-flight `rpc.chunk` transfers: (writer_id, req_id) → buffer.
+        self._chunk_bufs: dict[tuple[int, Any], dict[str, Any]] = {}
         self._server: Optional[asyncio.AbstractServer] = None
         self.scheduler = scheduler.Scheduler(self)
 
@@ -34,7 +36,9 @@ class Daemon:
                 pass
 
         self._server = await asyncio.start_unix_server(
-            self._on_client, path=str(sock)
+            self._on_client,
+            path=str(sock),
+            limit=protocol.STREAM_LIMIT,
         )
         try:
             os.chmod(sock, 0o600)
@@ -167,13 +171,32 @@ class Daemon:
         self._global_subscribers.discard(writer)
         for s in self._subscribers.values():
             s.discard(writer)
+        wid = id(writer)
+        stale = [k for k in self._chunk_bufs if k[0] == wid]
+        for k in stale:
+            self._chunk_bufs.pop(k, None)
 
     async def _on_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ValueError as e:
+                    # Still oversized relative to the reader limit — drop the
+                    # client cleanly instead of taking down the task uncaught.
+                    writer.write(
+                        protocol.encode(
+                            protocol.err(
+                                None,
+                                -32600,
+                                f"NDJSON line too large: {e}",
+                            )
+                        )
+                    )
+                    await writer.drain()
+                    break
                 if not line:
                     break
                 try:
@@ -205,6 +228,23 @@ class Daemon:
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
         try:
+            if method == protocol.CHUNK_METHOD:
+                try:
+                    assembled = self._ingest_chunk(writer, params)
+                except Exception as e:  # noqa: BLE001
+                    rid = params.get("reqId")
+                    self._chunk_bufs.pop((id(writer), rid), None)
+                    writer.write(
+                        protocol.encode(protocol.err(rid, -32000, str(e)))
+                    )
+                    await writer.drain()
+                    return
+                if assembled is None:
+                    # Intermediate chunk — no reply until the transfer completes.
+                    return
+                await self._dispatch(assembled, writer)
+                return
+
             if method == "ping":
                 result: Any = {"ok": True, "version": protocol.VERSION}
             elif method == "daemon.status":
@@ -268,6 +308,49 @@ class Daemon:
                 protocol.encode(protocol.err(req_id, -32000, str(e)))
             )
             await writer.drain()
+
+    def _ingest_chunk(
+        self, writer: asyncio.StreamWriter, params: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Buffer an `rpc.chunk` piece; return the full request when complete."""
+        req_id = params.get("reqId")
+        if req_id is None:
+            raise ValueError("rpc.chunk missing reqId")
+        try:
+            index = int(params.get("i"))
+            total = int(params.get("n"))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"rpc.chunk bad i/n: {e}") from e
+        if total < 1 or index < 0 or index >= total:
+            raise ValueError(f"rpc.chunk out of range i={index} n={total}")
+        data = params.get("data")
+        if not isinstance(data, str):
+            raise ValueError("rpc.chunk data must be a string")
+        encoding = str(params.get("encoding") or "base64")
+
+        key = (id(writer), req_id)
+        buf = self._chunk_bufs.get(key)
+        if buf is None:
+            buf = {
+                "n": total,
+                "encoding": encoding,
+                "parts": [None] * total,
+            }
+            self._chunk_bufs[key] = buf
+        elif buf["n"] != total:
+            self._chunk_bufs.pop(key, None)
+            raise ValueError("rpc.chunk n mismatch mid-transfer")
+
+        parts: list[Any] = buf["parts"]
+        parts[index] = data
+        if any(p is None for p in parts):
+            return None
+
+        self._chunk_bufs.pop(key, None)
+        return protocol.assemble_chunk_payload(
+            [str(p) for p in parts],
+            encoding=str(buf.get("encoding") or encoding),
+        )
 
     def _worker(self, chat_id: str) -> Worker:
         w = self.workers.get(chat_id)

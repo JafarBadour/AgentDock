@@ -56,7 +56,8 @@ def _daemon_alive() -> bool:
 async def _ping_ok() -> bool:
     try:
         reader, writer = await asyncio.open_unix_connection(
-            path=str(paths.socket_path())
+            path=str(paths.socket_path()),
+            limit=protocol.STREAM_LIMIT,
         )
     except Exception:  # noqa: BLE001
         return False
@@ -128,7 +129,8 @@ async def _status() -> int:
         return 1
     try:
         reader, writer = await asyncio.open_unix_connection(
-            path=str(paths.socket_path())
+            path=str(paths.socket_path()),
+            limit=protocol.STREAM_LIMIT,
         )
     except Exception as e:  # noqa: BLE001
         print(f"ADSM unreachable: {e}")
@@ -152,7 +154,10 @@ async def _client() -> int:
         # Best-effort auto-start.
         _ensure_running(sys.executable)
     try:
-        reader, writer = await asyncio.open_unix_connection(path=str(sock))
+        reader, writer = await asyncio.open_unix_connection(
+            path=str(sock),
+            limit=protocol.STREAM_LIMIT,
+        )
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"ADSM connect failed: {e}\n")
         return 1

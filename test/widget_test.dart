@@ -180,6 +180,18 @@ void main() {
         classifySshFailure(SSHSocketError('reset')).isFatal,
         isFalse,
       );
+      expect(
+        classifySshFailure(StateError('ADSM channel closed')),
+        SshFailureKind.network,
+      );
+      expect(
+        isTransientBridgeError(StateError('ADSM channel closed')),
+        isTrue,
+      );
+      expect(
+        isTransientBridgeErrorText('Bad state: ADSM channel closed'),
+        isTrue,
+      );
     });
   });
 

@@ -19,8 +19,12 @@ class GcpSpeechService {
   String? _activePath;
   bool _recording = false;
 
-  /// Flash is multimodal, cheap, and accepts inline WAV under the request limit.
-  static const _model = 'gemini-2.0-flash';
+  /// Prefer current Flash models; fall back if a key's project lags.
+  static const _models = <String>[
+    'gemini-2.5-flash',
+    'gemini-flash-latest',
+    'gemini-2.0-flash',
+  ];
 
   bool get isRecording => _recording;
 
@@ -45,7 +49,6 @@ class GcpSpeechService {
         encoder: AudioEncoder.wav,
         sampleRate: 16000,
         numChannels: 1,
-        bitRate: 256000,
       ),
       path: path,
     );
@@ -68,8 +71,8 @@ class GcpSpeechService {
         throw StateError('Recording file missing.');
       }
       final bytes = await file.readAsBytes();
-      if (bytes.isEmpty) {
-        throw StateError('Recording was empty.');
+      if (bytes.length < 44) {
+        throw StateError('Recording was empty — hold longer and try again.');
       }
       return await _recognize(bytes);
     } finally {
@@ -99,9 +102,46 @@ class GcpSpeechService {
     }
     final language = await _store.readGcpSpeechLanguage();
 
+    Object? lastError;
+    for (final model in _models) {
+      try {
+        return await _recognizeWithModel(
+          apiKey: apiKey,
+          model: model,
+          language: language,
+          wavBytes: wavBytes,
+        );
+      } catch (e) {
+        lastError = e;
+        SafeLog.d('Gemini STT $model failed', e);
+        // Auth / quota — no point trying other models.
+        final msg = e.toString().toLowerCase();
+        if (msg.contains('api key') ||
+            msg.contains('permission') ||
+            msg.contains('403') ||
+            msg.contains('401') ||
+            msg.contains('quota') ||
+            msg.contains('billing')) {
+          rethrow;
+        }
+      }
+    }
+    throw StateError(
+      lastError == null
+          ? 'Speech-to-text failed.'
+          : _friendlyError(lastError),
+    );
+  }
+
+  Future<String> _recognizeWithModel({
+    required String apiKey,
+    required String model,
+    required String language,
+    required Uint8List wavBytes,
+  }) async {
     final uri = Uri.https(
       'generativelanguage.googleapis.com',
-      '/v1beta/models/$_model:generateContent',
+      '/v1beta/models/$model:generateContent',
       {'key': apiKey},
     );
 
@@ -111,6 +151,7 @@ class GcpSpeechService {
         'Return only the transcript — no quotes, labels, or commentary. '
         'If there is no intelligible speech, return an empty string.';
 
+    // REST uses proto-JSON snake_case for Blob fields.
     final body = jsonEncode({
       'contents': [
         {
@@ -118,8 +159,8 @@ class GcpSpeechService {
           'parts': [
             {'text': prompt},
             {
-              'inlineData': {
-                'mimeType': 'audio/wav',
+              'inline_data': {
+                'mime_type': 'audio/wav',
                 'data': base64Encode(wavBytes),
               },
             },
@@ -129,6 +170,9 @@ class GcpSpeechService {
       'generationConfig': {
         'temperature': 0,
         'maxOutputTokens': 2048,
+        // 2.5+ Flash spends output budget on "thinking" by default — a short
+        // transcript can come back empty unless we turn that off.
+        'thinkingConfig': {'thinkingBudget': 0},
       },
     });
 
@@ -142,24 +186,58 @@ class GcpSpeechService {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       SafeLog.d('Gemini STT HTTP ${response.statusCode}: ${response.body}');
-      String detail = response.body;
-      try {
-        final err = jsonDecode(response.body);
-        if (err is Map && err['error'] is Map) {
-          detail = (err['error'] as Map)['message']?.toString() ?? detail;
-        }
-      } catch (_) {}
-      throw StateError('Speech-to-text failed: $detail');
+      throw StateError(_httpDetail(response.statusCode, response.body));
     }
 
     return _extractText(response.body).trim();
   }
 
+  static String _httpDetail(int status, String body) {
+    String detail = body;
+    try {
+      final err = jsonDecode(body);
+      if (err is Map && err['error'] is Map) {
+        detail = (err['error'] as Map)['message']?.toString() ?? detail;
+      }
+    } catch (_) {}
+    if (status == 400 && detail.toLowerCase().contains('api key')) {
+      return 'Invalid Gemini API key — paste a key from aistudio.google.com in Connect.';
+    }
+    if (status == 403 || status == 401) {
+      return 'Gemini rejected the API key (HTTP $status). Check Connect → Gemini key.';
+    }
+    if (status == 404) {
+      return 'Gemini model not available for this key (HTTP 404).';
+    }
+    if (detail.length > 240) detail = '${detail.substring(0, 240)}…';
+    return 'Speech-to-text failed (HTTP $status): $detail';
+  }
+
+  static String _friendlyError(Object error) {
+    final raw = error.toString();
+    const prefix = 'Bad state: ';
+    if (raw.startsWith(prefix)) return raw.substring(prefix.length);
+    return raw;
+  }
+
+  /// Strip Dart's `Bad state:` prefix for snackbars.
+  static String userFacingMessage(Object error) => _friendlyError(error);
+
   static String _extractText(String responseBody) {
     final decoded = jsonDecode(responseBody);
     if (decoded is! Map) return '';
     final candidates = decoded['candidates'];
-    if (candidates is! List || candidates.isEmpty) return '';
+    if (candidates is! List || candidates.isEmpty) {
+      // Often blocked / empty audio — treat as no speech rather than a hard fail.
+      final feedback = decoded['promptFeedback'];
+      if (feedback is Map) {
+        final reason = feedback['blockReason']?.toString();
+        if (reason != null && reason.isNotEmpty) {
+          throw StateError('Speech blocked by Gemini ($reason).');
+        }
+      }
+      return '';
+    }
     final first = candidates.first;
     if (first is! Map) return '';
     final content = first['content'];

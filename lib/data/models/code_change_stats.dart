@@ -20,15 +20,32 @@ class CodeChangeStats {
 
   int get fileCount => files.length;
 
+  /// Prefer live tool totals, but never drop already-persisted session totals.
+  static ({int added, int removed, int files}) mergeDisplay({
+    CodeChangeStats? live,
+    int persistedAdded = 0,
+    int persistedRemoved = 0,
+    int persistedFiles = 0,
+  }) {
+    final a = live?.added ?? 0;
+    final r = live?.removed ?? 0;
+    final f = live?.fileCount ?? 0;
+    return (
+      added: a > persistedAdded ? a : persistedAdded,
+      removed: r > persistedRemoved ? r : persistedRemoved,
+      files: f > persistedFiles ? f : persistedFiles,
+    );
+  }
+
   CodeChangeStats operator +(CodeChangeStats other) => CodeChangeStats(
         added: added + other.added,
         removed: removed + other.removed,
         files: {...files, ...other.files},
       );
 
-  /// `Delta +4356 -265 | 45 φ`
+  /// `Δ +4356 -265 | 45 φ`
   String get label {
-    final parts = <String>['Delta'];
+    final parts = <String>['Δ'];
     parts.add('+$added');
     parts.add('-$removed');
     if (fileCount > 0) {

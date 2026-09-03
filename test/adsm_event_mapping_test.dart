@@ -24,6 +24,7 @@ void main() {
       expect(AcpUpdate.delta('x').kind, AcpUpdateKind.delta);
       expect(AcpUpdate.thought('t').kind, AcpUpdateKind.thought);
       expect(AcpUpdate.turnComplete().kind, AcpUpdateKind.turnComplete);
+      expect(AcpUpdate.activity('Thinking').kind, AcpUpdateKind.activity);
       expect(
         AcpUpdate.toolCall(
           const ToolCallState(toolCallId: '1', title: 'T'),

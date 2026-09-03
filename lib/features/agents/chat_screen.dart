@@ -17,6 +17,7 @@ import '../../data/models/agent_model.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/chat_message.dart';
+import '../../data/models/code_change_stats.dart';
 import '../../data/models/host.dart';
 import '../../data/models/prompt_image.dart';
 import '../../data/models/repo.dart';
@@ -28,6 +29,7 @@ import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
 import '../../services/chat_session_runtime.dart';
 import '../../services/cursor_acp_service.dart';
+import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
@@ -414,7 +416,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
       _mode = runtime.mode;
       _permission = runtime.permissionPolicy;
-      if (runtime.lastError != null && runtime.closed) {
+      // Auto-reconnect clears runtime.lastError, but this screen used to copy
+      // "ADSM channel closed" into sticky [_error] and keep it after · live.
+      if (runtime.reconnecting || !runtime.closed) {
+        if (_error != null && isTransientBridgeErrorText(_error!)) {
+          _error = null;
+        }
+        if (runtime.lastError != null &&
+            isTransientBridgeErrorText(runtime.lastError!)) {
+          runtime.lastError = null;
+        }
+      } else if (runtime.lastError != null &&
+          !isTransientBridgeErrorText(runtime.lastError!)) {
         _error = runtime.lastError;
       }
       final n = runtime.entries.length;
@@ -675,13 +688,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (mounted) {
         final isClaude = chat.provider == AgentProvider.claude;
         final isAdsm = e.tool.toUpperCase().contains('ADSM');
+        final mismatch = e.installHint.toLowerCase().contains('adsm mismatch');
         setState(() {
           _showSdkInstallGuide = true;
           _error = isAdsm
-              ? 'Could not install ADSM on ${host.displayLabel}.\n'
-                  'Agent Dock tried automatically — run the setup below on the '
-                  'remote, then Connect again.\n\n'
-                  '${e.tool} still missing.'
+              ? (mismatch
+                  ? 'ADSM mismatch — cannot run until the host matches this app '
+                      '(needs v$kRequiredAdsmVersion).\n'
+                      'Agent Dock tried to update automatically. Leave this chat '
+                      'and open it again to retry, or update ADSM on the remote.\n\n'
+                      '${e.installHint}'
+                  : 'Could not install ADSM on ${host.displayLabel}.\n'
+                      'Agent Dock tried automatically — run the setup below on the '
+                      'remote, then Connect again.\n\n'
+                      '${e.tool} still missing.')
               : isClaude
                   ? 'Could not install Claude on ${host.displayLabel}.\n'
                       'Agent Dock tried automatically — run the setup below on the '
@@ -995,11 +1015,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ..clear()
             ..addAll(images);
           _showSdkInstallGuide = false;
-          _error = 'Send failed: $e';
+          // Bridge blips reconnect underneath — don't sticky-banner them.
+          if (!isTransientBridgeError(e)) {
+            _error = 'Send failed: $e';
+          }
         });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Send failed: $e')),
-        );
+        if (!isTransientBridgeError(e)) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Send failed: $e')),
+          );
+        }
       }
     } finally {
       if (mounted) setState(() => _sending = false);
@@ -1429,7 +1454,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       SafeLog.d('voice start failed', e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Mic failed: $e')),
+          SnackBar(
+            content: Text(
+              'Mic failed: ${GcpSpeechService.userFacingMessage(e)}',
+            ),
+          ),
         );
       }
     } finally {
@@ -1541,7 +1570,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       SafeLog.d('voice transcribe failed', e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$e')),
+          SnackBar(content: Text(GcpSpeechService.userFacingMessage(e))),
         );
       }
     } finally {
@@ -1964,20 +1993,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   style: theme.textTheme.bodySmall,
                 ),
                 if (() {
-                  final live = runtime?.codeDelta;
-                  final added = live?.added ?? _chat!.linesAdded;
-                  final removed = live?.removed ?? _chat!.linesRemoved;
-                  final files = live?.fileCount ?? _chat!.filesChanged;
-                  return added > 0 || removed > 0 || files > 0;
+                  final d = CodeChangeStats.mergeDisplay(
+                    live: runtime?.codeDelta,
+                    persistedAdded: _chat!.linesAdded,
+                    persistedRemoved: _chat!.linesRemoved,
+                    persistedFiles: _chat!.filesChanged,
+                  );
+                  return d.added > 0 || d.removed > 0 || d.files > 0;
                 }())
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
-                    child: CodeDeltaLabel(
-                      added: runtime?.codeDelta.added ?? _chat!.linesAdded,
-                      removed:
-                          runtime?.codeDelta.removed ?? _chat!.linesRemoved,
-                      files:
-                          runtime?.codeDelta.fileCount ?? _chat!.filesChanged,
+                    child: Builder(
+                      builder: (context) {
+                        final d = CodeChangeStats.mergeDisplay(
+                          live: runtime?.codeDelta,
+                          persistedAdded: _chat!.linesAdded,
+                          persistedRemoved: _chat!.linesRemoved,
+                          persistedFiles: _chat!.filesChanged,
+                        );
+                        return CodeDeltaLabel(
+                          added: d.added,
+                          removed: d.removed,
+                          files: d.files,
+                        );
+                      },
                     ),
                   ),
               ],
