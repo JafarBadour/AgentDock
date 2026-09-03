@@ -416,14 +416,28 @@ class AdsmSession implements AgentSession {
         }
       case 'turn_complete':
         _finishPrompt();
+        _updates.add(const AcpUpdate.activity(''));
         _updates.add(
           AcpUpdate.turnComplete(params['reason']?.toString() ?? 'end_turn'),
         );
+      case 'activity':
+        final label = params['label']?.toString() ?? '';
+        _updates.add(AcpUpdate.activity(label));
       case 'status':
         _daemonStatus = params['status']?.toString() ?? _daemonStatus;
         final title = params['title']?.toString();
         if (title != null && title.isNotEmpty) {
           _updates.add(AcpUpdate.status('Session', title: title));
+        }
+        // Map daemon lifecycle into activity when no explicit activity event.
+        final st = params['status']?.toString();
+        if (st == 'running') {
+          _updates.add(const AcpUpdate.activity('Thinking'));
+        } else if (st == 'idle' || st == 'dead') {
+          _updates.add(const AcpUpdate.activity(''));
+        }
+        if (st == 'waiting_permission') {
+          _updates.add(const AcpUpdate.activity('Waiting for permission'));
         }
       case 'mode':
         final mid = params['mode']?.toString();
