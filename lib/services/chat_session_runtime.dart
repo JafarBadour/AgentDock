@@ -1335,15 +1335,23 @@ class ChatSessionRuntime extends ChangeNotifier {
     final stats = codeDelta;
     final meta = chatMeta;
     if (meta == null) return;
-    if (meta.linesAdded == stats.added &&
-        meta.linesRemoved == stats.removed &&
-        meta.filesChanged == stats.fileCount) {
+    // Never shrink: a partial hydrate (tools not yet restored) used to wipe
+    // the Δ line by writing zeros over a good session total.
+    final added = stats.added > meta.linesAdded ? stats.added : meta.linesAdded;
+    final removed =
+        stats.removed > meta.linesRemoved ? stats.removed : meta.linesRemoved;
+    final files = stats.fileCount > meta.filesChanged
+        ? stats.fileCount
+        : meta.filesChanged;
+    if (meta.linesAdded == added &&
+        meta.linesRemoved == removed &&
+        meta.filesChanged == files) {
       return;
     }
     final updated = meta.copyWith(
-      linesAdded: stats.added,
-      linesRemoved: stats.removed,
-      filesChanged: stats.fileCount,
+      linesAdded: added,
+      linesRemoved: removed,
+      filesChanged: files,
       updatedAt: DateTime.now(),
     );
     chatMeta = updated;

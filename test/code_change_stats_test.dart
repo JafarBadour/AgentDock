@@ -28,6 +28,34 @@ void main() {
       expect(s.label, contains('φ'));
     });
 
+    test('mergeDisplay keeps persisted totals when live is empty', () {
+      final d = CodeChangeStats.mergeDisplay(
+        live: const CodeChangeStats(),
+        persistedAdded: 10,
+        persistedRemoved: 3,
+        persistedFiles: 5,
+      );
+      expect(d.added, 10);
+      expect(d.removed, 3);
+      expect(d.files, 5);
+    });
+
+    test('mergeDisplay prefers larger live totals', () {
+      final d = CodeChangeStats.mergeDisplay(
+        live: const CodeChangeStats(
+          added: 40,
+          removed: 1,
+          files: {'a', 'b', 'c'},
+        ),
+        persistedAdded: 10,
+        persistedRemoved: 3,
+        persistedFiles: 2,
+      );
+      expect(d.added, 40);
+      expect(d.removed, 3);
+      expect(d.files, 3);
+    });
+
     test('counts old_string / new_string replacements', () {
       const tool = ToolCallState(
         toolCallId: '2',

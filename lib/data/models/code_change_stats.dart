@@ -20,6 +20,23 @@ class CodeChangeStats {
 
   int get fileCount => files.length;
 
+  /// Prefer live tool totals, but never drop already-persisted session totals.
+  static ({int added, int removed, int files}) mergeDisplay({
+    CodeChangeStats? live,
+    int persistedAdded = 0,
+    int persistedRemoved = 0,
+    int persistedFiles = 0,
+  }) {
+    final a = live?.added ?? 0;
+    final r = live?.removed ?? 0;
+    final f = live?.fileCount ?? 0;
+    return (
+      added: a > persistedAdded ? a : persistedAdded,
+      removed: r > persistedRemoved ? r : persistedRemoved,
+      files: f > persistedFiles ? f : persistedFiles,
+    );
+  }
+
   CodeChangeStats operator +(CodeChangeStats other) => CodeChangeStats(
         added: added + other.added,
         removed: removed + other.removed,

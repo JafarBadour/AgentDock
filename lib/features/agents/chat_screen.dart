@@ -17,6 +17,7 @@ import '../../data/models/agent_model.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/chat_message.dart';
+import '../../data/models/code_change_stats.dart';
 import '../../data/models/host.dart';
 import '../../data/models/prompt_image.dart';
 import '../../data/models/repo.dart';
@@ -1980,20 +1981,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   style: theme.textTheme.bodySmall,
                 ),
                 if (() {
-                  final live = runtime?.codeDelta;
-                  final added = live?.added ?? _chat!.linesAdded;
-                  final removed = live?.removed ?? _chat!.linesRemoved;
-                  final files = live?.fileCount ?? _chat!.filesChanged;
-                  return added > 0 || removed > 0 || files > 0;
+                  final d = CodeChangeStats.mergeDisplay(
+                    live: runtime?.codeDelta,
+                    persistedAdded: _chat!.linesAdded,
+                    persistedRemoved: _chat!.linesRemoved,
+                    persistedFiles: _chat!.filesChanged,
+                  );
+                  return d.added > 0 || d.removed > 0 || d.files > 0;
                 }())
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
-                    child: CodeDeltaLabel(
-                      added: runtime?.codeDelta.added ?? _chat!.linesAdded,
-                      removed:
-                          runtime?.codeDelta.removed ?? _chat!.linesRemoved,
-                      files:
-                          runtime?.codeDelta.fileCount ?? _chat!.filesChanged,
+                    child: Builder(
+                      builder: (context) {
+                        final d = CodeChangeStats.mergeDisplay(
+                          live: runtime?.codeDelta,
+                          persistedAdded: _chat!.linesAdded,
+                          persistedRemoved: _chat!.linesRemoved,
+                          persistedFiles: _chat!.filesChanged,
+                        );
+                        return CodeDeltaLabel(
+                          added: d.added,
+                          removed: d.removed,
+                          files: d.files,
+                        );
+                      },
                     ),
                   ),
               ],
