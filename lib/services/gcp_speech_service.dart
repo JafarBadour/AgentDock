@@ -22,8 +22,8 @@ class GcpSpeechService {
   /// Prefer current Flash models; fall back if a key's project lags.
   static const _models = <String>[
     'gemini-2.5-flash',
+    'gemini-flash-latest',
     'gemini-2.0-flash',
-    'gemini-1.5-flash',
   ];
 
   bool get isRecording => _recording;
@@ -170,6 +170,9 @@ class GcpSpeechService {
       'generationConfig': {
         'temperature': 0,
         'maxOutputTokens': 2048,
+        // 2.5+ Flash spends output budget on "thinking" by default — a short
+        // transcript can come back empty unless we turn that off.
+        'thinkingConfig': {'thinkingBudget': 0},
       },
     });
 
