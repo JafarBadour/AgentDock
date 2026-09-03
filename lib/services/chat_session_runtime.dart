@@ -132,6 +132,12 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// Turn was handed to the durable host after the phone disconnected.
   bool remoteTurnActive = false;
 
+  /// User message is on its way to ADSM (before host ack).
+  bool sendingToHost = false;
+
+  /// Last delivery failure for the UI snackbar / banner.
+  String? deliveryError;
+
   /// True while a local prompt is in flight, the host is still producing, or
   /// any tool call is still pending/running — so the UI stays on "working"
   /// through long tool chains, not only while text is streaming.
@@ -139,7 +145,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       entries.any((e) => e.tool?.isActive ?? false);
 
   bool get isWorking =>
-      promptInFlight || remoteTurnActive || hasActiveTools;
+      sendingToHost || promptInFlight || remoteTurnActive || hasActiveTools;
 
   /// Live code churn from edit/write tools in this transcript.
   CodeChangeStats get codeDelta => CodeChangeStats.fromTools([
@@ -394,9 +400,17 @@ class ChatSessionRuntime extends ChangeNotifier {
     reconnectAttempts = 0;
     // A reconnect must not inherit a hung prompt chain from the dead socket.
     _breakPromptChain();
-    // A turn handed off to the host may still be running — show working until
-    // we see idle/turn-complete in the journal stream.
-    if (remoteTurnActive) {
+    // Prefer host snapshot: if ADSM says idle, do not resurrect sticky Thinking.
+    final hostStatus =
+        session is AdsmSession ? session.daemonStatus : null;
+    if (hostStatus == 'idle' || hostStatus == 'dead') {
+      remoteTurnActive = false;
+      promptInFlight = false;
+      sendingToHost = false;
+      activityLabel = null;
+      deliveryError = null;
+    } else if (remoteTurnActive) {
+      // A turn handed off to the host may still be running.
       promptInFlight = true;
       _armHostBusyWatchdog();
     }
@@ -406,7 +420,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     onTransportReady?.call(chatId);
     unawaited(pullHostTranscriptAndSync());
     // Pick up anything that was waiting while the socket was down.
-    if (!remoteTurnActive) {
+    if (!remoteTurnActive && !promptInFlight) {
       resumeOutboundQueue();
     }
   }
@@ -815,7 +829,9 @@ class ChatSessionRuntime extends ChangeNotifier {
     remoteTurnActive = false;
     _clearHostBusyWatchdog();
     promptInFlight = true;
-    activityLabel = 'Thinking';
+    sendingToHost = true;
+    deliveryError = null;
+    activityLabel = 'Sending to host…';
     _lastHostActivityAt = DateTime.now();
     _armHostBusyWatchdog();
     notifyListeners();
@@ -823,12 +839,40 @@ class ChatSessionRuntime extends ChangeNotifier {
     try {
       await flushAssistantBuffer();
       final payload = await ChatImageCodec.toPromptPayload(content);
-      await _session.prompt(
-        payload.text,
-        images: payload.images,
-        userMessageId: userMessageId,
-        userCreatedAt: userCreatedAt,
-      );
+
+      Object? lastError;
+      for (var attempt = 1; attempt <= 3; attempt++) {
+        if (_disposed || closed || epoch != _promptEpoch) return;
+        try {
+          if (attempt > 1) {
+            sendingToHost = true;
+            activityLabel = 'Retrying delivery ($attempt/3)…';
+            notifyListeners();
+            await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+          }
+          await _session.prompt(
+            payload.text,
+            images: payload.images,
+            userMessageId: userMessageId,
+            userCreatedAt: userCreatedAt,
+          );
+          lastError = null;
+          break;
+        } catch (e) {
+          lastError = e;
+          SafeLog.d('prompt delivery attempt $attempt failed', e);
+          final msg = e.toString().toLowerCase();
+          final retryable = msg.contains('channel closed') ||
+              msg.contains('timed out') ||
+              msg.contains('timeout') ||
+              msg.contains('adsm write') ||
+              msg.contains('connection') ||
+              msg.contains('socket');
+          if (!retryable || attempt == 3) rethrow;
+        }
+      }
+      if (lastError != null) throw lastError;
+
       // If the model only wrote to the thought channel, surface that as the
       // answer instead of leaving a blank agent turn with orphaned notes.
       if (assistantBuffer.trim().isEmpty && thoughtBuffer.trim().isNotEmpty) {
@@ -845,6 +889,8 @@ class ChatSessionRuntime extends ChangeNotifier {
       } else if (isTransientBridgeError(e)) {
         // Quiet reconnect — do not leave "Bad state: ADSM channel closed" up.
         lastError = null;
+        deliveryError =
+            'Trying to reach the host… message may not have been delivered.';
         transportFailed = true;
         if (!closed && sessionFactory != null) {
           closed = true;
@@ -852,6 +898,8 @@ class ChatSessionRuntime extends ChangeNotifier {
         }
       } else {
         lastError = e.toString();
+        deliveryError =
+            'Message may not have reached the host. Tap Stop and send again.';
         transportFailed = true;
         // Dead bridge / silence timeout — recover so the next send is not wedged.
         if (!closed && sessionFactory != null) {
@@ -863,6 +911,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       // Superseded by Force run / reconnect — do not touch shared state.
       final superseded = epoch != _promptEpoch;
       if (!superseded) {
+        sendingToHost = false;
         if (closed && !transportFailed) {
           // Bridge dropped via background handoff. Durable host may still be
           // mid-turn — keep the working indicator until idle arrives.
@@ -922,6 +971,15 @@ class ChatSessionRuntime extends ChangeNotifier {
         return;
       }
 
+      // Stuck in delivery (SSH/ADSM never acked) — fail fast vs long Thinking.
+      if (sendingToHost && silentFor >= const Duration(seconds: 25)) {
+        SafeLog.d(
+          'watchdog: delivery stall ${silentFor.inSeconds}s chat=$chatId',
+        );
+        unawaited(_watchdogUnstickPrompt());
+        return;
+      }
+
       // Hung on "Thinking" with no tools and no host events.
       if (_session.isPromptActive && silentFor >= promptStaleAfter) {
         SafeLog.d(
@@ -931,8 +989,29 @@ class ChatSessionRuntime extends ChangeNotifier {
         return;
       }
 
-      // Still awaiting ACP / host — keep polling.
-      if (_session.isPromptActive || remoteTurnActive) {
+      // Sticky remoteTurnActive with silence: host likely finished while we
+      // missed turn_complete. Clear after a short durable grace period.
+      if (remoteTurnActive &&
+          !_session.isPromptActive &&
+          silentFor >=
+              (durable
+                  ? const Duration(seconds: 45)
+                  : const Duration(seconds: 25))) {
+        SafeLog.d(
+          'watchdog: clear sticky remoteTurnActive after '
+          '${silentFor.inSeconds}s silence chat=$chatId',
+        );
+        remoteTurnActive = false;
+        promptInFlight = false;
+        sendingToHost = false;
+        activityLabel = null;
+        notifyListeners();
+        if (!closed) _drainOutboundQueue();
+        return;
+      }
+
+      // Still awaiting a live local prompt — keep polling.
+      if (_session.isPromptActive) {
         _armHostBusyWatchdog();
         return;
       }
@@ -940,6 +1019,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       // Silence after reconnect: host likely finished while we were away.
       remoteTurnActive = false;
       promptInFlight = false;
+      sendingToHost = false;
       activityLabel = null;
       notifyListeners();
       if (!closed) _drainOutboundQueue();
@@ -978,13 +1058,20 @@ class ChatSessionRuntime extends ChangeNotifier {
     await flushAssistantBuffer();
     await commitThought();
     _breakPromptChain();
+    final wasSending = sendingToHost;
     promptInFlight = false;
     // Always clear local busy chrome. Leaving remoteTurnActive stuck the
     // composer on "Thinking / queued until Force run" forever after a pause.
     remoteTurnActive = false;
+    sendingToHost = false;
     activityLabel = null;
     if (hadProgress) {
       lastError = null;
+      deliveryError = null;
+    } else if (wasSending) {
+      deliveryError =
+          'Could not reach the host. Check the connection and send again.';
+      lastError = deliveryError;
     } else {
       lastError =
           'Agent went quiet with no reply (often a large image or a stuck turn). '
@@ -1052,8 +1139,10 @@ class ChatSessionRuntime extends ChangeNotifier {
     await commitThought();
     _breakPromptChain();
     promptInFlight = false;
+    sendingToHost = false;
     activityLabel = null;
     lastError = null;
+    deliveryError = null;
     notifyListeners();
     if (closed && sessionFactory != null && !_suspended) {
       _scheduleReconnect(immediate: true);
@@ -1082,6 +1171,9 @@ class ChatSessionRuntime extends ChangeNotifier {
         final label = update.text.trim();
         activityLabel = label.isEmpty ? null : label;
         if (activityLabel != null) {
+          if (sendingToHost && activityLabel != 'Sending to host…') {
+            sendingToHost = false;
+          }
           _noteHostActivity();
         } else {
           // ADSM clears the chip between phases; that is not silence — re-arm
@@ -1090,6 +1182,39 @@ class ChatSessionRuntime extends ChangeNotifier {
           _armHostBusyWatchdog();
         }
         notifyListeners();
+      case AcpUpdateKind.promptAccepted:
+        sendingToHost = false;
+        deliveryError = null;
+        activityLabel = 'Thinking';
+        _noteHostActivity();
+        notifyListeners();
+      case AcpUpdateKind.daemonStatus:
+        final st = update.text.trim().toLowerCase();
+        if (st == 'idle' || st == 'dead') {
+          // Host finished (or never started) — never leave sticky Thinking.
+          if (!hasActiveTools) {
+            sendingToHost = false;
+            remoteTurnActive = false;
+            activityLabel = null;
+            _clearHostBusyWatchdog();
+            if (!_session.isPromptActive) {
+              promptInFlight = false;
+              notifyListeners();
+              if (!closed) _drainOutboundQueue();
+            } else {
+              // Complete the local await so prompt() can unwind.
+              if (_session is AdsmSession) {
+                (_session as AdsmSession).handOffPrompt();
+              }
+              notifyListeners();
+            }
+          }
+        } else if (st == 'running') {
+          sendingToHost = false;
+          activityLabel ??= 'Thinking';
+          _noteHostActivity();
+          notifyListeners();
+        }
       case AcpUpdateKind.mode:
         notifyListeners();
       case AcpUpdateKind.delta:
@@ -1156,6 +1281,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         // Clearing promptInFlight here while a local await is open lets a new
         // send race ahead — only clear UI busy when nothing owns the prompt.
         _clearHostBusyWatchdog();
+        sendingToHost = false;
         remoteTurnActive = false;
         activityLabel = null;
         if (hasActiveTools) {

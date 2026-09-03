@@ -26,6 +26,14 @@ void main() {
       expect(AcpUpdate.turnComplete().kind, AcpUpdateKind.turnComplete);
       expect(AcpUpdate.activity('Thinking').kind, AcpUpdateKind.activity);
       expect(
+        AcpUpdate.promptAccepted('m1').kind,
+        AcpUpdateKind.promptAccepted,
+      );
+      expect(
+        AcpUpdate.daemonStatus('idle').kind,
+        AcpUpdateKind.daemonStatus,
+      );
+      expect(
         AcpUpdate.toolCall(
           const ToolCallState(toolCallId: '1', title: 'T'),
         ).kind,

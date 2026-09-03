@@ -37,7 +37,7 @@ class ProtocolTest(unittest.TestCase):
     def test_chunk_constants(self) -> None:
         self.assertLess(protocol.CHUNK_SOFT_LIMIT, 64 * 1024)
         self.assertEqual(protocol.CHUNK_METHOD, "rpc.chunk")
-        self.assertEqual(protocol.VERSION, "0.4.2")
+        self.assertEqual(protocol.VERSION, "0.4.3")
 
 
 class ChunkIngestTest(unittest.TestCase):

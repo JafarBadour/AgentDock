@@ -218,6 +218,8 @@ class Worker:
         self._lock = asyncio.Lock()
         self._attached = False
         self._journal_pos = 0
+        # Background ACP turn after early `session.prompt` accept reply.
+        self._turn_task: Optional[asyncio.Task[None]] = None
 
     @property
     def dir(self) -> Path:
@@ -683,6 +685,10 @@ class Worker:
     ) -> dict[str, Any]:
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
+        if self._turn_task is not None and not self._turn_task.done():
+            raise RuntimeError(
+                "agent is already running a turn — wait for it to finish"
+            )
         blocks: list[dict[str, Any]] = []
         for img in images or []:
             if not isinstance(img, dict):
@@ -720,34 +726,59 @@ class Worker:
         except Exception:  # noqa: BLE001
             pass
         await self._set_status(self.chat_id, protocol.STATUS_RUNNING, None)
+        # Ack to the phone *before* the long ACP call so the UI can leave
+        # "Sending…" and enter Thinking, and so retries know the host has it.
+        await self._emit_event(
+            "prompt_accepted",
+            userMessageId=self._turn_user_id,
+            status=protocol.STATUS_RUNNING,
+        )
         await self._emit_event("status", status=protocol.STATUS_RUNNING)
-        try:
-            result = await self._request(
-                "session/prompt",
-                {
-                    "sessionId": self.acp_session_id,
-                    "prompt": blocks,
-                },
-                timeout=600.0,
-            )
-            stop = (
-                result.get("stopReason")
-                if isinstance(result, dict)
-                else "end_turn"
-            )
-            self._persist_assistant_turn()
-            await self._emit_event("turn_complete", reason=stop or "end_turn")
-            await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
-            await self._emit_event("status", status=protocol.STATUS_IDLE)
-            return result if isinstance(result, dict) else {"stopReason": "end_turn"}
-        except Exception as e:  # noqa: BLE001
-            self.last_error = str(e)
-            self._persist_assistant_turn()
-            await self._set_status(
-                self.chat_id, protocol.STATUS_ERROR, str(e)
-            )
-            await self._emit_event("error", text=str(e))
-            raise
+        await self._emit_event("activity", label="Thinking")
+
+        async def _run_turn() -> None:
+            try:
+                result = await self._request(
+                    "session/prompt",
+                    {
+                        "sessionId": self.acp_session_id,
+                        "prompt": blocks,
+                    },
+                    timeout=600.0,
+                )
+                stop = (
+                    result.get("stopReason")
+                    if isinstance(result, dict)
+                    else "end_turn"
+                )
+                self._persist_assistant_turn()
+                await self._emit_event(
+                    "turn_complete", reason=stop or "end_turn"
+                )
+                await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+                await self._emit_event("status", status=protocol.STATUS_IDLE)
+            except asyncio.CancelledError:
+                self._persist_assistant_turn()
+                await self._emit_event("turn_complete", reason="cancelled")
+                await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+                await self._emit_event("status", status=protocol.STATUS_IDLE)
+                raise
+            except Exception as e:  # noqa: BLE001
+                self.last_error = str(e)
+                self._persist_assistant_turn()
+                await self._set_status(
+                    self.chat_id, protocol.STATUS_ERROR, str(e)
+                )
+                await self._emit_event("error", text=str(e))
+                await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+                await self._emit_event("status", status=protocol.STATUS_IDLE)
+
+        self._turn_task = asyncio.create_task(_run_turn())
+        return {
+            "accepted": True,
+            "userMessageId": self._turn_user_id,
+            "status": protocol.STATUS_RUNNING,
+        }
 
     def _persist_assistant_turn(self) -> None:
         if self._assistant_persisted:
@@ -769,6 +800,15 @@ class Worker:
     async def cancel(self) -> None:
         if not self.acp_session_id:
             return
+        task = self._turn_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
         try:
             await self._request(
                 "session/cancel",
@@ -785,6 +825,7 @@ class Worker:
         self._persist_assistant_turn()
         await self._emit_event("turn_complete", reason="cancelled")
         await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+        await self._emit_event("status", status=protocol.STATUS_IDLE)
 
     async def respond_permission(self, request_id: str, option_id: str) -> None:
         pending = self._open_permissions.pop(str(request_id), None)
