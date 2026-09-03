@@ -979,14 +979,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     await commitThought();
     _breakPromptChain();
     promptInFlight = false;
-    // Keep remoteTurnActive on durable+progress so reconnect can resume the
-    // host turn; otherwise clear busy chrome.
-    if (!(durable && hadProgress)) {
-      remoteTurnActive = false;
-    }
+    // Always clear local busy chrome. Leaving remoteTurnActive stuck the
+    // composer on "Thinking / queued until Force run" forever after a pause.
+    remoteTurnActive = false;
     activityLabel = null;
     if (hadProgress) {
-      // Do not scare the user — the agent already answered / ran tools.
       lastError = null;
     } else {
       lastError =
@@ -994,7 +991,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           'Tap Stop if it hangs again, or resend with a smaller screenshot.';
     }
     notifyListeners();
-    if (!closed && !remoteTurnActive) _drainOutboundQueue();
+    if (!closed) _drainOutboundQueue();
   }
 
   /// Mark leftover pending/running tools finished so [isWorking] can clear.
@@ -1055,6 +1052,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     await commitThought();
     _breakPromptChain();
     promptInFlight = false;
+    activityLabel = null;
     lastError = null;
     notifyListeners();
     if (closed && sessionFactory != null && !_suspended) {
