@@ -10,6 +10,7 @@ import '../data/local/app_database.dart';
 import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
+import 'adsm_version.dart';
 import 'remote_setup_guide.dart';
 import 'ssh_no_delay_socket.dart';
 
@@ -601,12 +602,13 @@ test -x "$HOME/.local/bin/claude-code-acp"
     return path;
   }
 
-  /// Installs/starts ADSM on the host and verifies it responds.
+  /// Installs/starts ADSM on the host and verifies it responds at
+  /// [kRequiredAdsmVersion] or newer.
   ///
-  /// Uses the GitHub `install-adsm.sh` installer only when the binary is
-  /// missing. If `agentdock-adsm` already exists, we only call
-  /// `ensure-running` — never the install script (it `pkill`s the daemon and
-  /// can leave Connect falsely reporting "ADSM still missing").
+  /// - Missing binary → curl `install-adsm.sh` from GitHub `main`.
+  /// - Running but older than this app → same install (upgrade), with a clear
+  ///   status line so the UI can say "ADSM mismatch… updating".
+  /// - Healthy and version-ok → start only via `ensure-running` (no reinstall).
   Future<void> ensureAdsm(
     Host host, {
     void Function(String status)? onProgress,
@@ -614,7 +616,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
     final client = await connect(host);
     var lastProbe = '';
 
-    Future<({bool ok, bool hasBin, String raw})> probe() async {
+    Future<({bool ok, bool hasBin, String? version, String raw})> probe() async {
       try {
         final out = await _run(
           client,
@@ -626,7 +628,7 @@ BIN="$(command -v agentdock-adsm 2>/dev/null)"
 
 # Direct socket ping — works even when the wrapper is not on PATH.
 python3 - <<'PY' 2>/dev/null
-import os, socket, sys
+import json, os, socket, sys
 p = os.path.expanduser("~/.agentdock/adsm.sock")
 if not os.path.exists(p):
     sys.exit(2)
@@ -637,6 +639,14 @@ try:
     s.sendall(b'{"id":1,"method":"ping","params":{}}\n')
     data = s.recv(8192).decode("utf-8", "replace")
     print(data.strip())
+    ver = ""
+    try:
+        msg = json.loads(data.strip().splitlines()[0])
+        ver = str((msg.get("result") or {}).get("version") or "")
+    except Exception:
+        pass
+    if ver:
+        print(f"ADSM_VERSION={ver}")
     if '"ok"' in data or "version" in data:
         print("ADSM_PROBE=ok")
         sys.exit(0)
@@ -663,6 +673,31 @@ echo "ADSM_BIN=$BIN"
 OUT="$("$BIN" ensure-running 2>&1)"
 EC=$?
 printf '%s\n' "$OUT"
+# Re-ping after ensure-running for version.
+python3 - <<'PY' 2>/dev/null
+import json, os, socket, sys
+p = os.path.expanduser("~/.agentdock/adsm.sock")
+if not os.path.exists(p):
+    sys.exit(0)
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3)
+try:
+    s.connect(p)
+    s.sendall(b'{"id":1,"method":"ping","params":{}}\n')
+    data = s.recv(8192).decode("utf-8", "replace")
+    print(data.strip())
+    msg = json.loads(data.strip().splitlines()[0])
+    ver = str((msg.get("result") or {}).get("version") or "")
+    if ver:
+        print(f"ADSM_VERSION={ver}")
+except Exception:
+    pass
+finally:
+    try:
+        s.close()
+    except Exception:
+        pass
+PY
 if [ "$EC" -eq 0 ]; then
   echo "ADSM_PROBE=ok"
 else
@@ -676,78 +711,173 @@ exit 0
         );
         lastProbe = out.trim();
         SafeLog.d('ADSM probe: $lastProbe');
+        String? version;
+        for (final line in out.split('\n')) {
+          final t = line.trim();
+          if (t.startsWith('ADSM_VERSION=')) {
+            version = t.substring('ADSM_VERSION='.length).trim();
+            if (version.isEmpty) version = null;
+          }
+        }
+        // Fallback: parse version from status / ping JSON line.
+        if (version == null) {
+          final m = RegExp(r'"version"\s*:\s*"([^"]+)"').firstMatch(out);
+          if (m != null) version = m.group(1);
+        }
         return (
           ok: out.contains('ADSM_PROBE=ok'),
           hasBin: !out.contains('ADSM_PROBE=missing_bin'),
+          version: version,
           raw: out,
         );
       } catch (e) {
         lastProbe = e.toString();
         SafeLog.d('ADSM probe exception', e);
-        return (ok: false, hasBin: false, raw: lastProbe);
+        return (ok: false, hasBin: false, version: null, raw: lastProbe);
       }
     }
 
-    onProgress?.call('Checking ADSM…');
-    var state = await probe();
-    if (state.ok) {
-      onProgress?.call('ADSM ready');
-      return;
-    }
-
-    // Binary is on the host — start/repair only. Do NOT curl install-adsm.sh
-    // (that script kills the live daemon and often races the next probe).
-    if (state.hasBin) {
-      onProgress?.call('Starting ADSM…');
-      for (var i = 0; i < 5; i++) {
-        await Future<void>.delayed(Duration(milliseconds: 400 + i * 250));
-        state = await probe();
-        if (state.ok) {
-          onProgress?.call('ADSM ready');
-          return;
-        }
-      }
-      throw MissingToolException(
-        'ADSM',
-        '${kRemoteAdsmSetupGuide.trim()}\n\n'
-        '# Probe (daemon binary found but not healthy):\n$lastProbe',
+    Future<void> installOrUpgrade({required String reason}) async {
+      onProgress?.call(reason);
+      final installed = await _runAgentDockInstallScript(
+        client,
+        hostId: host.id,
+        scriptName: 'install-adsm.sh',
+        onProgress: onProgress,
       );
-    }
-
-    onProgress?.call('Installing ADSM on the remote…');
-    final installed = await _runAgentDockInstallScript(
-      client,
-      hostId: host.id,
-      scriptName: 'install-adsm.sh',
-      onProgress: onProgress,
-    );
-    if (!installed) {
-      onProgress?.call('Starting ADSM…');
-      try {
-        await _run(
-          client,
-          r'''
+      if (!installed) {
+        onProgress?.call('Starting ADSM…');
+        try {
+          await _run(
+            client,
+            r'''
 set +e
 export PATH="$HOME/.local/bin:$PATH"
 command -v agentdock-adsm >/dev/null || exit 1
 agentdock-adsm ensure-running
 exit 0
 ''',
-          hostId: host.id,
-          timeout: const Duration(seconds: 45),
-        );
-      } catch (e) {
-        SafeLog.d('ADSM ensure-running after failed install failed', e);
+            hostId: host.id,
+            timeout: const Duration(seconds: 45),
+          );
+        } catch (e) {
+          SafeLog.d('ADSM ensure-running after failed install failed', e);
+        }
       }
     }
 
-    for (var i = 0; i < 8; i++) {
+    onProgress?.call('Checking ADSM…');
+    var state = await probe();
+
+    // Healthy + new enough → done.
+    if (state.ok && adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+      onProgress?.call('ADSM ready (v${state.version})');
+      return;
+    }
+
+    // Running but too old (or version unknown on an old build).
+    if (state.ok &&
+        !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+      final have = state.version ?? 'unknown';
+      await installOrUpgrade(
+        reason:
+            'ADSM mismatch — host has v$have, this app needs '
+            'v$kRequiredAdsmVersion. Updating…',
+      );
+      for (var i = 0; i < 10; i++) {
+        await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
+        state = await probe();
+        if (state.ok &&
+            adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+          onProgress?.call('ADSM updated to v${state.version}');
+          return;
+        }
+        onProgress?.call(
+          'Waiting for ADSM v$kRequiredAdsmVersion… '
+          '(host reports ${state.version ?? "unknown"})',
+        );
+      }
+      throw MissingToolException(
+        'ADSM',
+        'ADSM mismatch — cannot run until the host is on '
+        'v$kRequiredAdsmVersion (host still reports '
+        '${state.version ?? "unknown"}).\n'
+        'Open this agent again to retry the automatic update, or run:\n'
+        '  curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash\n\n'
+        '# Probe:\n$lastProbe',
+      );
+    }
+
+    // Binary present but daemon not healthy — start/repair only first.
+    if (state.hasBin) {
+      onProgress?.call('Starting ADSM…');
+      for (var i = 0; i < 5; i++) {
+        await Future<void>.delayed(Duration(milliseconds: 400 + i * 250));
+        state = await probe();
+        if (state.ok &&
+            adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+          onProgress?.call('ADSM ready (v${state.version})');
+          return;
+        }
+        if (state.ok &&
+            !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+          break; // fall through to upgrade
+        }
+      }
+      if (state.ok &&
+          !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+        final have = state.version ?? 'unknown';
+        await installOrUpgrade(
+          reason:
+              'ADSM mismatch — host has v$have, this app needs '
+              'v$kRequiredAdsmVersion. Updating…',
+        );
+        for (var i = 0; i < 10; i++) {
+          await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
+          state = await probe();
+          if (state.ok &&
+              adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+            onProgress?.call('ADSM updated to v${state.version}');
+            return;
+          }
+        }
+      } else if (!state.ok) {
+        throw MissingToolException(
+          'ADSM',
+          '${kRemoteAdsmSetupGuide.trim()}\n\n'
+          '# Probe (daemon binary found but not healthy):\n$lastProbe',
+        );
+      }
+    }
+
+    // Missing binary (or upgrade path above failed) — install from GitHub.
+    if (!state.hasBin ||
+        !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+      await installOrUpgrade(
+        reason: state.hasBin
+            ? 'ADSM mismatch — updating host to v$kRequiredAdsmVersion…'
+            : 'Installing ADSM on the remote…',
+      );
+    }
+
+    for (var i = 0; i < 10; i++) {
       state = await probe();
-      if (state.ok) {
-        onProgress?.call('ADSM ready');
+      if (state.ok &&
+          adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+        onProgress?.call('ADSM ready (v${state.version})');
         return;
       }
       await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
+    }
+
+    if (state.ok &&
+        !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+      throw MissingToolException(
+        'ADSM',
+        'ADSM mismatch — cannot run. Host is still '
+        'v${state.version ?? "unknown"}; this app needs v$kRequiredAdsmVersion.\n'
+        'Reconnect to retry the automatic update.\n\n# Probe:\n$lastProbe',
+      );
     }
 
     throw MissingToolException(

@@ -688,13 +688,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (mounted) {
         final isClaude = chat.provider == AgentProvider.claude;
         final isAdsm = e.tool.toUpperCase().contains('ADSM');
+        final mismatch = e.installHint.toLowerCase().contains('adsm mismatch');
         setState(() {
           _showSdkInstallGuide = true;
           _error = isAdsm
-              ? 'Could not install ADSM on ${host.displayLabel}.\n'
-                  'Agent Dock tried automatically — run the setup below on the '
-                  'remote, then Connect again.\n\n'
-                  '${e.tool} still missing.'
+              ? (mismatch
+                  ? 'ADSM mismatch — cannot run until the host matches this app '
+                      '(needs v$kRequiredAdsmVersion).\n'
+                      'Agent Dock tried to update automatically. Leave this chat '
+                      'and open it again to retry, or update ADSM on the remote.\n\n'
+                      '${e.installHint}'
+                  : 'Could not install ADSM on ${host.displayLabel}.\n'
+                      'Agent Dock tried automatically — run the setup below on the '
+                      'remote, then Connect again.\n\n'
+                      '${e.tool} still missing.')
               : isClaude
                   ? 'Could not install Claude on ${host.displayLabel}.\n'
                       'Agent Dock tried automatically — run the setup below on the '

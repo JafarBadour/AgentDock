@@ -48,7 +48,8 @@ tmux -V
 
 /// Shown only if the app’s automatic ADSM install somehow fails.
 const kRemoteAdsmSetupGuide = '''
-# Agent Dock installs ADSM automatically on Connect (curl install-adsm.sh).
+# Agent Dock installs/upgrades ADSM automatically when you open an agent.
+# On version mismatch it re-runs install-adsm.sh so the host matches the app.
 # If that failed, run once on the remote:
 
 curl -fsSL $kAgentDockScriptsBase/install-adsm.sh | bash

@@ -14,8 +14,11 @@ import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'agent_session.dart';
+import 'adsm_version.dart';
 import 'cursor_acp_service.dart';
 import 'ssh_service.dart';
+
+export 'adsm_version.dart';
 
 /// NDJSON control client for the host ADSM daemon (`agentdock-adsm client`).
 class AdsmClient {
@@ -48,8 +51,9 @@ fi
     );
     final adsm = AdsmClient._(session);
     adsm._listen();
-    // Warm ping.
-    await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    // Warm ping — also learns protocol version for wire chunking.
+    final pong = await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    adsm.protocolVersion = pong['version']?.toString();
     return adsm;
   }
 
@@ -124,6 +128,18 @@ fi
     }
   }
 
+  /// Host ADSM protocol version from the last successful `ping` (e.g. `0.4.2`).
+  String? protocolVersion;
+
+  /// Soft max NDJSON line size. Larger RPCs go out as `rpc.chunk` pieces when
+  /// the host is ≥ 0.4.2 (avoids killing the channel on big prompts/images).
+  static const int chunkSoftLimit = 48 * 1024;
+
+  /// Payload bytes per `rpc.chunk` line (ASCII base64); leave headroom for framing.
+  static const int chunkPayloadBytes = 36 * 1024;
+
+  bool get _supportsWireChunks => adsmSupportsWireChunks(protocolVersion);
+
   Future<Map<String, dynamic>> request(
     String method,
     Map<String, dynamic> params, {
@@ -133,13 +149,13 @@ fi
     final id = _nextId++;
     final c = Completer<Map<String, dynamic>>();
     _pending[id] = c;
-    final line = '${jsonEncode({
-          'id': id,
-          'method': method,
-          'params': params,
-        })}\n';
+    final payload = jsonEncode({
+      'id': id,
+      'method': method,
+      'params': params,
+    });
     try {
-      _session.stdin.add(utf8.encode(line));
+      _writeRequest(id, payload);
     } catch (e) {
       _pending.remove(id);
       throw StateError('ADSM write failed: $e');
@@ -154,6 +170,33 @@ fi
       );
     } finally {
       _pending.remove(id);
+    }
+  }
+
+  void _writeRequest(Object id, String payload) {
+    final bytes = utf8.encode(payload);
+    if (!_supportsWireChunks || bytes.length <= chunkSoftLimit) {
+      _session.stdin.add(utf8.encode('$payload\n'));
+      return;
+    }
+    final b64 = base64Encode(bytes);
+    final n = (b64.length + chunkPayloadBytes - 1) ~/ chunkPayloadBytes;
+    for (var i = 0; i < n; i++) {
+      final start = i * chunkPayloadBytes;
+      final end = start + chunkPayloadBytes > b64.length
+          ? b64.length
+          : start + chunkPayloadBytes;
+      final chunkLine = jsonEncode({
+        'method': 'rpc.chunk',
+        'params': {
+          'reqId': id,
+          'i': i,
+          'n': n,
+          'encoding': 'base64',
+          'data': b64.substring(start, end),
+        },
+      });
+      _session.stdin.add(utf8.encode('$chunkLine\n'));
     }
   }
 
