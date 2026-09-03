@@ -223,6 +223,48 @@ fi
   }
 }
 
+/// Snapshot for the ADSM host status sheet (daemon + this chat's worker).
+class AdsmHostHealth {
+  const AdsmHostHealth({
+    required this.hostLabel,
+    required this.bridgeOpen,
+    required this.pingVersion,
+    required this.requiredVersion,
+    this.daemonPid,
+    this.workerCount,
+    this.eventSeq,
+    this.agentStatus,
+    this.agentLastError,
+    this.acpSessionId,
+    this.fetchError,
+  });
+
+  final String hostLabel;
+  final bool bridgeOpen;
+  final String? pingVersion;
+  final String requiredVersion;
+  final int? daemonPid;
+  final int? workerCount;
+  final int? eventSeq;
+  final String? agentStatus;
+  final String? agentLastError;
+  final String? acpSessionId;
+  final String? fetchError;
+
+  bool get versionMeets =>
+      adsmVersionMeets(pingVersion, requiredVersion);
+
+  bool get daemonReachable =>
+      bridgeOpen && fetchError == null && daemonPid != null;
+
+  bool get agentHealthy {
+    final st = agentStatus?.toLowerCase();
+    return st != 'dead' && st != 'error';
+  }
+
+  bool get healthy => bridgeOpen && versionMeets && daemonReachable && agentHealthy;
+}
+
 /// Durable agent session mediated by ADSM (not a raw ACP journal bridge).
 class AdsmSession implements AgentSession {
   AdsmSession._({
@@ -277,6 +319,101 @@ class AdsmSession implements AgentSession {
 
   /// Host-authoritative status when known (`idle` / `running` / …).
   String? get daemonStatus => _daemonStatus;
+
+  /// ADSM protocol version from the last successful `ping`.
+  String? get protocolVersion => _client.protocolVersion;
+
+  /// Live daemon + agent snapshot for the status sheet.
+  Future<AdsmHostHealth> fetchHostHealth({required bool bridgeOpen}) async {
+    String? pingVersion = _client.protocolVersion;
+    int? pid;
+    int? workers;
+    int? seq;
+    String? agentStatus = _daemonStatus;
+    String? agentError;
+    String? acpId = sessionId;
+    String? fetchError;
+
+    if (!bridgeOpen) {
+      return AdsmHostHealth(
+        hostLabel: host.displayLabel,
+        bridgeOpen: false,
+        pingVersion: pingVersion,
+        requiredVersion: kRequiredAdsmVersion,
+        daemonPid: pid,
+        workerCount: workers,
+        eventSeq: seq,
+        agentStatus: agentStatus,
+        agentLastError: agentError,
+        acpSessionId: acpId,
+        fetchError: 'Bridge closed — reconnect to refresh',
+      );
+    }
+
+    try {
+      final pong = await _client
+          .request('ping', {}, timeout: const Duration(seconds: 6));
+      pingVersion = pong['version']?.toString() ?? pingVersion;
+      _client.protocolVersion = pingVersion;
+    } catch (e) {
+      fetchError = 'Ping failed: $e';
+    }
+
+    try {
+      final daemon = await _client.request(
+        'daemon.status',
+        {},
+        timeout: const Duration(seconds: 6),
+      );
+      pid = daemon['pid'] is int ? daemon['pid'] as int : int.tryParse('${daemon['pid']}');
+      workers = daemon['workers'] is int
+          ? daemon['workers'] as int
+          : int.tryParse('${daemon['workers']}');
+      seq = daemon['seq'] is int
+          ? daemon['seq'] as int
+          : int.tryParse('${daemon['seq']}');
+      pingVersion ??= daemon['version']?.toString();
+    } catch (e) {
+      fetchError ??= 'Daemon status failed: $e';
+    }
+
+    try {
+      final list = await _client.request(
+        'agents.list',
+        {},
+        timeout: const Duration(seconds: 8),
+      );
+      final agents = list['agents'];
+      if (agents is List) {
+        for (final raw in agents) {
+          if (raw is! Map) continue;
+          if (raw['chatId']?.toString() != chatId) continue;
+          final snap = Map<String, dynamic>.from(raw);
+          _applySnapshot(snap);
+          agentStatus = snap['status']?.toString() ?? agentStatus;
+          agentError = snap['lastError']?.toString();
+          acpId = snap['acpSessionId']?.toString() ?? acpId;
+          break;
+        }
+      }
+    } catch (e) {
+      fetchError ??= 'Agent list failed: $e';
+    }
+
+    return AdsmHostHealth(
+      hostLabel: host.displayLabel,
+      bridgeOpen: true,
+      pingVersion: pingVersion,
+      requiredVersion: kRequiredAdsmVersion,
+      daemonPid: pid,
+      workerCount: workers,
+      eventSeq: seq,
+      agentStatus: agentStatus,
+      agentLastError: agentError,
+      acpSessionId: acpId,
+      fetchError: fetchError,
+    );
+  }
 
   static Future<AdsmSession> start({
     required SshService ssh,
@@ -584,7 +721,7 @@ class AdsmSession implements AgentSession {
     _promptCompleter = c;
     try {
       // ADSM ≥0.4.3 returns {accepted:true} immediately; older hosts block
-      // until the full turn. Either way we wait on [c] for turn_complete.
+      // until the full turn. Delivery retries must not wait for the turn.
       final result = await _client.request(
         'session.prompt',
         {
@@ -597,47 +734,34 @@ class AdsmSession implements AgentSession {
           if (userCreatedAt != null)
             'userCreatedAt': userCreatedAt.toUtc().toIso8601String(),
         },
-        // Accept should be fast; long turns complete via events.
-        timeout: const Duration(seconds: 20),
+        timeout: const Duration(seconds: 12),
       );
 
       final accepted = result['accepted'] == true;
-      if (!accepted) {
-        // Legacy host: RPC waited for the whole turn.
-        _finishPrompt();
+      if (accepted) {
+        final mid = result['userMessageId']?.toString() ?? '';
+        _emitDelivered(mid);
         return;
       }
 
-      // Accepted — stay "in flight" until turn_complete / cancel / idle.
-      if (c.isCompleted) return;
-      await Future.any<void>([
-        c.future,
-        Future<void>.delayed(const Duration(minutes: 30)),
-      ]);
-      if (!c.isCompleted) {
-        // Safety net — host may have gone idle without turn_complete.
-        _finishPrompt();
-      }
+      // Legacy host: RPC waited for the whole turn.
+      _finishPrompt();
     } catch (e) {
       final msg = e.toString().toLowerCase();
-      // Host already took the prompt (ack lost / double-send). Wait for the
-      // in-flight turn instead of failing the UI as undelivered.
-      if (msg.contains('already running') || msg.contains('already running a turn')) {
-        if (!_updates.isClosed) {
-          _updates.add(const AcpUpdate.promptAccepted());
-          _updates.add(const AcpUpdate.activity('Thinking'));
-        }
-        if (c.isCompleted) return;
-        await Future.any<void>([
-          c.future,
-          Future<void>.delayed(const Duration(minutes: 30)),
-        ]);
-        if (!c.isCompleted) _finishPrompt();
+      // Host already took the prompt (ack lost / double-send / retry).
+      if (msg.contains('already running')) {
+        _emitDelivered('');
         return;
       }
       _finishPrompt();
       rethrow;
     }
+  }
+
+  void _emitDelivered(String userMessageId) {
+    if (_updates.isClosed) return;
+    _updates.add(AcpUpdate.promptAccepted(userMessageId));
+    _updates.add(const AcpUpdate.activity('Thinking'));
   }
 
   @override

@@ -1909,6 +1909,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             : kRemoteCursorSetupGuide;
 
     final runtime = _runtime;
+    final adsmSession = runtime?.session is AdsmSession
+        ? runtime!.session as AdsmSession
+        : null;
     final queue = runtime?.outboundQueue ?? const <ChatMessage>[];
     final queuedIds = {for (final m in queue) m.id};
     // Queued messages live in the DB but stay out of [entries] until promoted,
@@ -2100,10 +2103,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             )
           else
             IconButton(
-              tooltip: connected
-                  ? 'Agent live — keeps running on the host if you disconnect'
-                  : 'Reconnect ACP',
-              onPressed: _connecting ? null : _ensureAcp,
+              tooltip: adsmSession != null
+                  ? 'ADSM host status'
+                  : connected
+                      ? 'Agent live — keeps running on the host if you disconnect'
+                      : 'Reconnect ACP',
+              onPressed: _connecting
+                  ? null
+                  : () {
+                      if (adsmSession != null) {
+                        unawaited(
+                          AdsmHealthSheet.show(
+                            context,
+                            session: adsmSession,
+                            bridgeOpen: connected,
+                            onReconnect: connected ? null : _ensureAcp,
+                          ),
+                        );
+                      } else {
+                        unawaited(_ensureAcp());
+                      }
+                    },
               icon: Icon(connected ? Icons.sensors : Icons.link),
             ),
         ],
