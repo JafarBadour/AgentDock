@@ -390,7 +390,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     _sub?.cancel();
     _retryTimer?.cancel();
     _retryTimer = null;
+    final old = _session;
     _session = session;
+    if (old != session) {
+      unawaited(old.close());
+    }
     session.mode = preferredMode;
     session.permissionPolicy = preferredPermissionPolicy;
     pendingPermission = null;
@@ -867,7 +871,17 @@ class ChatSessionRuntime extends ChangeNotifier {
               msg.contains('timeout') ||
               msg.contains('adsm write') ||
               msg.contains('connection') ||
-              msg.contains('socket');
+              msg.contains('socket') ||
+              msg.contains('broken pipe');
+          if (msg.contains('unknown chatid') ||
+              msg.contains('agents.ensure')) {
+            // Daemon lost this worker — reconnect runs agents.ensure again.
+            if (!closed && sessionFactory != null) {
+              closed = true;
+              _scheduleReconnect(immediate: true);
+            }
+            rethrow;
+          }
           if (!retryable || attempt == 3) rethrow;
         }
       }

@@ -22,8 +22,11 @@ export 'adsm_version.dart';
 
 /// NDJSON control client for the host ADSM daemon (`agentdock-adsm client`).
 class AdsmClient {
-  AdsmClient._(this._session);
+  AdsmClient._(this._sshClient, this._session);
 
+  /// Dedicated SSH connection — not pooled, so periodic pool health checks
+  /// cannot tear down a long-lived ADSM bridge mid-turn.
+  final SSHClient _sshClient;
   final SSHSession _session;
   final _pending = <Object, Completer<Map<String, dynamic>>>{};
   final _events = StreamController<Map<String, dynamic>>.broadcast();
@@ -35,7 +38,7 @@ class AdsmClient {
   Stream<Map<String, dynamic>> get events => _events.stream;
 
   static Future<AdsmClient> connect(SshService ssh, Host host) async {
-    final client = await ssh.connect(host);
+    final client = await ssh.connectExclusive(host);
     final session = await client.execute(
       r'''
 export PATH="$HOME/.local/bin:$PATH"
@@ -49,7 +52,7 @@ else
 fi
 ''',
     );
-    final adsm = AdsmClient._(session);
+    final adsm = AdsmClient._(client, session);
     adsm._listen();
     // Warm ping — also learns protocol version for wire chunking.
     final pong = await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
@@ -217,6 +220,9 @@ fi
     } catch (_) {}
     try {
       _session.close();
+    } catch (_) {}
+    try {
+      _sshClient.close();
     } catch (_) {}
     _failAll(StateError('ADSM closed'));
     await _events.close();
@@ -734,7 +740,7 @@ class AdsmSession implements AgentSession {
           if (userCreatedAt != null)
             'userCreatedAt': userCreatedAt.toUtc().toIso8601String(),
         },
-        timeout: const Duration(seconds: 12),
+        timeout: const Duration(seconds: 25),
       );
 
       final accepted = result['accepted'] == true;
