@@ -18,12 +18,10 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
   final _passphraseController = TextEditingController();
   final _cursorKeyController = TextEditingController();
   final _anthropicKeyController = TextEditingController();
-  final _gcpKeyController = TextEditingController();
   final _gcpLangController = TextEditingController(text: 'en-US');
   bool _hasKey = false;
   bool _hasCursorKey = false;
   bool _hasAnthropicKey = false;
-  bool _hasGcpKey = false;
   bool _saving = false;
   String? _status;
 
@@ -41,14 +39,12 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     final hasKey = await store.hasSshPrivateKey();
     final hasCursor = await store.hasCursorApiKey();
     final hasAnthropic = await store.hasAnthropicApiKey();
-    final hasGcp = await store.hasGcpSpeechApiKey();
     final gcpLang = await store.readGcpSpeechLanguage();
     if (!mounted) return;
     setState(() {
       _hasKey = hasKey;
       _hasCursorKey = hasCursor;
       _hasAnthropicKey = hasAnthropic;
-      _hasGcpKey = hasGcp;
       if (_gcpLangController.text.trim().isEmpty ||
           _gcpLangController.text == 'en-US') {
         _gcpLangController.text = gcpLang;
@@ -142,26 +138,18 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     });
     try {
       final store = ref.read(secureStoreProvider);
-      await store.saveGcpSpeechApiKey(_gcpKeyController.text);
       await store.saveGcpSpeechLanguage(_gcpLangController.text);
-      _gcpKeyController.clear();
       await _load();
       setState(
         () => _status =
-            'Gemini API key saved. Chat mic uses Gemini to transcribe speech.',
+            'Speech language saved. Mic uses on-device recognition.',
       );
     } catch (e) {
-      SafeLog.d('save gemini key failed', e);
-      setState(() => _status = 'Failed to save Gemini key: $e');
+      SafeLog.d('save speech language failed', e);
+      setState(() => _status = 'Failed to save speech language: $e');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
-  }
-
-  Future<void> _clearGcpKey() async {
-    await ref.read(secureStoreProvider).saveGcpSpeechApiKey(null);
-    await _load();
-    setState(() => _status = 'Gemini API key removed.');
   }
 
   @override
@@ -170,7 +158,6 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     _passphraseController.dispose();
     _cursorKeyController.dispose();
     _anthropicKeyController.dispose();
-    _gcpKeyController.dispose();
     _gcpLangController.dispose();
     super.dispose();
   }
@@ -291,29 +278,13 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
           const Divider(height: 40),
           ListTile(
             contentPadding: EdgeInsets.zero,
-            leading: Icon(
-              _hasGcpKey ? Icons.check_circle : Icons.mic_none,
-              color: _hasGcpKey ? Colors.green : null,
-            ),
-            title: Text(
-              _hasGcpKey
-                  ? 'Gemini API key stored'
-                  : 'Gemini speech (optional)',
-            ),
+            leading: const Icon(Icons.mic),
+            title: const Text('Chat mic'),
             subtitle: const Text(
-              'Powers the chat mic. Use an API key from Google AI Studio '
-              '(aistudio.google.com). Audio is sent to Gemini for transcription only.',
+              'Uses on-device speech recognition (no Gemini upload). '
+              'Set a language hint below if needed.',
             ),
           ),
-          TextField(
-            controller: _gcpKeyController,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'Gemini API key',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
           TextField(
             controller: _gcpLangController,
             decoration: const InputDecoration(
@@ -324,19 +295,9 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
             ),
           ),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              FilledButton.tonal(
-                onPressed: _saving ? null : _saveGcpKey,
-                child: const Text('Save Gemini key'),
-              ),
-              const SizedBox(width: 12),
-              if (_hasGcpKey)
-                OutlinedButton(
-                  onPressed: _saving ? null : _clearGcpKey,
-                  child: const Text('Remove'),
-                ),
-            ],
+          FilledButton.tonal(
+            onPressed: _saving ? null : _saveGcpKey,
+            child: const Text('Save language'),
           ),
           if (_status != null) ...[
             const SizedBox(height: 20),

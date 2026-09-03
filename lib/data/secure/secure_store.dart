@@ -100,11 +100,44 @@ class SecureStore {
     await _write(_gcpSpeechApiKey, key.trim());
   }
 
-  Future<String?> readGcpSpeechApiKey() => _read(_gcpSpeechApiKey);
+  /// Gemini key from Connect, else `GEMINI_API_KEY` env / project `.env` (dev).
+  Future<String?> readGcpSpeechApiKey() async {
+    final stored = await _read(_gcpSpeechApiKey);
+    if (stored != null && stored.trim().isNotEmpty) return stored.trim();
+    final fromEnv = Platform.environment['GEMINI_API_KEY']?.trim();
+    if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
+    return _readDotEnvValue('GEMINI_API_KEY');
+  }
 
   Future<bool> hasGcpSpeechApiKey() async {
     final value = await readGcpSpeechApiKey();
     return value != null && value.trim().isNotEmpty;
+  }
+
+  /// Best-effort `KEY=value` from a local `.env` (flutter run / tests only).
+  Future<String?> _readDotEnvValue(String key) async {
+    try {
+      for (final path in ['.env', '../.env']) {
+        final f = File(path);
+        if (!await f.exists()) continue;
+        for (final line in await f.readAsLines()) {
+          final t = line.trim();
+          if (t.isEmpty || t.startsWith('#')) continue;
+          final i = t.indexOf('=');
+          if (i <= 0) continue;
+          if (t.substring(0, i).trim() != key) continue;
+          var v = t.substring(i + 1).trim();
+          if ((v.startsWith('"') && v.endsWith('"')) ||
+              (v.startsWith("'") && v.endsWith("'"))) {
+            v = v.substring(1, v.length - 1);
+          }
+          if (v.isNotEmpty) return v;
+        }
+      }
+    } catch (e) {
+      SafeLog.d('dotenv read failed', e);
+    }
+    return null;
   }
 
   Future<void> saveGcpSpeechLanguage(String? code) async {

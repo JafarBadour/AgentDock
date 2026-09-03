@@ -1,260 +1,181 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
-import 'dart:typed_data';
 
-import 'package:http/http.dart' as http;
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
-import 'package:record/record.dart';
+import 'package:flutter/foundation.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 
-/// Records mic audio and transcribes it with the Gemini API (Google AI key).
+/// Hold-to-talk mic using **on-device** speech recognition (fast; no Gemini).
+///
+/// Gemini upload was routinely slower than the UI's 3s budget, so the mic now
+/// uses the platform recognizer (`speech_to_text`) and returns as soon as you
+/// release. [SecureStore] language preference is still used as a locale hint.
 class GcpSpeechService {
   GcpSpeechService(this._store);
 
   final SecureStore _store;
-  final AudioRecorder _recorder = AudioRecorder();
-  String? _activePath;
-  bool _recording = false;
+  final SpeechToText _speech = SpeechToText();
 
-  /// Prefer current Flash models; fall back if a key's project lags.
-  static const _models = <String>[
-    'gemini-2.5-flash',
-    'gemini-flash-latest',
-    'gemini-2.0-flash',
-  ];
+  bool _ready = false;
+  bool _recording = false;
+  String _words = '';
+  String? _lastError;
 
   bool get isRecording => _recording;
 
-  Future<bool> hasApiKey() => _store.hasGcpSpeechApiKey();
+  /// Mic no longer needs a cloud key — native STT is enough.
+  Future<bool> hasApiKey() => isAvailable();
 
-  Future<bool> hasMicPermission() => _recorder.hasPermission();
+  Future<bool> isAvailable() async {
+    try {
+      return await _ensureReady();
+    } catch (e) {
+      SafeLog.d('speech init failed', e);
+      return false;
+    }
+  }
 
-  /// Start capturing mono 16 kHz WAV to a temp file.
+  Future<bool> hasMicPermission() async {
+    return _ensureReady();
+  }
+
+  Future<bool> _ensureReady() async {
+    if (_ready) return true;
+    _lastError = null;
+    final ok = await _speech.initialize(
+      onError: (e) {
+        _lastError = e.errorMsg;
+        SafeLog.d('speech error', e.errorMsg);
+      },
+      onStatus: (status) {
+        SafeLog.d('speech status: $status');
+      },
+    );
+    _ready = ok;
+    return ok;
+  }
+
+  /// Start listening; partial results accumulate until [stopAndTranscribe].
   Future<void> start() async {
     if (_recording) return;
-    final ok = await _recorder.hasPermission();
+    final ok = await _ensureReady();
     if (!ok) {
-      throw StateError('Microphone permission denied.');
+      throw StateError(
+        _lastError == null || _lastError!.isEmpty
+            ? 'Speech recognition is not available on this device.'
+            : 'Speech recognition unavailable: $_lastError',
+      );
     }
-    final dir = await getTemporaryDirectory();
-    final path = p.join(
-      dir.path,
-      'agentdock-stt-${DateTime.now().millisecondsSinceEpoch}.wav',
-    );
-    await _recorder.start(
-      const RecordConfig(
-        encoder: AudioEncoder.wav,
-        sampleRate: 16000,
-        numChannels: 1,
-      ),
-      path: path,
-    );
-    _activePath = path;
-    _recording = true;
-  }
 
-  /// Stop recording and return the transcript (may be empty).
-  Future<String> stopAndTranscribe() async {
-    if (!_recording) return '';
-    _recording = false;
-    final path = await _recorder.stop() ?? _activePath;
-    _activePath = null;
-    if (path == null || path.isEmpty) {
-      throw StateError('No audio captured.');
-    }
-    try {
-      final file = File(path);
-      if (!await file.exists()) {
-        throw StateError('Recording file missing.');
-      }
-      final bytes = await file.readAsBytes();
-      if (bytes.length < 44) {
-        throw StateError('Recording was empty — hold longer and try again.');
-      }
-      return await _recognize(bytes);
-    } finally {
-      try {
-        await File(path).delete();
-      } catch (_) {}
-    }
-  }
-
-  /// Cancel without uploading.
-  Future<void> cancel() async {
-    if (!_recording) return;
-    _recording = false;
-    final path = await _recorder.stop() ?? _activePath;
-    _activePath = null;
-    if (path != null) {
-      try {
-        await File(path).delete();
-      } catch (_) {}
-    }
-  }
-
-  Future<String> _recognize(Uint8List wavBytes) async {
-    final apiKey = await _store.readGcpSpeechApiKey();
-    if (apiKey == null || apiKey.isEmpty) {
-      throw StateError('Add a Gemini API key in Connect first.');
-    }
     final language = await _store.readGcpSpeechLanguage();
+    _words = '';
+    _recording = true;
 
-    Object? lastError;
-    for (final model in _models) {
-      try {
-        return await _recognizeWithModel(
-          apiKey: apiKey,
-          model: model,
-          language: language,
-          wavBytes: wavBytes,
-        );
-      } catch (e) {
-        lastError = e;
-        SafeLog.d('Gemini STT $model failed', e);
-        // Auth / quota — no point trying other models.
-        final msg = e.toString().toLowerCase();
-        if (msg.contains('api key') ||
-            msg.contains('permission') ||
-            msg.contains('403') ||
-            msg.contains('401') ||
-            msg.contains('quota') ||
-            msg.contains('billing')) {
-          rethrow;
+    // Prefer the saved BCP-47 code when the OS exposes it.
+    String? localeId;
+    try {
+      final locales = await _speech.locales();
+      final want = language.toLowerCase();
+      for (final loc in locales) {
+        final id = loc.localeId.toLowerCase();
+        if (id == want || id.startsWith(want.split('-').first)) {
+          localeId = loc.localeId;
+          break;
         }
       }
+    } catch (e) {
+      SafeLog.d('speech locales failed', e);
     }
-    throw StateError(
-      lastError == null
-          ? 'Speech-to-text failed.'
-          : _friendlyError(lastError),
-    );
-  }
 
-  Future<String> _recognizeWithModel({
-    required String apiKey,
-    required String model,
-    required String language,
-    required Uint8List wavBytes,
-  }) async {
-    final uri = Uri.https(
-      'generativelanguage.googleapis.com',
-      '/v1beta/models/$model:generateContent',
-      {'key': apiKey},
-    );
-
-    final prompt =
-        'Transcribe the spoken audio to plain text. '
-        'Language hint: $language. '
-        'Return only the transcript — no quotes, labels, or commentary. '
-        'If there is no intelligible speech, return an empty string.';
-
-    // REST uses proto-JSON snake_case for Blob fields.
-    final body = jsonEncode({
-      'contents': [
-        {
-          'role': 'user',
-          'parts': [
-            {'text': prompt},
-            {
-              'inline_data': {
-                'mime_type': 'audio/wav',
-                'data': base64Encode(wavBytes),
-              },
-            },
-          ],
-        },
-      ],
-      'generationConfig': {
-        'temperature': 0,
-        'maxOutputTokens': 2048,
-        // 2.5+ Flash spends output budget on "thinking" by default — a short
-        // transcript can come back empty unless we turn that off.
-        'thinkingConfig': {'thinkingBudget': 0},
+    await _speech.listen(
+      onResult: (result) {
+        _words = result.recognizedWords;
       },
-    });
-
-    final response = await http
-        .post(
-          uri,
-          headers: {'Content-Type': 'application/json; charset=utf-8'},
-          body: body,
-        )
-        .timeout(const Duration(seconds: 60));
-
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      SafeLog.d('Gemini STT HTTP ${response.statusCode}: ${response.body}');
-      throw StateError(_httpDetail(response.statusCode, response.body));
-    }
-
-    return _extractText(response.body).trim();
+      listenOptions: SpeechListenOptions(
+        localeId: localeId,
+        listenFor: const Duration(minutes: 2),
+        pauseFor: const Duration(seconds: 8),
+        partialResults: true,
+        cancelOnError: true,
+        listenMode: ListenMode.dictation,
+        // Prefer OS recognizer (on-device when available, network otherwise).
+        // Still far faster than uploading WAV to Gemini.
+        onDevice: false,
+      ),
+    );
   }
 
-  static String _httpDetail(int status, String body) {
-    String detail = body;
+  /// Stop listening and return the recognized text (may be empty).
+  Future<String> stopAndTranscribe() async {
+    if (!_recording) return _words.trim();
+    _recording = false;
     try {
-      final err = jsonDecode(body);
-      if (err is Map && err['error'] is Map) {
-        detail = (err['error'] as Map)['message']?.toString() ?? detail;
-      }
-    } catch (_) {}
-    if (status == 400 && detail.toLowerCase().contains('api key')) {
-      return 'Invalid Gemini API key — paste a key from aistudio.google.com in Connect.';
+      await _speech.stop();
+    } catch (e) {
+      SafeLog.d('speech stop failed', e);
     }
-    if (status == 403 || status == 401) {
-      return 'Gemini rejected the API key (HTTP $status). Check Connect → Gemini key.';
-    }
-    if (status == 404) {
-      return 'Gemini model not available for this key (HTTP 404).';
-    }
-    if (detail.length > 240) detail = '${detail.substring(0, 240)}…';
-    return 'Speech-to-text failed (HTTP $status): $detail';
+    // Brief settle so a final partial can land.
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    return _words.trim();
   }
 
-  static String _friendlyError(Object error) {
+  /// Cancel without keeping the transcript.
+  Future<void> cancel() async {
+    if (!_recording && !_speech.isListening) {
+      _words = '';
+      return;
+    }
+    _recording = false;
+    _words = '';
+    try {
+      await _speech.cancel();
+    } catch (e) {
+      SafeLog.d('speech cancel failed', e);
+    }
+  }
+
+  static String userFacingMessage(Object error) {
     final raw = error.toString();
     const prefix = 'Bad state: ';
     if (raw.startsWith(prefix)) return raw.substring(prefix.length);
     return raw;
   }
 
-  /// Strip Dart's `Bad state:` prefix for snackbars.
-  static String userFacingMessage(Object error) => _friendlyError(error);
-
-  static String _extractText(String responseBody) {
-    final decoded = jsonDecode(responseBody);
-    if (decoded is! Map) return '';
-    final candidates = decoded['candidates'];
-    if (candidates is! List || candidates.isEmpty) {
-      // Often blocked / empty audio — treat as no speech rather than a hard fail.
-      final feedback = decoded['promptFeedback'];
-      if (feedback is Map) {
-        final reason = feedback['blockReason']?.toString();
-        if (reason != null && reason.isNotEmpty) {
-          throw StateError('Speech blocked by Gemini ($reason).');
-        }
-      }
-      return '';
-    }
-    final first = candidates.first;
-    if (first is! Map) return '';
-    final content = first['content'];
-    if (content is! Map) return '';
-    final parts = content['parts'];
-    if (parts is! List) return '';
-    final buf = StringBuffer();
-    for (final part in parts) {
-      if (part is Map && part['text'] is String) {
-        buf.write(part['text']);
-      }
-    }
-    return buf.toString();
-  }
-
   Future<void> dispose() async {
     await cancel();
-    await _recorder.dispose();
   }
+}
+
+/// Legacy Gemini response parser (unit tests).
+@visibleForTesting
+String extractGeminiTranscript(String responseBody) {
+  final decoded = jsonDecode(responseBody);
+  if (decoded is! Map) return '';
+  final candidates = decoded['candidates'];
+  if (candidates is! List || candidates.isEmpty) {
+    final feedback = decoded['promptFeedback'];
+    if (feedback is Map) {
+      final reason = feedback['blockReason']?.toString();
+      if (reason != null && reason.isNotEmpty) {
+        throw StateError('Speech blocked by Gemini ($reason).');
+      }
+    }
+    return '';
+  }
+  final first = candidates.first;
+  if (first is! Map) return '';
+  final content = first['content'];
+  if (content is! Map) return '';
+  final parts = content['parts'];
+  if (parts is! List) return '';
+  final buf = StringBuffer();
+  for (final part in parts) {
+    if (part is! Map) continue;
+    if (part['thought'] == true) continue;
+    final text = part['text'];
+    if (text is String) buf.write(text);
+  }
+  return buf.toString();
 }
