@@ -216,3 +216,161 @@ String shortTimeAgo(DateTime time, {DateTime? now}) {
   if (delta.inDays < 365) return '${(delta.inDays / 7).floor()}w';
   return '${(delta.inDays / 365).floor()}y';
 }
+
+/// Green `+X` / red `-Y` / `N φ` files — agent code churn.
+class CodeDeltaLabel extends StatelessWidget {
+  const CodeDeltaLabel({
+    super.key,
+    required this.added,
+    required this.removed,
+    required this.files,
+    this.compact = false,
+  });
+
+  final int added;
+  final int removed;
+  final int files;
+  final bool compact;
+
+  bool get isEmpty => added == 0 && removed == 0 && files == 0;
+
+  @override
+  Widget build(BuildContext context) {
+    if (isEmpty) return const SizedBox.shrink();
+    final style = Theme.of(context).textTheme.labelSmall?.copyWith(
+          fontFeatures: const [FontFeature.tabularFigures()],
+          fontWeight: FontWeight.w600,
+          height: 1.1,
+        );
+    const green = Color(0xFF2E7D32);
+    const red = Color(0xFFC62828);
+    return Text.rich(
+      TextSpan(
+        style: style?.copyWith(
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+        children: [
+          if (!compact) const TextSpan(text: 'Delta '),
+          TextSpan(
+            text: '+$added',
+            style: style?.copyWith(color: green),
+          ),
+          const TextSpan(text: ' '),
+          TextSpan(
+            text: '-$removed',
+            style: style?.copyWith(color: red),
+          ),
+          if (files > 0) ...[
+            TextSpan(
+              text: compact ? ' · ' : ' | ',
+              style: style?.copyWith(
+                color: Theme.of(context).colorScheme.outline,
+              ),
+            ),
+            TextSpan(
+              text: '$files φ',
+              style: style?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ],
+      ),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+    );
+  }
+}
+
+/// Live `Exploring 8 φ, 7 🔍` while the agent reads/searches.
+class ExploreStatsLabel extends StatelessWidget {
+  const ExploreStatsLabel({
+    super.key,
+    required this.files,
+    required this.searches,
+    this.style,
+    this.showEllipsis = false,
+  });
+
+  final int files;
+  final int searches;
+  final TextStyle? style;
+  final bool showEllipsis;
+
+  bool get isEmpty => files == 0 && searches == 0;
+
+  @override
+  Widget build(BuildContext context) {
+    if (isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final resolved = style ??
+        theme.textTheme.labelSmall?.copyWith(
+          fontFeatures: const [FontFeature.tabularFigures()],
+          fontWeight: FontWeight.w600,
+          height: 1.1,
+          color: theme.colorScheme.primary,
+        );
+    final iconSize = (resolved?.fontSize ?? 12) + 2;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('Exploring ', style: resolved),
+        if (files > 0) Text('$files φ', style: resolved),
+        if (files > 0 && searches > 0) Text(', ', style: resolved),
+        if (searches > 0) ...[
+          Text('$searches', style: resolved),
+          const SizedBox(width: 2),
+          Icon(Icons.search, size: iconSize, color: resolved?.color),
+        ],
+        if (showEllipsis) Text('…', style: resolved),
+      ],
+    );
+  }
+}
+
+/// Shows which automated schedule (`#N`) last ran into an agent chat.
+class AutoNumberBadge extends StatelessWidget {
+  const AutoNumberBadge({super.key, required this.number, this.compact = true});
+
+  final int number;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = compact ? '#$number' : 'Auto #$number';
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: compact ? 6 : 8,
+        vertical: compact ? 2 : 3,
+      ),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primary.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: theme.colorScheme.primary.withValues(alpha: 0.35),
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.schedule,
+            size: compact ? 11 : 13,
+            color: theme.colorScheme.primary,
+          ),
+          const SizedBox(width: 3),
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.primary,
+              fontWeight: FontWeight.w700,
+              fontSize: compact ? 10 : 11,
+              height: 1.1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

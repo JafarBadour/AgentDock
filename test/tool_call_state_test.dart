@@ -72,6 +72,9 @@ void main() {
       expect(_tool(kind: 'execute').displayTitle, 'Ran a command');
       expect(_tool(kind: 'read_file').displayTitle, 'Read a file');
       expect(_tool(kind: 'grep').displayTitle, 'Searched the code');
+      expect(_tool(kind: 'search').displayTitle, 'Searched the code');
+      expect(_tool(kind: 'web_search').displayTitle, 'Web search');
+      expect(_tool(kind: 'WebFetch').displayTitle, 'Fetched a URL');
       expect(_tool(kind: null).displayTitle, 'Tool call');
     });
 

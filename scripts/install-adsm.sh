@@ -42,7 +42,7 @@ else
   trap cleanup EXIT
   # Sparse-ish: pull individual modules.
   mkdir -p "$TMP/adsm"
-  for f in __init__.py __main__.py paths.py protocol.py worker.py daemon.py cli.py; do
+  for f in __init__.py __main__.py paths.py protocol.py worker.py daemon.py cli.py scheduler.py transcript.py; do
     curl -fsSL "$REPO_URL/host/adsm/$f" -o "$TMP/adsm/$f"
   done
   rm -rf "$DEST_SHARE/host"
@@ -77,6 +77,13 @@ if ! command -v tmux >/dev/null 2>&1; then
   warn "tmux not found — install tmux (ADSM workers need it)"
 fi
 
+# Always restart so a prior daemon cannot keep old code in memory.
+pkill -f 'python3 -m adsm serve' 2>/dev/null || true
+pkill -f 'python -m adsm serve' 2>/dev/null || true
+sleep 0.3
+rm -f "${HOME}/.agentdock/adsm.sock" 2>/dev/null || true
+
 "$DEST_BIN/agentdock-adsm" ensure-running
+ok "ADSM daemon running"
 "$DEST_BIN/agentdock-adsm" status || true
 ok "ADSM ready"

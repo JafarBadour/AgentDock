@@ -9,7 +9,8 @@ import signal
 import sys
 from typing import Any, Optional
 
-from . import paths, protocol
+from . import paths, protocol, scheduler
+from . import transcript as transcript_store
 from .worker import Worker
 
 
@@ -21,6 +22,7 @@ class Daemon:
         self._global_subscribers: set[asyncio.StreamWriter] = set()
         self._event_log: dict[str, list[dict[str, Any]]] = {}
         self._server: Optional[asyncio.AbstractServer] = None
+        self.scheduler = scheduler.Scheduler(self)
 
     async def start(self) -> None:
         paths.ensure_layout()
@@ -71,6 +73,8 @@ class Daemon:
                         protocol.STATUS_IDLE if alive else protocol.STATUS_DEAD
                     )
 
+        self.scheduler.start()
+
         async with self._server:
             await self._server.serve_forever()
 
@@ -92,6 +96,9 @@ class Daemon:
         error: Optional[str] = None,
         acp_session_id: Optional[str] = None,
         model_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        binary: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> None:
         path = paths.agent_record_path(chat_id)
         data: dict[str, Any] = {}
@@ -108,6 +115,12 @@ class Daemon:
             data["acp_session_id"] = acp_session_id
         if model_id is not None:
             data["model_id"] = model_id
+        if cwd:
+            data["cwd"] = cwd
+        if binary:
+            data["binary"] = binary
+        if provider:
+            data["provider"] = provider
         if error is not None:
             data["last_error"] = error
         from datetime import datetime, timezone
@@ -193,12 +206,13 @@ class Daemon:
 
         try:
             if method == "ping":
-                result: Any = {"ok": True, "version": "0.1.0"}
+                result: Any = {"ok": True, "version": protocol.VERSION}
             elif method == "daemon.status":
                 result = {
                     "pid": os.getpid(),
                     "workers": len(self.workers),
                     "seq": self._seq,
+                    "version": protocol.VERSION,
                 }
             elif method == "agents.list":
                 result = {
@@ -222,6 +236,20 @@ class Daemon:
                 result = await self._set_mode(params)
             elif method == "session.set_model":
                 result = await self._set_model(params)
+            elif method == "session.refresh_models":
+                result = await self._refresh_models(params)
+            elif method == "schedules.list":
+                result = {"schedules": scheduler.list_jobs()}
+            elif method == "schedules.upsert":
+                result = await self._schedules_upsert(params)
+            elif method == "schedules.delete":
+                result = await self._schedules_delete(params)
+            elif method == "schedules.run_now":
+                result = await self._schedules_run_now(params)
+            elif method == "transcript.pull":
+                result = await self._transcript_pull(params)
+            elif method == "transcript.sync":
+                result = await self._transcript_sync(params)
             else:
                 writer.write(
                     protocol.encode(
@@ -255,10 +283,13 @@ class Daemon:
         if not chat_id:
             raise ValueError("chatId required")
         w = self._worker(chat_id)
+        cwd = str(params.get("cwd") or "")
+        binary = str(params.get("binary") or "")
+        provider = str(params.get("provider") or "cursor")
         snap = await w.ensure(
-            cwd=str(params.get("cwd") or ""),
-            binary=str(params.get("binary") or ""),
-            provider=str(params.get("provider") or "cursor"),
+            cwd=cwd,
+            binary=binary,
+            provider=provider,
             api_key=params.get("apiKey"),
             full_access=bool(params.get("fullAccess", True)),
             resume_session_id=params.get("resumeSessionId"),
@@ -266,6 +297,15 @@ class Daemon:
             mode=params.get("mode"),
             model_id=params.get("modelId"),
             permission_ask=bool(params.get("permissionAsk", False)),
+        )
+        await self._patch_agent_record(
+            chat_id,
+            status=snap.get("status"),
+            acp_session_id=snap.get("acpSessionId"),
+            model_id=snap.get("modelId"),
+            cwd=cwd or None,
+            binary=binary or None,
+            provider=provider or None,
         )
         return snap
 
@@ -281,6 +321,7 @@ class Daemon:
                 rec = paths.agent_record_path(chat_id)
                 if rec.exists():
                     rec.unlink(missing_ok=True)
+                transcript_store.clear_messages(chat_id)
         return {"ok": True}
 
     async def _subscribe(
@@ -308,10 +349,48 @@ class Daemon:
     async def _prompt(self, params: dict[str, Any]) -> dict[str, Any]:
         chat_id = str(params.get("chatId") or "")
         text = str(params.get("text") or "")
+        images = params.get("images") or []
+        if not isinstance(images, list):
+            images = []
         w = self.workers.get(chat_id)
         if not w:
             raise RuntimeError("unknown chatId — call agents.ensure first")
-        return await w.prompt(text)
+        return await w.prompt(
+            text,
+            images=images,
+            user_message_id=(
+                str(params["userMessageId"])
+                if params.get("userMessageId")
+                else None
+            ),
+            user_created_at=(
+                str(params["userCreatedAt"])
+                if params.get("userCreatedAt")
+                else None
+            ),
+        )
+
+    async def _transcript_pull(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        if not chat_id:
+            raise ValueError("chatId required")
+        return {"messages": transcript_store.list_messages(chat_id)}
+
+    async def _transcript_sync(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        if not chat_id:
+            raise ValueError("chatId required")
+        raw = params.get("messages") or []
+        if not isinstance(raw, list):
+            raise ValueError("messages must be a list")
+        changed = transcript_store.upsert_messages(
+            chat_id, [m for m in raw if isinstance(m, dict)]
+        )
+        return {
+            "ok": True,
+            "changed": changed,
+            "count": len(transcript_store.list_messages(chat_id)),
+        }
 
     async def _cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         chat_id = str(params.get("chatId") or "")
@@ -351,6 +430,37 @@ class Daemon:
         await self._patch_agent_record(chat_id, model_id=model_id)
         return w.snapshot()
 
+    async def _refresh_models(self, params: dict[str, Any]) -> dict[str, Any]:
+        chat_id = str(params.get("chatId") or "")
+        if not chat_id:
+            raise ValueError("chatId required")
+        w = self._worker(chat_id)
+        return await w.refresh_models(
+            mcp_servers=params.get("mcpServers") or [],
+        )
+
+    async def _schedules_upsert(self, params: dict[str, Any]) -> dict[str, Any]:
+        job = params.get("job") if isinstance(params.get("job"), dict) else params
+        if not isinstance(job, dict):
+            raise ValueError("job object required")
+        saved = scheduler.save_job(job)
+        return {"schedule": saved}
+
+    async def _schedules_delete(self, params: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(params.get("id") or params.get("jobId") or "")
+        if not job_id:
+            raise ValueError("id required")
+        ok = scheduler.delete_job(job_id)
+        return {"ok": ok}
+
+    async def _schedules_run_now(self, params: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(params.get("id") or params.get("jobId") or "")
+        job = scheduler.load_job(job_id)
+        if not job:
+            raise RuntimeError("unknown schedule id")
+        updated = await self.scheduler.run_job(job, force=True)
+        return {"schedule": updated}
+
 
 async def run_serve() -> None:
     paths.ensure_layout()
@@ -376,6 +486,7 @@ async def run_serve() -> None:
 
     serve_task = asyncio.create_task(daemon.start())
     await stop.wait()
+    await daemon.scheduler.stop()
     serve_task.cancel()
     try:
         await serve_task

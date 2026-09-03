@@ -102,6 +102,92 @@ void main() {
     expect(all.single.content, 'local streaming copy');
   });
 
+  test('merge prefers the longer body when ids match', () async {
+    final at = DateTime(2026, 1, 1, 10);
+    await db.insertMessage(
+      _msg('a1', 'partial', at, role: MessageRole.assistant),
+    );
+
+    await db.mergeMessages('chat-1', [
+      _msg('a1', 'partial then the rest of the turn', at,
+          role: MessageRole.assistant),
+    ]);
+
+    final all = await db.listMessages('chat-1');
+    expect(all, hasLength(1));
+    expect(all.single.content, 'partial then the rest of the turn');
+  });
+
+  test('merge skips same role+content under a different host id', () async {
+    final at = DateTime(2026, 1, 1, 10);
+    await db.insertMessage(_msg('phone-u1', 'hello from phone', at));
+
+    final changed = await db.mergeMessages('chat-1', [
+      _msg('adsm-u1', 'hello from phone', at),
+      _msg('adsm-a1', 'host reply', at, role: MessageRole.assistant),
+    ]);
+
+    expect(changed, 1, reason: 'only the assistant is new');
+    final all = await db.listMessages('chat-1');
+    expect(all.map((m) => m.id).toList(), ['phone-u1', 'adsm-a1']);
+  });
+
+  test('reconnect merge restores host transcript without duplicates', () async {
+    final base = DateTime(2026, 1, 1, 10);
+    // Phone already has the user turn locally; host also stored it under the
+    // same id, plus an assistant turn written while the phone was away.
+    await db.insertMessage(_msg('u1', 'do the thing', base));
+
+    final changed = await db.mergeMessages('chat-1', [
+      _msg('u1', 'do the thing', base),
+      _msg(
+        'a1',
+        'done on host',
+        base.add(const Duration(seconds: 2)),
+        role: MessageRole.assistant,
+      ),
+    ]);
+
+    expect(changed, 1);
+    final all = await db.listMessages('chat-1');
+    expect(all.map((m) => m.id).toList(), ['u1', 'a1']);
+    expect(all.last.content, 'done on host');
+  });
+
+  test('ChatMessage round-trips host snake_case maps', () {
+    final map = <String, Object?>{
+      'id': 'm1',
+      'chat_id': 'chat-1',
+      'role': 'assistant',
+      'content': 'from ads',
+      'created_at': '2026-01-01T10:00:00.000Z',
+    };
+    final msg = ChatMessage.fromMap(map);
+    expect(msg.toMap()['id'], 'm1');
+    expect(msg.role, MessageRole.assistant);
+    expect(ChatMessage.fromMap(msg.toMap()).content, 'from ads');
+  });
+
+  test('AgentDockService union keeps host-only rows across rewrite', () {
+    final base = DateTime(2026, 1, 1, 10);
+    final local = [
+      _msg('u1', 'local', base),
+      _msg('a1', 'short', base.add(const Duration(seconds: 1)),
+          role: MessageRole.assistant),
+    ];
+    final remote = [
+      _msg('u1', 'local', base),
+      _msg('a1', 'short then longer on host',
+          base.add(const Duration(seconds: 1)),
+          role: MessageRole.assistant),
+      _msg('a2', 'host only', base.add(const Duration(seconds: 2)),
+          role: MessageRole.assistant),
+    ];
+    final merged = AgentDockService.unionMessagesForTest(remote, local);
+    expect(merged.map((m) => m.id).toList(), ['u1', 'a1', 'a2']);
+    expect(merged[1].content, 'short then longer on host');
+  });
+
   test('replaceMessages still resets a transcript when asked', () async {
     final at = DateTime(2026, 1, 1, 10);
     await db.insertMessage(_msg('old', 'gone', at));

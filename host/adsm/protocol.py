@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Optional
 
+# Bump when the wire protocol or daemon behaviour changes in a way the
+# phone must pick up (install script restarts the daemon on mismatch).
+VERSION = "0.4.0"
+
 
 def encode(obj: Mapping[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode(

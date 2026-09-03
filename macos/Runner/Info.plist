@@ -30,5 +30,9 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Attach screenshots and photos to agent prompts.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dictate messages with Google Cloud Speech-to-Text.</string>
 </dict>
 </plist>

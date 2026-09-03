@@ -7,7 +7,9 @@ import 'package:dartssh2/dartssh2.dart';
 import '../data/models/agent_mode.dart';
 import '../data/models/agent_model.dart';
 import '../data/models/agent_provider.dart';
+import '../data/models/chat_message.dart';
 import '../data/models/host.dart';
+import '../data/models/prompt_image.dart';
 import '../data/models/tool_call_state.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
@@ -32,7 +34,17 @@ class AdsmClient {
   static Future<AdsmClient> connect(SshService ssh, Host host) async {
     final client = await ssh.connect(host);
     final session = await client.execute(
-      r'export PATH="$HOME/.local/bin:$PATH"; exec agentdock-adsm client',
+      r'''
+export PATH="$HOME/.local/bin:$PATH"
+if command -v agentdock-adsm >/dev/null 2>&1; then
+  exec agentdock-adsm client
+elif [ -x "$HOME/.local/bin/agentdock-adsm" ]; then
+  exec "$HOME/.local/bin/agentdock-adsm" client
+else
+  echo "agentdock-adsm not found" >&2
+  exit 127
+fi
+''',
     );
     final adsm = AdsmClient._(session);
     adsm._listen();
@@ -278,7 +290,42 @@ class AdsmSession implements AgentSession {
     if (state == 'idle' && (resumeSessionId != null || session.sessionId != null)) {
       session.resumedInPlace = snap['acpSessionId'] == resumeSessionId;
     }
+    // Pull durable host transcript ASAP — before UI settles on SQLite-only.
+    try {
+      session.hostTranscript = await session.pullTranscript();
+    } catch (e) {
+      SafeLog.d('ADSM transcript.pull failed', e);
+    }
     return session;
+  }
+
+  /// Messages pulled from host `~/.agentdock/messages/<chatId>.jsonl`.
+  List<ChatMessage> hostTranscript = const [];
+
+  Future<List<ChatMessage>> pullTranscript() async {
+    final result = await _client.request('transcript.pull', {
+      'chatId': chatId,
+    });
+    final raw = result['messages'];
+    if (raw is! List) return const [];
+    final out = <ChatMessage>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      try {
+        out.add(ChatMessage.fromMap(Map<String, Object?>.from(item)));
+      } catch (_) {}
+    }
+    hostTranscript = out;
+    return out;
+  }
+
+  /// Push local messages into the host store (merge by id).
+  Future<void> syncTranscriptToHost(List<ChatMessage> messages) async {
+    if (messages.isEmpty) return;
+    await _client.request('transcript.sync', {
+      'chatId': chatId,
+      'messages': [for (final m in messages) m.toMap()],
+    });
   }
 
   void _applySnapshot(Map<String, dynamic> snap) {
@@ -439,6 +486,7 @@ class AdsmSession implements AgentSession {
       locations: locations,
       rawInput: ToolCallState.formatOpaque(m['rawInput']),
       rawOutput: ToolCallState.formatOpaque(m['rawOutput']),
+      content: ToolCallState.formatOpaque(m['content']),
     );
   }
 
@@ -450,25 +498,47 @@ class AdsmSession implements AgentSession {
   }
 
   @override
-  Future<void> prompt(String text) async {
+  Future<void> prompt(
+    String text, {
+    List<PromptImage> images = const [],
+    String? userMessageId,
+    DateTime? userCreatedAt,
+  }) async {
     _promptInFlight = true;
     final c = Completer<void>();
     _promptCompleter = c;
     try {
-      await _client.request(
+      final rpc = _client.request(
         'session.prompt',
-        {'chatId': chatId, 'text': text},
+        {
+          'chatId': chatId,
+          'text': text,
+          if (images.isNotEmpty)
+            'images': [for (final img in images) img.toWire()],
+          if (userMessageId != null && userMessageId.isNotEmpty)
+            'userMessageId': userMessageId,
+          if (userCreatedAt != null)
+            'userCreatedAt': userCreatedAt.toUtc().toIso8601String(),
+        },
         timeout: const Duration(minutes: 15),
       );
-      // Daemon may have already emitted turn_complete; still finish.
-      _finishPrompt();
+      // Race cancel() so a hung image/turn can unlock without waiting 15 min.
+      final winner = await Future.any<String>([
+        rpc.then((_) => 'rpc'),
+        c.future.then((_) => 'cancel'),
+      ]);
+      if (winner == 'rpc') {
+        _finishPrompt();
+      } else {
+        // cancel() already completed [c] via _finishPrompt — drop late RPC.
+        unawaited(rpc.then((_) {}, onError: (_) {}));
+      }
     } catch (e) {
       _finishPrompt();
       rethrow;
     }
     // If turn_complete arrived before RPC returned, completer already done.
     if (!c.isCompleted) {
-      // Soft wait: events may still be draining.
       try {
         await c.future.timeout(const Duration(seconds: 2));
       } on TimeoutException {
@@ -538,20 +608,33 @@ class AdsmSession implements AgentSession {
     required List<Map<String, dynamic>> mcpServers,
   }) async {
     if (availableModels.isNotEmpty) return;
-    // Re-ensure to refresh catalogue without restarting if already idle.
     try {
-      final snap = await _client.request('agents.list', {});
-      final agents = snap['agents'];
-      if (agents is List) {
-        for (final a in agents) {
-          if (a is Map && a['chatId'] == chatId) {
-            _applySnapshot(Map<String, dynamic>.from(a));
-            break;
+      final snap = await _client.request(
+        'session.refresh_models',
+        {
+          'chatId': chatId,
+          'mcpServers': mcpServers,
+        },
+        timeout: const Duration(seconds: 90),
+      );
+      _applySnapshot(snap);
+    } catch (e) {
+      SafeLog.d('ADSM model catalog refresh failed', e);
+      // Older ADSM: fall back to agents.list (may still be empty).
+      try {
+        final snap = await _client.request('agents.list', {});
+        final agents = snap['agents'];
+        if (agents is List) {
+          for (final a in agents) {
+            if (a is Map && a['chatId'] == chatId) {
+              _applySnapshot(Map<String, dynamic>.from(a));
+              break;
+            }
           }
         }
+      } catch (e2) {
+        SafeLog.d('ADSM model catalog list fallback failed', e2);
       }
-    } catch (e) {
-      SafeLog.d('ADSM model catalog failed', e);
     }
   }
 

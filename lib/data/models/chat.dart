@@ -13,6 +13,10 @@ class Chat {
     this.journalOffset = 0,
     this.modelId,
     this.lastReadAt,
+    this.lastAutoNumber,
+    this.linesAdded = 0,
+    this.linesRemoved = 0,
+    this.filesChanged = 0,
     this.status = ChatStatus.idle,
     this.sortOrder = 0,
     required this.createdAt,
@@ -40,6 +44,20 @@ class Chat {
   ///
   /// Only ever moves forward — see [AppDatabase.markChatRead].
   final DateTime? lastReadAt;
+
+  /// Last automated schedule number (`#N`) that delivered a prompt into this
+  /// chat. Local-only — used for the Agents list badge.
+  final int? lastAutoNumber;
+
+  /// Session code churn from agent edit/write tools (`+` lines).
+  final int linesAdded;
+
+  /// Session code churn from agent edit/write tools (`-` lines).
+  final int linesRemoved;
+
+  /// Distinct files touched by agent edits this session.
+  final int filesChanged;
+
   final ChatStatus status;
   final int sortOrder;
   final DateTime createdAt;
@@ -55,6 +73,10 @@ class Chat {
         'journal_offset': journalOffset,
         'model_id': modelId,
         'last_read_at': lastReadAt?.toIso8601String(),
+        'last_auto_number': lastAutoNumber,
+        'lines_added': linesAdded,
+        'lines_removed': linesRemoved,
+        'files_changed': filesChanged,
         'status': status.name,
         'sort_order': sortOrder,
         'created_at': createdAt.toIso8601String(),
@@ -71,6 +93,10 @@ class Chat {
         journalOffset: (map['journal_offset'] as int?) ?? 0,
         modelId: map['model_id'] as String?,
         lastReadAt: DateTime.tryParse((map['last_read_at'] as String?) ?? ''),
+        lastAutoNumber: map['last_auto_number'] as int?,
+        linesAdded: (map['lines_added'] as int?) ?? 0,
+        linesRemoved: (map['lines_removed'] as int?) ?? 0,
+        filesChanged: (map['files_changed'] as int?) ?? 0,
         status: ChatStatus.values.firstWhere(
           (s) => s.name == map['status'],
           orElse: () => ChatStatus.idle,
@@ -84,9 +110,17 @@ class Chat {
     String? title,
     String? tmuxSession,
     String? acpSessionId,
+    bool clearTmuxSession = false,
+    bool clearAcpSessionId = false,
     int? journalOffset,
     String? modelId,
     DateTime? lastReadAt,
+    int? lastAutoNumber,
+    bool clearLastAutoNumber = false,
+    int? linesAdded,
+    int? linesRemoved,
+    int? filesChanged,
+    bool clearCodeDelta = false,
     ChatStatus? status,
     int? sortOrder,
     DateTime? updatedAt,
@@ -96,11 +130,19 @@ class Chat {
         repoId: repoId,
         title: title ?? this.title,
         provider: provider,
-        tmuxSession: tmuxSession ?? this.tmuxSession,
-        acpSessionId: acpSessionId ?? this.acpSessionId,
+        tmuxSession:
+            clearTmuxSession ? null : (tmuxSession ?? this.tmuxSession),
+        acpSessionId:
+            clearAcpSessionId ? null : (acpSessionId ?? this.acpSessionId),
         journalOffset: journalOffset ?? this.journalOffset,
         modelId: modelId ?? this.modelId,
         lastReadAt: lastReadAt ?? this.lastReadAt,
+        lastAutoNumber: clearLastAutoNumber
+            ? null
+            : (lastAutoNumber ?? this.lastAutoNumber),
+        linesAdded: clearCodeDelta ? 0 : (linesAdded ?? this.linesAdded),
+        linesRemoved: clearCodeDelta ? 0 : (linesRemoved ?? this.linesRemoved),
+        filesChanged: clearCodeDelta ? 0 : (filesChanged ?? this.filesChanged),
         status: status ?? this.status,
         sortOrder: sortOrder ?? this.sortOrder,
         createdAt: createdAt,

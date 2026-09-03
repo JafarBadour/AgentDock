@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' show max;
 
+import 'package:flutter/foundation.dart';
+
 import '../data/local/app_database.dart';
 import '../data/models/agent_provider.dart';
 import '../data/models/chat.dart';
@@ -221,7 +223,7 @@ class AgentDockService {
       if (repo == null) return;
       final host = await _db.getHost(repo.hostId);
       if (host == null) return;
-      final messages = await _db.listMessages(chatId);
+      final localMessages = await _db.listMessages(chatId);
       final queue = await _db.getOutboundQueue(chatId);
 
       final root = await _root(host);
@@ -235,11 +237,28 @@ class AgentDockService {
       // A streaming turn is checkpointed in place, so a message we already
       // pushed can change without the count moving. Appending would leave the
       // host holding the truncated copy, so verify the prefix first.
-      final prefixHash = _hashContents(messages.take(pushed));
+      final prefixHash = _hashContents(localMessages.take(pushed));
       final canAppend = pushed > 0 &&
-          pushed <= messages.length &&
+          pushed <= localMessages.length &&
           _pushedPrefixHash[chatId] == prefixHash;
-      final slice = canAppend ? messages.sublist(pushed) : messages;
+
+      // Full rewrite must union with the host file — ADSM may have appended
+      // turns the phone has not pulled yet, and a blind overwrite would drop them.
+      var messages = localMessages;
+      if (!canAppend) {
+        try {
+          final remote = await pullMessages(host, chatId);
+          if (remote.isNotEmpty) {
+            messages = _unionMessages(remote, localMessages);
+            if (messages.length != localMessages.length) {
+              await _db.mergeMessages(chatId, remote);
+            }
+          }
+        } catch (e) {
+          SafeLog.d('agentdock merge remote before push failed', e);
+        }
+      }
+      final slice = canAppend ? localMessages.sublist(pushed) : messages;
 
       final buf = StringBuffer();
       for (final m in slice) {
@@ -364,6 +383,35 @@ class AgentDockService {
     }
     return buf.toString();
   }
+
+  /// Union by id (longer body wins), sorted by createdAt then id.
+  static List<ChatMessage> _unionMessages(
+    List<ChatMessage> a,
+    List<ChatMessage> b,
+  ) {
+    final byId = <String, ChatMessage>{};
+    for (final m in [...a, ...b]) {
+      final prev = byId[m.id];
+      if (prev == null || m.content.length >= prev.content.length) {
+        byId[m.id] = m;
+      }
+    }
+    final out = byId.values.toList()
+      ..sort((x, y) {
+        final c = x.createdAt.compareTo(y.createdAt);
+        if (c != 0) return c;
+        return x.id.compareTo(y.id);
+      });
+    return out;
+  }
+
+  /// Test seam for [_unionMessages].
+  @visibleForTesting
+  static List<ChatMessage> unionMessagesForTest(
+    List<ChatMessage> a,
+    List<ChatMessage> b,
+  ) =>
+      _unionMessages(a, b);
 
   /// Pull all agents for [host] into local DB (create repos by path as needed).
   Future<int> syncHostCatalog(Host host) async {

@@ -12,22 +12,29 @@ class ModelPickerSheet extends StatefulWidget {
     super.key,
     required this.models,
     this.selectedId,
+    this.connected = false,
   });
 
   final List<AgentModel> models;
   final String? selectedId;
+  final bool connected;
 
   /// Returns the chosen model id, or null if dismissed.
   static Future<String?> show(
     BuildContext context, {
     required List<AgentModel> models,
     String? selectedId,
+    bool connected = false,
   }) {
     return showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
-      builder: (_) => ModelPickerSheet(models: models, selectedId: selectedId),
+      builder: (_) => ModelPickerSheet(
+        models: models,
+        selectedId: selectedId,
+        connected: connected,
+      ),
     );
   }
 
@@ -137,8 +144,10 @@ class _ModelPickerSheetState extends State<ModelPickerSheet> {
                       padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
                       child: Text(
                         widget.models.isEmpty
-                            ? 'Connect to the agent to load its model list.'
-                            : 'No model matches those filters.',
+                            ? (widget.connected
+                                ? 'Connected, but the agent has not advertised any models yet. Close this, wait a moment, then open Model again.'
+                                : 'No models yet. Tap Connect on the chat first — the list loads from the live agent session.')
+                            : 'No model matches those filters. Clear Thinking / Fast / Large context and try again.',
                         style: theme.textTheme.bodyMedium,
                       ),
                     )

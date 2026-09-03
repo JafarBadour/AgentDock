@@ -27,6 +27,8 @@ class SecureStore {
   static const _sshPassphrase = 'ssh_key_passphrase';
   static const _cursorApiKey = 'cursor_api_key';
   static const _anthropicApiKey = 'anthropic_api_key';
+  static const _gcpSpeechApiKey = 'gcp_speech_api_key';
+  static const _gcpSpeechLanguage = 'gcp_speech_language';
 
   final FlutterSecureStorage _storage;
 
@@ -88,6 +90,35 @@ class SecureStore {
   Future<bool> hasAnthropicApiKey() async {
     final value = await readAnthropicApiKey();
     return value != null && value.trim().isNotEmpty;
+  }
+
+  Future<void> saveGcpSpeechApiKey(String? key) async {
+    if (key == null || key.trim().isEmpty) {
+      await _delete(_gcpSpeechApiKey);
+      return;
+    }
+    await _write(_gcpSpeechApiKey, key.trim());
+  }
+
+  Future<String?> readGcpSpeechApiKey() => _read(_gcpSpeechApiKey);
+
+  Future<bool> hasGcpSpeechApiKey() async {
+    final value = await readGcpSpeechApiKey();
+    return value != null && value.trim().isNotEmpty;
+  }
+
+  Future<void> saveGcpSpeechLanguage(String? code) async {
+    if (code == null || code.trim().isEmpty) {
+      await _delete(_gcpSpeechLanguage);
+      return;
+    }
+    await _write(_gcpSpeechLanguage, code.trim());
+  }
+
+  Future<String> readGcpSpeechLanguage() async {
+    final v = await _read(_gcpSpeechLanguage);
+    if (v == null || v.trim().isEmpty) return 'en-US';
+    return v.trim();
   }
 
   Future<void> _write(String key, String value) async {

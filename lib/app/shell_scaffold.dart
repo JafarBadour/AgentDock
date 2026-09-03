@@ -35,9 +35,9 @@ class ShellScaffold extends StatelessWidget {
                 label: 'Agents',
               ),
               NavigationDestination(
-                icon: Icon(Icons.terminal_outlined),
-                selectedIcon: Icon(Icons.terminal),
-                label: 'Terminal',
+                icon: Icon(Icons.schedule_outlined),
+                selectedIcon: Icon(Icons.schedule),
+                label: 'Automate',
               ),
               NavigationDestination(
                 icon: Icon(Icons.dns_outlined),

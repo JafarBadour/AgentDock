@@ -126,13 +126,22 @@ class _ToolCallCardState extends State<ToolCallCard> {
 
   IconData get _kindIcon {
     final k = (widget.tool.kind ?? '').toLowerCase();
+    final title = widget.tool.title.toLowerCase();
+    final blob = '$k $title';
+    if (blob.contains('web') ||
+        blob.contains('browser') ||
+        k.contains('fetch') ||
+        k.contains('http')) {
+      return Icons.language_rounded;
+    }
     if (k.contains('exec') || k.contains('shell') || k.contains('terminal')) {
       return Icons.terminal_rounded;
     }
     if (k.contains('read')) return Icons.description_outlined;
     if (k.contains('edit') || k.contains('write')) return Icons.edit_outlined;
-    if (k.contains('search') || k.contains('grep')) return Icons.search_rounded;
-    if (k.contains('fetch') || k.contains('http')) return Icons.language_rounded;
+    if (k.contains('search') || k.contains('grep') || k.contains('glob')) {
+      return Icons.search_rounded;
+    }
     if (k.contains('delete')) return Icons.delete_outline;
     return Icons.auto_awesome_outlined;
   }
