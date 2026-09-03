@@ -365,7 +365,17 @@ class ChatSessionRuntime extends ChangeNotifier {
   void startListening() {
     _sub?.cancel();
     _sub = _session.updates.listen(_onUpdate, onError: (Object e) {
-      lastError = e.toString();
+      if (isTransientBridgeError(e)) {
+        // Same as a clean closed event — reconnect quietly.
+        SafeLog.d('session stream dropped', e);
+        lastError = null;
+        if (!closed && sessionFactory != null && !_suspended) {
+          closed = true;
+          _scheduleReconnect(immediate: true);
+        }
+      } else {
+        lastError = e.toString();
+      }
       notifyListeners();
     });
   }

@@ -420,6 +420,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         if (_error != null && isTransientBridgeErrorText(_error!)) {
           _error = null;
         }
+        if (runtime.lastError != null &&
+            isTransientBridgeErrorText(runtime.lastError!)) {
+          runtime.lastError = null;
+        }
       } else if (runtime.lastError != null &&
           !isTransientBridgeErrorText(runtime.lastError!)) {
         _error = runtime.lastError;
@@ -1002,11 +1006,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ..clear()
             ..addAll(images);
           _showSdkInstallGuide = false;
-          _error = 'Send failed: $e';
+          // Bridge blips reconnect underneath — don't sticky-banner them.
+          if (!isTransientBridgeError(e)) {
+            _error = 'Send failed: $e';
+          }
         });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Send failed: $e')),
-        );
+        if (!isTransientBridgeError(e)) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Send failed: $e')),
+          );
+        }
       }
     } finally {
       if (mounted) setState(() => _sending = false);
