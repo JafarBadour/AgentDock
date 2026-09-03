@@ -896,7 +896,8 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   void _armHostBusyWatchdog() {
     _hostBusyWatchdog?.cancel();
-    _hostBusyWatchdog = Timer(const Duration(seconds: 15), () {
+    // Tick often enough to notice stalls, but thresholds below decide action.
+    _hostBusyWatchdog = Timer(const Duration(seconds: 20), () {
       if (_disposed) return;
       if (!isWorking) return;
 
@@ -904,18 +905,25 @@ class ChatSessionRuntime extends ChangeNotifier {
           ? const Duration(days: 1)
           : DateTime.now().difference(_lastHostActivityAt!);
 
-      // Tool rows stuck pending/running with no new ACP events. Common after
-      // ADSM clears the activity label ("") while session/prompt is still open.
-      if (hasActiveTools && silentFor >= const Duration(seconds: 20)) {
-        unawaited(_finalizeStaleTools(reason: 'watchdog-silent-tools'));
+      final durable = _session.transport == AcpTransport.durable;
+      // Explore/edit turns often go quiet between tool batches; durable host
+      // work must not be cancelled after a short pause.
+      final toolStaleAfter =
+          durable ? const Duration(minutes: 3) : const Duration(seconds: 45);
+      final promptStaleAfter =
+          durable ? const Duration(minutes: 4) : const Duration(seconds: 90);
+
+      if (hasActiveTools) {
+        if (silentFor >= toolStaleAfter) {
+          unawaited(_finalizeStaleTools(reason: 'watchdog-silent-tools'));
+        } else {
+          _armHostBusyWatchdog();
+        }
         return;
       }
 
-      // Hung on "Thinking" with no tools and no host events — e.g. image
-      // prompt stalled inside Cursor / ADSM. Cancel so the UI unlocks.
-      if (_session.isPromptActive &&
-          !hasActiveTools &&
-          silentFor >= const Duration(seconds: 75)) {
+      // Hung on "Thinking" with no tools and no host events.
+      if (_session.isPromptActive && silentFor >= promptStaleAfter) {
         SafeLog.d(
           'watchdog: silent prompt ${silentFor.inSeconds}s chat=$chatId — unstick',
         );
@@ -923,42 +931,70 @@ class ChatSessionRuntime extends ChangeNotifier {
         return;
       }
 
-      // Local prompt still awaiting a real ACP result — keep waiting.
-      if (_session.isPromptActive && !hasActiveTools) {
+      // Still awaiting ACP / host — keep polling.
+      if (_session.isPromptActive || remoteTurnActive) {
         _armHostBusyWatchdog();
-        return;
-      }
-
-      if (hasActiveTools) {
-        unawaited(_finalizeStaleTools(reason: 'watchdog'));
         return;
       }
 
       // Silence after reconnect: host likely finished while we were away.
       remoteTurnActive = false;
       promptInFlight = false;
+      activityLabel = null;
       notifyListeners();
       if (!closed) _drainOutboundQueue();
     });
   }
 
-  Future<void> _watchdogUnstickPrompt() async {
-    try {
-      await _session.cancel().timeout(const Duration(seconds: 5));
-    } catch (e) {
-      SafeLog.d('watchdog prompt cancel failed', e);
+  /// True when this turn already produced visible progress (answer / tools).
+  bool get _turnHasProgress {
+    for (var i = entries.length - 1; i >= 0; i--) {
+      final m = entries[i].message;
+      if (m != null && m.role == MessageRole.user) break;
+      if (m != null && m.role == MessageRole.assistant && m.content.trim().isNotEmpty) {
+        return true;
+      }
+      if (entries[i].tool != null) return true;
     }
+    if (assistantBuffer.trim().isNotEmpty) return true;
+    if (thoughtBuffer.trim().isNotEmpty) return true;
+    return false;
+  }
+
+  Future<void> _watchdogUnstickPrompt() async {
+    final hadProgress = _turnHasProgress;
+    final durable = _session.transport == AcpTransport.durable;
+
+    // Durable host may still be working offline from our event stream. Prefer
+    // unlocking the UI over cancelling a live explore/edit turn.
+    if (!hadProgress || !durable) {
+      try {
+        await _session.cancel().timeout(const Duration(seconds: 5));
+      } catch (e) {
+        SafeLog.d('watchdog prompt cancel failed', e);
+      }
+    }
+
     await flushAssistantBuffer();
     await commitThought();
     _breakPromptChain();
     promptInFlight = false;
-    remoteTurnActive = false;
+    // Keep remoteTurnActive on durable+progress so reconnect can resume the
+    // host turn; otherwise clear busy chrome.
+    if (!(durable && hadProgress)) {
+      remoteTurnActive = false;
+    }
     activityLabel = null;
-    lastError =
-        'Agent went quiet with no reply (often a large image or a stuck turn). '
-        'Tap Stop if it hangs again, or resend with a smaller screenshot.';
+    if (hadProgress) {
+      // Do not scare the user — the agent already answered / ran tools.
+      lastError = null;
+    } else {
+      lastError =
+          'Agent went quiet with no reply (often a large image or a stuck turn). '
+          'Tap Stop if it hangs again, or resend with a smaller screenshot.';
+    }
     notifyListeners();
-    if (!closed) _drainOutboundQueue();
+    if (!closed && !remoteTurnActive) _drainOutboundQueue();
   }
 
   /// Mark leftover pending/running tools finished so [isWorking] can clear.
@@ -1049,9 +1085,10 @@ class ChatSessionRuntime extends ChangeNotifier {
         activityLabel = label.isEmpty ? null : label;
         if (activityLabel != null) {
           _noteHostActivity();
-        } else if (hasActiveTools) {
-          // ADSM clears the activity chip when writing stops, but tool rows
-          // often stay "in_progress". Arm the silence watchdog so we unstick.
+        } else {
+          // ADSM clears the chip between phases; that is not silence — re-arm
+          // so we do not treat a tool gap as a dead turn.
+          _lastHostActivityAt = DateTime.now();
           _armHostBusyWatchdog();
         }
         notifyListeners();
