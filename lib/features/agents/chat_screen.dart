@@ -1931,10 +1931,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // counts as "working" for the agent bubble.
     final streaming = runtime?.isWorking ?? false;
     final liveError = runtime?.lastError;
-    final displayError = _error ?? liveError;
+    final deliveryError = runtime?.deliveryError;
+    final displayError = _error ?? liveError ?? deliveryError;
     final connected = runtime != null && !runtime.closed;
     final reconnecting = runtime?.reconnecting ?? false;
     final remoteRunning = runtime?.remoteTurnActive == true;
+    final sending = runtime?.sendingToHost == true;
     final activeToolEntries = runtime == null
         ? const <ToolCallState>[]
         : [
@@ -1946,6 +1948,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final statusLabel = switch (true) {
       _ when reconnecting => ' · reconnecting…',
       _ when remoteRunning && !connected => ' · running on host',
+      _ when sending =>
+        ' · ${activityLabel?.isNotEmpty == true ? activityLabel! : 'Sending to host…'}',
       _ when streaming && activityLabel != null && activityLabel.isNotEmpty =>
         ' · $activityLabel',
       _ when streaming && activeTools == 1 =>
@@ -2188,6 +2192,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     _showSdkInstallGuide = false;
                                   });
                                   runtime?.lastError = null;
+                                  runtime?.deliveryError = null;
                                   unawaited(_ensureAcp());
                                 },
                           child: const Text('Reconnect'),
@@ -2200,6 +2205,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             _showSdkInstallGuide = false;
                           });
                           runtime?.lastError = null;
+                          runtime?.deliveryError = null;
                         },
                       ),
                     ],
@@ -2400,14 +2406,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 showEllipsis: true,
                               );
                             }
-                            final label = (activityLabel != null &&
-                                    activityLabel.isNotEmpty)
-                                ? activityLabel
-                                : activeTools == 1
-                                    ? activeToolEntries.first.displayTitle
-                                    : activeTools > 1
-                                        ? 'Working · $activeTools tools'
-                                        : 'Thinking';
+                            final label = sending
+                                ? (activityLabel?.isNotEmpty == true
+                                    ? activityLabel!
+                                    : 'Sending to host…')
+                                : (activityLabel != null &&
+                                        activityLabel.isNotEmpty)
+                                    ? activityLabel
+                                    : activeTools == 1
+                                        ? activeToolEntries.first.displayTitle
+                                        : activeTools > 1
+                                            ? 'Working · $activeTools tools'
+                                            : 'Thinking';
                             final text =
                                 label.endsWith('…') || label.endsWith('...')
                                     ? label

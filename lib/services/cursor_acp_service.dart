@@ -1294,6 +1294,15 @@ class AcpUpdate {
   /// Host/daemon activity label for the UI (Thinking, Connecting, tool name…).
   const AcpUpdate.activity(String label)
       : this._(AcpUpdateKind.activity, label);
+
+  /// ADSM accepted the user prompt (message is on the host; turn may still run).
+  const AcpUpdate.promptAccepted([String userMessageId = ''])
+      : this._(AcpUpdateKind.promptAccepted, userMessageId);
+
+  /// Host agent lifecycle (`idle` / `running` / …) from ADSM status events.
+  const AcpUpdate.daemonStatus(String status)
+      : this._(AcpUpdateKind.daemonStatus, status);
+
   AcpUpdate.toolCall(ToolCallState tool)
       : this._(AcpUpdateKind.tool, tool.title, tool: tool);
   AcpUpdate.mode(AgentSessionMode mode)
@@ -1510,4 +1519,6 @@ enum AcpUpdateKind {
   mode,
   turnComplete,
   activity,
+  promptAccepted,
+  daemonStatus,
 }

@@ -476,14 +476,22 @@ class AdsmSession implements AgentSession {
       case 'activity':
         final label = params['label']?.toString() ?? '';
         _updates.add(AcpUpdate.activity(label));
+      case 'prompt_accepted':
+        final mid = params['userMessageId']?.toString() ?? '';
+        _updates.add(AcpUpdate.promptAccepted(mid));
+        // Treat accept as host activity so Thinking can arm.
+        _updates.add(const AcpUpdate.activity('Thinking'));
       case 'status':
         _daemonStatus = params['status']?.toString() ?? _daemonStatus;
         final title = params['title']?.toString();
         if (title != null && title.isNotEmpty) {
           _updates.add(AcpUpdate.status('Session', title: title));
         }
-        // Map daemon lifecycle into activity when no explicit activity event.
         final st = params['status']?.toString();
+        if (st != null && st.isNotEmpty) {
+          _updates.add(AcpUpdate.daemonStatus(st));
+        }
+        // Map daemon lifecycle into activity when no explicit activity event.
         if (st == 'running') {
           _updates.add(const AcpUpdate.activity('Thinking'));
         } else if (st == 'idle' || st == 'dead') {
@@ -575,7 +583,9 @@ class AdsmSession implements AgentSession {
     final c = Completer<void>();
     _promptCompleter = c;
     try {
-      final rpc = _client.request(
+      // ADSM ≥0.4.3 returns {accepted:true} immediately; older hosts block
+      // until the full turn. Either way we wait on [c] for turn_complete.
+      final result = await _client.request(
         'session.prompt',
         {
           'chatId': chatId,
@@ -587,30 +597,46 @@ class AdsmSession implements AgentSession {
           if (userCreatedAt != null)
             'userCreatedAt': userCreatedAt.toUtc().toIso8601String(),
         },
-        timeout: const Duration(minutes: 15),
+        // Accept should be fast; long turns complete via events.
+        timeout: const Duration(seconds: 20),
       );
-      // Race cancel() so a hung image/turn can unlock without waiting 15 min.
-      final winner = await Future.any<String>([
-        rpc.then((_) => 'rpc'),
-        c.future.then((_) => 'cancel'),
-      ]);
-      if (winner == 'rpc') {
+
+      final accepted = result['accepted'] == true;
+      if (!accepted) {
+        // Legacy host: RPC waited for the whole turn.
         _finishPrompt();
-      } else {
-        // cancel() already completed [c] via _finishPrompt — drop late RPC.
-        unawaited(rpc.then((_) {}, onError: (_) {}));
+        return;
+      }
+
+      // Accepted — stay "in flight" until turn_complete / cancel / idle.
+      if (c.isCompleted) return;
+      await Future.any<void>([
+        c.future,
+        Future<void>.delayed(const Duration(minutes: 30)),
+      ]);
+      if (!c.isCompleted) {
+        // Safety net — host may have gone idle without turn_complete.
+        _finishPrompt();
       }
     } catch (e) {
+      final msg = e.toString().toLowerCase();
+      // Host already took the prompt (ack lost / double-send). Wait for the
+      // in-flight turn instead of failing the UI as undelivered.
+      if (msg.contains('already running') || msg.contains('already running a turn')) {
+        if (!_updates.isClosed) {
+          _updates.add(const AcpUpdate.promptAccepted());
+          _updates.add(const AcpUpdate.activity('Thinking'));
+        }
+        if (c.isCompleted) return;
+        await Future.any<void>([
+          c.future,
+          Future<void>.delayed(const Duration(minutes: 30)),
+        ]);
+        if (!c.isCompleted) _finishPrompt();
+        return;
+      }
       _finishPrompt();
       rethrow;
-    }
-    // If turn_complete arrived before RPC returned, completer already done.
-    if (!c.isCompleted) {
-      try {
-        await c.future.timeout(const Duration(seconds: 2));
-      } on TimeoutException {
-        // RPC returned — treat as done.
-      }
     }
   }
 
