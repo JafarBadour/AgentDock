@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+
+import '../../services/adsm_client.dart';
 
 /// Three dots that rise and fade in sequence while the agent is producing a
 /// turn. Deliberately small enough to sit in a list row's leading slot.
@@ -367,6 +370,271 @@ class AutoNumberBadge extends StatelessWidget {
               fontWeight: FontWeight.w700,
               fontSize: compact ? 10 : 11,
               height: 1.1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Bottom sheet: ADSM version + daemon health for the current host.
+class AdsmHealthSheet extends StatefulWidget {
+  const AdsmHealthSheet({
+    super.key,
+    required this.session,
+    required this.bridgeOpen,
+    this.onReconnect,
+  });
+
+  final AdsmSession session;
+  final bool bridgeOpen;
+  final VoidCallback? onReconnect;
+
+  static Future<void> show(
+    BuildContext context, {
+    required AdsmSession session,
+    required bool bridgeOpen,
+    VoidCallback? onReconnect,
+  }) {
+    return showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (ctx) => AdsmHealthSheet(
+        session: session,
+        bridgeOpen: bridgeOpen,
+        onReconnect: onReconnect,
+      ),
+    );
+  }
+
+  @override
+  State<AdsmHealthSheet> createState() => _AdsmHealthSheetState();
+}
+
+class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
+  AdsmHostHealth? _health;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_refresh());
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _loading = true);
+    try {
+      final h = await widget.session.fetchHostHealth(
+        bridgeOpen: widget.bridgeOpen,
+      );
+      if (mounted) {
+        setState(() {
+          _health = h;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _health = AdsmHostHealth(
+            hostLabel: widget.session.host.displayLabel,
+            bridgeOpen: widget.bridgeOpen,
+            pingVersion: widget.session.protocolVersion,
+            requiredVersion: kRequiredAdsmVersion,
+            agentStatus: widget.session.daemonStatus,
+            fetchError: '$e',
+          );
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final h = _health;
+    final healthy = h?.healthy ?? false;
+
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          0,
+          12,
+          16 + MediaQuery.paddingOf(context).bottom,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  healthy ? Icons.sensors : Icons.sensors_off,
+                  color: healthy
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.error,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Host · ${widget.session.host.displayLabel}',
+                    style: theme.textTheme.titleMedium,
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Refresh',
+                  onPressed: _loading ? null : _refresh,
+                  icon: _loading
+                      ? SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: theme.colorScheme.primary,
+                          ),
+                        )
+                      : const Icon(Icons.refresh),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (h != null) ...[
+              _HealthRow(
+                label: 'Bridge',
+                value: h.bridgeOpen ? 'Connected' : 'Disconnected',
+                ok: h.bridgeOpen,
+              ),
+              _HealthRow(
+                label: 'ADSM version',
+                value: h.pingVersion ?? 'unknown',
+                detail: 'app needs ${h.requiredVersion}',
+                ok: h.versionMeets,
+              ),
+              _HealthRow(
+                label: 'Daemon',
+                value: h.daemonPid != null
+                    ? 'pid ${h.daemonPid}'
+                    : (h.fetchError != null ? 'unreachable' : '…'),
+                detail: h.workerCount != null
+                    ? '${h.workerCount} worker${h.workerCount == 1 ? '' : 's'}'
+                    : null,
+                ok: h.daemonReachable,
+              ),
+              if (h.eventSeq != null)
+                _HealthRow(
+                  label: 'Event seq',
+                  value: '${h.eventSeq}',
+                  ok: true,
+                ),
+              _HealthRow(
+                label: 'This agent',
+                value: h.agentStatus ?? 'unknown',
+                ok: h.agentHealthy,
+              ),
+              if (h.acpSessionId != null && h.acpSessionId!.isNotEmpty)
+                _HealthRow(
+                  label: 'ACP session',
+                  value: h.acpSessionId!,
+                  ok: true,
+                  monospace: true,
+                ),
+              if (h.agentLastError != null && h.agentLastError!.isNotEmpty)
+                _HealthRow(
+                  label: 'Last error',
+                  value: h.agentLastError!,
+                  ok: false,
+                ),
+              if (h.fetchError != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    h.fetchError!,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.error,
+                    ),
+                  ),
+                ),
+            ],
+            if (!widget.bridgeOpen && widget.onReconnect != null) ...[
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.pop(context);
+                  widget.onReconnect!();
+                },
+                icon: const Icon(Icons.link),
+                label: const Text('Reconnect'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _HealthRow extends StatelessWidget {
+  const _HealthRow({
+    required this.label,
+    required this.value,
+    this.detail,
+    required this.ok,
+    this.monospace = false,
+  });
+
+  final String label;
+  final String value;
+  final String? detail;
+  final bool ok;
+  final bool monospace;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            ok ? Icons.check_circle_outline : Icons.error_outline,
+            size: 18,
+            color: ok
+                ? theme.colorScheme.primary
+                : theme.colorScheme.error,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                SelectableText(
+                  value,
+                  style: (monospace
+                          ? theme.textTheme.bodySmall?.copyWith(
+                              fontFamily: 'monospace',
+                            )
+                          : theme.textTheme.bodyMedium)
+                      ?.copyWith(fontWeight: FontWeight.w500),
+                ),
+                if (detail != null)
+                  Text(
+                    detail!,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+              ],
             ),
           ),
         ],

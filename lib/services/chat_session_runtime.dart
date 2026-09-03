@@ -873,14 +873,24 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
       if (lastError != null) throw lastError;
 
-      // If the model only wrote to the thought channel, surface that as the
-      // answer instead of leaving a blank agent turn with orphaned notes.
-      if (assistantBuffer.trim().isEmpty && thoughtBuffer.trim().isNotEmpty) {
-        assistantBuffer = thoughtBuffer;
-        thoughtBuffer = '';
+      // Delivered — leave Thinking until turn_complete / idle clears busy.
+      sendingToHost = false;
+      deliveryError = null;
+      activityLabel = 'Thinking';
+      promptInFlight = true;
+      remoteTurnActive = true;
+      _noteHostActivity();
+      notifyListeners();
+
+      // Legacy ADSM (<0.4.3): prompt() blocked until the full turn finished.
+      if (!_session.isPromptActive) {
+        if (assistantBuffer.trim().isEmpty && thoughtBuffer.trim().isNotEmpty) {
+          assistantBuffer = thoughtBuffer;
+          thoughtBuffer = '';
+        }
+        await flushAssistantBuffer();
+        await commitThought();
       }
-      await flushAssistantBuffer();
-      await commitThought();
     } catch (e) {
       SafeLog.d('prompt failed', e);
       // Late failure from a session that Force-run / reconnect already replaced.
@@ -912,22 +922,40 @@ class ChatSessionRuntime extends ChangeNotifier {
       final superseded = epoch != _promptEpoch;
       if (!superseded) {
         sendingToHost = false;
-        if (closed && !transportFailed) {
+        if (transportFailed) {
+          promptInFlight = false;
+          remoteTurnActive = false;
+          _clearHostBusyWatchdog();
+          notifyListeners();
+          if (!closed) _drainOutboundQueue();
+        } else if (closed && !transportFailed) {
           // Bridge dropped via background handoff. Durable host may still be
           // mid-turn — keep the working indicator until idle arrives.
           remoteTurnActive = true;
           promptInFlight = false;
           _armHostBusyWatchdog();
           notifyListeners();
-        } else {
+        } else if (!_session.isPromptActive && !remoteTurnActive) {
+          // Legacy turn finished inline, or nothing started.
           promptInFlight = false;
-          remoteTurnActive = false;
           _clearHostBusyWatchdog();
           notifyListeners();
           if (!closed) _drainOutboundQueue();
+        } else {
+          // Delivered; turn still running on host — keep busy chrome.
+          notifyListeners();
         }
       }
     }
+  }
+
+  Future<void> _flushTurnBuffers() async {
+    if (assistantBuffer.trim().isEmpty && thoughtBuffer.trim().isNotEmpty) {
+      assistantBuffer = thoughtBuffer;
+      thoughtBuffer = '';
+    }
+    await flushAssistantBuffer();
+    await commitThought();
   }
 
   /// Live journal output means the host is still on a turn — even when we did
@@ -1277,7 +1305,8 @@ class ChatSessionRuntime extends ChangeNotifier {
         // No "tap Reconnect" nag — auto-reconnect handles it when possible.
         notifyListeners();
       case AcpUpdateKind.turnComplete:
-        // Flush is awaited in _runPromptBody after session/prompt returns.
+        // Flush streaming buffers once the host turn ends.
+        unawaited(_flushTurnBuffers());
         // Clearing promptInFlight here while a local await is open lets a new
         // send race ahead — only clear UI busy when nothing owns the prompt.
         _clearHostBusyWatchdog();
