@@ -77,6 +77,6 @@
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach screenshots and photos to agent prompts.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Dictate messages with Google Cloud Speech-to-Text.</string>
+	<string>Dictate chat messages. Audio is transcribed with Gemini.</string>
 </dict>
 </plist>

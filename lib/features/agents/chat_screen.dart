@@ -29,6 +29,7 @@ import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
 import '../../services/chat_session_runtime.dart';
 import '../../services/cursor_acp_service.dart';
+import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
@@ -1446,7 +1447,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       SafeLog.d('voice start failed', e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Mic failed: $e')),
+          SnackBar(
+            content: Text(
+              'Mic failed: ${GcpSpeechService.userFacingMessage(e)}',
+            ),
+          ),
         );
       }
     } finally {
@@ -1558,7 +1563,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       SafeLog.d('voice transcribe failed', e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$e')),
+          SnackBar(content: Text(GcpSpeechService.userFacingMessage(e))),
         );
       }
     } finally {
