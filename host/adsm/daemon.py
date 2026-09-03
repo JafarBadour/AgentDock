@@ -34,7 +34,9 @@ class Daemon:
                 pass
 
         self._server = await asyncio.start_unix_server(
-            self._on_client, path=str(sock)
+            self._on_client,
+            path=str(sock),
+            limit=protocol.STREAM_LIMIT,
         )
         try:
             os.chmod(sock, 0o600)
@@ -173,7 +175,22 @@ class Daemon:
     ) -> None:
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ValueError as e:
+                    # Still oversized relative to the reader limit — drop the
+                    # client cleanly instead of taking down the task uncaught.
+                    writer.write(
+                        protocol.encode(
+                            protocol.err(
+                                None,
+                                -32600,
+                                f"NDJSON line too large: {e}",
+                            )
+                        )
+                    )
+                    await writer.drain()
+                    break
                 if not line:
                     break
                 try:

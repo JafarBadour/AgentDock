@@ -320,12 +320,22 @@ class AdsmSession implements AgentSession {
   }
 
   /// Push local messages into the host store (merge by id).
+  ///
+  /// Chunked so a full history sync cannot blow asyncio's NDJSON line limit on
+  /// the host (that used to kill the ADSM channel mid-send).
   Future<void> syncTranscriptToHost(List<ChatMessage> messages) async {
     if (messages.isEmpty) return;
-    await _client.request('transcript.sync', {
-      'chatId': chatId,
-      'messages': [for (final m in messages) m.toMap()],
-    });
+    const chunkSize = 40;
+    for (var i = 0; i < messages.length; i += chunkSize) {
+      final end = i + chunkSize > messages.length
+          ? messages.length
+          : i + chunkSize;
+      final slice = messages.sublist(i, end);
+      await _client.request('transcript.sync', {
+        'chatId': chatId,
+        'messages': [for (final m in slice) m.toMap()],
+      });
+    }
   }
 
   void _applySnapshot(Map<String, dynamic> snap) {
