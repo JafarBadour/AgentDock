@@ -2,6 +2,15 @@ import 'dart:convert';
 
 import 'tool_call_state.dart';
 
+/// Local calendar day key for daily stat rollovers (`YYYY-MM-DD`).
+String codeDeltaLocalDayKey([DateTime? when]) {
+  final d = when ?? DateTime.now();
+  final y = d.year.toString().padLeft(4, '0');
+  final m = d.month.toString().padLeft(2, '0');
+  final day = d.day.toString().padLeft(2, '0');
+  return '$y-$m-$day';
+}
+
 /// Aggregate code churn attributed to agent tool calls.
 class CodeChangeStats {
   const CodeChangeStats({
@@ -21,12 +30,21 @@ class CodeChangeStats {
   int get fileCount => files.length;
 
   /// Prefer live tool totals, but never drop already-persisted session totals.
+  /// Persisted values apply only when [persistedDay] matches [todayDay].
   static ({int added, int removed, int files}) mergeDisplay({
     CodeChangeStats? live,
     int persistedAdded = 0,
     int persistedRemoved = 0,
     int persistedFiles = 0,
+    String? persistedDay,
+    String? todayDay,
   }) {
+    final today = todayDay ?? codeDeltaLocalDayKey();
+    if (persistedDay != null && persistedDay != today) {
+      persistedAdded = 0;
+      persistedRemoved = 0;
+      persistedFiles = 0;
+    }
     final a = live?.added ?? 0;
     final r = live?.removed ?? 0;
     final f = live?.fileCount ?? 0;

@@ -17,6 +17,7 @@ class Chat {
     this.linesAdded = 0,
     this.linesRemoved = 0,
     this.filesChanged = 0,
+    this.codeDeltaDay,
     this.status = ChatStatus.idle,
     this.sortOrder = 0,
     required this.createdAt,
@@ -58,6 +59,10 @@ class Chat {
   /// Distinct files touched by agent edits this session.
   final int filesChanged;
 
+  /// Local calendar day (`YYYY-MM-DD`) for [linesAdded]/[linesRemoved]/[filesChanged].
+  /// Stats reset when this is not today.
+  final String? codeDeltaDay;
+
   final ChatStatus status;
   final int sortOrder;
   final DateTime createdAt;
@@ -77,6 +82,7 @@ class Chat {
         'lines_added': linesAdded,
         'lines_removed': linesRemoved,
         'files_changed': filesChanged,
+        'code_delta_day': codeDeltaDay,
         'status': status.name,
         'sort_order': sortOrder,
         'created_at': createdAt.toIso8601String(),
@@ -97,6 +103,7 @@ class Chat {
         linesAdded: (map['lines_added'] as int?) ?? 0,
         linesRemoved: (map['lines_removed'] as int?) ?? 0,
         filesChanged: (map['files_changed'] as int?) ?? 0,
+        codeDeltaDay: map['code_delta_day'] as String?,
         status: ChatStatus.values.firstWhere(
           (s) => s.name == map['status'],
           orElse: () => ChatStatus.idle,
@@ -120,6 +127,7 @@ class Chat {
     int? linesAdded,
     int? linesRemoved,
     int? filesChanged,
+    String? codeDeltaDay,
     bool clearCodeDelta = false,
     ChatStatus? status,
     int? sortOrder,
@@ -143,6 +151,8 @@ class Chat {
         linesAdded: clearCodeDelta ? 0 : (linesAdded ?? this.linesAdded),
         linesRemoved: clearCodeDelta ? 0 : (linesRemoved ?? this.linesRemoved),
         filesChanged: clearCodeDelta ? 0 : (filesChanged ?? this.filesChanged),
+        codeDeltaDay:
+            clearCodeDelta ? null : (codeDeltaDay ?? this.codeDeltaDay),
         status: status ?? this.status,
         sortOrder: sortOrder ?? this.sortOrder,
         createdAt: createdAt,

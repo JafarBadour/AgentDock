@@ -512,30 +512,78 @@ command -v cursor-agent >/dev/null || command -v agent >/dev/null
     return path;
   }
 
-  /// Resolves the Claude ACP adapter, installing Claude Code + adapter if needed.
-  Future<String> ensureClaudeAcpBinary(
-    Host host, {
+  Future<String> _runWithInstallProgress(
+    SSHClient client,
+    String command, {
+    required String hostId,
+    Duration timeout = const Duration(minutes: 10),
     void Function(String status)? onProgress,
   }) async {
-    final client = await connect(host);
-    var path = await _resolveClaudeAcpPath(client, host.id);
-    if (path != null) return path;
+    final gate = _pool[hostId]?.gate;
+    Future<String> body() async {
+      final session = await client.execute(command);
+      final stdout = StringBuffer();
+      final stderr = StringBuffer();
 
-    onProgress?.call(
-      'Installing Claude Code + ACP adapter on the remote (this can take a few minutes)…',
-    );
-    final installed = await _runAgentDockInstallScript(
-      client,
-      hostId: host.id,
-      scriptName: 'claude-acp.sh',
-      onProgress: onProgress,
-    );
-    if (!installed) {
-      onProgress?.call('Trying local npm/nvm install…');
+      void pushLine(String source, String line) {
+        if (source == 'out') {
+          stdout.writeln(line);
+        } else {
+          stderr.writeln(line);
+        }
+        final t = line.trim();
+        if (t.startsWith('==> ')) {
+          onProgress?.call(t.substring(4));
+        } else if (t.startsWith('✓ ')) {
+          onProgress?.call(t.substring(2));
+        }
+      }
+
+      Future<void> drain(Stream<Uint8List> stream, String source) async {
+        final carry = StringBuffer();
+        await for (final chunk in stream) {
+          carry.write(utf8.decode(chunk, allowMalformed: true));
+          var text = carry.toString();
+          var idx = text.indexOf('\n');
+          while (idx >= 0) {
+            pushLine(source, text.substring(0, idx));
+            text = text.substring(idx + 1);
+            idx = text.indexOf('\n');
+          }
+          carry
+            ..clear()
+            ..write(text);
+        }
+        final tail = carry.toString();
+        if (tail.isNotEmpty) pushLine(source, tail);
+      }
+
       try {
-        await _run(
-          client,
-          r'''
+        await Future.wait<void>([
+          drain(session.stdout, 'out'),
+          drain(session.stderr, 'err'),
+        ]).timeout(timeout);
+        await session.done.timeout(const Duration(seconds: 5));
+        final code = session.exitCode ?? 0;
+        if (code != 0) {
+          final err = stderr.toString().trim();
+          throw Exception(
+            err.isEmpty ? 'Command failed (exit $code)' : err,
+          );
+        }
+        return stdout.toString();
+      } on TimeoutException {
+        try {
+          session.close();
+        } catch (_) {}
+        throw TimeoutException('Remote command timed out after $timeout');
+      }
+    }
+
+    return gate == null ? body() : gate.run(body);
+  }
+
+  static const _claudeInlineInstall = r'''
 set -e
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 [ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
@@ -569,25 +617,83 @@ for dir in "$NODE_BIN" "$PREFIX_BIN"; do
 done
 [ -n "$REAL" ]
 
-cat > "$HOME/.local/bin/claude-code-acp" <<EOF
+cat > "$HOME/.local/bin/claude-code-acp" <<'EOF'
 #!/usr/bin/env bash
-export NVM_DIR="\${NVM_DIR:-\$HOME/.nvm}"
-[ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
-for d in "\$HOME"/.nvm/versions/node/*/bin; do
-  [ -d "\$d" ] && PATH="\$d:\$PATH"
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+for d in "$HOME"/.nvm/versions/node/*/bin; do
+  [ -d "$d" ] && PATH="$d:$PATH"
 done
-export PATH="\$HOME/.local/bin:\$PATH"
-exec $REAL "\$@"
+export PATH="$HOME/.local/bin:$PATH"
 EOF
+printf 'exec %q "$@"\n' "$REAL" >> "$HOME/.local/bin/claude-code-acp"
 chmod +x "$HOME/.local/bin/claude-code-acp"
 ln -sfn "$HOME/.local/bin/claude-code-acp" "$HOME/.local/bin/claude-agent-acp"
 test -x "$HOME/.local/bin/claude-code-acp"
-''',
+''';
+
+  Future<void> _tryClaudeInlineInstall(
+    SSHClient client, {
+    required String hostId,
+    void Function(String status)? onProgress,
+  }) async {
+    onProgress?.call('Installing Claude ACP adapter (npm)…');
+    await _runWithInstallProgress(
+      client,
+      _claudeInlineInstall,
+      hostId: hostId,
+      timeout: const Duration(minutes: 12),
+      onProgress: onProgress,
+    );
+  }
+
+  /// Resolves the Claude ACP adapter, installing Claude Code + adapter if needed.
+  Future<String> ensureClaudeAcpBinary(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    final client = await connect(host);
+    var path = await _resolveClaudeAcpPath(client, host.id);
+    if (path != null) return path;
+
+    onProgress?.call(
+      'First Claude setup on this host — usually 3–8 minutes…',
+    );
+
+    // Fast path: npm/nvm only (tmux + ADSM are handled separately).
+    try {
+      await _tryClaudeInlineInstall(
+        client,
+        hostId: host.id,
+        onProgress: onProgress,
+      );
+      path = await _resolveClaudeAcpPath(client, host.id);
+      if (path != null) {
+        onProgress?.call('Claude ACP ready');
+        return path;
+      }
+    } catch (e) {
+      SafeLog.d('claude ACP inline install failed', e);
+      onProgress?.call('Inline install failed — trying full setup script…');
+    }
+
+    final installed = await _runAgentDockInstallScript(
+      client,
+      hostId: host.id,
+      scriptName: 'claude-acp.sh',
+      onProgress: onProgress,
+      timeout: const Duration(minutes: 15),
+    );
+    if (!installed) {
+      onProgress?.call('Retrying npm install…');
+      try {
+        await _tryClaudeInlineInstall(
+          client,
           hostId: host.id,
-          timeout: const Duration(minutes: 8),
+          onProgress: onProgress,
         );
       } catch (e) {
-        SafeLog.d('claude ACP inline install failed', e);
+        SafeLog.d('claude ACP inline install retry failed', e);
       }
     }
 
@@ -894,20 +1000,24 @@ exit 0
     required String hostId,
     required String scriptName,
     void Function(String status)? onProgress,
+    Duration timeout = const Duration(minutes: 10),
   }) async {
     final url = '$kAgentDockScriptsBase/$scriptName';
-    onProgress?.call('Downloading $scriptName…');
+    onProgress?.call('Running $scriptName on the remote…');
     try {
-      await _run(
+      await _runWithInstallProgress(
         client,
         '''
 set -e
+export AGENTDOCK_SKIP_TMUX=1
+export AGENTDOCK_SKIP_ADSM=1
 export PATH="\$HOME/.local/bin:\$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"
 [ -s "\$HOME/.nvm/nvm.sh" ] && . "\$HOME/.nvm/nvm.sh"
 curl -fsSL ${shellQuote(url)} | bash
 ''',
         hostId: hostId,
-        timeout: const Duration(minutes: 10),
+        timeout: timeout,
+        onProgress: onProgress,
       );
       return true;
     } catch (e) {

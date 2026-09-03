@@ -115,30 +115,38 @@ ok "adapter → $REAL"
 ok "wrapper → $HOME/.local/bin/claude-code-acp"
 
 # --- tmux -------------------------------------------------------------------
-say "tmux (durable sessions)"
-if have tmux; then
-  ok "tmux $(tmux -V 2>/dev/null | awk '{print $2}')"
+if [ "${AGENTDOCK_SKIP_TMUX:-}" = "1" ]; then
+  say "tmux (skipped — Agent Dock already checked)"
 else
-  if have apt-get; then
-    sudo apt-get update -y && sudo apt-get install -y tmux
-  elif have dnf; then
-    sudo dnf install -y tmux
-  elif have brew; then
-    brew install tmux
+  say "tmux (durable sessions)"
+  if have tmux; then
+    ok "tmux $(tmux -V 2>/dev/null | awk '{print $2}')"
   else
-    warn "Install tmux manually, then re-run."
-    exit 1
+    if have apt-get; then
+      sudo apt-get update -y && sudo apt-get install -y tmux
+    elif have dnf; then
+      sudo dnf install -y tmux
+    elif have brew; then
+      brew install tmux
+    else
+      warn "Install tmux manually, then re-run."
+      exit 1
+    fi
+    ok "tmux installed"
   fi
-  ok "tmux installed"
 fi
 
 # --- ADSM (session manager) -------------------------------------------------
-say "ADSM (Agent Dock Session Manager)"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/install-adsm.sh" ]; then
-  bash "${SCRIPT_DIR}/install-adsm.sh"
+if [ "${AGENTDOCK_SKIP_ADSM:-}" = "1" ]; then
+  say "ADSM (skipped — Agent Dock manages ADSM separately)"
 else
-  curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash
+  say "ADSM (Agent Dock Session Manager)"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+  if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/install-adsm.sh" ]; then
+    bash "${SCRIPT_DIR}/install-adsm.sh"
+  else
+    curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash
+  fi
 fi
 
 say "Done"

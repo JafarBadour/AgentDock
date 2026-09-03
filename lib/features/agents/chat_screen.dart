@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../app/app_theme.dart';
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/agent_mode.dart';
 import '../../data/models/agent_model.dart';
@@ -29,11 +30,13 @@ import '../../data/secure/safe_log.dart';
 import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
 import '../../services/chat_session_runtime.dart';
+import '../../services/claude_remote_auth.dart';
 import '../../services/cursor_acp_service.dart';
 import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
+import '../connect/claude_login_sheet.dart';
 import 'message_body.dart';
 import 'model_picker_sheet.dart';
 import 'project_files_screen.dart';
@@ -117,6 +120,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   static const _voiceCancelThreshold = -72.0;
   static const _voiceLockThreshold = -56.0;
 
+  void _syncComposerDraft([String? text]) {
+    ref
+        .read(chatComposerDraftsProvider.notifier)
+        .setDraft(widget.chatId, text ?? _composer.text);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -125,6 +134,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       duration: const Duration(milliseconds: 700),
     );
     _composer.addListener(_onComposerChanged);
+    final saved = ref.read(chatComposerDraftsProvider)[widget.chatId];
+    if (saved != null && saved.isNotEmpty) {
+      _composer.text = saved;
+      _composerHasText = saved.trim().isNotEmpty;
+      _showSlashMenu = saved.startsWith('/') &&
+          !saved.contains('\n') &&
+          !saved.contains(' ');
+    }
     _scroll.addListener(_onScrollOffsetChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(focusedChatIdProvider.notifier).state = widget.chatId;
@@ -134,6 +151,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   void _onComposerChanged() {
     final raw = _composer.text;
+    _syncComposerDraft(raw);
     final has = raw.trim().isNotEmpty;
     final slash = raw.startsWith('/') && !raw.contains('\n') && !raw.contains(' ');
     if (has != _composerHasText || slash != _showSlashMenu) {
@@ -625,6 +643,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _showSdkInstallGuide = false;
     });
 
+    if (chat.provider == AgentProvider.claude) {
+      final apiKey =
+          await ref.read(secureStoreProvider).readAnthropicApiKey();
+      if ((apiKey == null || apiKey.isEmpty) && mounted) {
+        setState(() {
+          _connectStatus =
+              'Preparing Claude… (save ANTHROPIC_API_KEY in Connect, or run '
+              '`claude login` on the host)';
+        });
+      }
+    }
+
     try {
       // Pull the live session id Mac wrote before we attach — without it the
       // agent starts over and only sees messages sent on this device.
@@ -643,6 +673,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }
       } catch (e) {
         SafeLog.d('sync chat record before connect failed', e);
+      }
+
+      if (chat.provider == AgentProvider.claude) {
+        final apiKey =
+            await ref.read(secureStoreProvider).readAnthropicApiKey();
+        if (apiKey == null || apiKey.isEmpty) {
+          final auth = ClaudeRemoteAuth(ref.read(sshServiceProvider));
+          if (!await auth.isLoggedIn(host)) {
+            if (!mounted) return;
+            setState(() => _connectStatus = 'Claude sign-in required…');
+            final signedIn =
+                await ClaudeLoginSheet.show(context, host: host);
+            if (signedIn != true) {
+              if (mounted) {
+                setState(() {
+                  _connecting = false;
+                  _connectStatus = null;
+                  _error =
+                      'Claude sign-in required. Open Connect → Sign in to Claude, '
+                      'or save ANTHROPIC_API_KEY.';
+                });
+              }
+              return;
+            }
+          }
+        }
       }
 
       final factory = _buildSessionFactory(chatId: chat.id, cwd: repo.remotePath);
@@ -977,6 +1033,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // Composer stays usable while a turn runs — messages go on the outbound
     // queue. Only block the button briefly while we ensure the transport.
     _composer.clear();
+    _syncComposerDraft('');
     setState(() {
       _sending = true;
       _pendingImages.clear();
@@ -1385,6 +1442,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _voicePulse.dispose();
     _scroll.removeListener(_onScrollOffsetChanged);
     _composer.removeListener(_onComposerChanged);
+    _syncComposerDraft();
     if (_recordingVoice) {
       unawaited(ref.read(gcpSpeechServiceProvider).cancel());
     }
@@ -1741,49 +1799,168 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Widget _buildSendOrMicButton({
+  Widget _buildComposerField({
+    required ThemeData theme,
+    required bool streaming,
+    required bool connected,
+  }) {
+    const fieldRadius = 26.0;
+    final border = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(fieldRadius),
+      borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
+    );
+
+    return Stack(
+      clipBehavior: Clip.none,
+      alignment: Alignment.bottomRight,
+      children: [
+        TextField(
+          controller: _composer,
+          minLines: 1,
+          maxLines: 5,
+          enabled: _chat!.provider.isAvailable && !_connecting,
+          decoration: InputDecoration(
+            hintText: _connecting
+                ? 'Connecting agent…'
+                : streaming
+                    ? 'Message (queued until Force run)…'
+                    : connected
+                        ? 'Message ${_chat!.provider.label} agent…'
+                        : 'Message agent…',
+            filled: true,
+            fillColor: theme.colorScheme.surfaceContainerHighest
+                .withValues(alpha: 0.55),
+            contentPadding: const EdgeInsets.fromLTRB(16, 12, 92, 12),
+            border: border,
+            enabledBorder: border,
+            focusedBorder: border.copyWith(
+              borderSide: BorderSide(color: theme.colorScheme.outline),
+            ),
+          ),
+          onSubmitted: (_) {
+            if (!_sending && !_compressing) {
+              unawaited(_send());
+            }
+          },
+        ),
+        Padding(
+          padding: const EdgeInsets.only(right: 6, bottom: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              _buildInlineMicButton(theme: theme),
+              const SizedBox(width: 2),
+              _buildInlinePrimaryButton(theme: theme, streaming: streaming),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Filled circle inside the composer: Send, Queue, or Stop.
+  Widget _buildInlinePrimaryButton({
     required ThemeData theme,
     required bool streaming,
   }) {
     final busy = _connecting || _sending || _compressing;
-    final showSend = !_recordingVoice &&
-        (_composerHasText || _pendingImages.isNotEmpty);
+    final hasPayload = _composerHasText || _pendingImages.isNotEmpty;
+    final isStop = streaming && !hasPayload;
+    final isQueue = streaming && hasPayload;
+    final enabled = !busy &&
+        _chat!.provider.isAvailable &&
+        (streaming || hasPayload);
 
-    if (showSend) {
-      return IconButton.filled(
-        tooltip: streaming ? 'Queue message' : 'Send',
-        onPressed: busy || !_chat!.provider.isAvailable
-            ? null
-            : () => unawaited(_send()),
-        icon: busy
-            ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : Icon(streaming ? Icons.playlist_add : Icons.send),
-      );
-    }
+    final tooltip = isStop
+        ? 'Stop'
+        : isQueue
+            ? 'Queue message'
+            : 'Send';
 
-    // Locked hands-free recording — tap stop to finish (Telegram lock).
-    if (_voiceLocked && _recordingVoice) {
-      return IconButton.filled(
-        tooltip: 'Stop & transcribe',
-        onPressed: busy ? null : () => unawaited(_finishVoiceRecord()),
-        style: IconButton.styleFrom(
-          backgroundColor: theme.colorScheme.primary,
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: enabled
+            ? theme.colorScheme.onSurface
+            : theme.colorScheme.onSurface.withValues(alpha: 0.35),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: !enabled
+              ? null
+              : () async {
+                  if (isStop) {
+                    final rt = _runtime ??
+                        ref
+                            .read(activeAcpSessionsProvider.notifier)
+                            .get(widget.chatId);
+                    if (rt == null) return;
+                    try {
+                      await rt.unstick();
+                    } catch (e) {
+                      SafeLog.d('stop turn failed', e);
+                    }
+                    if (mounted) setState(() {});
+                    return;
+                  }
+                  unawaited(_send());
+                },
+          child: SizedBox(
+            width: 36,
+            height: 36,
+            child: Center(
+              child: busy
+                  ? SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: theme.colorScheme.surface,
+                      ),
+                    )
+                  : Icon(
+                      isStop
+                          ? Icons.stop_rounded
+                          : isQueue
+                              ? Icons.playlist_add
+                              : Icons.arrow_upward_rounded,
+                      size: isStop ? 20 : 22,
+                      color: theme.colorScheme.surface,
+                    ),
+            ),
+          ),
         ),
-        icon: busy
-            ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.stop_rounded),
+      ),
+    );
+  }
+
+  Widget _buildInlineMicButton({required ThemeData theme}) {
+    final busy = _connecting || _sending || _compressing;
+
+    if (_voiceLocked && _recordingVoice) {
+      return Tooltip(
+        message: 'Stop & transcribe',
+        child: Material(
+          color: theme.colorScheme.primary,
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: busy ? null : () => unawaited(_finishVoiceRecord()),
+            child: SizedBox(
+              width: 36,
+              height: 36,
+              child: Icon(
+                Icons.stop_rounded,
+                size: 20,
+                color: theme.colorScheme.onPrimary,
+              ),
+            ),
+          ),
+        ),
       );
     }
 
-    // Telegram-style hold-to-record mic.
     return Listener(
       behavior: HitTestBehavior.opaque,
       onPointerDown: busy || !_chat!.provider.isAvailable
@@ -1800,79 +1977,58 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         builder: (context, _) {
           final pulse = _recordingVoice ? _voicePulse.value : 0.0;
           final cancel = _voiceCancelArmed;
-          final bg = cancel
-              ? theme.colorScheme.error
-              : _recordingVoice
-                  ? Color.lerp(
-                      theme.colorScheme.error,
-                      const Color(0xFFE53935),
-                      pulse,
-                    )!
-                  : theme.colorScheme.primary;
-          final scale = _recordingVoice ? 1.0 + 0.14 * pulse : 1.0;
+          final recording = _recordingVoice;
 
           return Transform.translate(
-            offset: _recordingVoice
-                ? Offset(_voiceDragDx * 0.35, _voiceDragDy * 0.25)
+            offset: recording
+                ? Offset(_voiceDragDx * 0.25, _voiceDragDy * 0.2)
                 : Offset.zero,
-            child: Transform.scale(
-              scale: scale,
-              child: SizedBox(
-                width: 56,
-                height: 56,
-                child: Stack(
-                  alignment: Alignment.center,
-                  clipBehavior: Clip.none,
-                  children: [
-                    if (_recordingVoice)
-                      ...List.generate(2, (i) {
-                        final t = (pulse + i * 0.45) % 1.0;
-                        final ring = 34.0 + 24.0 * t;
-                        return Container(
-                          width: ring,
-                          height: ring,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: (cancel
-                                      ? theme.colorScheme.error
-                                      : Colors.red)
-                                  .withValues(alpha: (1 - t) * 0.55),
-                              width: 2,
-                            ),
-                          ),
-                        );
-                      }),
-                    Material(
-                      color: bg,
-                      shape: const CircleBorder(),
-                      elevation: _recordingVoice ? 4 + 6 * pulse : 1,
-                      shadowColor: Colors.red.withValues(alpha: 0.55),
-                      child: SizedBox(
-                        width: 48,
-                        height: 48,
+            child: SizedBox(
+              width: 36,
+              height: 36,
+              child: Stack(
+                alignment: Alignment.center,
+                clipBehavior: Clip.none,
+                children: [
+                  if (recording && !cancel)
+                    Positioned(
+                      top: -22,
+                      child: Opacity(
+                        opacity: (-_voiceDragDy / 56).clamp(0.0, 1.0),
                         child: Icon(
-                          cancel ? Icons.delete_outline : Icons.mic,
-                          color: _recordingVoice || cancel
-                              ? theme.colorScheme.onError
-                              : theme.colorScheme.onPrimary,
+                          Icons.lock_outline,
+                          size: 16,
+                          color: theme.colorScheme.primary,
                         ),
                       ),
                     ),
-                    if (_recordingVoice && !_voiceCancelArmed)
-                      Positioned(
-                        top: -30,
-                        child: Opacity(
-                          opacity: (-_voiceDragDy / 56).clamp(0.0, 1.0),
-                          child: Icon(
-                            Icons.lock_outline,
-                            size: 18,
-                            color: theme.colorScheme.primary,
-                          ),
-                        ),
+                  Material(
+                    color: cancel
+                        ? theme.colorScheme.error
+                        : recording
+                            ? Color.lerp(
+                                theme.colorScheme.error,
+                                const Color(0xFFE53935),
+                                pulse,
+                              )!
+                            : Colors.transparent,
+                    shape: const CircleBorder(),
+                    clipBehavior: Clip.antiAlias,
+                    child: SizedBox(
+                      width: 36,
+                      height: 36,
+                      child: Icon(
+                        cancel
+                            ? Icons.delete_outline
+                            : Icons.mic_none_outlined,
+                        size: 22,
+                        color: cancel || recording
+                            ? theme.colorScheme.onError
+                            : theme.colorScheme.onSurfaceVariant,
                       ),
-                  ],
-                ),
+                    ),
+                  ),
+                ],
               ),
             ),
           );
@@ -2003,6 +2159,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     return Scaffold(
       appBar: AppBar(
+        automaticallyImplyLeading: !useDesktopShell(context),
         title: InkWell(
           onTap: _renameChat,
           borderRadius: BorderRadius.circular(8),
@@ -2039,6 +2196,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     persistedAdded: _chat!.linesAdded,
                     persistedRemoved: _chat!.linesRemoved,
                     persistedFiles: _chat!.filesChanged,
+                    persistedDay: _chat!.codeDeltaDay,
                   );
                   return d.added > 0 || d.removed > 0 || d.files > 0;
                 }())
@@ -2051,6 +2209,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           persistedAdded: _chat!.linesAdded,
                           persistedRemoved: _chat!.linesRemoved,
                           persistedFiles: _chat!.filesChanged,
+                          persistedDay: _chat!.codeDeltaDay,
                         );
                         return CodeDeltaLabel(
                           added: d.added,
@@ -2447,22 +2606,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         ),
                       ),
                     ),
-                    TextButton(
-                      onPressed: () async {
-                        final rt = _runtime ??
-                            ref
-                                .read(activeAcpSessionsProvider.notifier)
-                                .get(widget.chatId);
-                        if (rt == null) return;
-                        try {
-                          await rt.unstick();
-                        } catch (e) {
-                          SafeLog.d('stop turn failed', e);
-                        }
-                        if (mounted) setState(() {});
-                      },
-                      child: const Text('Stop'),
-                    ),
                   ],
                 ),
               ),
@@ -2554,35 +2697,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
                             if (_showSlashMenu) _buildSlashMenu(theme),
-                            TextField(
-                              controller: _composer,
-                              minLines: 1,
-                              maxLines: 5,
-                              enabled:
-                                  _chat!.provider.isAvailable && !_connecting,
-                              decoration: InputDecoration(
-                                hintText: _connecting
-                                    ? 'Connecting agent…'
-                                    : streaming
-                                        ? 'Message (queued until Force run)…'
-                                        : connected
-                                            ? 'Message ${_chat!.provider.label} agent…'
-                                            : 'Message agent…',
-                                border: const OutlineInputBorder(),
-                              ),
-                              onSubmitted: (_) {
-                                if (!_sending && !_compressing) {
-                                  unawaited(_send());
-                                }
-                              },
+                            _buildComposerField(
+                              theme: theme,
+                              streaming: streaming,
+                              connected: connected,
                             ),
                           ],
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      _buildSendOrMicButton(
-                        theme: theme,
-                        streaming: streaming,
                       ),
                     ],
                   ),

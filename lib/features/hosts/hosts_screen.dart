@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
 
@@ -10,40 +11,52 @@ final hostsListProvider = FutureProvider.autoDispose<List<Host>>((ref) {
 });
 
 class HostsScreen extends ConsumerWidget {
-  const HostsScreen({super.key});
+  const HostsScreen({super.key, this.embedded = false});
+
+  final bool embedded;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final hostsAsync = ref.watch(hostsListProvider);
     final hasKey = ref.watch(hasSshKeyProvider);
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Hosts')),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () => context.push('/hosts/new'),
-        child: const Icon(Icons.add),
-      ),
-      body: Column(
-        children: [
-          hasKey.when(
-            data: (ok) => ok
-                ? const SizedBox.shrink()
-                : MaterialBanner(
-                    content: const Text(
-                      'Add an SSH private key in Connect before testing hosts.',
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => context.go('/connect'),
-                        child: const Text('Connect'),
-                      ),
-                    ],
-                  ),
-            loading: () => const SizedBox.shrink(),
-            error: (_, _) => const SizedBox.shrink(),
+    final body = Column(
+      children: [
+        if (embedded)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.tonalIcon(
+                onPressed: () => context.push('/hosts/new'),
+                icon: const Icon(Icons.add),
+                label: const Text('Add host'),
+              ),
+            ),
           ),
-          Expanded(
-            child: hostsAsync.when(
+        hasKey.when(
+          data: (ok) => ok
+              ? const SizedBox.shrink()
+              : MaterialBanner(
+                  content: const Text(
+                    'Add an SSH private key in Connect before testing hosts.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => openAppPanel(
+                        context,
+                        ref,
+                        DesktopRightPanel.connect,
+                      ),
+                      child: const Text('Connect'),
+                    ),
+                  ],
+                ),
+          loading: () => const SizedBox.shrink(),
+          error: (_, _) => const SizedBox.shrink(),
+        ),
+        Expanded(
+          child: hostsAsync.when(
               data: (hosts) {
                 if (hosts.isEmpty) {
                   return const Center(
@@ -101,7 +114,17 @@ class HostsScreen extends ConsumerWidget {
             ),
           ),
         ],
+      );
+
+    if (embedded) return body;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Hosts')),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => context.push('/hosts/new'),
+        child: const Icon(Icons.add),
       ),
+      body: body,
     );
   }
 }

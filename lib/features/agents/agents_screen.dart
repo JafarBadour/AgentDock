@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
@@ -71,7 +72,15 @@ class _Section {
 }
 
 class AgentsScreen extends ConsumerStatefulWidget {
-  const AgentsScreen({super.key});
+  const AgentsScreen({
+    super.key,
+    this.embedded = false,
+    this.selectedChatId,
+  });
+
+  /// Sidebar mode for macOS / desktop shell.
+  final bool embedded;
+  final String? selectedChatId;
 
   @override
   ConsumerState<AgentsScreen> createState() => _AgentsScreenState();
@@ -249,7 +258,11 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
   Future<void> _openChat(Chat chat) async {
     await _markRead(chat);
     if (!mounted) return;
-    await context.push('/agents/chat/${chat.id}');
+    if (widget.embedded || useDesktopShell(context)) {
+      context.go('/agents/chat/${chat.id}');
+    } else {
+      await context.push('/agents/chat/${chat.id}');
+    }
     if (!mounted) return;
     // The transcript almost certainly moved on while we were inside it.
     await _markRead(chat);
@@ -266,26 +279,15 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
         ? 'Syncing agents from remotes…'
         : syncAsync.valueOrNull;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Agents'),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh / sync ~/.agentdock',
-            onPressed: () {
-              setState(_dismissedChats.clear);
-              ref.invalidate(agentsTreeProvider);
-              ref.invalidate(agentsSyncProvider);
-              ref.invalidate(unreadCountsProvider);
-            },
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: treeAsync.when(
+    final list = treeAsync.when(
         data: (tree) {
           final sections = _sections(tree);
-          if (sections.isEmpty) return _EmptyState(hasHosts: tree.hosts.isNotEmpty);
+          if (sections.isEmpty) {
+            return _EmptyState(
+              hasHosts: tree.hosts.isNotEmpty,
+              embedded: widget.embedded,
+            );
+          }
 
           return RefreshIndicator(
             onRefresh: () async {
@@ -297,7 +299,10 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
               await ref.read(agentsTreeProvider.future);
             },
             child: ReorderableListView.builder(
-              padding: const EdgeInsets.only(top: 4, bottom: 32),
+              padding: EdgeInsets.only(
+                top: 4,
+                bottom: widget.embedded ? 8 : 32,
+              ),
               buildDefaultDragHandles: false,
               header: syncNote == null
                   ? null
@@ -324,6 +329,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
                   runtimes: runtimes,
                   unread: unread,
                   collapsed: _collapsedRepos.contains(section.repo.id),
+                  selectedChatId: widget.selectedChatId,
                   onToggle: () => setState(() {
                     if (!_collapsedRepos.remove(section.repo.id)) {
                       _collapsedRepos.add(section.repo.id);
@@ -355,18 +361,41 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
         },
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => Center(child: Text('$e')),
+      );
+
+    if (widget.embedded) {
+      return list;
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Agents'),
+        actions: [
+          IconButton(
+            tooltip: 'Refresh / sync ~/.agentdock',
+            onPressed: () {
+              setState(_dismissedChats.clear);
+              ref.invalidate(agentsTreeProvider);
+              ref.invalidate(agentsSyncProvider);
+              ref.invalidate(unreadCountsProvider);
+            },
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
       ),
+      body: list,
     );
   }
 }
 
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({required this.hasHosts});
+class _EmptyState extends ConsumerWidget {
+  const _EmptyState({required this.hasHosts, this.embedded = false});
 
   final bool hasHosts;
+  final bool embedded;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -389,7 +418,11 @@ class _EmptyState extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             FilledButton(
-              onPressed: () => context.go('/hosts'),
+              onPressed: () => openAppPanel(
+                context,
+                ref,
+                DesktopRightPanel.hosts,
+              ),
               child: const Text('Go to Hosts'),
             ),
           ],
@@ -415,6 +448,7 @@ class _RepoSection extends StatelessWidget {
     required this.onDeleteChat,
     required this.onDismissChat,
     required this.onReorderChats,
+    this.selectedChatId,
   });
 
   final int index;
@@ -422,6 +456,7 @@ class _RepoSection extends StatelessWidget {
   final Map<String, ChatSessionRuntime> runtimes;
   final Map<String, int> unread;
   final bool collapsed;
+  final String? selectedChatId;
   final VoidCallback onToggle;
   final VoidCallback onNewAgent;
   final void Function(Chat chat) onOpenChat;
@@ -482,6 +517,7 @@ class _RepoSection extends StatelessWidget {
                       chat: chat,
                       runtime: runtimes[chat.id],
                       unread: unread[chat.id] ?? 0,
+                      selected: chat.id == selectedChatId,
                       onTap: () => onOpenChat(chat),
                       onRename: () => onRenameChat(chat),
                       onDelete: () async {
@@ -651,6 +687,7 @@ class _AgentRow extends StatelessWidget {
     required this.onTap,
     required this.onDelete,
     required this.onRename,
+    this.selected = false,
   });
 
   final Chat chat;
@@ -659,6 +696,7 @@ class _AgentRow extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onDelete;
   final VoidCallback onRename;
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
@@ -714,9 +752,11 @@ class _AgentRow extends StatelessWidget {
       onTap: onTap,
       onSecondaryTapDown: (d) => _showMenu(context, d.globalPosition),
       child: Container(
-        color: hasUnread
-            ? unreadAccent(context).withValues(alpha: 0.06)
-            : Colors.transparent,
+        color: selected
+            ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.12)
+            : hasUnread
+                ? unreadAccent(context).withValues(alpha: 0.06)
+                : Colors.transparent,
         padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
         child: Row(
           children: [
@@ -784,6 +824,7 @@ class _AgentRow extends StatelessWidget {
                       persistedAdded: chat.linesAdded,
                       persistedRemoved: chat.linesRemoved,
                       persistedFiles: chat.filesChanged,
+                      persistedDay: chat.codeDeltaDay,
                     );
                     return d.added > 0 || d.removed > 0 || d.files > 0;
                   }())
@@ -794,6 +835,7 @@ class _AgentRow extends StatelessWidget {
                           persistedAdded: chat.linesAdded,
                           persistedRemoved: chat.linesRemoved,
                           persistedFiles: chat.filesChanged,
+                          persistedDay: chat.codeDeltaDay,
                         );
                         return CodeDeltaLabel(
                           added: d.added,

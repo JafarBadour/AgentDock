@@ -29,11 +29,14 @@ void main() {
     });
 
     test('mergeDisplay keeps persisted totals when live is empty', () {
+      const today = '2026-09-03';
       final d = CodeChangeStats.mergeDisplay(
         live: const CodeChangeStats(),
         persistedAdded: 10,
         persistedRemoved: 3,
         persistedFiles: 5,
+        persistedDay: today,
+        todayDay: today,
       );
       expect(d.added, 10);
       expect(d.removed, 3);
@@ -41,6 +44,7 @@ void main() {
     });
 
     test('mergeDisplay prefers larger live totals', () {
+      const today = '2026-09-03';
       final d = CodeChangeStats.mergeDisplay(
         live: const CodeChangeStats(
           added: 40,
@@ -50,10 +54,33 @@ void main() {
         persistedAdded: 10,
         persistedRemoved: 3,
         persistedFiles: 2,
+        persistedDay: today,
+        todayDay: today,
       );
       expect(d.added, 40);
       expect(d.removed, 3);
       expect(d.files, 3);
+    });
+
+    test('mergeDisplay resets persisted totals on a new local day', () {
+      final d = CodeChangeStats.mergeDisplay(
+        live: const CodeChangeStats(),
+        persistedAdded: 1852,
+        persistedRemoved: 1838,
+        persistedFiles: 6,
+        persistedDay: '2026-09-02',
+        todayDay: '2026-09-03',
+      );
+      expect(d.added, 0);
+      expect(d.removed, 0);
+      expect(d.files, 0);
+    });
+
+    test('codeDeltaLocalDayKey uses local calendar date', () {
+      expect(
+        codeDeltaLocalDayKey(DateTime(2026, 9, 3, 23, 59)),
+        '2026-09-03',
+      );
     });
 
     test('counts old_string / new_string replacements', () {

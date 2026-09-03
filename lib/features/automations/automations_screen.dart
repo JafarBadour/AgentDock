@@ -16,7 +16,9 @@ final scheduledJobsProvider =
 });
 
 class AutomationsScreen extends ConsumerStatefulWidget {
-  const AutomationsScreen({super.key});
+  const AutomationsScreen({super.key, this.embedded = false});
+
+  final bool embedded;
 
   @override
   ConsumerState<AutomationsScreen> createState() => _AutomationsScreenState();
@@ -62,14 +64,7 @@ class _AutomationsScreenState extends ConsumerState<AutomationsScreen> {
     final jobsAsync = ref.watch(scheduledJobsProvider);
     final treeAsync = ref.watch(agentsTreeProvider);
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Automated agents')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/automate/new'),
-        icon: const Icon(Icons.add),
-        label: const Text('Schedule'),
-      ),
-      body: jobsAsync.when(
+    final body = jobsAsync.when(
         data: (jobs) {
           if (jobs.isEmpty) {
             return const Center(
@@ -178,7 +173,36 @@ class _AutomationsScreenState extends ConsumerState<AutomationsScreen> {
         },
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => Center(child: Text('Error: $e')),
+      );
+
+    if (widget.embedded) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.tonalIcon(
+                onPressed: () => context.push('/automate/new'),
+                icon: const Icon(Icons.add),
+                label: const Text('Schedule'),
+              ),
+            ),
+          ),
+          Expanded(child: body),
+        ],
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Automated agents')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => context.push('/automate/new'),
+        icon: const Icon(Icons.add),
+        label: const Text('Schedule'),
       ),
+      body: body,
     );
   }
 }

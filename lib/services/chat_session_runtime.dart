@@ -147,11 +147,24 @@ class ChatSessionRuntime extends ChangeNotifier {
   bool get isWorking =>
       sendingToHost || promptInFlight || remoteTurnActive || hasActiveTools;
 
-  /// Live code churn from edit/write tools in this transcript.
-  CodeChangeStats get codeDelta => CodeChangeStats.fromTools([
-        for (final e in entries)
-          if (e.tool != null) e.tool!,
-      ]);
+  /// Live code churn from edit/write tools since local midnight.
+  CodeChangeStats get codeDelta =>
+      CodeChangeStats.fromTools(_toolsSinceStartOfLocalDay());
+
+  Iterable<ToolCallState> _toolsSinceStartOfLocalDay() sync* {
+    final start = DateTime(
+      DateTime.now().year,
+      DateTime.now().month,
+      DateTime.now().day,
+    );
+    for (final e in entries) {
+      final tool = e.tool;
+      if (tool == null) continue;
+      final at = e.createdAt;
+      if (at != null && at.isBefore(start)) continue;
+      yield tool;
+    }
+  }
 
   /// Reads + searches since the last user message (current turn).
   ExploreStats get turnExploreStats =>
@@ -1539,15 +1552,23 @@ class ChatSessionRuntime extends ChangeNotifier {
     final stats = codeDelta;
     final meta = chatMeta;
     if (meta == null) return;
-    // Never shrink: a partial hydrate (tools not yet restored) used to wipe
-    // the Δ line by writing zeros over a good session total.
-    final added = stats.added > meta.linesAdded ? stats.added : meta.linesAdded;
-    final removed =
-        stats.removed > meta.linesRemoved ? stats.removed : meta.linesRemoved;
-    final files = stats.fileCount > meta.filesChanged
-        ? stats.fileCount
-        : meta.filesChanged;
-    if (meta.linesAdded == added &&
+    final today = codeDeltaLocalDayKey();
+    final sameDay =
+        meta.codeDeltaDay == null || meta.codeDeltaDay == today;
+    // New local day — do not carry yesterday's persisted totals forward.
+    final added = sameDay
+        ? (stats.added > meta.linesAdded ? stats.added : meta.linesAdded)
+        : stats.added;
+    final removed = sameDay
+        ? (stats.removed > meta.linesRemoved ? stats.removed : meta.linesRemoved)
+        : stats.removed;
+    final files = sameDay
+        ? (stats.fileCount > meta.filesChanged
+            ? stats.fileCount
+            : meta.filesChanged)
+        : stats.fileCount;
+    if (sameDay &&
+        meta.linesAdded == added &&
         meta.linesRemoved == removed &&
         meta.filesChanged == files) {
       return;
@@ -1556,6 +1577,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       linesAdded: added,
       linesRemoved: removed,
       filesChanged: files,
+      codeDeltaDay: today,
       updatedAt: DateTime.now(),
     );
     chatMeta = updated;

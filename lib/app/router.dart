@@ -14,6 +14,8 @@ import '../features/repos/repos_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
+import 'desktop_shell_scaffold.dart';
+import 'platform_layout.dart';
 import 'shell_scaffold.dart';
 
 final _rootKey = GlobalKey<NavigatorState>();
@@ -24,8 +26,15 @@ final goRouterProvider = Provider<GoRouter>((ref) {
     initialLocation: '/agents',
     routes: [
       StatefulShellRoute.indexedStack(
-        builder: (context, state, navigationShell) =>
-            ShellScaffold(navigationShell: navigationShell),
+        builder: (context, state, navigationShell) {
+          if (useDesktopShell(context)) {
+            return DesktopShellScaffold(
+              navigationShell: navigationShell,
+              state: state,
+            );
+          }
+          return ShellScaffold(navigationShell: navigationShell);
+        },
         branches: [
           StatefulShellBranch(
             routes: [

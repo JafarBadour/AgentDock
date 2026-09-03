@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/mcp_server.dart';
 import '../../data/secure/safe_log.dart';
@@ -19,7 +20,9 @@ final mcpListProvider = FutureProvider.autoDispose<List<McpServer>>((ref) {
 });
 
 class SettingsScreen extends ConsumerStatefulWidget {
-  const SettingsScreen({super.key});
+  const SettingsScreen({super.key, this.embedded = false});
+
+  final bool embedded;
 
   @override
   ConsumerState<SettingsScreen> createState() => _SettingsScreenState();
@@ -176,15 +179,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Widget build(BuildContext context) {
     final mcps = ref.watch(mcpListProvider);
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Settings')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/settings/mcp/new'),
-        icon: const Icon(Icons.add),
-        label: const Text('Add MCP'),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 88),
+    final body = ListView(
+        padding: EdgeInsets.fromLTRB(16, 12, 16, widget.embedded ? 16 : 88),
         children: [
           if (!kIsWeb &&
               (defaultTargetPlatform == TargetPlatform.android ||
@@ -293,10 +289,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             leading: const Icon(Icons.vpn_key_outlined),
             title: const Text('SSH & Cursor keys'),
             subtitle: const Text('Managed in the Connect tab'),
-            onTap: () => context.go('/connect'),
+            onTap: () => openAppPanel(context, ref, DesktopRightPanel.connect),
           ),
         ],
+      );
+
+    if (widget.embedded) return body;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => context.push('/settings/mcp/new'),
+        icon: const Icon(Icons.add),
+        label: const Text('Add MCP'),
       ),
+      body: body,
     );
   }
 }

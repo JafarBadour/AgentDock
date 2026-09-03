@@ -5,9 +5,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/providers.dart';
 import '../../data/secure/safe_log.dart';
+import 'claude_login_sheet.dart';
 
 class ConnectScreen extends ConsumerStatefulWidget {
-  const ConnectScreen({super.key});
+  const ConnectScreen({super.key, this.embedded = false});
+
+  final bool embedded;
 
   @override
   ConsumerState<ConnectScreen> createState() => _ConnectScreenState();
@@ -164,11 +167,9 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Connect')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
+    final body = ListView(
+      padding: EdgeInsets.all(widget.embedded ? 12 : 16),
+      children: [
           Text(
             'Secrets stay on this device in the platform keystore. '
             'Nothing is uploaded to our servers — this app has no analytics or cloud backend.',
@@ -246,6 +247,8 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
             child: const Text('Save Cursor key'),
           ),
           const Divider(height: 40),
+          const ClaudeHostLoginPanel(),
+          const Divider(height: 40),
           ListTile(
             contentPadding: EdgeInsets.zero,
             leading: Icon(
@@ -258,8 +261,9 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
                   : 'Anthropic API key (optional)',
             ),
             subtitle: const Text(
-              'For Claude agents. Prefer `claude login` on the remote. '
-              'If set, the key is injected only into that agent process environment.',
+              'Optional if you signed in with Claude on the remote (Connect → '
+              'Sign in to Claude). If set, the key is injected only into that '
+              'agent process environment.',
             ),
           ),
           TextField(
@@ -304,7 +308,13 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
             Text(_status!, style: Theme.of(context).textTheme.bodySmall),
           ],
         ],
-      ),
+      );
+
+    if (widget.embedded) return body;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Connect')),
+      body: body,
     );
   }
 }

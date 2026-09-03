@@ -331,8 +331,45 @@ final scheduleRunnerProvider = Provider<ScheduleRunner>((ref) {
   return runner;
 });
 
+/// Composer text drafts keyed by chat id — survives leaving and re-opening a chat.
+class ChatComposerDrafts extends StateNotifier<Map<String, String>> {
+  ChatComposerDrafts() : super(const {});
+
+  String? draftFor(String chatId) => state[chatId];
+
+  void setDraft(String chatId, String text) {
+    if (text.isEmpty) {
+      if (!state.containsKey(chatId)) return;
+      final next = Map<String, String>.from(state)..remove(chatId);
+      state = next;
+      return;
+    }
+    if (state[chatId] == text) return;
+    state = {...state, chatId: text};
+  }
+
+  void clearDraft(String chatId) => setDraft(chatId, '');
+}
+
+final chatComposerDraftsProvider =
+    StateNotifierProvider<ChatComposerDrafts, Map<String, String>>(
+  (ref) => ChatComposerDrafts(),
+);
+
 /// Chat currently open in the UI — used to suppress local notifications.
 final focusedChatIdProvider = StateProvider<String?>((ref) => null);
+
+enum DesktopRightPanel {
+  none,
+  automate,
+  hosts,
+  connect,
+  settings,
+}
+
+/// Right-hand panel on macOS / desktop (Automate, Hosts, Connect, Settings).
+final desktopRightPanelProvider =
+    StateProvider<DesktopRightPanel>((ref) => DesktopRightPanel.none);
 
 /// True while the Flutter app is in the resumed lifecycle state.
 final appInForegroundProvider = StateProvider<bool>((ref) => true);

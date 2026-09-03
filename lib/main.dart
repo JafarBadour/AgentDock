@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'app/app_theme.dart';
 import 'app/providers.dart';
 import 'app/router.dart';
+import 'app/platform_layout.dart';
 import 'app/wavy_background.dart';
 
 class AgentDockApp extends ConsumerStatefulWidget {
@@ -83,8 +84,11 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
         theme: buildAppTheme(),
         darkTheme: buildAppTheme(),
         themeMode: ThemeMode.dark,
-        builder: (context, child) =>
-            WavyBackground(child: child ?? const SizedBox.shrink()),
+        builder: (context, child) {
+          final body = child ?? const SizedBox.shrink();
+          if (useDesktopShell(context)) return body;
+          return WavyBackground(child: body);
+        },
         routerConfig: router,
       ),
     );

@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 
 import '../models/chat.dart';
 import '../models/chat_message.dart';
+import '../models/code_change_stats.dart';
 import '../models/host.dart';
 import '../models/mcp_server.dart';
 import '../models/repo.dart';
@@ -33,7 +34,7 @@ class AppDatabase {
         p.join((await getApplicationDocumentsDirectory()).path, 'agentic_phone.db');
     return openDatabase(
       path,
-      version: 12,
+      version: 13,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -75,6 +76,7 @@ CREATE TABLE chats (
   lines_added INTEGER NOT NULL DEFAULT 0,
   lines_removed INTEGER NOT NULL DEFAULT 0,
   files_changed INTEGER NOT NULL DEFAULT 0,
+  code_delta_day TEXT,
   outbound_queue TEXT,
   status TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
@@ -145,6 +147,18 @@ CREATE TABLE messages (
           );
           await db.execute(
             'ALTER TABLE chats ADD COLUMN files_changed INTEGER NOT NULL DEFAULT 0',
+          );
+        }
+        if (oldVersion < 13) {
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN code_delta_day TEXT',
+          );
+          final today = codeDeltaLocalDayKey();
+          await db.update(
+            'chats',
+            {'code_delta_day': today},
+            where:
+                'code_delta_day IS NULL AND (lines_added > 0 OR lines_removed > 0 OR files_changed > 0)',
           );
         }
       },
