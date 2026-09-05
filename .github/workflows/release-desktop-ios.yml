@@ -1,0 +1,108 @@
+name: Release Windows / Linux / iOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.41.8'
+
+jobs:
+  windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build windows --release
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path build/windows/x64/runner/Release/* `
+            -DestinationPath AgentDock-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentDock-windows-x64
+          path: AgentDock-windows-x64.zip
+
+  linux:
+    name: Build Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev libsecret-1-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build linux --release
+      - name: Package
+        run: |
+          tar -czf AgentDock-linux-x64.tar.gz \
+            -C build/linux/x64/release/bundle .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentDock-linux-x64
+          path: AgentDock-linux-x64.tar.gz
+
+  ios:
+    name: Build iOS (unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: Build iOS (no codesign)
+        run: flutter build ios --release --no-codesign
+      - name: Package Runner.app
+        run: |
+          cd build/ios/iphoneos
+          zip -r "$GITHUB_WORKSPACE/AgentDock-ios-unsigned.zip" Runner.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentDock-ios-unsigned
+          path: AgentDock-ios-unsigned.zip
+
+  release:
+    name: GitHub Release
+    needs: [windows, linux, ios]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Agent Dock desktop & iOS builds
+
+            - **Windows**: unzip `AgentDock-windows-x64.zip` and run `agent_dock.exe`
+            - **Linux (Ubuntu)**: `tar -xzf AgentDock-linux-x64.tar.gz` then run `./agent_dock`
+            - **iOS**: `AgentDock-ios-unsigned.zip` is an unsigned `Runner.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
+          files: |
+            artifacts/AgentDock-windows-x64/AgentDock-windows-x64.zip
+            artifacts/AgentDock-linux-x64/AgentDock-linux-x64.tar.gz
+            artifacts/AgentDock-ios-unsigned/AgentDock-ios-unsigned.zip

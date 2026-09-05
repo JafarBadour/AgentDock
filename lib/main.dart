@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'app/app_theme.dart';
 import 'app/providers.dart';
@@ -114,6 +117,11 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // sqflite has no native Windows/Linux plugin — use FFI SQLite there.
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
   FlutterForegroundTask.initCommunicationPort();
   runApp(const ProviderScope(child: AgentDockApp()));
 }
