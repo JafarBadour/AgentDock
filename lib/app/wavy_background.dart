@@ -67,15 +67,15 @@ class _WavyPainter extends CustomPainter {
     canvas.drawRect(
       rect,
       Paint()
-        ..shader = LinearGradient(
+        ..shader = const LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
           colors: [
             AppColors.deep,
             AppColors.mid,
-            const Color(0xFF0A2444),
+            Color(0xFF1A1624),
           ],
-          stops: const [0.0, 0.55, 1.0],
+          stops: [0.0, 0.55, 1.0],
         ).createShader(rect),
     );
 
@@ -87,7 +87,7 @@ class _WavyPainter extends CustomPainter {
           center: const Alignment(0, -0.35),
           radius: 1.15,
           colors: [
-            AppColors.glow.withValues(alpha: 0.18),
+            AppColors.glow.withValues(alpha: 0.22),
             Colors.transparent,
           ],
         ).createShader(rect),
@@ -100,7 +100,7 @@ class _WavyPainter extends CustomPainter {
       amplitude: size.height * 0.045,
       wavelength: size.width * 0.85,
       speed: 1.0,
-      color: AppColors.glow.withValues(alpha: 0.22),
+      color: AppColors.glow.withValues(alpha: 0.28),
     );
     _drawWave(
       canvas,
@@ -109,7 +109,7 @@ class _WavyPainter extends CustomPainter {
       amplitude: size.height * 0.035,
       wavelength: size.width * 1.1,
       speed: -0.65,
-      color: AppColors.accentSoft.withValues(alpha: 0.14),
+      color: AppColors.accentSoft.withValues(alpha: 0.10),
     );
     _drawWave(
       canvas,
@@ -118,7 +118,7 @@ class _WavyPainter extends CustomPainter {
       amplitude: size.height * 0.028,
       wavelength: size.width * 0.65,
       speed: 0.45,
-      color: AppColors.accent.withValues(alpha: 0.10),
+      color: AppColors.accent.withValues(alpha: 0.07),
     );
   }
 

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -5,10 +7,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../app/providers.dart';
+import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/models/scheduled_job.dart';
+import '../../data/secure/safe_log.dart';
+import '../../services/agent_runtime_host.dart';
 import '../agents/agents_screen.dart';
 
 class ScheduleEditScreen extends ConsumerStatefulWidget {
@@ -45,6 +50,7 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
   bool _attachContext = false;
   bool _repeatUntilDone = false;
   String? _contextSummary;
+  /// Null = create a fresh agent chat when the schedule is saved.
   String? _chatId;
   int _hour = 9;
   int _minute = 0;
@@ -53,6 +59,7 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
   ScheduledJob? _existing;
 
   List<_AgentOption> _agents = const [];
+  List<_RepoOption> _repos = const [];
 
   @override
   void initState() {
@@ -74,8 +81,12 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
     final tree = await ref.read(agentsTreeProvider.future);
     final hostsById = {for (final h in tree.hosts) h.id: h};
     final options = <_AgentOption>[];
+    final repos = <_RepoOption>[];
     for (final repo in tree.repos) {
       final host = hostsById[repo.hostId];
+      if (host != null) {
+        repos.add(_RepoOption(repo: repo, host: host));
+      }
       for (final chat in tree.chatsByRepo[repo.id] ?? const <Chat>[]) {
         options.add(
           _AgentOption(
@@ -89,6 +100,9 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
     options.sort(
       (a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()),
     );
+    repos.sort(
+      (a, b) => a.label.toLowerCase().compareTo(b.label.toLowerCase()),
+    );
 
     if (widget.jobId != null) {
       final job = await db.getScheduledJob(widget.jobId!);
@@ -98,7 +112,7 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
         _prompt.text = job.prompt;
         _kind = job.kind;
         _enabled = job.enabled;
-        _chatId = job.chatId;
+        _chatId = job.chatId.isEmpty ? null : job.chatId;
         _hour = job.hour ?? 9;
         _minute = job.minute ?? 0;
         _interval.text = '${job.intervalMinutes ?? 60}';
@@ -113,6 +127,7 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
         _repeatUntilDone = job.repeatUntilDone;
       }
     } else {
+      // New schedule: leave chat null unless caller passed one (e.g. from a chat).
       _chatId = widget.initialChatId;
       if (widget.initialPrompt != null && widget.initialPrompt!.isNotEmpty) {
         _prompt.text = widget.initialPrompt!;
@@ -131,16 +146,77 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
       }
     }
 
-    if (_chatId == null && options.isNotEmpty) {
-      _chatId = options.first.chat.id;
-    }
-
     if (mounted) {
       setState(() {
         _agents = options;
+        _repos = repos;
         _loading = false;
       });
     }
+  }
+
+  Future<_RepoOption?> _pickRepoForNewAgent() async {
+    if (_repos.isEmpty) return null;
+    if (_repos.length == 1) return _repos.first;
+    return showDialog<_RepoOption>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Project for new agent'),
+        children: [
+          for (final r in _repos)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, r),
+              child: Text(r.label),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Creates a chat when Agent chat is left empty, then returns its id.
+  Future<String?> _createAgentForSchedule({required String titleHint}) async {
+    final picked = await _pickRepoForNewAgent();
+    if (picked == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Add a host project first, or pick an agent chat.'),
+          ),
+        );
+      }
+      return null;
+    }
+
+    final title = titleHint.trim().isEmpty ? 'Scheduled agent' : titleHint.trim();
+    final chatId = const Uuid().v4();
+    final now = DateTime.now();
+    final chat = Chat(
+      id: chatId,
+      repoId: picked.repo.id,
+      title: title.length > 60 ? '${title.substring(0, 59)}…' : title,
+      provider: AgentProvider.cursor,
+      tmuxSession: AgentRuntimeHost.sessionNameForChat(chatId),
+      status: ChatStatus.idle,
+      sortOrder:
+          await ref.read(appDatabaseProvider).nextChatSortOrder(picked.repo.id),
+      titleUpdatedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    );
+    await ref.read(appDatabaseProvider).upsertChat(chat);
+    unawaited(() async {
+      try {
+        await ref.read(agentDockServiceProvider).pushAgent(
+              host: picked.host,
+              chat: chat,
+              repo: picked.repo,
+            );
+      } catch (e) {
+        SafeLog.d('schedule new-agent push failed', e);
+      }
+    }());
+    ref.invalidate(agentsTreeProvider);
+    return chatId;
   }
 
   Future<void> _pickOnceDate() async {
@@ -181,13 +257,6 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
 
   Future<void> _save() async {
     final prompt = _prompt.text.trim();
-    final chatId = _chatId;
-    if (chatId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Create an agent chat first.')),
-      );
-      return;
-    }
     if (prompt.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Prompt is required.')),
@@ -207,6 +276,17 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
     final title = _title.text.trim().isEmpty
         ? (prompt.length > 40 ? '${prompt.substring(0, 40)}…' : prompt)
         : _title.text.trim();
+
+    var chatId = _chatId;
+    if (chatId == null || chatId.isEmpty) {
+      final created = await _createAgentForSchedule(titleHint: title);
+      if (created == null) {
+        if (mounted) setState(() => _saving = false);
+        return;
+      }
+      chatId = created;
+      _chatId = created;
+    }
 
     final next = _kind == ScheduleKind.once
         ? _onceAt
@@ -326,6 +406,8 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
 
     final ctxPreview = _contextSummary?.trim() ?? '';
     final hasCtx = ctxPreview.isNotEmpty;
+    final selectedChatId =
+        _agents.any((a) => a.chat.id == _chatId) ? _chatId : null;
 
     return Scaffold(
       appBar: AppBar(
@@ -354,26 +436,36 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
             ),
           ),
           const SizedBox(height: 12),
-          DropdownButtonFormField<String>(
+          DropdownButtonFormField<String?>(
             // ignore: deprecated_member_use
-            value: _agents.any((a) => a.chat.id == _chatId) ? _chatId : null,
-            decoration: const InputDecoration(labelText: 'Agent chat'),
+            value: selectedChatId,
+            isExpanded: true,
+            decoration: const InputDecoration(
+              labelText: 'Agent chat',
+              helperText: 'Leave empty to create a new agent on save',
+            ),
             items: [
+              const DropdownMenuItem<String?>(
+                value: null,
+                child: Text('New agent (on save)'),
+              ),
               for (final a in _agents)
-                DropdownMenuItem(
+                DropdownMenuItem<String?>(
                   value: a.chat.id,
-                  child: Text(a.label, overflow: TextOverflow.ellipsis),
+                  child: Text(
+                    a.label,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
                 ),
             ],
-            onChanged: _agents.isEmpty
-                ? null
-                : (v) => setState(() => _chatId = v),
+            onChanged: (v) => setState(() => _chatId = v),
           ),
-          if (_agents.isEmpty)
+          if (_repos.isEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Text(
-                'No agent chats yet — create one under Agents first.',
+                'No host projects yet — add a host under Hosts first.',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
@@ -397,15 +489,16 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
               labelText: 'Done criteria (optional)',
               alignLabelWithHint: true,
               hintText:
-                  'After each run, ask the agent if this is finished. '
-                  'It must answer DONE: yes or DONE: no.',
+                  'After each run we ask if this is finished. '
+                  'The agent must answer with first word yes or no, then explain.',
+              helperText: 'yes = stop automation · no = keep running',
             ),
           ),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Repeat until done'),
             subtitle: const Text(
-              'Keep the schedule enabled until the agent answers DONE: yes',
+              'Keep the schedule enabled until the agent answers yes',
             ),
             value: _repeatUntilDone,
             onChanged: (v) => setState(() => _repeatUntilDone = v),
@@ -580,4 +673,13 @@ class _AgentOption {
     final hostLabel = host?.displayLabel ?? 'host';
     return '${chat.title} · ${repo.name} · $hostLabel';
   }
+}
+
+class _RepoOption {
+  const _RepoOption({required this.repo, required this.host});
+
+  final Repo repo;
+  final Host host;
+
+  String get label => '${repo.name} · ${host.displayLabel}';
 }

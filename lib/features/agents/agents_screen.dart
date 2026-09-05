@@ -4,11 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../app/app_theme.dart';
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
-import '../../data/models/code_change_stats.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/secure/safe_log.dart';
@@ -29,8 +29,13 @@ class AgentsTree {
 }
 
 /// Local-only tree. Never touches the network, so the list paints immediately.
+///
+/// Do **not** watch [chatActivityTickProvider] here — that tick fires while a
+/// turn streams and was forcing a full SQLite reload (and loading flash) every
+/// ~700ms. Live working/delta UI comes from [activeAcpSessionsProvider] +
+/// ListenableBuilder on each row.
 final agentsTreeProvider = FutureProvider.autoDispose<AgentsTree>((ref) async {
-  ref.watch(chatActivityTickProvider);
+  ref.watch(agentsCatalogEpochProvider);
   final db = ref.watch(appDatabaseProvider);
   final hosts = await db.listHosts();
   final repos = await db.listRepos();
@@ -41,20 +46,40 @@ final agentsTreeProvider = FutureProvider.autoDispose<AgentsTree>((ref) async {
   return AgentsTree(hosts: hosts, repos: repos, chatsByRepo: chatsByRepo);
 });
 
-/// Unread agent replies per chat id. Recomputed whenever a runtime writes.
+/// Unread agent replies per chat id. Recomputed on [chatActivityTickProvider]
+/// (debounced ~8s while a turn runs). The Agents screen must not watch this at
+/// the list root — only badge widgets — or the sidebar remounts and flickers.
 final unreadCountsProvider =
     FutureProvider.autoDispose<Map<String, int>>((ref) async {
   ref.watch(chatActivityTickProvider);
   return ref.watch(appDatabaseProvider).unreadCounts();
 });
 
-/// Background catalog + transcript sync, kept off the render path.
+/// Background catalog sync — runs once per Agents screen lifetime, not on a
+/// timer. Manual refresh re-invalidates this provider.
 final agentsSyncProvider = FutureProvider.autoDispose<String?>((ref) async {
   final hasKey = await ref.watch(secureStoreProvider).hasSshPrivateKey();
-  if (!hasKey) return null;
+  // Catalog sync needs some form of SSH auth; password-only hosts are fine —
+  // syncAllHostsCatalog will skip hosts it can't reach.
+  final store = ref.watch(secureStoreProvider);
+  final hosts = await ref.watch(appDatabaseProvider).listHosts();
+  var canAuth = hasKey;
+  if (!canAuth) {
+    for (final h in hosts) {
+      if (await store.hasHostPassword(h.id)) {
+        canAuth = true;
+        break;
+      }
+    }
+  }
+  if (!canAuth) return null;
   try {
     final note = await ref.read(agentDockServiceProvider).syncAllHostsCatalog();
-    ref.invalidate(agentsTreeProvider);
+    // Only reload the tree when something actually merged — otherwise the
+    // sidebar flashes for a no-op sync.
+    if (note != null && note.startsWith('Synced')) {
+      ref.invalidate(agentsTreeProvider);
+    }
     return note;
   } catch (e) {
     SafeLog.d('agentdock catalog sync failed', e);
@@ -69,6 +94,25 @@ class _Section {
   final Repo repo;
   final Host host;
   final List<Chat> chats;
+}
+
+/// Flat chat row for the phone Agents list.
+class _FlatChat {
+  const _FlatChat({
+    required this.chat,
+    required this.host,
+    required this.repo,
+  });
+
+  final Chat chat;
+  final Host host;
+  final Repo repo;
+
+  DateTime get lastInteracted {
+    final read = chat.lastReadAt;
+    if (read == null) return chat.updatedAt;
+    return read.isAfter(chat.updatedAt) ? read : chat.updatedAt;
+  }
 }
 
 class AgentsScreen extends ConsumerStatefulWidget {
@@ -128,6 +172,24 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       return ra == rb ? 0 : ra.compareTo(rb);
     });
     return sections;
+  }
+
+  List<_FlatChat> _flatChats(AgentsTree tree) {
+    final hostsById = {for (final h in tree.hosts) h.id: h};
+    final reposById = {for (final r in tree.repos) r.id: r};
+    final out = <_FlatChat>[];
+    for (final entry in tree.chatsByRepo.entries) {
+      final repo = reposById[entry.key];
+      if (repo == null) continue;
+      final host = hostsById[repo.hostId];
+      if (host == null) continue;
+      for (final chat in entry.value) {
+        if (_dismissedChats.contains(chat.id)) continue;
+        out.add(_FlatChat(chat: chat, host: host, repo: repo));
+      }
+    }
+    out.sort((a, b) => b.lastInteracted.compareTo(a.lastInteracted));
+    return out;
   }
 
   Future<void> _reorderRepos(
@@ -195,25 +257,37 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
   }
 
   Future<void> _deleteChat(Host host, Chat chat) async {
+    // Tear down the live bridge first so it cannot recreate the host record.
+    try {
+      await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+    } catch (e) {
+      SafeLog.d('closing ACP session on delete failed', e);
+    }
     await ref.read(appDatabaseProvider).deleteChat(chat.id);
-    final agentDock = ref.read(agentDockServiceProvider);
-    final runtimeHost = ref.read(agentRuntimeHostProvider);
-    unawaited(() async {
-      try {
-        // Also stop the detached agent, otherwise it keeps running on the host
-        // with nothing pointing at it.
-        await runtimeHost.stop(host, chat.id);
-      } catch (e) {
-        SafeLog.d('stopping remote agent failed', e);
-      }
-      try {
-        await agentDock.deleteAgent(host: host, chatId: chat.id);
-      } catch (e) {
-        SafeLog.d('agentdock delete failed', e);
-      }
-    }());
     ref.invalidate(agentsTreeProvider);
     ref.invalidate(unreadCountsProvider);
+
+    final agentDock = ref.read(agentDockServiceProvider);
+    final runtimeHost = ref.read(agentRuntimeHostProvider);
+    try {
+      await runtimeHost.stop(host, chat.id);
+    } catch (e) {
+      SafeLog.d('stopping remote agent failed', e);
+    }
+    try {
+      await agentDock.deleteAgent(host: host, chatId: chat.id);
+    } catch (e) {
+      SafeLog.d('agentdock delete failed', e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Removed locally, but host delete failed — sync may bring it back. $e',
+            ),
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _markRead(Chat chat) async {
@@ -249,9 +323,14 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     );
     // Dialog disposed the field; copy before using.
     if (next == null || next.isEmpty || next == chat.title) return;
-    final updated = chat.copyWith(title: next, updatedAt: DateTime.now());
+    final now = DateTime.now();
+    final updated = chat.copyWith(
+      title: next,
+      titleUpdatedAt: now,
+      updatedAt: now,
+    );
     await ref.read(appDatabaseProvider).upsertChat(updated);
-    ref.read(agentDockServiceProvider).schedulePushChat(chat.id);
+    ref.read(agentDockServiceProvider).pushChatNow(chat.id);
     ref.invalidate(agentsTreeProvider);
   }
 
@@ -266,111 +345,52 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     if (!mounted) return;
     // The transcript almost certainly moved on while we were inside it.
     await _markRead(chat);
-    ref.invalidate(agentsTreeProvider);
+    // Do not invalidate agentsTreeProvider here — that reloads the sidebar
+    // and flickers every time you open a chat on desktop.
+  }
+
+  void _startWizard() {
+    unawaited(startNewAgentWizard(context: context, ref: ref));
   }
 
   @override
   Widget build(BuildContext context) {
     final treeAsync = ref.watch(agentsTreeProvider);
-    final syncAsync = ref.watch(agentsSyncProvider);
-    final unread = ref.watch(unreadCountsProvider).valueOrNull ?? const {};
+    // Only rebuild when the sync *message* changes, not while loading.
+    final syncNote = ref.watch(
+      agentsSyncProvider.select((async) => async.hasValue
+          ? async.valueOrNull
+          : (async.isLoading ? 'Syncing agents from remotes…' : null)),
+    );
     final runtimes = ref.watch(activeAcpSessionsProvider);
-    final syncNote = syncAsync.isLoading
-        ? 'Syncing agents from remotes…'
-        : syncAsync.valueOrNull;
+    final phoneList = !widget.embedded;
 
     final list = treeAsync.when(
+        skipLoadingOnReload: true,
+        skipLoadingOnRefresh: true,
         data: (tree) {
-          final sections = _sections(tree);
-          if (sections.isEmpty) {
-            return _EmptyState(
-              hasHosts: tree.hosts.isNotEmpty,
-              embedded: widget.embedded,
-            );
+          if (phoneList) {
+            return _buildPhoneList(tree, runtimes, syncNote);
           }
-
-          return RefreshIndicator(
-            onRefresh: () async {
-              setState(_dismissedChats.clear);
-              ref.invalidate(agentsSyncProvider);
-              await ref.read(agentsSyncProvider.future);
-              ref.invalidate(agentsTreeProvider);
-              ref.invalidate(unreadCountsProvider);
-              await ref.read(agentsTreeProvider.future);
-            },
-            child: ReorderableListView.builder(
-              padding: EdgeInsets.only(
-                top: 4,
-                bottom: widget.embedded ? 8 : 32,
-              ),
-              buildDefaultDragHandles: false,
-              header: syncNote == null
-                  ? null
-                  : Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
-                      child: Text(
-                        syncNote,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ),
-              itemCount: sections.length,
-              onReorder: (o, n) => unawaited(_reorderRepos(sections, o, n)),
-              proxyDecorator: (child, index, animation) => Material(
-                elevation: 6,
-                color: Theme.of(context).colorScheme.surface,
-                child: child,
-              ),
-              itemBuilder: (context, index) {
-                final section = sections[index];
-                return _RepoSection(
-                  key: ValueKey('repo-${section.repo.id}'),
-                  index: index,
-                  section: section,
-                  runtimes: runtimes,
-                  unread: unread,
-                  collapsed: _collapsedRepos.contains(section.repo.id),
-                  selectedChatId: widget.selectedChatId,
-                  onToggle: () => setState(() {
-                    if (!_collapsedRepos.remove(section.repo.id)) {
-                      _collapsedRepos.add(section.repo.id);
-                    }
-                  }),
-                  onNewAgent: () => startNewAgentChat(
-                    context: context,
-                    ref: ref,
-                    host: section.host,
-                    repo: section.repo,
-                  ),
-                  onOpenChat: _openChat,
-                  onRenameChat: (chat) => unawaited(_renameChat(chat)),
-                  onConfirmDeleteChat: (chat) =>
-                      _confirmDeleteChat(section.host, chat),
-                  onDeleteChat: (chat) =>
-                      unawaited(_deleteChat(section.host, chat)),
-                  onDismissChat: (chat) {
-                    setState(() => _dismissedChats.add(chat.id));
-                    unawaited(_deleteChat(section.host, chat));
-                  },
-                  onReorderChats: (o, n) => unawaited(
-                    _reorderChats(section.repo, section.chats, o, n),
-                  ),
-                );
-              },
-            ),
-          );
+          return _buildDesktopTree(tree, runtimes, syncNote);
         },
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => Center(child: Text('$e')),
       );
 
     if (widget.embedded) {
-      return list;
+      return ClipRect(child: list);
     }
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Agents'),
         actions: [
+          IconButton(
+            tooltip: 'New agent',
+            onPressed: _startWizard,
+            icon: const Icon(Icons.add),
+          ),
           IconButton(
             tooltip: 'Refresh / sync ~/.agentdock',
             onPressed: () {
@@ -386,13 +406,173 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       body: list,
     );
   }
+
+  Widget _buildPhoneList(
+    AgentsTree tree,
+    Map<String, ChatSessionRuntime> runtimes,
+    String? syncNote,
+  ) {
+    final flat = _flatChats(tree);
+    if (flat.isEmpty) {
+      return _EmptyState(
+        hasHosts: tree.hosts.isNotEmpty,
+        embedded: false,
+        onNewAgent: _startWizard,
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: () async {
+        setState(_dismissedChats.clear);
+        ref.invalidate(agentsSyncProvider);
+        await ref.read(agentsSyncProvider.future);
+        ref.invalidate(agentsTreeProvider);
+        ref.invalidate(unreadCountsProvider);
+        await ref.read(agentsTreeProvider.future);
+      },
+      child: ListView.builder(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 32),
+        itemCount: flat.length + (syncNote == null ? 0 : 1),
+        itemBuilder: (context, index) {
+          if (syncNote != null) {
+            if (index == 0) {
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                child: Text(
+                  syncNote,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              );
+            }
+            index -= 1;
+          }
+          final item = flat[index];
+          final chat = item.chat;
+          return Dismissible(
+            key: ValueKey('dismiss-${chat.id}'),
+            direction: DismissDirection.endToStart,
+            background: const _DeleteBackground(),
+            confirmDismiss: (_) => _confirmDeleteChat(item.host, chat),
+            onDismissed: (_) {
+              setState(() => _dismissedChats.add(chat.id));
+              unawaited(_deleteChat(item.host, chat));
+            },
+            child: _PhoneChatCard(
+              chat: chat,
+              host: item.host,
+              repo: item.repo,
+              runtime: runtimes[chat.id],
+              onTap: () => _openChat(chat),
+              onRename: () => unawaited(_renameChat(chat)),
+              onDelete: () async {
+                if (await _confirmDeleteChat(item.host, chat)) {
+                  unawaited(_deleteChat(item.host, chat));
+                }
+              },
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildDesktopTree(
+    AgentsTree tree,
+    Map<String, ChatSessionRuntime> runtimes,
+    String? syncNote,
+  ) {
+    final sections = _sections(tree);
+    if (sections.isEmpty) {
+      return _EmptyState(
+        hasHosts: tree.hosts.isNotEmpty,
+        embedded: true,
+        onNewAgent: _startWizard,
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: () async {
+        setState(_dismissedChats.clear);
+        ref.invalidate(agentsSyncProvider);
+        await ref.read(agentsSyncProvider.future);
+        ref.invalidate(agentsTreeProvider);
+        ref.invalidate(unreadCountsProvider);
+        await ref.read(agentsTreeProvider.future);
+      },
+      child: ReorderableListView.builder(
+        padding: const EdgeInsets.only(top: 4, bottom: 8),
+        buildDefaultDragHandles: false,
+        header: syncNote == null
+            ? null
+            : Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: Text(
+                  syncNote,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+        itemCount: sections.length,
+        onReorder: (o, n) => unawaited(_reorderRepos(sections, o, n)),
+        proxyDecorator: (child, index, animation) => Material(
+          elevation: 6,
+          color: Theme.of(context).colorScheme.surface,
+          child: child,
+        ),
+        itemBuilder: (context, index) {
+          final section = sections[index];
+          return _RepoSection(
+            key: ValueKey('repo-${section.repo.id}'),
+            index: index,
+            section: section,
+            runtimes: runtimes,
+            collapsed: _collapsedRepos.contains(section.repo.id),
+            selectedChatId: widget.selectedChatId,
+            compact: true,
+            onToggle: () => setState(() {
+              if (!_collapsedRepos.remove(section.repo.id)) {
+                _collapsedRepos.add(section.repo.id);
+              }
+            }),
+            onNewAgent: () => startNewAgentChat(
+              context: context,
+              ref: ref,
+              host: section.host,
+              repo: section.repo,
+            ),
+            onOpenChat: _openChat,
+            onRenameChat: (chat) => unawaited(_renameChat(chat)),
+            onConfirmDeleteChat: (chat) =>
+                _confirmDeleteChat(section.host, chat),
+            onDeleteChat: (chat) =>
+                unawaited(_deleteChat(section.host, chat)),
+            onDismissChat: (chat) {
+              setState(() => _dismissedChats.add(chat.id));
+              unawaited(_deleteChat(section.host, chat));
+            },
+            onReorderChats: (o, n) => unawaited(
+              _reorderChats(section.repo, section.chats, o, n),
+            ),
+          );
+        },
+      ),
+    );
+  }
 }
 
 class _EmptyState extends ConsumerWidget {
-  const _EmptyState({required this.hasHosts, this.embedded = false});
+  const _EmptyState({
+    required this.hasHosts,
+    this.embedded = false,
+    this.onNewAgent,
+  });
 
   final bool hasHosts;
   final bool embedded;
+  final VoidCallback? onNewAgent;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -403,28 +583,35 @@ class _EmptyState extends ConsumerWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.folder_off_outlined,
+              Icons.forum_outlined,
               size: 40,
               color: Theme.of(context).colorScheme.outline,
             ),
             const SizedBox(height: 12),
             Text(
               hasHosts
-                  ? 'No folders yet. Add a remote directory on one of your hosts, '
-                      'then start agents inside it.'
-                  : 'Add a host, then a folder (remote directory). '
-                      'Agents live inside folders.',
+                  ? 'No agents yet. Tap + to pick a host and folder, '
+                      'then start a chat.'
+                  : 'Add a host first, then tap + to create an agent '
+                      'in a remote folder.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
-            FilledButton(
-              onPressed: () => openAppPanel(
-                context,
-                ref,
-                DesktopRightPanel.hosts,
+            if (onNewAgent != null && hasHosts)
+              FilledButton.icon(
+                onPressed: onNewAgent,
+                icon: const Icon(Icons.add),
+                label: const Text('New agent'),
+              )
+            else
+              FilledButton(
+                onPressed: () => openAppPanel(
+                  context,
+                  ref,
+                  DesktopRightPanel.hosts,
+                ),
+                child: const Text('Go to Hosts'),
               ),
-              child: const Text('Go to Hosts'),
-            ),
           ],
         ),
       ),
@@ -438,7 +625,6 @@ class _RepoSection extends StatelessWidget {
     required this.index,
     required this.section,
     required this.runtimes,
-    required this.unread,
     required this.collapsed,
     required this.onToggle,
     required this.onNewAgent,
@@ -449,14 +635,15 @@ class _RepoSection extends StatelessWidget {
     required this.onDismissChat,
     required this.onReorderChats,
     this.selectedChatId,
+    this.compact = false,
   });
 
   final int index;
   final _Section section;
   final Map<String, ChatSessionRuntime> runtimes;
-  final Map<String, int> unread;
   final bool collapsed;
   final String? selectedChatId;
+  final bool compact;
   final VoidCallback onToggle;
   final VoidCallback onNewAgent;
   final void Function(Chat chat) onOpenChat;
@@ -470,7 +657,6 @@ class _RepoSection extends StatelessWidget {
   Widget build(BuildContext context) {
     final chats = section.chats;
     final busy = chats.any((c) => runtimes[c.id]?.isWorking ?? false);
-    final unreadHere = chats.fold<int>(0, (sum, c) => sum + (unread[c.id] ?? 0));
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -482,53 +668,58 @@ class _RepoSection extends StatelessWidget {
             host: section.host,
             collapsed: collapsed,
             busy: busy,
-            hiddenUnread: collapsed ? unreadHere : 0,
+            chatIds: [for (final c in chats) c.id],
+            compact: compact,
             onToggle: onToggle,
             onNewAgent: onNewAgent,
           ),
         ),
         if (!collapsed)
           if (chats.isEmpty)
-            _EmptyRepoRow(onNewAgent: onNewAgent)
+            _EmptyRepoRow(onNewAgent: onNewAgent, compact: compact)
           else
-            ReorderableListView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              buildDefaultDragHandles: false,
-              itemCount: chats.length,
-              onReorder: onReorderChats,
-              proxyDecorator: (child, i, animation) => Material(
-                elevation: 6,
-                color: Theme.of(context).colorScheme.surface,
-                child: child,
-              ),
-              itemBuilder: (context, i) {
-                final chat = chats[i];
-                return ReorderableDelayedDragStartListener(
-                  key: ValueKey('chat-${chat.id}'),
-                  index: i,
-                  child: Dismissible(
-                    key: ValueKey('dismiss-${chat.id}'),
-                    direction: DismissDirection.endToStart,
-                    background: const _DeleteBackground(),
-                    confirmDismiss: (_) => onConfirmDeleteChat(chat),
-                    onDismissed: (_) => onDismissChat(chat),
-                    child: _AgentRow(
-                      chat: chat,
-                      runtime: runtimes[chat.id],
-                      unread: unread[chat.id] ?? 0,
-                      selected: chat.id == selectedChatId,
-                      onTap: () => onOpenChat(chat),
-                      onRename: () => onRenameChat(chat),
-                      onDelete: () async {
-                        if (await onConfirmDeleteChat(chat)) {
-                          onDeleteChat(chat);
-                        }
-                      },
+            Padding(
+              // Indent agents under their folder on desktop sidebar.
+              padding: EdgeInsets.only(left: compact ? 14 : 0),
+              child: ReorderableListView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                buildDefaultDragHandles: false,
+                itemCount: chats.length,
+                onReorder: onReorderChats,
+                proxyDecorator: (child, i, animation) => Material(
+                  elevation: 6,
+                  color: Theme.of(context).colorScheme.surface,
+                  child: child,
+                ),
+                itemBuilder: (context, i) {
+                  final chat = chats[i];
+                  return ReorderableDelayedDragStartListener(
+                    key: ValueKey('chat-${chat.id}'),
+                    index: i,
+                    child: Dismissible(
+                      key: ValueKey('dismiss-${chat.id}'),
+                      direction: DismissDirection.endToStart,
+                      background: const _DeleteBackground(),
+                      confirmDismiss: (_) => onConfirmDeleteChat(chat),
+                      onDismissed: (_) => onDismissChat(chat),
+                      child: _AgentRow(
+                        chat: chat,
+                        runtime: runtimes[chat.id],
+                        selected: chat.id == selectedChatId,
+                        compact: compact,
+                        onTap: () => onOpenChat(chat),
+                        onRename: () => onRenameChat(chat),
+                        onDelete: () async {
+                          if (await onConfirmDeleteChat(chat)) {
+                            onDeleteChat(chat);
+                          }
+                        },
+                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
       ],
     );
@@ -541,16 +732,18 @@ class _RepoHeader extends StatelessWidget {
     required this.host,
     required this.collapsed,
     required this.busy,
-    required this.hiddenUnread,
+    required this.chatIds,
     required this.onToggle,
     required this.onNewAgent,
+    this.compact = false,
   });
 
   final Repo repo;
   final Host host;
   final bool collapsed;
   final bool busy;
-  final int hiddenUnread;
+  final List<String> chatIds;
+  final bool compact;
   final VoidCallback onToggle;
   final VoidCallback onNewAgent;
 
@@ -560,43 +753,75 @@ class _RepoHeader extends StatelessWidget {
     return InkWell(
       onTap: onToggle,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 14, 4, 6),
+        padding: EdgeInsets.fromLTRB(compact ? 10 : 12, 12, 2, 4),
         child: Row(
           children: [
-            // The whole label group is one flexible unit, so a long folder name
-            // or host alias eats into itself rather than shoving the + inward.
             Expanded(
-              child: Row(
-                children: [
-                  Icon(
-                    collapsed
-                        ? Icons.folder_outlined
-                        : Icons.folder_open_outlined,
-                    size: 20,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 10),
-                  Flexible(
-                    child: Text(
-                      repo.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleSmall
-                          ?.copyWith(fontWeight: FontWeight.w600),
+              child: compact
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              collapsed
+                                  ? Icons.folder_outlined
+                                  : Icons.folder_open_outlined,
+                              size: 18,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                repo.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.titleSmall
+                                    ?.copyWith(fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                            if (busy) ...[
+                              const SizedBox(width: 6),
+                              WorkingDots(key: ValueKey('busy-${repo.id}'), size: 4),
+                            ],
+                            if (collapsed)
+                              _FolderUnreadBadge(chatIds: chatIds),
+                          ],
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(left: 26, top: 2),
+                          child: _HostTag(host: host, expand: true),
+                        ),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        Icon(
+                          collapsed
+                              ? Icons.folder_outlined
+                              : Icons.folder_open_outlined,
+                          size: 20,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 10),
+                        Flexible(
+                          child: Text(
+                            repo.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleSmall
+                                ?.copyWith(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Flexible(child: _HostTag(host: host)),
+                        if (busy) ...[
+                          const SizedBox(width: 8),
+                          WorkingDots(key: ValueKey('busy-${repo.id}'), size: 4),
+                        ],
+                        if (collapsed) _FolderUnreadBadge(chatIds: chatIds),
+                      ],
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Flexible(child: _HostTag(host: host)),
-                  if (busy) ...[
-                    const SizedBox(width: 8),
-                    const WorkingDots(size: 4),
-                  ],
-                  if (hiddenUnread > 0) ...[
-                    const SizedBox(width: 8),
-                    UnreadBadge(count: hiddenUnread),
-                  ],
-                ],
-              ),
             ),
             IconButton(
               tooltip: 'New agent in ${repo.name}',
@@ -611,16 +836,71 @@ class _RepoHeader extends StatelessWidget {
   }
 }
 
+/// Watches unread counts without rebuilding the whole agents list.
+class _FolderUnreadBadge extends ConsumerWidget {
+  const _FolderUnreadBadge({required this.chatIds});
+
+  final List<String> chatIds;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final n = ref.watch(
+      unreadCountsProvider.select((async) {
+        final map = async.valueOrNull;
+        if (map == null) return 0;
+        var sum = 0;
+        for (final id in chatIds) {
+          sum += map[id] ?? 0;
+        }
+        return sum;
+      }),
+    );
+    if (n <= 0) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: UnreadBadge(count: n),
+    );
+  }
+}
+
+class _ChatUnreadBadge extends ConsumerWidget {
+  const _ChatUnreadBadge({required this.chatId});
+
+  final String chatId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final n = ref.watch(
+      unreadCountsProvider.select((async) => async.valueOrNull?[chatId] ?? 0),
+    );
+    if (n <= 0) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: UnreadBadge(count: n),
+    );
+  }
+}
+
 /// Which machine a folder lives on, shown inline so the host tree does not
 /// need its own level of nesting.
 class _HostTag extends StatelessWidget {
-  const _HostTag({required this.host});
+  const _HostTag({required this.host, this.expand = false});
 
   final Host host;
+  final bool expand;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final label = Text(
+      host.alias,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: theme.textTheme.labelSmall?.copyWith(
+        color: theme.colorScheme.onSurfaceVariant,
+        height: 1.2,
+      ),
+    );
     return Tooltip(
       message: '${host.username}@${host.hostname}',
       child: Container(
@@ -630,7 +910,7 @@ class _HostTag extends StatelessWidget {
           borderRadius: BorderRadius.circular(6),
         ),
         child: Row(
-          mainAxisSize: MainAxisSize.min,
+          mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
           children: [
             Icon(
               Icons.dns_outlined,
@@ -638,18 +918,7 @@ class _HostTag extends StatelessWidget {
               color: theme.colorScheme.onSurfaceVariant,
             ),
             const SizedBox(width: 4),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 110),
-              child: Text(
-                host.alias,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  height: 1.2,
-                ),
-              ),
-            ),
+            if (expand) Expanded(child: label) else Flexible(child: label),
           ],
         ),
       ),
@@ -658,9 +927,10 @@ class _HostTag extends StatelessWidget {
 }
 
 class _EmptyRepoRow extends StatelessWidget {
-  const _EmptyRepoRow({required this.onNewAgent});
+  const _EmptyRepoRow({required this.onNewAgent, this.compact = false});
 
   final VoidCallback onNewAgent;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -668,12 +938,218 @@ class _EmptyRepoRow extends StatelessWidget {
     return InkWell(
       onTap: onNewAgent,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(42, 8, 16, 12),
+        padding: EdgeInsets.fromLTRB(compact ? 40 : 42, 8, 12, 12),
         child: Text(
           'No agents yet — tap to start one',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
           style: theme.textTheme.bodySmall
               ?.copyWith(color: theme.colorScheme.outline),
         ),
+      ),
+    );
+  }
+}
+
+/// Phone Agents list: chat-style card with host + folder tags.
+class _PhoneChatCard extends StatelessWidget {
+  const _PhoneChatCard({
+    required this.chat,
+    required this.host,
+    required this.repo,
+    required this.runtime,
+    required this.onTap,
+    required this.onRename,
+    required this.onDelete,
+  });
+
+  final Chat chat;
+  final Host host;
+  final Repo repo;
+  final ChatSessionRuntime? runtime;
+  final VoidCallback onTap;
+  final VoidCallback onRename;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: runtime ?? Listenable.merge(const []),
+      builder: (context, _) => _build(context),
+    );
+  }
+
+  Future<void> _showMenu(BuildContext context, Offset at) async {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        at & Size.zero,
+        Offset.zero & overlay.size,
+      ),
+      items: const [
+        PopupMenuItem(
+          value: 'rename',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.edit_outlined),
+            title: Text('Rename'),
+          ),
+        ),
+        PopupMenuItem(
+          value: 'delete',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.delete_outline),
+            title: Text('Delete agent'),
+          ),
+        ),
+      ],
+    );
+    if (choice == 'rename') onRename();
+    if (choice == 'delete') onDelete();
+  }
+
+  Widget _build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final working = runtime?.isWorking ?? false;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: scheme.surfaceContainerHigh.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          onSecondaryTapDown: (d) => _showMenu(context, d.globalPosition),
+          onLongPress: () => _showMenu(
+            context,
+            (context.findRenderObject() as RenderBox)
+                .localToGlobal(Offset.zero),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 12, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    working
+                        ? WorkingDots(
+                            key: ValueKey('phone-dots-${chat.id}'),
+                            color: AppColors.accent,
+                          )
+                        : Icon(
+                            chat.provider == AgentProvider.cursor
+                                ? Icons.auto_awesome
+                                : Icons.psychology_alt_outlined,
+                            size: 18,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        chat.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      shortTimeAgo(chat.updatedAt),
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: scheme.outline,
+                      ),
+                    ),
+                    _ChatUnreadBadge(chatId: chat.id),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    _HostTag(host: host),
+                    _FolderTag(name: repo.name),
+                    if (chat.lastAutoNumber != null)
+                      AutoNumberBadge(number: chat.lastAutoNumber!),
+                  ],
+                ),
+                if (working) ...[
+                  const SizedBox(height: 6),
+                  Builder(
+                    builder: (context) {
+                      final explore = runtime?.turnExploreStats;
+                      if (explore != null && explore.isNotEmpty) {
+                        return ExploreStatsLabel(
+                          files: explore.fileCount,
+                          searches: explore.searchCount,
+                          showEllipsis: true,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: AppColors.accent.withValues(alpha: 0.9),
+                            fontWeight: FontWeight.w500,
+                          ),
+                        );
+                      }
+                      return Text(
+                        'Working…',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: AppColors.accent.withValues(alpha: 0.9),
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FolderTag extends StatelessWidget {
+  const _FolderTag({required this.name});
+
+  final String name;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.folder_outlined,
+            size: 11,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                height: 1.2,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -683,20 +1159,20 @@ class _AgentRow extends StatelessWidget {
   const _AgentRow({
     required this.chat,
     required this.runtime,
-    required this.unread,
     required this.onTap,
     required this.onDelete,
     required this.onRename,
     this.selected = false,
+    this.compact = false,
   });
 
   final Chat chat;
   final ChatSessionRuntime? runtime;
-  final int unread;
   final VoidCallback onTap;
   final VoidCallback onDelete;
   final VoidCallback onRename;
   final bool selected;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -746,37 +1222,49 @@ class _AgentRow extends StatelessWidget {
   Widget _build(BuildContext context) {
     final theme = Theme.of(context);
     final working = runtime?.isWorking ?? false;
-    final hasUnread = unread > 0;
 
     return InkWell(
       onTap: onTap,
       onSecondaryTapDown: (d) => _showMenu(context, d.globalPosition),
+      borderRadius: BorderRadius.circular(compact ? 8 : 10),
       child: Container(
-        color: selected
-            ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.12)
-            : hasUnread
-                ? unreadAccent(context).withValues(alpha: 0.06)
-                : Colors.transparent,
-        padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
+        margin: EdgeInsets.symmetric(
+          horizontal: compact ? 6 : 8,
+          vertical: 1,
+        ),
+        decoration: BoxDecoration(
+          color: selected ? AppColors.agentSelected : Colors.transparent,
+          borderRadius: BorderRadius.circular(compact ? 8 : 10),
+          border: selected
+              ? Border.all(
+                  color: AppColors.agentSelectedBorder.withValues(alpha: 0.55),
+                )
+              : null,
+        ),
+        padding: EdgeInsets.fromLTRB(compact ? 8 : 10, 8, compact ? 8 : 10, 8),
         child: Row(
           children: [
             SizedBox(
-              width: 28,
+              width: compact ? 22 : 28,
               child: Center(
                 child: working
-                    ? const WorkingDots()
+                    ? WorkingDots(
+                        key: ValueKey('dots-${chat.id}'),
+                        color: AppColors.accent,
+                      )
                     : Icon(
                         chat.provider == AgentProvider.cursor
-                            ? Icons.smart_toy_outlined
+                            ? Icons.auto_awesome
                             : Icons.psychology_alt_outlined,
-                        size: 18,
-                        color: hasUnread
-                            ? unreadAccent(context)
-                            : theme.colorScheme.onSurfaceVariant,
+                        size: 16,
+                        color: selected
+                            ? AppColors.accent
+                            : theme.colorScheme.onSurfaceVariant
+                                .withValues(alpha: 0.7),
                       ),
               ),
             ),
-            const SizedBox(width: 8),
+            SizedBox(width: compact ? 6 : 8),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -790,14 +1278,27 @@ class _AgentRow extends StatelessWidget {
                           overflow: TextOverflow.ellipsis,
                           style: theme.textTheme.bodyMedium?.copyWith(
                             fontWeight:
-                                hasUnread ? FontWeight.w600 : FontWeight.w400,
+                                selected ? FontWeight.w600 : FontWeight.w500,
+                            color: selected
+                                ? AppColors.mist
+                                : theme.colorScheme.onSurface
+                                    .withValues(alpha: 0.88),
                           ),
                         ),
                       ),
                       if (chat.lastAutoNumber != null) ...[
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 4),
                         AutoNumberBadge(number: chat.lastAutoNumber!),
                       ],
+                      const SizedBox(width: 6),
+                      Text(
+                        shortTimeAgo(chat.updatedAt),
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: theme.colorScheme.outline
+                              .withValues(alpha: 0.85),
+                        ),
+                      ),
+                      _ChatUnreadBadge(chatId: chat.id),
                     ],
                   ),
                   if (working) ...[
@@ -808,56 +1309,27 @@ class _AgentRow extends StatelessWidget {
                           return ExploreStatsLabel(
                             files: explore.fileCount,
                             searches: explore.searchCount,
+                            showEllipsis: true,
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: AppColors.accent.withValues(alpha: 0.9),
+                              fontWeight: FontWeight.w500,
+                            ),
                           );
                         }
                         return Text(
                           'Working…',
-                          style: theme.textTheme.labelSmall
-                              ?.copyWith(color: theme.colorScheme.primary),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: AppColors.accent.withValues(alpha: 0.9),
+                          ),
                         );
                       },
                     ),
                   ],
-                  if (() {
-                    final d = CodeChangeStats.mergeDisplay(
-                      live: runtime?.codeDelta,
-                      persistedAdded: chat.linesAdded,
-                      persistedRemoved: chat.linesRemoved,
-                      persistedFiles: chat.filesChanged,
-                      persistedDay: chat.codeDeltaDay,
-                    );
-                    return d.added > 0 || d.removed > 0 || d.files > 0;
-                  }())
-                    Builder(
-                      builder: (context) {
-                        final d = CodeChangeStats.mergeDisplay(
-                          live: runtime?.codeDelta,
-                          persistedAdded: chat.linesAdded,
-                          persistedRemoved: chat.linesRemoved,
-                          persistedFiles: chat.filesChanged,
-                          persistedDay: chat.codeDeltaDay,
-                        );
-                        return CodeDeltaLabel(
-                          added: d.added,
-                          removed: d.removed,
-                          files: d.files,
-                          compact: true,
-                        );
-                      },
-                    ),
                 ],
               ),
             ),
-            const SizedBox(width: 8),
-            Text(
-              shortTimeAgo(chat.updatedAt),
-              style: theme.textTheme.labelSmall
-                  ?.copyWith(color: theme.colorScheme.outline),
-            ),
-            if (hasUnread) ...[
-              const SizedBox(width: 8),
-              UnreadBadge(count: unread),
-            ],
           ],
         ),
       ),

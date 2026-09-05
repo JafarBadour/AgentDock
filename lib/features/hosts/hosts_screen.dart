@@ -37,20 +37,36 @@ class HostsScreen extends ConsumerWidget {
         hasKey.when(
           data: (ok) => ok
               ? const SizedBox.shrink()
-              : MaterialBanner(
-                  content: const Text(
-                    'Add an SSH private key in Connect before testing hosts.',
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => openAppPanel(
-                        context,
-                        ref,
-                        DesktopRightPanel.connect,
+              : Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                  child: Material(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .secondaryContainer
+                        .withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'Add an SSH private key in Connect before testing hosts.',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () => openAppPanel(
+                              context,
+                              ref,
+                              DesktopRightPanel.connect,
+                            ),
+                            child: const Text('Connect'),
+                          ),
+                        ],
                       ),
-                      child: const Text('Connect'),
                     ),
-                  ],
+                  ),
                 ),
           loading: () => const SizedBox.shrink(),
           error: (_, _) => const SizedBox.shrink(),
@@ -89,9 +105,17 @@ class HostsScreen extends ConsumerWidget {
                           IconButton(
                             tooltip: 'Open terminal',
                             icon: const Icon(Icons.terminal),
-                            onPressed: () => context.push(
-                              '/hosts/terminal/${host.id}',
-                            ),
+                            onPressed: () {
+                              final loc = '/hosts/terminal/${host.id}';
+                              // Desktop Hosts list lives outside the hosts
+                              // branch navigator — go() updates the shell URI
+                              // so the center column can show the session.
+                              if (useDesktopShell(context)) {
+                                context.go(loc);
+                              } else {
+                                context.push(loc);
+                              }
+                            },
                           ),
                           IconButton(
                             tooltip: 'Edit host',

@@ -15,6 +15,7 @@ import '../data/models/explore_stats.dart';
 import '../data/models/prompt_image.dart';
 import '../data/models/thought_message.dart';
 import '../data/models/tool_call_state.dart';
+import '../data/models/turn_stats_message.dart';
 import '../data/secure/safe_log.dart';
 import 'adsm_client.dart';
 import 'agent_session.dart';
@@ -150,6 +151,14 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// Live code churn from edit/write tools since local midnight.
   CodeChangeStats get codeDelta =>
       CodeChangeStats.fromTools(_toolsSinceStartOfLocalDay());
+
+  /// Code churn for the open turn (since last user message).
+  CodeChangeStats get turnCodeDelta =>
+      CodeChangeStats.fromTools(_toolsSinceLastUserMessage());
+
+  /// Latest ACP context-window reading (`usage_update`).
+  int? usageTokensUsed;
+  int? usageContextSize;
 
   Iterable<ToolCallState> _toolsSinceStartOfLocalDay() sync* {
     final start = DateTime(
@@ -426,6 +435,9 @@ class ChatSessionRuntime extends ChangeNotifier {
       sendingToHost = false;
       activityLabel = null;
       deliveryError = null;
+      if (hasActiveTools) {
+        unawaited(_finalizeStaleTools(reason: 'reconnect-daemon-$hostStatus'));
+      }
     } else if (remoteTurnActive) {
       // A turn handed off to the host may still be running.
       promptInFlight = true;
@@ -1011,11 +1023,20 @@ class ChatSessionRuntime extends ChangeNotifier {
 
       final durable = _session.transport == AcpTransport.durable;
       // Explore/edit turns often go quiet between tool batches; durable host
-      // work must not be cancelled after a short pause.
-      final toolStaleAfter =
-          durable ? const Duration(minutes: 3) : const Duration(seconds: 45);
-      final promptStaleAfter =
-          durable ? const Duration(minutes: 4) : const Duration(seconds: 90);
+      // work must not be cancelled after a short pause. Once an assistant
+      // reply is already on screen, leftover in_progress rows are almost
+      // always stale UI — clear them much sooner.
+      final answered = _turnHasAssistantReply;
+      final toolStaleAfter = answered
+          ? const Duration(seconds: 25)
+          : (durable
+              ? const Duration(minutes: 3)
+              : const Duration(seconds: 45));
+      final promptStaleAfter = answered
+          ? const Duration(seconds: 40)
+          : (durable
+              ? const Duration(minutes: 4)
+              : const Duration(seconds: 90));
 
       if (hasActiveTools) {
         if (silentFor >= toolStaleAfter) {
@@ -1093,6 +1114,21 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
     if (assistantBuffer.trim().isNotEmpty) return true;
     if (thoughtBuffer.trim().isNotEmpty) return true;
+    return false;
+  }
+
+  /// True when the agent already posted a visible answer this turn.
+  bool get _turnHasAssistantReply {
+    if (assistantBuffer.trim().isNotEmpty) return true;
+    for (var i = entries.length - 1; i >= 0; i--) {
+      final m = entries[i].message;
+      if (m != null && m.role == MessageRole.user) break;
+      if (m != null &&
+          m.role == MessageRole.assistant &&
+          m.content.trim().isNotEmpty) {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -1211,12 +1247,17 @@ class ChatSessionRuntime extends ChangeNotifier {
       case AcpUpdateKind.ignored:
         break;
       case AcpUpdateKind.status:
+        // Only accept ACP-suggested titles while the row is still a placeholder
+        // ("New agent"). User renames must stick across devices.
         if (update.title != null &&
             update.title!.isNotEmpty &&
-            chatMeta != null) {
+            chatMeta != null &&
+            chatMeta!.isPlaceholderTitle) {
+          final now = DateTime.now();
           chatMeta = chatMeta!.copyWith(
             title: update.title,
-            updatedAt: DateTime.now(),
+            titleUpdatedAt: now,
+            updatedAt: now,
           );
           unawaited(_db.upsertChat(chatMeta!));
           onLocalChange?.call(chatId);
@@ -1231,9 +1272,9 @@ class ChatSessionRuntime extends ChangeNotifier {
           }
           _noteHostActivity();
         } else {
-          // ADSM clears the chip between phases; that is not silence — re-arm
-          // so we do not treat a tool gap as a dead turn.
-          _lastHostActivityAt = DateTime.now();
+          // ADSM clears the chip between phases — keep the watchdog armed, but
+          // do not treat the clear as fresh host work (that froze "Exploring…"
+          // forever after the answer already landed).
           _armHostBusyWatchdog();
         }
         notifyListeners();
@@ -1246,23 +1287,20 @@ class ChatSessionRuntime extends ChangeNotifier {
       case AcpUpdateKind.daemonStatus:
         final st = update.text.trim().toLowerCase();
         if (st == 'idle' || st == 'dead') {
-          // Host finished (or never started) — never leave sticky Thinking.
-          if (!hasActiveTools) {
-            sendingToHost = false;
-            remoteTurnActive = false;
-            activityLabel = null;
-            _clearHostBusyWatchdog();
-            if (!_session.isPromptActive) {
-              promptInFlight = false;
-              notifyListeners();
-              if (!closed) _drainOutboundQueue();
-            } else {
-              // Complete the local await so prompt() can unwind.
-              if (_session is AdsmSession) {
-                (_session as AdsmSession).handOffPrompt();
-              }
-              notifyListeners();
-            }
+          // Host is done — even if some tool rows never got a terminal status.
+          _clearHostBusyWatchdog();
+          sendingToHost = false;
+          remoteTurnActive = false;
+          activityLabel = null;
+          if (_session.isPromptActive && _session is AdsmSession) {
+            (_session as AdsmSession).handOffPrompt();
+          }
+          if (hasActiveTools) {
+            unawaited(_finalizeStaleTools(reason: 'daemon-$st'));
+          } else {
+            promptInFlight = false;
+            notifyListeners();
+            if (!closed) _drainOutboundQueue();
           }
         } else if (st == 'running') {
           sendingToHost = false;
@@ -1274,6 +1312,10 @@ class ChatSessionRuntime extends ChangeNotifier {
         notifyListeners();
       case AcpUpdateKind.delta:
         _noteHostActivity();
+        if (lastError != null || deliveryError != null) {
+          lastError = null;
+          deliveryError = null;
+        }
         activityLabel ??= 'Writing';
         if (thoughtBuffer.isNotEmpty) {
           unawaited(commitThought());
@@ -1286,6 +1328,10 @@ class ChatSessionRuntime extends ChangeNotifier {
         notifyListeners();
       case AcpUpdateKind.thought:
         _noteHostActivity();
+        if (lastError != null || deliveryError != null) {
+          lastError = null;
+          deliveryError = null;
+        }
         activityLabel ??= 'Thinking';
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
@@ -1296,6 +1342,10 @@ class ChatSessionRuntime extends ChangeNotifier {
         final tool = update.tool;
         if (tool == null) break;
         _noteHostActivity();
+        if (lastError != null || deliveryError != null) {
+          lastError = null;
+          deliveryError = null;
+        }
         if (tool.isActive) {
           activityLabel = tool.displayTitle;
         }
@@ -1311,7 +1361,9 @@ class ChatSessionRuntime extends ChangeNotifier {
         activityLabel = 'Waiting for permission';
         notifyListeners();
       case AcpUpdateKind.error:
-        lastError = update.text;
+        final msg = update.text.trim();
+        if (msg.isEmpty) break;
+        lastError = msg;
         notifyListeners();
       case AcpUpdateKind.closed:
         // Unlock the composer immediately — a hanging prompt would otherwise
@@ -1331,9 +1383,21 @@ class ChatSessionRuntime extends ChangeNotifier {
         }
         // No "tap Reconnect" nag — auto-reconnect handles it when possible.
         notifyListeners();
+      case AcpUpdateKind.usage:
+        if (update.tokensUsed != null) {
+          usageTokensUsed = update.tokensUsed;
+        }
+        if (update.contextSize != null) {
+          usageContextSize = update.contextSize;
+        }
+        notifyListeners();
       case AcpUpdateKind.turnComplete:
-        // Flush streaming buffers once the host turn ends.
-        unawaited(_flushTurnBuffers());
+        // Flush streaming buffers once the host turn ends, then record
+        // per-command code delta + token footer.
+        unawaited(() async {
+          await _flushTurnBuffers();
+          await _persistTurnStats();
+        }());
         // Clearing promptInFlight here while a local await is open lets a new
         // send race ahead — only clear UI busy when nothing owns the prompt.
         _clearHostBusyWatchdog();
@@ -1353,6 +1417,51 @@ class ChatSessionRuntime extends ChangeNotifier {
         }
         break;
     }
+  }
+
+  /// Persist `+X -Y · Z φ · N τ` for the turn that just finished.
+  Future<void> _persistTurnStats() async {
+    if (_disposed) return;
+    final code = turnCodeDelta;
+    final tokens = usageTokensUsed;
+    final size = usageContextSize;
+    if (code.isEmpty && tokens == null) return;
+
+    // Avoid stacking duplicates when turn_complete fires more than once.
+    for (var i = entries.length - 1; i >= 0; i--) {
+      final m = entries[i].message;
+      if (m == null) continue;
+      if (m.role == MessageRole.user) break;
+      if (m.role == MessageRole.system &&
+          TurnStatsMessage.isTurnStats(m.content)) {
+        return;
+      }
+    }
+
+    final message = ChatMessage(
+      id: const Uuid().v4(),
+      chatId: chatId,
+      role: MessageRole.system,
+      content: TurnStatsMessage.encode(
+        added: code.added,
+        removed: code.removed,
+        files: code.fileCount,
+        tokensUsed: tokens,
+        contextSize: size,
+      ),
+      createdAt: DateTime.now(),
+    );
+    entries.add(TranscriptEntry.message(message));
+    _writesInFlight++;
+    try {
+      await _db.insertMessage(message);
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('persist turn stats failed', e);
+    } finally {
+      _writesInFlight--;
+    }
+    notifyListeners();
   }
 
   void _drainOutboundQueue() {

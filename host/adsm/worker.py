@@ -23,6 +23,63 @@ def _shell_quote(s: str) -> str:
     return shlex.quote(s)
 
 
+def _flatten_config_select_options(options: Any) -> list[dict[str, Any]]:
+    """Flatten nested select option groups from ACP configOptions."""
+    if not isinstance(options, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in options:
+        if not isinstance(entry, dict):
+            continue
+        nested = entry.get("options")
+        if isinstance(nested, list):
+            for sub in nested:
+                if isinstance(sub, dict) and sub.get("value") is not None:
+                    out.append(dict(sub))
+        elif entry.get("value") is not None:
+            out.append(dict(entry))
+    return out
+
+
+def models_from_config_options(config_options: Any) -> list[dict[str, Any]]:
+    """Extract model catalogue from Claude-style session configOptions."""
+    if not isinstance(config_options, list):
+        return []
+    model_opt: Optional[dict[str, Any]] = None
+    for entry in config_options:
+        if not isinstance(entry, dict):
+            continue
+        opt_id = entry.get("id") or entry.get("configId") or entry.get("config_id")
+        category = entry.get("category")
+        if opt_id == "model" or category == "model":
+            model_opt = entry
+            break
+    if model_opt is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for item in _flatten_config_select_options(model_opt.get("options")):
+        value = item.get("value")
+        if value is None:
+            continue
+        name = item.get("name") or str(value)
+        out.append({"modelId": str(value), "name": str(name)})
+    return out
+
+
+def current_model_from_config_options(config_options: Any) -> Optional[str]:
+    if not isinstance(config_options, list):
+        return None
+    for entry in config_options:
+        if not isinstance(entry, dict):
+            continue
+        opt_id = entry.get("id") or entry.get("configId") or entry.get("config_id")
+        category = entry.get("category")
+        if opt_id == "model" or category == "model":
+            cur = entry.get("currentValue") or entry.get("current_value")
+            return str(cur) if cur is not None else None
+    return None
+
+
 def _run_script(
     *,
     dir_path: str,
@@ -194,6 +251,7 @@ class Worker:
         self.acp_session_id: Optional[str] = None
         self.model_id: Optional[str] = None
         self.available_models: list[dict[str, Any]] = []
+        self._models_via_config_option = False
         self.available_modes: list[str] = ["ask", "agent", "plan"]
         self.mode = "agent"
         self.load_session = False
@@ -306,16 +364,28 @@ class Worker:
             else:
                 self.acp_session_id = effective
                 self._restore_catalog()
-                if model_id:
-                    self.model_id = model_id
-                if mode:
-                    self.mode = mode
+                if self.provider == "claude" and self.available_models:
+                    self._models_via_config_option = True
                 # Re-attach after daemon restart leaves availableModels empty.
                 if not self.available_models and effective:
                     try:
                         await self._refresh_models_unlocked(mcp_servers or [])
                     except Exception as e:  # noqa: BLE001
                         self.last_error = f"refresh_models: {e}"
+                # Must call ACP — assigning self.model_id alone only updates the
+                # UI chip while the live Claude/Cursor session keeps its old model.
+                if model_id:
+                    try:
+                        await self.set_model(model_id)
+                    except Exception as e:  # noqa: BLE001
+                        self.last_error = f"set_model: {e}"
+                        self.model_id = model_id
+                if mode:
+                    try:
+                        await self.set_mode(mode)
+                    except Exception as e:  # noqa: BLE001
+                        self.last_error = f"set_mode: {e}"
+                        self.mode = mode
 
             await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
             await self._emit_event(
@@ -588,6 +658,9 @@ class Worker:
             result.get("sessionId") or result.get("session_id")
         )
         self._apply_models(result.get("models"))
+        self._apply_config_options(
+            result.get("configOptions") or result.get("config_options")
+        )
         self._apply_modes(result.get("modes"))
         self._persist_session_id()
 
@@ -608,6 +681,9 @@ class Worker:
             )
             self.acp_session_id = session_id
             self._apply_models(result.get("models"))
+            self._apply_config_options(
+                result.get("configOptions") or result.get("config_options")
+            )
             self._apply_modes(result.get("modes"))
             self._persist_session_id()
         finally:
@@ -634,6 +710,17 @@ class Worker:
         if cur is not None:
             self.model_id = str(cur)
         self._persist_catalog()
+
+    def _apply_config_options(self, config_options: Any) -> None:
+        out = models_from_config_options(config_options)
+        if out:
+            self.available_models = out
+            self._models_via_config_option = True
+        cur = current_model_from_config_options(config_options)
+        if cur is not None:
+            self.model_id = cur
+        if out or cur is not None:
+            self._persist_catalog()
 
     def _apply_modes(self, modes: Any) -> None:
         if not isinstance(modes, dict):
@@ -668,12 +755,42 @@ class Worker:
     async def set_model(self, model_id: str) -> None:
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
-        await self._request(
-            "session/set_model",
-            {"sessionId": self.acp_session_id, "modelId": model_id},
-            timeout=15.0,
+        if self.provider == "claude" or self._models_via_config_option:
+            result = await self._request(
+                "session/set_config_option",
+                {
+                    "sessionId": self.acp_session_id,
+                    "configId": "model",
+                    "value": model_id,
+                },
+                timeout=15.0,
+            )
+            # Response carries the authoritative currentValue (may be a
+            # canonical id rather than the alias we sent).
+            self._apply_config_options(
+                result.get("configOptions") or result.get("config_options")
+            )
+            confirmed = current_model_from_config_options(
+                result.get("configOptions") or result.get("config_options")
+            )
+            self.model_id = confirmed or model_id
+        else:
+            await self._request(
+                "session/set_model",
+                {"sessionId": self.acp_session_id, "modelId": model_id},
+                timeout=15.0,
+            )
+            self.model_id = model_id
+        self._persist_catalog()
+        await self._emit_event(
+            "session",
+            acpSessionId=self.acp_session_id,
+            models=self.available_models,
+            modes=self.available_modes,
+            mode=self.mode,
+            modelId=self.model_id,
+            loadSession=self.load_session,
         )
-        self.model_id = model_id
 
     async def prompt(
         self,
@@ -929,9 +1046,28 @@ class Worker:
         if typ in (
             "available_commands_update",
             "availableCommandsUpdate",
-            "config_option_update",
-            "configOptionUpdate",
         ):
+            return
+
+        if typ in ("config_option_update", "configOptionUpdate"):
+            opts = (
+                update.get("configOptions")
+                or update.get("config_options")
+                or update.get("options")
+            )
+            if opts is None and isinstance(update.get("configOption"), dict):
+                opts = [update["configOption"]]
+            if opts is not None:
+                self._apply_config_options(opts)
+                await self._emit_event(
+                    "session",
+                    acpSessionId=self.acp_session_id,
+                    models=self.available_models,
+                    modes=self.available_modes,
+                    mode=self.mode,
+                    modelId=self.model_id,
+                    loadSession=self.load_session,
+                )
             return
 
         if typ in ("current_mode_update", "currentModeUpdate"):
@@ -967,6 +1103,25 @@ class Worker:
             title = update.get("title")
             if title:
                 await self._emit_event("status", title=str(title))
+            return
+
+        if typ in ("usage_update", "usageUpdate"):
+            used = update.get("used")
+            size = update.get("size")
+            try:
+                used_i = int(used) if used is not None else None
+                size_i = int(size) if size is not None else None
+            except (TypeError, ValueError):
+                return
+            if used_i is None or size_i is None:
+                return
+            cost = update.get("cost")
+            await self._emit_event(
+                "usage",
+                used=used_i,
+                size=size_i,
+                cost=cost if isinstance(cost, dict) else None,
+            )
             return
 
         if typ in (

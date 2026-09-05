@@ -35,6 +35,7 @@ dependencies:
   record: ^6.2.1
   flutter_local_notifications: ^22.3.0
   speech_to_text: ^7.4.0
+  pdfrx: ^2.4.7
 
 dev_dependencies:
   flutter_test:
@@ -56,3 +57,12 @@ flutter:
   uses-material-design: true
   assets:
     - assets/branding/app_icon.png
+    - host/adsm/__init__.py
+    - host/adsm/__main__.py
+    - host/adsm/paths.py
+    - host/adsm/protocol.py
+    - host/adsm/worker.py
+    - host/adsm/daemon.py
+    - host/adsm/cli.py
+    - host/adsm/scheduler.py
+    - host/adsm/transcript.py

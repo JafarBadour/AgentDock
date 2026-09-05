@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
+import 'package:flutter/services.dart' show rootBundle;
 
 import '../data/local/app_database.dart';
 import '../data/models/host.dart';
@@ -237,17 +238,24 @@ class SshService {
       throw StateError('ProxyJump cycle detected for ${host.displayLabel}');
     }
 
-    final pem = await _secureStore.readSshPrivateKey();
-    if (pem == null || pem.trim().isEmpty) {
-      throw StateError('No SSH private key in secure storage. Add one in Connect.');
-    }
-    final passphrase = await _secureStore.readSshPassphrase();
+    final password = await _secureStore.readHostPassword(host.id);
+    final usePassword = password != null && password.isNotEmpty;
 
-    late List<SSHKeyPair> pairs;
-    try {
-      pairs = SSHKeyPair.fromPem(pem, passphrase);
-    } catch (e) {
-      throw StateError('Could not parse SSH private key (wrong passphrase?).');
+    List<SSHKeyPair>? pairs;
+    if (!usePassword) {
+      final pem = await _secureStore.readSshPrivateKey();
+      if (pem == null || pem.trim().isEmpty) {
+        throw StateError(
+          'No SSH private key in Connect, and no password on this host. '
+          'Add a key in Connect or set a password when editing the host.',
+        );
+      }
+      final passphrase = await _secureStore.readSshPassphrase();
+      try {
+        pairs = SSHKeyPair.fromPem(pem, passphrase);
+      } catch (e) {
+        throw StateError('Could not parse SSH private key (wrong passphrase?).');
+      }
     }
 
     final SSHSocket socket;
@@ -275,6 +283,7 @@ class SshService {
       socket,
       username: host.username,
       identities: pairs,
+      onPasswordRequest: usePassword ? () => password : null,
     );
     try {
       await client.authenticated.timeout(
@@ -711,19 +720,33 @@ test -x "$HOME/.local/bin/claude-code-acp"
   /// Installs/starts ADSM on the host and verifies it responds at
   /// [kRequiredAdsmVersion] or newer.
   ///
-  /// - Missing binary → curl `install-adsm.sh` from GitHub `main`.
-  /// - Running but older than this app → same install (upgrade), with a clear
-  ///   status line so the UI can say "ADSM mismatch… updating".
-  /// - Healthy and version-ok → start only via `ensure-running` (no reinstall).
+  /// Prefers uploading the ADSM package bundled with this app (so local
+  /// version bumps work before GitHub catches up). Falls back to curling
+  /// `install-adsm.sh` from GitHub `main`.
   Future<void> ensureAdsm(
     Host host, {
     void Function(String status)? onProgress,
   }) async {
-    final client = await connect(host);
+    var client = await connect(host);
     var lastProbe = '';
+
+    Future<SSHClient> refreshClient() async {
+      invalidate(host.id);
+      client = await connect(host);
+      return client;
+    }
+
+    bool transportDead(Object e) {
+      final t = e.toString().toLowerCase();
+      return t.contains('transport is closed') ||
+          t.contains('connection reset') ||
+          t.contains('broken pipe') ||
+          t.contains('socket has been shut down');
+    }
 
     Future<({bool ok, bool hasBin, String? version, String raw})> probe() async {
       try {
+        if (client.isClosed) await refreshClient();
         final out = await _run(
           client,
           r'''
@@ -839,12 +862,28 @@ exit 0
       } catch (e) {
         lastProbe = e.toString();
         SafeLog.d('ADSM probe exception', e);
+        if (transportDead(e)) {
+          try {
+            await refreshClient();
+          } catch (_) {}
+        }
         return (ok: false, hasBin: false, version: null, raw: lastProbe);
       }
     }
 
     Future<void> installOrUpgrade({required String reason}) async {
       onProgress?.call(reason);
+      if (client.isClosed || transportDead(lastProbe)) {
+        await refreshClient();
+      }
+      // Ship this app's ADSM first — GitHub main can lag a local version bump.
+      final pushed = await _pushBundledAdsm(
+        client,
+        hostId: host.id,
+        onProgress: onProgress,
+      );
+      if (pushed) return;
+
       final installed = await _runAgentDockInstallScript(
         client,
         hostId: host.id,
@@ -956,7 +995,7 @@ exit 0
       }
     }
 
-    // Missing binary (or upgrade path above failed) — install from GitHub.
+    // Missing binary, dead probe, or upgrade path above failed — push/install.
     if (!state.hasBin ||
         !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
       await installOrUpgrade(
@@ -990,6 +1029,111 @@ exit 0
       'ADSM',
       '${kRemoteAdsmSetupGuide.trim()}\n\n# Probe:\n$lastProbe',
     );
+  }
+
+  static const _bundledAdsmFiles = <String>[
+    '__init__.py',
+    '__main__.py',
+    'paths.py',
+    'protocol.py',
+    'worker.py',
+    'daemon.py',
+    'cli.py',
+    'scheduler.py',
+    'transcript.py',
+  ];
+
+  /// Upload this app's ADSM package over SFTP and restart the daemon.
+  Future<bool> _pushBundledAdsm(
+    SSHClient client, {
+    required String hostId,
+    void Function(String status)? onProgress,
+  }) async {
+    onProgress?.call('Uploading ADSM v$kRequiredAdsmVersion from this app…');
+    try {
+      final payloads = <String, Uint8List>{};
+      for (final name in _bundledAdsmFiles) {
+        final data = await rootBundle.load('host/adsm/$name');
+        payloads[name] = data.buffer.asUint8List(
+          data.offsetInBytes,
+          data.lengthInBytes,
+        );
+      }
+
+      final homeOut = await _run(
+        client,
+        r'printf %s "$HOME"',
+        hostId: hostId,
+        timeout: const Duration(seconds: 8),
+      );
+      final home = homeOut.trim();
+      if (home.isEmpty) return false;
+
+      final share = '$home/.local/share/agentdock/host/adsm';
+      final binDir = '$home/.local/bin';
+      await _run(
+        client,
+        'mkdir -p ${shellQuote(share)} ${shellQuote(binDir)}',
+        hostId: hostId,
+        timeout: const Duration(seconds: 10),
+      );
+
+      final sftp = await client.sftp();
+      for (final entry in payloads.entries) {
+        final remote = '$share/${entry.key}';
+        final remoteFile = await sftp.open(
+          remote,
+          mode: SftpFileOpenMode.create |
+              SftpFileOpenMode.truncate |
+              SftpFileOpenMode.write,
+        );
+        try {
+          await remoteFile.writeBytes(entry.value);
+        } finally {
+          await remoteFile.close();
+        }
+      }
+
+      final wrapper = '''
+#!/usr/bin/env bash
+export PYTHONPATH="\$HOME/.local/share/agentdock/host\${PYTHONPATH:+:\$PYTHONPATH}"
+exec python3 -m adsm "\$@"
+''';
+      final wrapperPath = '$binDir/agentdock-adsm';
+      final wrapperFile = await sftp.open(
+        wrapperPath,
+        mode: SftpFileOpenMode.create |
+            SftpFileOpenMode.truncate |
+            SftpFileOpenMode.write,
+      );
+      try {
+        await wrapperFile.writeBytes(Uint8List.fromList(utf8.encode(wrapper)));
+      } finally {
+        await wrapperFile.close();
+      }
+
+      await _run(
+        client,
+        r'''
+set -e
+chmod +x "$HOME/.local/bin/agentdock-adsm"
+export PATH="$HOME/.local/bin:$PATH"
+pkill -f 'python3 -m adsm serve' 2>/dev/null || true
+pkill -f 'python -m adsm serve' 2>/dev/null || true
+sleep 0.3
+rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
+agentdock-adsm ensure-running
+''',
+        hostId: hostId,
+        timeout: const Duration(seconds: 45),
+      );
+      onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
+      return true;
+    } catch (e) {
+      SafeLog.d('Bundled ADSM upload failed', e);
+      onProgress?.call('Bundled ADSM upload failed — trying GitHub…');
+      return false;
+    }
   }
 
   /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.

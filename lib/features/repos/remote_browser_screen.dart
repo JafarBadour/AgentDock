@@ -100,6 +100,61 @@ class _RemoteBrowserScreenState extends ConsumerState<RemoteBrowserScreen> {
     await _load(next);
   }
 
+  Future<void> _createFolder() async {
+    final parent = _path;
+    if (parent == null || _loading) return;
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('New folder'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Folder name',
+            hintText: 'my-project',
+          ),
+          onSubmitted: (v) => Navigator.pop(context, v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('Create'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty || !mounted) return;
+    if (name.contains('/') || name == '.' || name == '..') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Invalid folder name')),
+      );
+      return;
+    }
+    final full = SshService.joinRemotePath(parent, name);
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      await ref.read(sshServiceProvider).mkdirRemote(widget.host, full);
+      if (!mounted) return;
+      await _load(full);
+    } catch (e) {
+      SafeLog.d('mkdir remote failed', e);
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Could not create folder\n$e';
+      });
+    }
+  }
+
   void _selectCurrent() {
     final path = _path;
     if (path == null) return;
@@ -114,6 +169,11 @@ class _RemoteBrowserScreenState extends ConsumerState<RemoteBrowserScreen> {
       appBar: AppBar(
         title: Text('Browse · ${widget.host.displayLabel}'),
         actions: [
+          IconButton(
+            tooltip: 'New folder',
+            onPressed: _path == null || _loading ? null : _createFolder,
+            icon: const Icon(Icons.create_new_folder_outlined),
+          ),
           TextButton(
             onPressed: _path == null || _loading ? null : _selectCurrent,
             child: const Text('Use this folder'),
@@ -139,6 +199,11 @@ class _RemoteBrowserScreenState extends ConsumerState<RemoteBrowserScreen> {
                       _path ?? '…',
                       style: Theme.of(context).textTheme.titleSmall,
                     ),
+                  ),
+                  IconButton(
+                    tooltip: 'New folder',
+                    onPressed: _path == null || _loading ? null : _createFolder,
+                    icon: const Icon(Icons.create_new_folder_outlined),
                   ),
                   IconButton(
                     tooltip: 'Refresh',

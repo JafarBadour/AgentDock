@@ -26,6 +26,7 @@ import '../../data/models/repo.dart';
 import '../../data/models/scheduled_job.dart';
 import '../../data/models/thought_message.dart';
 import '../../data/models/tool_call_state.dart';
+import '../../data/models/turn_stats_message.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
@@ -219,9 +220,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (existing.closed) {
         existing.resume();
       }
+    } else if (chat.provider.isAvailable) {
+      // Connect as soon as the chat is selected — fire-and-forget so the
+      // transcript stays interactive while SSH/ADSM comes up.
+      unawaited(() async {
+        final host = _host;
+        if (host == null) return;
+        if (!await ref
+            .read(secureStoreProvider)
+            .canAuthenticateToHost(host.id)) {
+          return;
+        }
+        if (!mounted) return;
+        await _ensureAcp();
+      }());
     }
-    // Don't auto-connect a brand-new chat — reconnect when you send or tap
-    // Connect. Auto-connect was blocking messaging when SSH hung.
 
     unawaited(_syncFromRemote());
   }
@@ -230,7 +243,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final host = _host;
     if (host == null) return;
     try {
-      if (!await ref.read(secureStoreProvider).hasSshPrivateKey()) return;
+      if (!await ref.read(secureStoreProvider).canAuthenticateToHost(host.id)) {
+        return;
+      }
       final dock = ref.read(agentDockServiceProvider);
       final recordChanged = await dock.syncChatRecord(
         host: host,
@@ -302,18 +317,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// Collapse tool spam between user messages into one expandable row.
   ///
   /// System (thought) messages fold into the next assistant reply as a
-  /// collapsible "Thinking" section.
-  static List<_ChatBlock> _blocksFor(List<TranscriptEntry> entries) {
+  /// collapsible "Thinking" section. Turn stats attach to the last block of
+  /// each finished assistant segment.
+  static List<_ChatBlock> _blocksFor(
+    List<TranscriptEntry> entries, {
+    bool openTurnActive = false,
+  }) {
     final thinkingByAssistantId = <String, String>{};
     final pendingThoughts = <String>[];
     final compact = <TranscriptEntry>[];
     final orphanBeforeIndex = <int, String>{};
+    final turnStatsAfterIndex = <int, TurnStats>{};
     String? trailingThinking;
 
     for (final e in entries) {
       final role = e.message?.role;
       if (role == MessageRole.system) {
-        final body = ThoughtMessage.display(e.message!.content);
+        final content = e.message!.content;
+        final stats = TurnStatsMessage.tryParse(content);
+        if (stats != null) {
+          if (compact.isNotEmpty) {
+            turnStatsAfterIndex[compact.length - 1] = stats;
+          }
+          continue;
+        }
+        final body = ThoughtMessage.display(content);
         if (body.isNotEmpty) pendingThoughts.add(body);
         continue;
       }
@@ -364,18 +392,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         i++;
       }
 
+      TurnStats? persistedStats;
+      for (var j = segmentStart; j < i; j++) {
+        final s = turnStatsAfterIndex[j];
+        if (s != null) persistedStats = s;
+      }
+      final toolsInSeg = [
+        for (final e in segment)
+          if (e.tool != null) e.tool!,
+      ];
+      final computed = CodeChangeStats.fromTools(toolsInSeg);
+      final turnStats = (persistedStats ?? const TurnStats())
+          .mergeComputed(computed);
+
       final tools = [for (final e in segment) if (e.tool != null) e];
+      final segmentBlocks = <_ChatBlock>[];
       if (tools.length > 2) {
         var emittedTools = false;
         for (final e in segment) {
           if (e.tool != null) {
             if (!emittedTools) {
-              blocks.add(_ChatBlock.tools(tools));
+              segmentBlocks.add(_ChatBlock.tools(tools));
               emittedTools = true;
             }
           } else {
             final id = e.message?.id;
-            blocks.add(
+            segmentBlocks.add(
               _ChatBlock.single(
                 e,
                 thinking: e.message?.role == MessageRole.assistant && id != null
@@ -388,7 +430,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       } else {
         for (final e in segment) {
           final id = e.message?.id;
-          blocks.add(
+          segmentBlocks.add(
             _ChatBlock.single(
               e,
               thinking: e.message?.role == MessageRole.assistant && id != null
@@ -398,6 +440,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           );
         }
       }
+      final followedByUser = i < compact.length &&
+          compact[i].message?.role == MessageRole.user;
+      final isLastSegment = i >= compact.length;
+      // Code delta + τ only after the command finishes — not mid-stream.
+      final showStats = turnStats.isNotEmpty &&
+          (persistedStats != null ||
+              followedByUser ||
+              (isLastSegment && !openTurnActive));
+      if (segmentBlocks.isNotEmpty && showStats) {
+        final last = segmentBlocks.removeLast();
+        segmentBlocks.add(last.withTurnStats(turnStats));
+      }
+      blocks.addAll(segmentBlocks);
     }
 
     if (trailingThinking != null && trailingThinking.isNotEmpty) {
@@ -450,6 +505,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       } else if (runtime.lastError != null &&
           !isTransientBridgeErrorText(runtime.lastError!)) {
         _error = runtime.lastError;
+      }
+      // Live output means the turn recovered — drop sticky banners so they
+      // don't sit empty/red over the transcript.
+      if (runtime.isWorking &&
+          (runtime.assistantBuffer.isNotEmpty ||
+              runtime.thoughtBuffer.isNotEmpty ||
+              runtime.hasActiveTools)) {
+        _error = null;
+        _showSdkInstallGuide = false;
       }
       final n = runtime.entries.length;
       if (n != _messageCount) _messageCount = n;
@@ -596,15 +660,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_chat == null || repo == null || host == null) return;
     var chat = _chat!;
 
-    final hasKey = await ref.read(secureStoreProvider).hasSshPrivateKey();
-    if (!hasKey) {
+    final canAuth =
+        await ref.read(secureStoreProvider).canAuthenticateToHost(host.id);
+    if (!canAuth) {
       if (mounted) {
         setState(() {
-          _error = 'No SSH private key. Add one in the Connect tab first.';
+          _error =
+              'No SSH credentials for this host. Add a password on the host, '
+              'or an SSH key in Connect.';
           _showSdkInstallGuide = false;
         });
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Add an SSH key in Connect first.')),
+          const SnackBar(
+            content: Text(
+              'Add a host password or an SSH key in Connect first.',
+            ),
+          ),
         );
       }
       return;
@@ -921,7 +992,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }
       }
       if (!mounted) return;
-      setState(() => _chat = _chat?.copyWith(modelId: chosen));
+      final confirmed =
+          runtime?.currentModelId ?? chosen;
+      setState(() => _chat = _chat?.copyWith(modelId: confirmed));
     } catch (e) {
       SafeLog.d('setModel failed', e);
       if (mounted) {
@@ -1343,9 +1416,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ),
     );
     if (next == null || next.isEmpty || next == chat.title || !mounted) return;
-    final updated = chat.copyWith(title: next, updatedAt: DateTime.now());
+    final now = DateTime.now();
+    final updated = chat.copyWith(
+      title: next,
+      titleUpdatedAt: now,
+      updatedAt: now,
+    );
     await ref.read(appDatabaseProvider).upsertChat(updated);
-    ref.read(agentDockServiceProvider).schedulePushChat(chat.id);
+    ref.read(agentDockServiceProvider).pushChatNow(chat.id);
     final runtime =
         ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (runtime != null) runtime.chatMeta = updated;
@@ -1818,7 +1896,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           controller: _composer,
           minLines: 1,
           maxLines: 5,
-          enabled: _chat!.provider.isAvailable && !_connecting,
+          enabled: _chat!.provider.isAvailable,
           decoration: InputDecoration(
             hintText: _connecting
                 ? 'Connecting agent…'
@@ -2083,15 +2161,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     ];
     // System thoughts are folded into assistant bubbles by [_blocksFor].
     final entries = _entriesByTime(filtered);
-    final blocks = _blocksFor(entries);
     final thoughtBuffer = runtime?.thoughtBuffer ?? '';
     final assistantBuffer = runtime?.assistantBuffer ?? '';
     // Composer no longer locks for the whole turn — only the live buffer
     // counts as "working" for the agent bubble.
     final streaming = runtime?.isWorking ?? false;
+    final blocks = _blocksFor(entries, openTurnActive: streaming);
     final liveError = runtime?.lastError;
     final deliveryError = runtime?.deliveryError;
-    final displayError = _error ?? liveError ?? deliveryError;
+    final rawError = _error ?? liveError ?? deliveryError;
+    final trimmedError = rawError?.trim();
+    // Blank / whitespace-only errors still opened the red banner (ListTile +
+    // SingleChildScrollView collapsed the title to 0px — empty red strip).
+    final displayError =
+        (trimmedError == null || trimmedError.isEmpty) ? null : trimmedError;
     final connected = runtime != null && !runtime.closed;
     final reconnecting = runtime?.reconnecting ?? false;
     final remoteRunning = runtime?.remoteTurnActive == true;
@@ -2190,35 +2273,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
                   style: theme.textTheme.bodySmall,
                 ),
-                if (() {
-                  final d = CodeChangeStats.mergeDisplay(
-                    live: runtime?.codeDelta,
-                    persistedAdded: _chat!.linesAdded,
-                    persistedRemoved: _chat!.linesRemoved,
-                    persistedFiles: _chat!.filesChanged,
-                    persistedDay: _chat!.codeDeltaDay,
-                  );
-                  return d.added > 0 || d.removed > 0 || d.files > 0;
-                }())
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Builder(
-                      builder: (context) {
-                        final d = CodeChangeStats.mergeDisplay(
-                          live: runtime?.codeDelta,
-                          persistedAdded: _chat!.linesAdded,
-                          persistedRemoved: _chat!.linesRemoved,
-                          persistedFiles: _chat!.filesChanged,
-                          persistedDay: _chat!.codeDeltaDay,
-                        );
-                        return CodeDeltaLabel(
-                          added: d.added,
-                          removed: d.removed,
-                          files: d.files,
-                        );
-                      },
-                    ),
-                  ),
               ],
             ),
           ),
@@ -2346,49 +2400,55 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           else if (displayError != null)
             Material(
               color: theme.colorScheme.errorContainer,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 140),
-                child: ListTile(
-                  dense: true,
-                  title: SingleChildScrollView(
-                    child: SelectableText(
-                      displayError,
-                      style: TextStyle(
-                        color: theme.colorScheme.onErrorContainer,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 120),
+                        child: SingleChildScrollView(
+                          child: SelectableText(
+                            displayError,
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onErrorContainer,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (!connected)
-                        TextButton(
-                          onPressed: _connecting
-                              ? null
-                              : () {
-                                  setState(() {
-                                    _error = null;
-                                    _showSdkInstallGuide = false;
-                                  });
-                                  runtime?.lastError = null;
-                                  runtime?.deliveryError = null;
-                                  unawaited(_ensureAcp());
-                                },
-                          child: const Text('Reconnect'),
-                        ),
-                      IconButton(
-                        icon: const Icon(Icons.close),
-                        onPressed: () {
-                          setState(() {
-                            _error = null;
-                            _showSdkInstallGuide = false;
-                          });
-                          runtime?.lastError = null;
-                          runtime?.deliveryError = null;
-                        },
+                    if (!connected)
+                      TextButton(
+                        onPressed: _connecting
+                            ? null
+                            : () {
+                                setState(() {
+                                  _error = null;
+                                  _showSdkInstallGuide = false;
+                                });
+                                runtime?.lastError = null;
+                                runtime?.deliveryError = null;
+                                unawaited(_ensureAcp());
+                              },
+                        child: const Text('Reconnect'),
                       ),
-                    ],
-                  ),
+                    IconButton(
+                      tooltip: 'Dismiss',
+                      icon: Icon(
+                        Icons.close,
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                      onPressed: () {
+                        setState(() {
+                          _error = null;
+                          _showSdkInstallGuide = false;
+                        });
+                        runtime?.lastError = null;
+                        runtime?.deliveryError = null;
+                      },
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -2468,12 +2528,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         body = bubble;
                       }
                     }
-                    if (!showDate) return body;
+                    final stats = block.turnStats;
+                    final withStats = stats != null && stats.isNotEmpty
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              body,
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                  left: 6,
+                                  top: 2,
+                                  bottom: 4,
+                                ),
+                                child: TurnMetricsLabel(
+                                  added: stats.added,
+                                  removed: stats.removed,
+                                  files: stats.files,
+                                  tokensUsed: stats.tokensUsed,
+                                  contextSize: stats.contextSize,
+                                ),
+                              ),
+                            ],
+                          )
+                        : body;
+                    if (!showDate) return withStats;
                     return Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         _DateChip(at),
-                        body,
+                        withStats,
                       ],
                     );
                   },
@@ -2673,24 +2756,38 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       ),
                     ),
                   Row(
-                    crossAxisAlignment: CrossAxisAlignment.end,
+                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      IconButton(
-                        tooltip: 'Attach image',
-                        onPressed: _connecting ||
-                                _pickingImages ||
-                                !_chat!.provider.isAvailable
-                            ? null
-                            : () => unawaited(_pickImages()),
-                        icon: _pickingImages
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Icon(Icons.add_photo_alternate_outlined),
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            tooltip: 'Attach image',
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(
+                              minWidth: 40,
+                              minHeight: 36,
+                            ),
+                            onPressed: _connecting ||
+                                    _pickingImages ||
+                                    !_chat!.provider.isAvailable
+                                ? null
+                                : () => unawaited(_pickImages()),
+                            icon: _pickingImages
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(
+                                    Icons.add_photo_alternate_outlined,
+                                  ),
+                          ),
+                          _buildComposerModelHint(theme),
+                        ],
                       ),
                       Expanded(
                         child: Column(
@@ -2715,6 +2812,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ),
     );
   }
+
+  /// Model chip under the attach button, beside the composer.
+  Widget _buildComposerModelHint(ThemeData theme) {
+    final model = _selectedModel;
+    final label = model?.summary ??
+        (_chat?.modelId != null && _chat!.modelId!.isNotEmpty
+            ? AgentModel.parse(_chat!.modelId!).summary
+            : null);
+    if (label == null || label.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Tooltip(
+      message: 'Model: $label',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: _pickModel,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 56),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(2, 0, 2, 4),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.primary.withValues(alpha: 0.9),
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// One paint unit in the transcript list: a message, a lone tool, a
@@ -2725,6 +2857,7 @@ class _ChatBlock {
     this.tools,
     this.thinking,
     this.thinkingOnly,
+    this.turnStats,
   });
 
   factory _ChatBlock.single(TranscriptEntry entry, {String? thinking}) =>
@@ -2744,6 +2877,17 @@ class _ChatBlock {
 
   /// Standalone thinking row (no assistant text yet / orphan).
   final String? thinkingOnly;
+
+  /// Per-command `+X -Y · Z φ · N τ` footer after this block.
+  final TurnStats? turnStats;
+
+  _ChatBlock withTurnStats(TurnStats stats) => _ChatBlock._(
+        entry: entry,
+        tools: tools,
+        thinking: thinking,
+        thinkingOnly: thinkingOnly,
+        turnStats: stats,
+      );
 
   DateTime? get createdAt =>
       tools?.first.createdAt ?? entry?.createdAt;
@@ -3252,7 +3396,7 @@ class _OutboundQueueBar extends StatelessWidget {
   }
 }
 
-/// Ask-mode approval strip — one action the agent is blocked on.
+/// Ask-mode approval strip — compact card above the composer.
 class _PermissionPromptBar extends StatelessWidget {
   const _PermissionPromptBar({
     required this.request,
@@ -3261,6 +3405,18 @@ class _PermissionPromptBar extends StatelessWidget {
 
   final PendingPermissionRequest request;
   final void Function(String optionId) onSelect;
+
+  static String _shortLabel(PermissionOption o) {
+    if (o.isAllowAlways) return 'Always';
+    if (o.isReject) return 'Deny';
+    if (o.isAllowOnce) return 'Allow';
+    final n = o.name.trim();
+    final lower = n.toLowerCase();
+    if (lower.startsWith('allow once')) return 'Allow';
+    if (lower.startsWith('allow always')) return 'Always';
+    if (lower.startsWith('reject') || lower.startsWith('deny')) return 'Deny';
+    return n.length > 14 ? '${n.substring(0, 13)}…' : n;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3281,57 +3437,133 @@ class _PermissionPromptBar extends StatelessWidget {
             ),
           ];
 
+    // Prefer Allow → Always → Deny so the primary action sits first.
+    final sorted = [...options]..sort((a, b) {
+        int rank(PermissionOption o) {
+          if (o.isAllowOnce) return 0;
+          if (o.isAllowAlways) return 1;
+          if (o.isReject) return 2;
+          return 3;
+        }
+
+        return rank(a).compareTo(rank(b));
+      });
+
+    final title = request.title.trim();
+    final desc = request.description?.trim();
+    final hasDesc = desc != null && desc.isNotEmpty;
+
+    final allowStyle = FilledButton.styleFrom(
+      visualDensity: VisualDensity.compact,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+      minimumSize: const Size(0, 28),
+      backgroundColor: AppColors.accent,
+      foregroundColor: AppColors.deep,
+      textStyle: theme.textTheme.labelMedium?.copyWith(
+        fontWeight: FontWeight.w700,
+      ),
+    );
+    final alwaysStyle = FilledButton.styleFrom(
+      visualDensity: VisualDensity.compact,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      minimumSize: const Size(0, 28),
+      backgroundColor: AppColors.accent.withValues(alpha: 0.2),
+      foregroundColor: AppColors.accent,
+      textStyle: theme.textTheme.labelMedium?.copyWith(
+        fontWeight: FontWeight.w600,
+      ),
+    );
+    final denyStyle = TextButton.styleFrom(
+      visualDensity: VisualDensity.compact,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      minimumSize: const Size(0, 28),
+      foregroundColor: scheme.onSurfaceVariant,
+      textStyle: theme.textTheme.labelMedium?.copyWith(
+        fontWeight: FontWeight.w600,
+      ),
+    );
+
     return Material(
-      color: scheme.tertiaryContainer,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.privacy_tip_outlined,
-                    size: 18, color: scheme.onTertiaryContainer),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    request.title,
-                    style: theme.textTheme.titleSmall?.copyWith(
-                      color: scheme.onTertiaryContainer,
-                      fontWeight: FontWeight.w600,
+      color: scheme.surfaceContainerHigh,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border(
+            top: BorderSide(color: AppColors.accent.withValues(alpha: 0.35)),
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.shield_outlined,
+                size: 14,
+                color: AppColors.accent.withValues(alpha: 0.95),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      title.isEmpty ? 'Allow this action?' : title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        color: scheme.onSurface,
+                        fontWeight: FontWeight.w600,
+                        height: 1.15,
+                      ),
                     ),
-                  ),
-                ),
-              ],
-            ),
-            if (request.description != null &&
-                request.description!.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Text(
-                request.description!,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: scheme.onTertiaryContainer,
+                    if (hasDesc)
+                      Text(
+                        desc,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                          height: 1.15,
+                        ),
+                      ),
+                  ],
                 ),
               ),
-            ],
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 4,
-              children: [
-                for (final o in options)
-                  o.isReject
-                      ? OutlinedButton(
-                          onPressed: () => onSelect(o.optionId),
-                          child: Text(o.name),
-                        )
-                      : FilledButton(
-                          onPressed: () => onSelect(o.optionId),
-                          child: Text(o.name),
-                        ),
+              const SizedBox(width: 8),
+              for (var i = 0; i < sorted.length; i++) ...[
+                if (i > 0) const SizedBox(width: 4),
+                Builder(
+                  builder: (context) {
+                    final o = sorted[i];
+                    final label = _shortLabel(o);
+                    if (o.isAllowOnce) {
+                      return FilledButton(
+                        style: allowStyle,
+                        onPressed: () => onSelect(o.optionId),
+                        child: Text(label),
+                      );
+                    }
+                    if (o.isAllowAlways) {
+                      return FilledButton(
+                        style: alwaysStyle,
+                        onPressed: () => onSelect(o.optionId),
+                        child: Text(label),
+                      );
+                    }
+                    return TextButton(
+                      style: denyStyle,
+                      onPressed: () => onSelect(o.optionId),
+                      child: Text(label),
+                    );
+                  },
+                ),
               ],
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

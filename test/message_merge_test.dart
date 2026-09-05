@@ -404,4 +404,111 @@ void main() {
 
     expect((await db.getChat('chat-1'))!.modelId, modelId);
   });
+
+  group('title sync across devices', () {
+    test('rename clock wins over a newer ADSM updated_at with old title', () {
+      final renamedAt = DateTime(2026, 3, 1, 12);
+      final local = Chat(
+        id: 'chat-1',
+        repoId: 'repo-1',
+        title: 'My rename',
+        provider: AgentProvider.cursor,
+        titleUpdatedAt: renamedAt,
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: renamedAt,
+      );
+      final remote = AgentDockRecord(
+        id: 'chat-1',
+        title: 'Agent',
+        provider: AgentProvider.cursor.id,
+        repoPath: '/home/me/proj',
+        repoName: 'proj',
+        status: ChatStatus.running.name,
+        // ADSM bumped updated_at without touching the title.
+        titleUpdatedAt: DateTime(2026, 1, 1),
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: DateTime(2026, 3, 1, 13),
+      );
+
+      final merged = AgentDockRecord.mergeTitle(local, remote);
+      expect(merged.title, 'My rename');
+      expect(merged.titleUpdatedAt, renamedAt);
+    });
+
+    test('a newer remote rename replaces the local title', () {
+      final local = Chat(
+        id: 'chat-1',
+        repoId: 'repo-1',
+        title: 'Old name',
+        provider: AgentProvider.cursor,
+        titleUpdatedAt: DateTime(2026, 3, 1, 10),
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: DateTime(2026, 3, 1, 10),
+      );
+      final remote = AgentDockRecord(
+        id: 'chat-1',
+        title: 'Phone rename',
+        provider: AgentProvider.cursor.id,
+        repoPath: '/home/me/proj',
+        repoName: 'proj',
+        status: ChatStatus.idle.name,
+        titleUpdatedAt: DateTime(2026, 3, 1, 12),
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: DateTime(2026, 3, 1, 12),
+      );
+
+      final merged = AgentDockRecord.mergeTitle(local, remote);
+      expect(merged.title, 'Phone rename');
+      expect(merged.titleUpdatedAt, DateTime(2026, 3, 1, 12));
+    });
+
+    test('legacy remote without title_updated_at cannot overwrite a rename', () {
+      final local = Chat(
+        id: 'chat-1',
+        repoId: 'repo-1',
+        title: 'Kept',
+        provider: AgentProvider.cursor,
+        titleUpdatedAt: DateTime(2026, 3, 1),
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: DateTime(2026, 3, 1),
+      );
+      final remote = AgentDockRecord(
+        id: 'chat-1',
+        title: 'Stale',
+        provider: AgentProvider.cursor.id,
+        repoPath: '/home/me/proj',
+        repoName: 'proj',
+        status: ChatStatus.running.name,
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: DateTime(2026, 3, 2),
+      );
+
+      expect(AgentDockRecord.mergedTitle(local, remote), 'Kept');
+    });
+
+    test('title_updated_at round-trips through the host JSON', () {
+      final at = DateTime(2026, 3, 1, 15, 30);
+      final chat = Chat(
+        id: 'chat-1',
+        repoId: 'repo-1',
+        title: 'Synced name',
+        provider: AgentProvider.cursor,
+        titleUpdatedAt: at,
+        createdAt: DateTime(2026, 1, 1),
+        updatedAt: at,
+      );
+      final repo = Repo(
+        id: 'repo-1',
+        hostId: 'host-1',
+        name: 'proj',
+        remotePath: '/home/me/proj',
+        createdAt: DateTime(2026, 1, 1),
+      );
+      final json = AgentDockRecord.fromChat(chat, repo).toJson();
+      final back =
+          AgentDockRecord.fromJson(Map<String, dynamic>.from(json));
+      expect(back.title, 'Synced name');
+      expect(back.titleUpdatedAt, at);
+    });
+  });
 }

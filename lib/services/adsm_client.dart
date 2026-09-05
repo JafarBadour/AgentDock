@@ -329,6 +329,49 @@ class AdsmSession implements AgentSession {
   /// ADSM protocol version from the last successful `ping`.
   String? get protocolVersion => _client.protocolVersion;
 
+  /// Pull this worker's status from `agents.list` and push it through the same
+  /// update path as live daemon events — clears sticky "Exploring / Thinking"
+  /// when the host already went idle.
+  Future<String?> refreshDaemonStatus() async {
+    if (_updates.isClosed) return _daemonStatus;
+    try {
+      final list = await _client.request(
+        'agents.list',
+        {},
+        timeout: const Duration(seconds: 8),
+      );
+      final agents = list['agents'];
+      if (agents is! List) return _daemonStatus;
+      for (final raw in agents) {
+        if (raw is! Map) continue;
+        if (raw['chatId']?.toString() != chatId) continue;
+        final snap = Map<String, dynamic>.from(raw);
+        final prev = _daemonStatus;
+        _applySnapshot(snap);
+        final st = _daemonStatus;
+        if (st == null || st.isEmpty) return st;
+        // Always re-emit idle/dead so the runtime can finalize stuck tools even
+        // when the string status did not change. For other states, only emit
+        // on change to avoid thrashing the activity chip.
+        final changed = st != prev;
+        if (changed || st == 'idle' || st == 'dead') {
+          if (!_updates.isClosed) {
+            _updates.add(AcpUpdate.daemonStatus(st));
+            if (st == 'idle' || st == 'dead') {
+              _updates.add(const AcpUpdate.activity(''));
+            } else if (changed && st == 'running') {
+              _updates.add(const AcpUpdate.activity('Thinking'));
+            }
+          }
+        }
+        return st;
+      }
+    } catch (e) {
+      SafeLog.d('ADSM status poll failed chat=$chatId', e);
+    }
+    return _daemonStatus;
+  }
+
   /// Live daemon + agent snapshot for the status sheet.
   Future<AdsmHostHealth> fetchHostHealth({required bool bridgeOpen}) async {
     String? pingVersion = _client.protocolVersion;
@@ -649,6 +692,12 @@ class AdsmSession implements AgentSession {
           mode = AgentSessionMode.fromId(mid);
           _updates.add(AcpUpdate.mode(mode));
         }
+      case 'usage':
+        final used = _asInt(params['used']);
+        final size = _asInt(params['size']);
+        if (used != null && size != null) {
+          _updates.add(AcpUpdate.usage(used: used, size: size));
+        }
       case 'session':
         _applySnapshot({
           'acpSessionId': params['acpSessionId'],
@@ -681,6 +730,13 @@ class AdsmSession implements AgentSession {
       default:
         break;
     }
+  }
+
+  static int? _asInt(Object? v) {
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v == null) return null;
+    return int.tryParse(v.toString());
   }
 
   static ToolCallState? _toolFrom(Object? raw) {

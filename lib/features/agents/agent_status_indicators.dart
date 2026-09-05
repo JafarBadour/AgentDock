@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../../app/app_theme.dart';
 import '../../services/adsm_client.dart';
 
 /// Three dots that rise and fade in sequence while the agent is producing a
@@ -240,48 +241,98 @@ class CodeDeltaLabel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (isEmpty) return const SizedBox.shrink();
+    return TurnMetricsLabel(
+      added: added,
+      removed: removed,
+      files: files,
+      compact: compact,
+    );
+  }
+}
+
+/// Per-command footer: `+X -Y · Z φ · N τ` (omits all-zero code; τ after finish).
+class TurnMetricsLabel extends StatelessWidget {
+  const TurnMetricsLabel({
+    super.key,
+    this.added = 0,
+    this.removed = 0,
+    this.files = 0,
+    this.tokensUsed,
+    this.contextSize,
+    this.compact = true,
+  });
+
+  final int added;
+  final int removed;
+  final int files;
+  final int? tokensUsed;
+  final int? contextSize;
+  final bool compact;
+
+  bool get hasCode => added > 0 || removed > 0 || files > 0;
+  bool get hasTokens => tokensUsed != null;
+  bool get isEmpty => !hasCode && !hasTokens;
+
+  @override
+  Widget build(BuildContext context) {
+    if (isEmpty) return const SizedBox.shrink();
     final style = Theme.of(context).textTheme.labelSmall?.copyWith(
           fontFeatures: const [FontFeature.tabularFigures()],
           fontWeight: FontWeight.w600,
           height: 1.1,
         );
-    const green = Color(0xFF2E7D32);
-    const red = Color(0xFFC62828);
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    final outline = Theme.of(context).colorScheme.outline;
+    const green = AppColors.diffAdd;
+    const red = AppColors.diffRemove;
+    final sep = TextSpan(
+      text: ' · ',
+      style: style?.copyWith(color: outline),
+    );
+    final children = <InlineSpan>[];
+    if (hasCode) {
+      if (!compact) {
+        children.add(TextSpan(text: 'Δ ', style: style?.copyWith(color: muted)));
+      }
+      children.add(
+        TextSpan(text: '+$added', style: style?.copyWith(color: green)),
+      );
+      children.add(const TextSpan(text: ' '));
+      children.add(
+        TextSpan(text: '-$removed', style: style?.copyWith(color: red)),
+      );
+      if (files > 0) {
+        children.add(sep);
+        children.add(
+          TextSpan(text: '$files φ', style: style?.copyWith(color: muted)),
+        );
+      }
+    }
+    if (hasTokens) {
+      if (children.isNotEmpty) children.add(sep);
+      final used = tokensUsed!;
+      final tokenText = contextSize != null && contextSize! > 0
+          ? '${_compactInt(used)}/${_compactInt(contextSize!)} τ'
+          : '${_compactInt(used)} τ';
+      children.add(
+        TextSpan(text: tokenText, style: style?.copyWith(color: muted)),
+      );
+    }
     return Text.rich(
-      TextSpan(
-        style: style?.copyWith(
-          color: Theme.of(context).colorScheme.onSurfaceVariant,
-        ),
-        children: [
-          if (!compact) const TextSpan(text: 'Δ '),
-          TextSpan(
-            text: '+$added',
-            style: style?.copyWith(color: green),
-          ),
-          const TextSpan(text: ' '),
-          TextSpan(
-            text: '-$removed',
-            style: style?.copyWith(color: red),
-          ),
-          if (files > 0) ...[
-            TextSpan(
-              text: compact ? ' · ' : ' | ',
-              style: style?.copyWith(
-                color: Theme.of(context).colorScheme.outline,
-              ),
-            ),
-            TextSpan(
-              text: '$files φ',
-              style: style?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ],
-      ),
+      TextSpan(style: style?.copyWith(color: muted), children: children),
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
     );
+  }
+
+  static String _compactInt(int n) {
+    if (n.abs() < 1000) return '$n';
+    if (n.abs() < 10000) {
+      final k = n / 1000;
+      final s = k.toStringAsFixed(1);
+      return s.endsWith('.0') ? '${s.substring(0, s.length - 2)}k' : '${s}k';
+    }
+    return '${(n / 1000).round()}k';
   }
 }
 
@@ -311,22 +362,38 @@ class ExploreStatsLabel extends StatelessWidget {
           fontFeatures: const [FontFeature.tabularFigures()],
           fontWeight: FontWeight.w600,
           height: 1.1,
-          color: theme.colorScheme.primary,
+          color: AppColors.accent.withValues(alpha: 0.92),
         );
     final iconSize = (resolved?.fontSize ?? 12) + 2;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text('Exploring ', style: resolved),
-        if (files > 0) Text('$files φ', style: resolved),
-        if (files > 0 && searches > 0) Text(', ', style: resolved),
-        if (searches > 0) ...[
-          Text('$searches', style: resolved),
-          const SizedBox(width: 2),
-          Icon(Icons.search, size: iconSize, color: resolved?.color),
-        ],
-        if (showEllipsis) Text('…', style: resolved),
-      ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final row = Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Exploring ', style: resolved),
+            if (files > 0) Text('$files φ', style: resolved),
+            if (files > 0 && searches > 0) Text(', ', style: resolved),
+            if (searches > 0) ...[
+              Text('$searches', style: resolved),
+              const SizedBox(width: 2),
+              Icon(Icons.search, size: iconSize, color: resolved?.color),
+            ],
+            if (showEllipsis) Text('…', style: resolved),
+          ],
+        );
+        if (!constraints.hasBoundedWidth ||
+            constraints.maxWidth == double.infinity) {
+          return row;
+        }
+        return FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: constraints.maxWidth),
+            child: row,
+          ),
+        );
+      },
     );
   }
 }

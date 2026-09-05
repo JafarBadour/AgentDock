@@ -94,13 +94,13 @@ class ScheduledJob {
   final DateTime? lastRunAt;
   final String? lastError;
 
-  /// Optional follow-up criteria; host asks the agent `DONE: yes/no`.
+  /// Optional follow-up criteria; host asks the agent to answer yes/no first.
   final String? donePrompt;
 
   /// Optional compressed conversation blob prepended to each run.
   final String? contextSummary;
 
-  /// When true (and [donePrompt] set), keep repeating until DONE: yes.
+  /// When true (and [donePrompt] set), keep repeating until the agent answers yes.
   final bool repeatUntilDone;
 
   final DateTime createdAt;

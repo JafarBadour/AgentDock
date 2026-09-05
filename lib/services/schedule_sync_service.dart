@@ -173,9 +173,10 @@ class ScheduleSyncService {
 
   /// Pull from every known host (best-effort).
   Future<void> pullAllHosts() async {
-    if (!await _secureStore.hasSshPrivateKey()) return;
     final hosts = await _db.listHosts();
+    final hasKey = await _secureStore.hasSshPrivateKey();
     for (final host in hosts) {
+      if (!hasKey && !await _secureStore.hasHostPassword(host.id)) continue;
       await pullFromHost(host);
     }
   }

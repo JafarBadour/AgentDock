@@ -12,6 +12,8 @@ import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/agent_runtime_host.dart';
+import '../../services/ssh_service.dart';
+import '../repos/remote_browser_screen.dart';
 import 'agents_screen.dart';
 
 class _NewAgentRequest {
@@ -114,6 +116,84 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
   }
 }
 
+/// Top-level + flow: pick host → browse/create folder → name agent.
+Future<void> startNewAgentWizard({
+  required BuildContext context,
+  required WidgetRef ref,
+}) async {
+  final db = ref.read(appDatabaseProvider);
+  final hosts = await db.listHosts();
+  if (!context.mounted) return;
+  if (hosts.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Add a host first under Hosts.')),
+    );
+    return;
+  }
+
+  Host? host;
+  if (hosts.length == 1) {
+    host = hosts.first;
+  } else {
+    host = await showDialog<Host>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Choose host'),
+        children: [
+          for (final h in hosts)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, h),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.dns_outlined),
+                title: Text(h.displayLabel),
+                subtitle: Text(h.endpointLabel),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+  if (host == null || !context.mounted) return;
+
+  final path = await RemoteBrowserScreen.open(context, host: host);
+  if (path == null || !context.mounted) return;
+
+  final folderName = path == '/'
+      ? 'root'
+      : path.split('/').where((s) => s.isNotEmpty).last;
+
+  try {
+    final exists =
+        await ref.read(sshServiceProvider).remotePathExists(host, path);
+    if (!exists) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Folder does not exist: $path')),
+        );
+      }
+      return;
+    }
+  } catch (e) {
+    SafeLog.d('new agent path check failed', e);
+  }
+
+  final repo = await db.findOrCreateRepoByPath(
+    hostId: host.id,
+    remotePath: SshService.normalizeRemotePath(path),
+    name: folderName,
+  );
+  ref.invalidate(agentsTreeProvider);
+  if (!context.mounted) return;
+
+  await startNewAgentChat(
+    context: context,
+    ref: ref,
+    host: host,
+    repo: repo,
+  );
+}
+
 /// Dialog + create chat + navigate to `/agents/chat/:id`.
 Future<void> startNewAgentChat({
   required BuildContext context,
@@ -160,6 +240,7 @@ Future<void> startNewAgentChat({
       tmuxSession: session,
       status: ChatStatus.idle,
       sortOrder: await db.nextChatSortOrder(repo.id),
+      titleUpdatedAt: now,
       createdAt: now,
       updatedAt: now,
     );
@@ -193,7 +274,10 @@ Future<void> startNewAgentChat({
           title: const Text('Could not create chat'),
           content: Text('$e'),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
           ],
         ),
       );

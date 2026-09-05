@@ -1,18 +1,22 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../features/agents/agents_screen.dart';
 import '../features/agents/chat_screen.dart';
+import '../features/agents/new_agent_flow.dart';
 import '../features/automations/automations_screen.dart';
 import '../features/connect/connect_screen.dart';
 import '../features/hosts/hosts_screen.dart';
 import '../features/settings/settings_screen.dart';
+import '../features/terminal/terminal_session_screen.dart';
 import 'app_theme.dart';
 import 'platform_layout.dart';
 import 'providers.dart';
 
-/// Cursor-style macOS layout: agent list | chat | secondary panels.
+/// Cursor-style macOS layout: agent list | chat / detail | secondary panels.
 class DesktopShellScaffold extends ConsumerStatefulWidget {
   const DesktopShellScaffold({
     super.key,
@@ -29,33 +33,44 @@ class DesktopShellScaffold extends ConsumerStatefulWidget {
 }
 
 class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
-  static const _leftWidth = 280.0;
+  static const _leftWidth = 300.0;
   static const _rightWidth = 400.0;
   static const _railWidth = 52.0;
 
   @override
   void initState() {
     super.initState();
-    _syncPanelFromRoute(widget.state.uri.path);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _syncFromRoute(widget.state.uri.path);
+    });
   }
 
   @override
   void didUpdateWidget(covariant DesktopShellScaffold oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.state.uri.path != widget.state.uri.path) {
-      _syncPanelFromRoute(widget.state.uri.path);
+      _syncFromRoute(widget.state.uri.path);
     }
   }
 
-  void _syncPanelFromRoute(String path) {
+  void _syncFromRoute(String path) {
     final panel = desktopPanelForPath(path);
-    if (panel == null) return;
-    final current = ref.read(desktopRightPanelProvider);
-    if (current != panel) {
-      ref.read(desktopRightPanelProvider.notifier).state = panel;
+    if (panel != null) {
+      final current = ref.read(desktopRightPanelProvider);
+      if (current != panel) {
+        ref.read(desktopRightPanelProvider.notifier).state = panel;
+      }
     }
-    if (widget.navigationShell.currentIndex != 0) {
+
+    // Panel list roots (/hosts, /settings, …) should not steal the center
+    // column — bounce back to Agents while keeping the right panel open.
+    // Never do this for detail routes (/hosts/new, /automate/edit/…): those
+    // must stay on their branch so navigationShell can render them.
+    if (isDesktopPanelRoot(path) &&
+        widget.navigationShell.currentIndex != 0) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
         widget.navigationShell.goBranch(0, initialLocation: false);
       });
     }
@@ -67,14 +82,35 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
         current == panel ? DesktopRightPanel.none : panel;
   }
 
+  Widget _centerColumn(String path, String? chatId) {
+    // Terminal is opened from the embedded Hosts panel (outside the hosts
+    // branch navigator). Render it here directly — relying on navigationShell
+    // alone left the center column on Agents/chat and the session never appeared.
+    final terminalHostId = terminalHostIdFromPath(path);
+    if (terminalHostId != null) {
+      return TerminalSessionScreen(
+        key: ValueKey('terminal-$terminalHostId'),
+        hostId: terminalHostId,
+      );
+    }
+    // Host edit, schedule editor, repos, MCP editor, etc.
+    if (isDesktopDetailRoute(path)) {
+      return widget.navigationShell;
+    }
+    if (chatId == null) {
+      return const _DesktopChatPlaceholder();
+    }
+    return ChatScreen(key: ValueKey(chatId), chatId: chatId);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final path = widget.state.uri.path;
     final chatId = chatIdFromRoute(widget.state);
     final panel = ref.watch(desktopRightPanelProvider);
-
     final scheme = Theme.of(context).colorScheme;
 
-    return ColoredBox(
+    return Material(
       color: scheme.surfaceContainerLow,
       child: Row(
         children: [
@@ -91,9 +127,20 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
                 Expanded(
                   child: ColoredBox(
                     color: scheme.surfaceContainer.withValues(alpha: 0.55),
-                    child: AgentsScreen(
-                      embedded: true,
-                      selectedChatId: chatId,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const _DesktopSidebarHeader(),
+                        const Divider(height: 1),
+                        Expanded(
+                          child: ClipRect(
+                            child: AgentsScreen(
+                              embedded: true,
+                              selectedChatId: chatId,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -101,11 +148,7 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
             ),
           ),
           const VerticalDivider(width: 1),
-          Expanded(
-            child: chatId == null
-                ? const _DesktopChatPlaceholder()
-                : ChatScreen(key: ValueKey(chatId), chatId: chatId),
-          ),
+          Expanded(child: _centerColumn(path, chatId)),
           if (panel != DesktopRightPanel.none) ...[
             const VerticalDivider(width: 1),
             SizedBox(
@@ -121,6 +164,47 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
               ),
             ),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+class _DesktopSidebarHeader extends ConsumerWidget {
+  const _DesktopSidebarHeader();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 10, 6, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              'Agents',
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
+          ),
+          IconButton(
+            tooltip: 'New agent',
+            visualDensity: VisualDensity.compact,
+            onPressed: () {
+              unawaited(startNewAgentWizard(context: context, ref: ref));
+            },
+            icon: const Icon(Icons.add, size: 18),
+          ),
+          IconButton(
+            tooltip: 'Refresh / sync',
+            visualDensity: VisualDensity.compact,
+            onPressed: () {
+              ref.invalidate(agentsTreeProvider);
+              ref.invalidate(agentsSyncProvider);
+              ref.invalidate(unreadCountsProvider);
+            },
+            icon: const Icon(Icons.refresh, size: 18),
+          ),
         ],
       ),
     );
@@ -152,8 +236,7 @@ class _DesktopNavRail extends StatelessWidget {
               message: 'Agents',
               child: IconButton(
                 icon: const Icon(Icons.forum_outlined),
-                onPressed: () =>
-                    onSelectPanel(DesktopRightPanel.none),
+                onPressed: () => onSelectPanel(DesktopRightPanel.none),
               ),
             ),
             const Spacer(),
@@ -213,8 +296,9 @@ class _RailIcon extends StatelessWidget {
             backgroundColor: selected
                 ? AppColors.accent.withValues(alpha: 0.18)
                 : null,
-            foregroundColor:
-                selected ? AppColors.accent : AppColors.mist.withValues(alpha: 0.7),
+            foregroundColor: selected
+                ? AppColors.accent
+                : AppColors.mist.withValues(alpha: 0.7),
           ),
           icon: Icon(icon),
           onPressed: onTap,

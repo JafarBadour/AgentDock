@@ -34,6 +34,8 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       unawaited(ref.read(localNotificationServiceProvider).init());
       // Schedule runner polls due automated prompts while the app is alive.
       ref.read(scheduleRunnerProvider).start();
+      // Keep provider alive so remote deletes tear down ACP sessions.
+      ref.read(remoteDeletedChatsPrunerProvider);
     });
   }
 
@@ -77,17 +79,32 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
   @override
   Widget build(BuildContext context) {
     final router = ref.watch(goRouterProvider);
+    final dense = useDesktopShell();
+    final theme = buildAppTheme(dense: dense);
     return WithForegroundTask(
       child: MaterialApp.router(
         title: 'Agent Dock',
         debugShowCheckedModeBanner: false,
-        theme: buildAppTheme(),
-        darkTheme: buildAppTheme(),
+        theme: theme,
+        darkTheme: theme,
         themeMode: ThemeMode.dark,
         builder: (context, child) {
           final body = child ?? const SizedBox.shrink();
-          if (useDesktopShell(context)) return body;
-          return WavyBackground(child: body);
+          // Cap OS accessibility text scaling on desktop so the shell stays
+          // Cursor-dense even when macOS text size is turned up.
+          final scaled = dense
+              ? MediaQuery(
+                  data: MediaQuery.of(context).copyWith(
+                    textScaler: MediaQuery.textScalerOf(context).clamp(
+                      minScaleFactor: 0.85,
+                      maxScaleFactor: 1.05,
+                    ),
+                  ),
+                  child: body,
+                )
+              : body;
+          if (dense) return scaled;
+          return WavyBackground(child: scaled);
         },
         routerConfig: router,
       ),

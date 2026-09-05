@@ -34,7 +34,7 @@ class AppDatabase {
         p.join((await getApplicationDocumentsDirectory()).path, 'agentic_phone.db');
     return openDatabase(
       path,
-      version: 13,
+      version: 14,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -80,6 +80,7 @@ CREATE TABLE chats (
   outbound_queue TEXT,
   status TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
+  title_updated_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (repo_id) REFERENCES repos (id) ON DELETE CASCADE
@@ -159,6 +160,17 @@ CREATE TABLE messages (
             {'code_delta_day': today},
             where:
                 'code_delta_day IS NULL AND (lines_added > 0 OR lines_removed > 0 OR files_changed > 0)',
+          );
+        }
+        if (oldVersion < 14) {
+          await db.execute(
+            'ALTER TABLE chats ADD COLUMN title_updated_at TEXT',
+          );
+          // Seed a title clock from the row's existing updated_at so renames
+          // after this migrate can win against ADSM status bumps.
+          await db.execute(
+            'UPDATE chats SET title_updated_at = updated_at '
+            'WHERE title_updated_at IS NULL',
           );
         }
       },

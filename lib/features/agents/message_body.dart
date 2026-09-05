@@ -248,22 +248,16 @@ String _shortUrl(String url) {
 
 Future<void> copyMessageForTeams(
   BuildContext context,
-  String source, {
-  String toast = 'Copied',
-}) async {
+  String source,
+) async {
   await Clipboard.setData(ClipboardData(text: toTeamsFriendlyCopy(source)));
-  if (!context.mounted) return;
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text(toast), duration: const Duration(seconds: 1)),
-  );
 }
 
 /// Copy rendered HTML (+ plain fallback) so Teams paste keeps tables and links.
 Future<void> copyMessageHtmlForTeams(
   BuildContext context,
-  String source, {
-  String toast = 'Copied HTML for Teams',
-}) async {
+  String source,
+) async {
   final html = toTeamsHtml(source);
   final plain = toTeamsFriendlyCopy(source);
 
@@ -276,11 +270,6 @@ Future<void> copyMessageHtmlForTeams(
   } else {
     await Clipboard.setData(ClipboardData(text: html.isEmpty ? plain : html));
   }
-
-  if (!context.mounted) return;
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text(toast), duration: const Duration(seconds: 1)),
-  );
 }
 
 Future<void> openRichLink(String url) async {
@@ -444,7 +433,6 @@ class _LinkChip extends StatelessWidget {
         onLongPress: () => copyMessageForTeams(
           context,
           '${link.label} <${link.url}>',
-          toast: 'Link copied',
         ),
         child: Padding(
           padding: EdgeInsets.symmetric(

@@ -20,6 +20,7 @@ class Chat {
     this.codeDeltaDay,
     this.status = ChatStatus.idle,
     this.sortOrder = 0,
+    this.titleUpdatedAt,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -65,8 +66,20 @@ class Chat {
 
   final ChatStatus status;
   final int sortOrder;
+
+  /// When [title] was last set by the user (or an accepted ACP suggestion).
+  /// Synced separately from [updatedAt] so ADSM status bumps cannot roll back
+  /// a rename on another device.
+  final DateTime? titleUpdatedAt;
+
   final DateTime createdAt;
   final DateTime updatedAt;
+
+  /// True when the title is still a create-time placeholder ACP may replace.
+  bool get isPlaceholderTitle {
+    final t = title.trim().toLowerCase();
+    return t.isEmpty || t == 'new agent' || t == 'agent';
+  }
 
   Map<String, Object?> toMap() => {
         'id': id,
@@ -85,6 +98,7 @@ class Chat {
         'code_delta_day': codeDeltaDay,
         'status': status.name,
         'sort_order': sortOrder,
+        'title_updated_at': titleUpdatedAt?.toIso8601String(),
         'created_at': createdAt.toIso8601String(),
         'updated_at': updatedAt.toIso8601String(),
       };
@@ -109,6 +123,8 @@ class Chat {
           orElse: () => ChatStatus.idle,
         ),
         sortOrder: (map['sort_order'] as int?) ?? 0,
+        titleUpdatedAt:
+            DateTime.tryParse((map['title_updated_at'] as String?) ?? ''),
         createdAt: DateTime.parse(map['created_at']! as String),
         updatedAt: DateTime.parse(map['updated_at']! as String),
       );
@@ -131,6 +147,7 @@ class Chat {
     bool clearCodeDelta = false,
     ChatStatus? status,
     int? sortOrder,
+    DateTime? titleUpdatedAt,
     DateTime? updatedAt,
   }) =>
       Chat(
@@ -155,6 +172,7 @@ class Chat {
             clearCodeDelta ? null : (codeDeltaDay ?? this.codeDeltaDay),
         status: status ?? this.status,
         sortOrder: sortOrder ?? this.sortOrder,
+        titleUpdatedAt: titleUpdatedAt ?? this.titleUpdatedAt,
         createdAt: createdAt,
         updatedAt: updatedAt ?? this.updatedAt,
       );

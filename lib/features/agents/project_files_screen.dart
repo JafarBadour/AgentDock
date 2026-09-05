@@ -11,6 +11,7 @@ import '../../app/providers.dart';
 import '../../data/models/host.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/ssh_service.dart';
+import 'pdf_viewer_screen.dart';
 
 /// Browse / download / upload files under a project root on [host].
 class ProjectFilesScreen extends ConsumerStatefulWidget {
@@ -418,6 +419,51 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     }
   }
 
+  Future<void> _viewPdf(RemoteFileEntry entry) async {
+    if (entry.isDirectory || !_isPdf(entry.name)) return;
+    final remote = SshService.joinRemotePath(_path ?? _root, entry.name);
+    setState(() {
+      _busy = true;
+      _status = 'Opening ${entry.name}…';
+    });
+    try {
+      final cache = await getTemporaryDirectory();
+      final localPath = await _uniquePathIn(cache, entry.name);
+      await ref.read(sshServiceProvider).downloadRemoteFile(
+            widget.host,
+            remote,
+            localPath,
+          );
+      if (!mounted) return;
+      setState(() => _status = entry.name);
+      await PdfViewerScreen.open(
+        context,
+        filePath: localPath,
+        title: entry.name,
+      );
+    } catch (e) {
+      SafeLog.d('pdf open failed', e);
+      if (!mounted) return;
+      setState(() => _status = 'Could not open PDF: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open PDF: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  static bool _isPdf(String name) =>
+      p.extension(name).toLowerCase() == '.pdf';
+
+  IconData _iconFor(RemoteFileEntry entry) {
+    if (entry.isDirectory) {
+      return entry.isSymlink ? Icons.link : Icons.folder_outlined;
+    }
+    if (_isPdf(entry.name)) return Icons.picture_as_pdf_outlined;
+    return Icons.insert_drive_file_outlined;
+  }
+
   void _showEntryMenu(RemoteFileEntry entry) {
     showModalBottomSheet<void>(
       context: context,
@@ -435,6 +481,15 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                 ].join(' · '),
               ),
             ),
+            if (!entry.isDirectory && _isPdf(entry.name))
+              ListTile(
+                leading: const Icon(Icons.picture_as_pdf_outlined),
+                title: const Text('View PDF'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _viewPdf(entry);
+                },
+              ),
             if (!entry.isDirectory) ...[
               ListTile(
                 leading: const Icon(Icons.download),
@@ -475,7 +530,10 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
               ),
             if (!entry.isDirectory)
               ListTile(
-                leading: Icon(Icons.delete_outline, color: Theme.of(context).colorScheme.error),
+                leading: Icon(
+                  Icons.delete_outline,
+                  color: Theme.of(context).colorScheme.error,
+                ),
                 title: const Text('Delete'),
                 onTap: () {
                   Navigator.pop(context);
@@ -606,13 +664,7 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                         itemBuilder: (context, index) {
                           final entry = _entries[index];
                           return ListTile(
-                            leading: Icon(
-                              entry.isDirectory
-                                  ? (entry.isSymlink
-                                      ? Icons.link
-                                      : Icons.folder_outlined)
-                                  : Icons.insert_drive_file_outlined,
-                            ),
+                            leading: Icon(_iconFor(entry)),
                             title: Text(entry.name),
                             subtitle: entry.sizeLabel.isEmpty
                                 ? null
@@ -620,14 +672,25 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                             trailing: entry.isDirectory
                                 ? const Icon(Icons.chevron_right)
                                 : IconButton(
-                                    tooltip: 'Download to Downloads',
-                                    icon: const Icon(Icons.download),
-                                    onPressed:
-                                        _busy ? null : () => _download(entry),
+                                    tooltip: _isPdf(entry.name)
+                                        ? 'View PDF'
+                                        : 'Download to Downloads',
+                                    icon: Icon(
+                                      _isPdf(entry.name)
+                                          ? Icons.visibility_outlined
+                                          : Icons.download,
+                                    ),
+                                    onPressed: _busy
+                                        ? null
+                                        : () => _isPdf(entry.name)
+                                            ? _viewPdf(entry)
+                                            : _download(entry),
                                   ),
                             onTap: entry.isDirectory
                                 ? () => _openDir(entry.name)
-                                : () => _showEntryMenu(entry),
+                                : _isPdf(entry.name)
+                                    ? () => _viewPdf(entry)
+                                    : () => _showEntryMenu(entry),
                             onLongPress: () => _showEntryMenu(entry),
                           );
                         },

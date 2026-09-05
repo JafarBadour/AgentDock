@@ -70,8 +70,36 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
     ref.watch(sshServiceProvider),
     ref.watch(appDatabaseProvider),
   );
+  service.onChatRemoved = (chatId) {
+    // Refresh the agents list when a remote delete lands. ACP teardown is
+    // handled separately to avoid a Riverpod provider cycle with
+    // activeAcpSessionsProvider.
+    ref.read(agentsCatalogEpochProvider.notifier).state++;
+    ref.read(pendingRemoteDeletedChatIdsProvider.notifier).update(
+          (ids) => [...ids, chatId],
+        );
+  };
   ref.onDispose(service.dispose);
   return service;
+});
+
+/// Bumped when the host catalog removes chats (cross-device delete).
+final agentsCatalogEpochProvider = StateProvider<int>((ref) => 0);
+
+/// Chat ids removed by host sync — drained by [remoteDeletedChatsPrunerProvider].
+final pendingRemoteDeletedChatIdsProvider =
+    StateProvider<List<String>>((ref) => const []);
+
+/// Closes ACP runtimes for chats deleted on another device.
+final remoteDeletedChatsPrunerProvider = Provider<void>((ref) {
+  ref.listen<List<String>>(pendingRemoteDeletedChatIdsProvider, (prev, next) {
+    if (next.isEmpty) return;
+    ref.read(pendingRemoteDeletedChatIdsProvider.notifier).state = const [];
+    final sessions = ref.read(activeAcpSessionsProvider.notifier);
+    for (final id in next) {
+      unawaited(sessions.close(id));
+    }
+  });
 });
 
 final configBackupServiceProvider = Provider<ConfigBackupService>(
@@ -97,7 +125,8 @@ final activeAcpSessionsProvider =
       },
       onLocalChange: (chatId) {
         ref.read(agentDockServiceProvider).schedulePushChat(chatId);
-        tick ??= Timer(const Duration(milliseconds: 700), () {
+        // Coalesce aggressively — Agents sidebar must not rebuild every token.
+        tick ??= Timer(const Duration(seconds: 8), () {
           tick = null;
           ref.read(chatActivityTickProvider.notifier).state++;
         });
@@ -127,10 +156,55 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
   final Map<String, Timer> _offsetTimers = {};
   final Map<String, int> _pendingOffsets = {};
   final Map<String, Timer> _transcriptPushTimers = {};
+  Timer? _adsmStatusPoll;
+  bool _adsmStatusPollInFlight = false;
+
+  /// How often to ask ADSM for authoritative worker status across all live
+  /// bridges. Cheap (`agents.list`) and keeps sticky UI in sync with the host.
+  static const _adsmStatusPollInterval = Duration(seconds: 15);
 
   ChatSessionRuntime? get(String chatId) => state[chatId];
 
   AgentSession? sessionFor(String chatId) => state[chatId]?.session;
+
+  void _syncAdsmStatusPoll() {
+    final hasAdsm = state.values.any(
+      (r) => !r.closed && r.session is AdsmSession,
+    );
+    if (!hasAdsm) {
+      _adsmStatusPoll?.cancel();
+      _adsmStatusPoll = null;
+      return;
+    }
+    if (_adsmStatusPoll != null) return;
+    // Immediate pass, then every interval — sticky chrome should not wait
+    // a full period after connect / resume.
+    unawaited(_pollAllAdsmStatuses());
+    _adsmStatusPoll = Timer.periodic(_adsmStatusPollInterval, (_) {
+      unawaited(_pollAllAdsmStatuses());
+    });
+  }
+
+  Future<void> _pollAllAdsmStatuses() async {
+    if (_adsmStatusPollInFlight) return;
+    _adsmStatusPollInFlight = true;
+    try {
+      final sessions = <AdsmSession>[
+        for (final runtime in state.values)
+          if (!runtime.closed && runtime.session is AdsmSession)
+            runtime.session as AdsmSession,
+      ];
+      // Parallel per bridge — each session owns its own ADSM SSH client.
+      await Future.wait(
+        sessions.map((s) => s.refreshDaemonStatus()),
+        eagerError: false,
+      );
+    } catch (e) {
+      SafeLog.d('ADSM status poll sweep failed', e);
+    } finally {
+      _adsmStatusPollInFlight = false;
+    }
+  }
 
   void _onRuntimeLocalChange(String chatId) {
     onLocalChange?.call(chatId);
@@ -168,6 +242,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       unawaited(existing.pullHostTranscriptAndSync());
       state = {...state};
       _syncKeepAlive();
+      _syncAdsmStatusPoll();
       return existing;
     }
 
@@ -201,6 +276,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     // Push any local-only rows up so the host stays complete.
     unawaited(runtime.pushTranscriptToHost());
     _syncKeepAlive();
+    _syncAdsmStatusPoll();
     return runtime;
   }
 
@@ -211,6 +287,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     state = {...state};
     unawaited(state[chatId]?.syncTranscriptFromDb());
     _syncKeepAlive();
+    _syncAdsmStatusPoll();
   }
 
   void _syncKeepAlive() {
@@ -273,6 +350,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     final next = Map<String, ChatSessionRuntime>.from(state)..remove(chatId);
     state = next;
     _syncKeepAlive();
+    _syncAdsmStatusPoll();
   }
 
   Future<void> closeAll() async {
@@ -285,6 +363,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       timer.cancel();
     }
     _transcriptPushTimers.clear();
+    _adsmStatusPoll?.cancel();
+    _adsmStatusPoll = null;
     for (final runtime in state.values) {
       await runtime.disposeRuntime();
     }
@@ -302,6 +382,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       timer.cancel();
     }
     _transcriptPushTimers.clear();
+    _adsmStatusPoll?.cancel();
+    _adsmStatusPoll = null;
     super.dispose();
   }
 }

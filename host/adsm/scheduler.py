@@ -164,11 +164,11 @@ def build_done_prompt(job: dict[str, Any]) -> str:
     return (
         "You are checking whether a scheduled automation is finished.\n"
         f"Done criteria:\n{criteria}\n\n"
-        "Reply with exactly one line in this form:\n"
-        "DONE: yes\n"
-        "or\n"
-        "DONE: no\n"
-        "You may add a short reason after that line."
+        "Answer with the first word yes or no, then a short explanation.\n"
+        "yes = the work is done — stop this automation.\n"
+        "no = not done yet — keep the schedule running.\n"
+        "Example: yes The deploy succeeded.\n"
+        "Example: no Still waiting on CI.\n"
     )
 
 
@@ -178,6 +178,13 @@ def parse_done_answer(text: str) -> Optional[bool]:
     if DONE_YES_RE.search(text):
         return True
     if DONE_NO_RE.search(text):
+        return False
+    # Prefer an explicit first-word yes/no (suffix instruction above).
+    first = text.strip().split(None, 1)[0].rstrip(".,:;!?")
+    low = first.lower()
+    if low == "yes":
+        return True
+    if low == "no":
         return False
     return None
 

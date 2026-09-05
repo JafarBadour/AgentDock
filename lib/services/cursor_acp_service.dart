@@ -110,6 +110,7 @@ class AcpSession implements AgentSession {
 
   int _consumed = 0;
   bool _replaying = false;
+  bool _modelViaConfigOption = false;
   bool _stdinOpen = true;
 
   /// Last time the agent sent anything, used as the liveness signal for a
@@ -537,6 +538,9 @@ class AcpSession implements AgentSession {
       });
       _applyModels(result['models']);
       _applyModes(result['modes']);
+      _applyConfigOptions(
+        result['configOptions'] ?? result['config_options'],
+      );
     } catch (e) {
       SafeLog.d('session/load for model catalog failed', e);
     } finally {
@@ -578,6 +582,9 @@ class AcpSession implements AgentSession {
       _started = true;
       _applyModes(result['modes']);
       _applyModels(result['models']);
+      _applyConfigOptions(
+        result['configOptions'] ?? result['config_options'],
+      );
     } finally {
       _replaying = false;
     }
@@ -592,6 +599,9 @@ class AcpSession implements AgentSession {
     _started = true;
     _applyModes(result['modes']);
     _applyModels(result['models']);
+    _applyConfigOptions(
+      result['configOptions'] ?? result['config_options'],
+    );
   }
 
   void _applyModels(Object? models) {
@@ -607,6 +617,54 @@ class AcpSession implements AgentSession {
     if (current != null) currentModelId = current.toString();
   }
 
+  void _applyConfigOptions(Object? configOptions) {
+    if (configOptions is! List) return;
+    AgentModel? fromOption(Map<String, dynamic> item) {
+      final value = item['value'];
+      if (value == null) return null;
+      final name = (item['name'] ?? value).toString();
+      return AgentModel.fromJson({'modelId': value.toString(), 'name': name});
+    }
+
+    Map<String, dynamic>? modelOpt;
+    for (final entry in configOptions) {
+      if (entry is! Map) continue;
+      final id = (entry['id'] ?? entry['configId'] ?? entry['config_id'])
+          ?.toString();
+      final category = entry['category']?.toString();
+      if (id == 'model' || category == 'model') {
+        modelOpt = Map<String, dynamic>.from(entry);
+        break;
+      }
+    }
+    if (modelOpt == null) return;
+
+    final options = modelOpt['options'];
+    if (options is List) {
+      final out = <AgentModel>[];
+      for (final raw in options) {
+        if (raw is Map && raw['options'] is List) {
+          for (final sub in raw['options'] as List) {
+            if (sub is Map) {
+              final m = fromOption(Map<String, dynamic>.from(sub));
+              if (m != null) out.add(m);
+            }
+          }
+        } else if (raw is Map) {
+          final m = fromOption(Map<String, dynamic>.from(raw));
+          if (m != null) out.add(m);
+        }
+      }
+      if (out.isNotEmpty) {
+        availableModels = out;
+        _modelViaConfigOption = true;
+      }
+    }
+
+    final cur = modelOpt['currentValue'] ?? modelOpt['current_value'];
+    if (cur != null) currentModelId = cur.toString();
+  }
+
   /// Switch the model for this session.
   ///
   /// Only ids the agent advertised are accepted; it rejects anything else with
@@ -614,11 +672,31 @@ class AcpSession implements AgentSession {
   /// straight from [availableModels].
   Future<void> setModel(String modelId) async {
     if (sessionId == null) throw StateError('ACP session not ready');
-    await _request('session/set_model', {
-      'sessionId': sessionId,
-      'modelId': modelId,
-    });
-    currentModelId = modelId;
+    if (_modelViaConfigOption) {
+      final previous = currentModelId;
+      final result = await _request('session/set_config_option', {
+        'sessionId': sessionId,
+        'configId': 'model',
+        'value': modelId,
+      });
+      _applyConfigOptions(
+        result['configOptions'] ?? result['config_options'],
+      );
+      // Keep ACP's currentValue when the response carried one; otherwise the
+      // id we asked for (so the chip never claims a switch that only wrote
+      // the local preference).
+      if (currentModelId == null ||
+          currentModelId!.isEmpty ||
+          currentModelId == previous) {
+        currentModelId = modelId;
+      }
+    } else {
+      await _request('session/set_model', {
+        'sessionId': sessionId,
+        'modelId': modelId,
+      });
+      currentModelId = modelId;
+    }
   }
 
   void _applyModes(Object? modes) {
@@ -1276,6 +1354,8 @@ class AcpUpdate {
     this.tool,
     this.mode,
     this.permissionRequest,
+    this.tokensUsed,
+    this.contextSize,
   });
 
   const AcpUpdate.delta(String text) : this._(AcpUpdateKind.delta, text);
@@ -1302,6 +1382,10 @@ class AcpUpdate {
   /// Host agent lifecycle (`idle` / `running` / …) from ADSM status events.
   const AcpUpdate.daemonStatus(String status)
       : this._(AcpUpdateKind.daemonStatus, status);
+
+  /// Context-window usage from ACP `usage_update`.
+  const AcpUpdate.usage({required int used, required int size})
+      : this._(AcpUpdateKind.usage, '', tokensUsed: used, contextSize: size);
 
   AcpUpdate.toolCall(ToolCallState tool)
       : this._(AcpUpdateKind.tool, tool.title, tool: tool);
@@ -1361,6 +1445,13 @@ class AcpUpdate {
         return AcpUpdate.status('Session', title: title);
       }
       return const AcpUpdate.ignored();
+    }
+
+    if (type == 'usage_update' || type == 'usageUpdate') {
+      final used = _asInt(update['used']);
+      final size = _asInt(update['size']);
+      if (used == null || size == null) return const AcpUpdate.ignored();
+      return AcpUpdate.usage(used: used, size: size);
     }
 
     if (type == 'agent_message_chunk' ||
@@ -1499,12 +1590,21 @@ class AcpUpdate {
     return null;
   }
 
+  static int? _asInt(Object? v) {
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v == null) return null;
+    return int.tryParse(v.toString());
+  }
+
   final AcpUpdateKind kind;
   final String text;
   final String? title;
   final ToolCallState? tool;
   final AgentSessionMode? mode;
   final PendingPermissionRequest? permissionRequest;
+  final int? tokensUsed;
+  final int? contextSize;
 }
 
 enum AcpUpdateKind {
@@ -1521,4 +1621,5 @@ enum AcpUpdateKind {
   activity,
   promptAccepted,
   daemonStatus,
+  usage,
 }

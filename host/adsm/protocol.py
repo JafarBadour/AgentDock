@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional
 
 # Bump when the wire protocol or daemon behaviour changes in a way the
 # phone must pick up (install script restarts the daemon on mismatch).
-VERSION = "0.4.3"
+VERSION = "0.4.7"
 
 # asyncio StreamReader.readline default is 64 KiB. Prompts with images and
 # transcript.sync payloads routinely exceed that and used to kill the client

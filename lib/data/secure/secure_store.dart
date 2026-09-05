@@ -29,6 +29,7 @@ class SecureStore {
   static const _anthropicApiKey = 'anthropic_api_key';
   static const _gcpSpeechApiKey = 'gcp_speech_api_key';
   static const _gcpSpeechLanguage = 'gcp_speech_language';
+  static const _hostPasswordPrefix = 'host_password_';
 
   final FlutterSecureStorage _storage;
 
@@ -60,6 +61,35 @@ class SecureStore {
   Future<bool> hasSshPrivateKey() async {
     final value = await readSshPrivateKey();
     return value != null && value.trim().isNotEmpty;
+  }
+
+  static String _hostPasswordKey(String hostId) => '$_hostPasswordPrefix$hostId';
+
+  /// Per-host SSH password (never stored in SQLite).
+  Future<void> saveHostPassword(String hostId, String? password) async {
+    final key = _hostPasswordKey(hostId);
+    if (password == null || password.isEmpty) {
+      await _delete(key);
+      return;
+    }
+    await _write(key, password);
+  }
+
+  Future<String?> readHostPassword(String hostId) =>
+      _read(_hostPasswordKey(hostId));
+
+  Future<bool> hasHostPassword(String hostId) async {
+    final value = await readHostPassword(hostId);
+    return value != null && value.isNotEmpty;
+  }
+
+  Future<void> clearHostPassword(String hostId) =>
+      _delete(_hostPasswordKey(hostId));
+
+  /// True when we can open SSH to [hostId]: either a global key or a host password.
+  Future<bool> canAuthenticateToHost(String? hostId) async {
+    if (hostId != null && await hasHostPassword(hostId)) return true;
+    return hasSshPrivateKey();
   }
 
   Future<void> saveCursorApiKey(String? key) async {

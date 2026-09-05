@@ -294,7 +294,25 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ],
       );
 
-    if (widget.embedded) return body;
+    if (widget.embedded) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.tonalIcon(
+                onPressed: () => context.push('/settings/mcp/new'),
+                icon: const Icon(Icons.add),
+                label: const Text('Add MCP'),
+              ),
+            ),
+          ),
+          Expanded(child: body),
+        ],
+      );
+    }
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),

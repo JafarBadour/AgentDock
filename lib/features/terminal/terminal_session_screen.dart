@@ -5,8 +5,10 @@ import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:xterm/xterm.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/secure/safe_log.dart';
 
@@ -24,6 +26,7 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   final _terminal = Terminal(maxLines: 10000);
   final _terminalController = TerminalController();
 
+  SSHClient? _client;
   SSHSession? _session;
   StreamSubscription<List<int>>? _stdoutSub;
   StreamSubscription<List<int>>? _stderrSub;
@@ -110,10 +113,13 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
       _title = host.displayLabel;
 
       final ssh = ref.read(sshServiceProvider);
-      final client = await ssh.connect(host).timeout(
+      // Exclusive client so an interactive shell is not fighting ADSM/agent
+      // channels on the shared pool connection.
+      final client = await ssh.connectExclusive(host).timeout(
         const Duration(seconds: 25),
         onTimeout: () => throw TimeoutException('SSH connect timed out'),
       );
+      _client = client;
       final session = await client
           .shell(
             pty: SSHPtyConfig(
@@ -165,6 +171,7 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
     } catch (e) {
       SafeLog.d('terminal connect failed', e);
       _terminal.write('\r\nFailed: $e\r\n');
+      await _closeClient();
       if (mounted) {
         setState(() {
           _connecting = false;
@@ -174,15 +181,34 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
     }
   }
 
+  Future<void> _closeClient() async {
+    final client = _client;
+    _client = null;
+    if (client == null) return;
+    try {
+      client.close();
+    } catch (_) {}
+  }
+
   Future<void> _disconnect() async {
     await _stdoutSub?.cancel();
     await _stderrSub?.cancel();
+    _stdoutSub = null;
+    _stderrSub = null;
     try {
       _session?.close();
     } catch (_) {}
-    // The client is pooled and shared with agent sessions; closing it here
-    // would drop them too. Releasing the shell channel is enough.
     _session = null;
+    await _closeClient();
+  }
+
+  void _closeScreen() {
+    if (context.canPop()) {
+      context.pop();
+      return;
+    }
+    // Desktop center-column embed has no navigator stack under this screen.
+    context.go('/agents');
   }
 
   void _sendKey(String seq) {
@@ -200,9 +226,19 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final desktop = useDesktopShell(context);
+    final canPop = GoRouter.of(context).canPop();
+
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
+        leading: desktop || !canPop
+            ? IconButton(
+                tooltip: 'Close terminal',
+                icon: const Icon(Icons.close),
+                onPressed: _closeScreen,
+              )
+            : null,
         title: Text(_title),
         actions: [
           IconButton(
@@ -247,7 +283,9 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
                 dense: true,
                 title: Text(
                   _error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer),
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onErrorContainer,
+                  ),
                 ),
               ),
             ),
@@ -262,14 +300,15 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
               deleteDetection: true,
             ),
           ),
-          _SpecialKeysBar(
-            onSend: _sendKey,
-            onCopy: () => unawaited(_copySelection()),
-            onPaste: () => unawaited(_pasteClipboard()),
-            onClearSelection:
-                _hasSelection ? _terminalController.clearSelection : null,
-            hasSelection: _hasSelection,
-          ),
+          if (!desktop)
+            _SpecialKeysBar(
+              onSend: _sendKey,
+              onCopy: () => unawaited(_copySelection()),
+              onPaste: () => unawaited(_pasteClipboard()),
+              onClearSelection:
+                  _hasSelection ? _terminalController.clearSelection : null,
+              hasSelection: _hasSelection,
+            ),
         ],
       ),
     );
