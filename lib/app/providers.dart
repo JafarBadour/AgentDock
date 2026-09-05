@@ -397,6 +397,7 @@ final scheduleSyncServiceProvider = Provider<ScheduleSyncService>((ref) {
     db: ref.watch(appDatabaseProvider),
     ssh: ref.watch(sshServiceProvider),
     secureStore: ref.watch(secureStoreProvider),
+    dock: ref.watch(agentDockServiceProvider),
   );
 });
 
@@ -404,6 +405,7 @@ final scheduleRunnerProvider = Provider<ScheduleRunner>((ref) {
   final runner = ScheduleRunner(
     db: ref.watch(appDatabaseProvider),
     sync: ref.watch(scheduleSyncServiceProvider),
+    dock: ref.watch(agentDockServiceProvider),
     onJobsChanged: () {
       ref.read(scheduledJobsTickProvider.notifier).state++;
       ref.read(chatActivityTickProvider.notifier).state++;

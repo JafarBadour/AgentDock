@@ -5,6 +5,7 @@ import '../data/models/scheduled_job.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'adsm_client.dart';
+import 'agentdock_service.dart';
 import 'ssh_service.dart';
 
 /// Pushes / pulls scheduled jobs between phone SQLite and host ADSM.
@@ -13,13 +14,16 @@ class ScheduleSyncService {
     required AppDatabase db,
     required SshService ssh,
     required SecureStore secureStore,
+    required AgentDockService dock,
   })  : _db = db,
         _ssh = ssh,
-        _secureStore = secureStore;
+        _secureStore = secureStore,
+        _dock = dock;
 
   final AppDatabase _db;
   final SshService _ssh;
   final SecureStore _secureStore;
+  final AgentDockService _dock;
 
   Future<Host?> hostForChat(String chatId) async {
     final chat = await _db.getChat(chatId);
@@ -146,7 +150,21 @@ class ScheduleSyncService {
   }
 
   /// Pull all schedules from [host] and merge into local SQLite.
-  Future<int> pullFromHost(Host host) async {
+  ///
+  /// Schedules reference chat ids. When [syncCatalogFirst] is true (Automate
+  /// tab open), import agents first so foreign keys resolve. Otherwise we
+  /// still fetch missing agent records one-by-one.
+  Future<int> pullFromHost(
+    Host host, {
+    bool syncCatalogFirst = false,
+  }) async {
+    if (syncCatalogFirst) {
+      try {
+        await _dock.syncHostCatalog(host);
+      } catch (e) {
+        SafeLog.d('schedule pull: catalog sync failed for ${host.id}', e);
+      }
+    }
     try {
       final result = await _withClient(host, (c) {
         return c.request('schedules.list', {});
@@ -158,9 +176,19 @@ class ScheduleSyncService {
         if (item is! Map) continue;
         final job = ScheduledJob.fromHostJson(Map<String, dynamic>.from(item));
         if (job.chatId.isEmpty || job.id.isEmpty) continue;
-        // Skip jobs whose chat is unknown locally (other device / deleted).
-        final chat = await _db.getChat(job.chatId);
-        if (chat == null) continue;
+        var chat = await _db.getChat(job.chatId);
+        if (chat == null) {
+          await _ensureLocalChat(host, job.chatId);
+          chat = await _db.getChat(job.chatId);
+        }
+        if (chat == null) {
+          // FK requires the chat row; without it we cannot store the job.
+          SafeLog.d(
+            'schedule pull skip ${job.id}: chat ${job.chatId} missing on '
+            '${host.displayLabel}',
+          );
+          continue;
+        }
         await _db.upsertScheduledJob(job);
         n++;
       }
@@ -171,13 +199,45 @@ class ScheduleSyncService {
     }
   }
 
+  /// Import a single agent record so a schedule FK can land.
+  Future<void> _ensureLocalChat(Host host, String chatId) async {
+    try {
+      final record = await _dock.pullAgentRecord(host, chatId);
+      if (record == null || record.repoPath.isEmpty) return;
+      final repo = await _db.findOrCreateRepoByPath(
+        hostId: host.id,
+        remotePath: record.repoPath,
+        name: record.repoName,
+      );
+      final sort = await _db.nextChatSortOrder(repo.id);
+      await _db.upsertChat(record.toChat(repoId: repo.id, sortOrder: sort));
+    } catch (e) {
+      SafeLog.d('schedule ensure chat $chatId failed', e);
+    }
+  }
+
   /// Pull from every known host (best-effort).
-  Future<void> pullAllHosts() async {
+  Future<void> pullAllHosts({bool syncCatalogFirst = false}) async {
     final hosts = await _db.listHosts();
     final hasKey = await _secureStore.hasSshPrivateKey();
     for (final host in hosts) {
       if (!hasKey && !await _secureStore.hasHostPassword(host.id)) continue;
-      await pullFromHost(host);
+      await pullFromHost(host, syncCatalogFirst: syncCatalogFirst);
+    }
+  }
+
+  /// Re-push every local schedule to its host (covers a failed first upsert).
+  Future<void> pushAllLocalJobs() async {
+    final jobs = await _db.listScheduledJobs();
+    for (final job in jobs) {
+      try {
+        final hostJob = await upsertToHost(job);
+        if (hostJob != null) {
+          await _db.upsertScheduledJob(hostJob);
+        }
+      } catch (e) {
+        SafeLog.d('schedule pushAll ${job.id} failed', e);
+      }
     }
   }
 }

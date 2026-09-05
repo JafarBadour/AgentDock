@@ -3,6 +3,7 @@ import 'dart:async';
 import '../data/local/app_database.dart';
 import '../data/models/scheduled_job.dart';
 import '../data/secure/safe_log.dart';
+import 'agentdock_service.dart';
 import 'schedule_sync_service.dart';
 
 /// Thin phone-side schedule helper: sync/pull + host `run_now`.
@@ -12,12 +13,15 @@ class ScheduleRunner {
   ScheduleRunner({
     required AppDatabase db,
     required ScheduleSyncService sync,
+    required AgentDockService dock,
     this.onJobsChanged,
   })  : _db = db,
-        _sync = sync;
+        _sync = sync,
+        _dock = dock;
 
   final AppDatabase _db;
   final ScheduleSyncService _sync;
+  final AgentDockService _dock;
   final void Function()? onJobsChanged;
 
   Timer? _timer;
@@ -52,11 +56,17 @@ class ScheduleRunner {
   }
 
   /// Pull host schedule state into local SQLite.
-  Future<void> tick() async {
+  ///
+  /// When [syncCatalogFirst] is true, agent chats are imported before schedules
+  /// so cross-device Automate lists can resolve foreign keys.
+  Future<void> tick({bool syncCatalogFirst = false}) async {
     if (_ticking) return;
     _ticking = true;
     try {
-      await _sync.pullAllHosts();
+      // Mac may have saved locally while host upsert failed — retry push first
+      // so the phone can pull a complete set.
+      await _sync.pushAllLocalJobs();
+      await _sync.pullAllHosts(syncCatalogFirst: syncCatalogFirst);
       onJobsChanged?.call();
     } catch (e) {
       SafeLog.d('schedule sync tick failed', e);
@@ -68,6 +78,13 @@ class ScheduleRunner {
   /// Local + host upsert used by Automate UI and `/schedule`.
   Future<void> saveJob(ScheduledJob job) async {
     await _db.upsertScheduledJob(job);
+    // Agent record must land on the host before (or with) the schedule, or
+    // other devices cannot import the job (SQLite FK needs the chat row).
+    try {
+      await _dock.pushChatById(job.chatId);
+    } catch (e) {
+      SafeLog.d('schedule save: push agent ${job.chatId} failed', e);
+    }
     try {
       final hostJob = await _sync.upsertToHost(job);
       if (hostJob != null) {
