@@ -1,4 +1,4 @@
-name: Release Windows / Linux / iOS
+name: Release builds
 
 on:
   workflow_dispatch:
@@ -13,6 +13,29 @@ env:
   FLUTTER_VERSION: '3.41.8'
 
 jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build apk --release
+      - name: Rename APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk AgentDock-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentDock-android
+          path: AgentDock-android.apk
+
   windows:
     name: Build Windows
     runs-on: windows-latest
@@ -85,7 +108,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [windows, linux, ios]
+    needs: [android, windows, linux, ios]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -97,12 +120,14 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            ## Agent Dock desktop & iOS builds
+            ## Agent Dock builds
 
+            - **Android**: install `AgentDock-android.apk` (sideload)
             - **Windows**: unzip `AgentDock-windows-x64.zip` and run `agent_dock.exe`
             - **Linux (Ubuntu)**: `tar -xzf AgentDock-linux-x64.tar.gz` then run `./agent_dock`
             - **iOS**: `AgentDock-ios-unsigned.zip` is an unsigned `Runner.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
           files: |
+            artifacts/AgentDock-android/AgentDock-android.apk
             artifacts/AgentDock-windows-x64/AgentDock-windows-x64.zip
             artifacts/AgentDock-linux-x64/AgentDock-linux-x64.tar.gz
             artifacts/AgentDock-ios-unsigned/AgentDock-ios-unsigned.zip
