@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../features/agents/agents_screen.dart';
 import '../features/agents/chat_screen.dart';
 import '../features/agents/new_agent_flow.dart';
+import '../features/agents/project_files_screen.dart';
 import '../features/automations/automations_screen.dart';
 import '../features/connect/connect_screen.dart';
 import '../features/hosts/hosts_screen.dart';
@@ -78,8 +79,16 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
 
   void _selectPanel(DesktopRightPanel panel) {
     final current = ref.read(desktopRightPanelProvider);
-    ref.read(desktopRightPanelProvider.notifier).state =
-        current == panel ? DesktopRightPanel.none : panel;
+    final next = current == panel ? DesktopRightPanel.none : panel;
+    ref.read(desktopRightPanelProvider.notifier).state = next;
+    if (next != DesktopRightPanel.files) {
+      ref.read(desktopProjectFilesProvider.notifier).state = null;
+    }
+  }
+
+  void _closeRightPanel() {
+    ref.read(desktopRightPanelProvider.notifier).state = DesktopRightPanel.none;
+    ref.read(desktopProjectFilesProvider.notifier).state = null;
   }
 
   Widget _centerColumn(String path, String? chatId) {
@@ -157,9 +166,7 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
                 color: scheme.surfaceContainer.withValues(alpha: 0.72),
                 child: _DesktopRightPanel(
                   panel: panel,
-                  onClose: () => ref
-                      .read(desktopRightPanelProvider.notifier)
-                      .state = DesktopRightPanel.none,
+                  onClose: _closeRightPanel,
                 ),
               ),
             ),
@@ -342,7 +349,7 @@ class _DesktopChatPlaceholder extends StatelessWidget {
   }
 }
 
-class _DesktopRightPanel extends StatelessWidget {
+class _DesktopRightPanel extends ConsumerWidget {
   const _DesktopRightPanel({
     required this.panel,
     required this.onClose,
@@ -351,25 +358,38 @@ class _DesktopRightPanel extends StatelessWidget {
   final DesktopRightPanel panel;
   final VoidCallback onClose;
 
-  String get _title => switch (panel) {
-        DesktopRightPanel.automate => 'Automate',
-        DesktopRightPanel.hosts => 'Hosts',
-        DesktopRightPanel.connect => 'Connect',
-        DesktopRightPanel.settings => 'Settings',
-        DesktopRightPanel.none => '',
-      };
-
-  Widget get _body => switch (panel) {
-        DesktopRightPanel.automate =>
-          const AutomationsScreen(embedded: true),
-        DesktopRightPanel.hosts => const HostsScreen(embedded: true),
-        DesktopRightPanel.connect => const ConnectScreen(embedded: true),
-        DesktopRightPanel.settings => const SettingsScreen(embedded: true),
-        DesktopRightPanel.none => const SizedBox.shrink(),
-      };
-
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final filesArgs = ref.watch(desktopProjectFilesProvider);
+    final title = switch (panel) {
+      DesktopRightPanel.automate => 'Automate',
+      DesktopRightPanel.hosts => 'Hosts',
+      DesktopRightPanel.connect => 'Connect',
+      DesktopRightPanel.settings => 'Settings',
+      DesktopRightPanel.files => filesArgs?.title ?? 'Project files',
+      DesktopRightPanel.none => '',
+    };
+
+    final body = switch (panel) {
+      DesktopRightPanel.automate =>
+        const AutomationsScreen(embedded: true),
+      DesktopRightPanel.hosts => const HostsScreen(embedded: true),
+      DesktopRightPanel.connect => const ConnectScreen(embedded: true),
+      DesktopRightPanel.settings => const SettingsScreen(embedded: true),
+      DesktopRightPanel.files => filesArgs == null
+          ? const Center(child: Text('No project selected'))
+          : ProjectFilesScreen(
+              key: ValueKey(
+                '${filesArgs.host.id}:${filesArgs.rootPath}',
+              ),
+              host: filesArgs.host,
+              rootPath: filesArgs.rootPath,
+              title: filesArgs.title,
+              embedded: true,
+            ),
+      DesktopRightPanel.none => const SizedBox.shrink(),
+    };
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -379,7 +399,7 @@ class _DesktopRightPanel extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  _title,
+                  title,
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
               ),
@@ -392,7 +412,7 @@ class _DesktopRightPanel extends StatelessWidget {
           ),
         ),
         const Divider(height: 1),
-        Expanded(child: _body),
+        Expanded(child: body),
       ],
     );
   }

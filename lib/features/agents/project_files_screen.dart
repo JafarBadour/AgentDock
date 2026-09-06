@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
 import '../../data/secure/safe_log.dart';
@@ -20,11 +21,15 @@ class ProjectFilesScreen extends ConsumerStatefulWidget {
     required this.host,
     required this.rootPath,
     this.title,
+    this.embedded = false,
   });
 
   final Host host;
   final String rootPath;
   final String? title;
+
+  /// When true (desktop right panel), omit the full-window AppBar.
+  final bool embedded;
 
   static Future<void> open(
     BuildContext context, {
@@ -32,6 +37,18 @@ class ProjectFilesScreen extends ConsumerStatefulWidget {
     required String rootPath,
     String? title,
   }) {
+    if (useDesktopShell(context)) {
+      final container = ProviderScope.containerOf(context);
+      container.read(desktopProjectFilesProvider.notifier).state =
+          DesktopProjectFilesArgs(
+        host: host,
+        rootPath: rootPath,
+        title: title,
+      );
+      container.read(desktopRightPanelProvider.notifier).state =
+          DesktopRightPanel.files;
+      return Future.value();
+    }
     return Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ProjectFilesScreen(
@@ -559,6 +576,151 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                 ? '/'
                 : _path!.substring(_root.length));
 
+    final pathBar = Material(
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: 'Up',
+              onPressed: !canGoUp || _loading || _busy ? null : _goUp,
+              icon: const Icon(Icons.arrow_upward),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SelectableText(
+                    relative,
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  Text(
+                    _root,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              tooltip: 'Refresh',
+              onPressed: _path == null || _loading || _busy
+                  ? null
+                  : () => _load(_path!),
+              icon: const Icon(Icons.refresh),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final body = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (widget.embedded)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.host.displayLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'New folder',
+                  onPressed: _busy || _loading ? null : _mkdir,
+                  icon: const Icon(Icons.create_new_folder_outlined, size: 20),
+                ),
+                IconButton(
+                  tooltip: 'Upload',
+                  onPressed: _busy || _loading ? null : _upload,
+                  icon: const Icon(Icons.upload_file, size: 20),
+                ),
+              ],
+            ),
+          ),
+        pathBar,
+        if (_busy || _status != null)
+          LinearProgressIndicator(
+            value: _busy ? null : 1,
+          ),
+        if (_status != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              _status!,
+              style: Theme.of(context).textTheme.bodySmall,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        if (_error != null)
+          Material(
+            color: Theme.of(context).colorScheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(
+                _error!,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onErrorContainer,
+                ),
+              ),
+            ),
+          ),
+        Expanded(
+          child: _loading
+              ? const Center(child: CircularProgressIndicator())
+              : _entries.isEmpty
+                  ? const Center(child: Text('Empty folder'))
+                  : ListView.separated(
+                      itemCount: _entries.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final entry = _entries[index];
+                        return ListTile(
+                          leading: Icon(_iconFor(entry)),
+                          title: Text(entry.name),
+                          subtitle: entry.sizeLabel.isEmpty
+                              ? null
+                              : Text(entry.sizeLabel),
+                          trailing: entry.isDirectory
+                              ? const Icon(Icons.chevron_right)
+                              : IconButton(
+                                  tooltip: _isPdf(entry.name)
+                                      ? 'View PDF'
+                                      : 'Download to Downloads',
+                                  icon: Icon(
+                                    _isPdf(entry.name)
+                                        ? Icons.visibility_outlined
+                                        : Icons.download,
+                                  ),
+                                  onPressed: _busy
+                                      ? null
+                                      : () => _isPdf(entry.name)
+                                          ? _viewPdf(entry)
+                                          : _download(entry),
+                                ),
+                          onTap: entry.isDirectory
+                              ? () => _openDir(entry.name)
+                              : _isPdf(entry.name)
+                                  ? () => _viewPdf(entry)
+                                  : () => _showEntryMenu(entry),
+                          onLongPress: () => _showEntryMenu(entry),
+                        );
+                      },
+                    ),
+        ),
+      ],
+    );
+
+    if (widget.embedded) return body;
+
     return Scaffold(
       appBar: AppBar(
         title: Column(
@@ -584,120 +746,7 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
           ),
         ],
       ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Material(
-            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-              child: Row(
-                children: [
-                  IconButton(
-                    tooltip: 'Up',
-                    onPressed: !canGoUp || _loading || _busy ? null : _goUp,
-                    icon: const Icon(Icons.arrow_upward),
-                  ),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        SelectableText(
-                          relative,
-                          style: Theme.of(context).textTheme.titleSmall,
-                        ),
-                        Text(
-                          _root,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Refresh',
-                    onPressed: _path == null || _loading || _busy
-                        ? null
-                        : () => _load(_path!),
-                    icon: const Icon(Icons.refresh),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (_busy || _status != null)
-            LinearProgressIndicator(
-              value: _busy ? null : 1,
-            ),
-          if (_status != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-              child: Text(
-                _status!,
-                style: Theme.of(context).textTheme.bodySmall,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          if (_error != null)
-            Material(
-              color: Theme.of(context).colorScheme.errorContainer,
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Text(
-                  _error!,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.onErrorContainer,
-                  ),
-                ),
-              ),
-            ),
-          Expanded(
-            child: _loading
-                ? const Center(child: CircularProgressIndicator())
-                : _entries.isEmpty
-                    ? const Center(child: Text('Empty folder'))
-                    : ListView.separated(
-                        itemCount: _entries.length,
-                        separatorBuilder: (_, _) => const Divider(height: 1),
-                        itemBuilder: (context, index) {
-                          final entry = _entries[index];
-                          return ListTile(
-                            leading: Icon(_iconFor(entry)),
-                            title: Text(entry.name),
-                            subtitle: entry.sizeLabel.isEmpty
-                                ? null
-                                : Text(entry.sizeLabel),
-                            trailing: entry.isDirectory
-                                ? const Icon(Icons.chevron_right)
-                                : IconButton(
-                                    tooltip: _isPdf(entry.name)
-                                        ? 'View PDF'
-                                        : 'Download to Downloads',
-                                    icon: Icon(
-                                      _isPdf(entry.name)
-                                          ? Icons.visibility_outlined
-                                          : Icons.download,
-                                    ),
-                                    onPressed: _busy
-                                        ? null
-                                        : () => _isPdf(entry.name)
-                                            ? _viewPdf(entry)
-                                            : _download(entry),
-                                  ),
-                            onTap: entry.isDirectory
-                                ? () => _openDir(entry.name)
-                                : _isPdf(entry.name)
-                                    ? () => _viewPdf(entry)
-                                    : () => _showEntryMenu(entry),
-                            onLongPress: () => _showEntryMenu(entry),
-                          );
-                        },
-                      ),
-          ),
-        ],
-      ),
+      body: body,
     );
   }
 }

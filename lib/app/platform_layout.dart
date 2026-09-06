@@ -83,6 +83,7 @@ void openAppPanel(
       context.go('/connect');
     case DesktopRightPanel.settings:
       context.go('/settings');
+    case DesktopRightPanel.files:
     case DesktopRightPanel.none:
       break;
   }

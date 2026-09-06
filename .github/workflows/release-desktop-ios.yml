@@ -36,6 +36,27 @@ jobs:
           name: AgentDock-android
           path: AgentDock-android.apk
 
+  macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter build macos --release
+      - name: Package
+        run: |
+          cd build/macos/Build/Products/Release
+          zip -r "$GITHUB_WORKSPACE/AgentDock-macos.zip" "Agent Dock.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentDock-macos
+          path: AgentDock-macos.zip
+
   windows:
     name: Build Windows
     runs-on: windows-latest
@@ -97,10 +118,12 @@ jobs:
       - run: flutter pub get
       - name: Build iOS (no codesign)
         run: flutter build ios --release --no-codesign
-      - name: Package Runner.app
+      - name: Package Agent Dock.app
         run: |
           cd build/ios/iphoneos
-          zip -r "$GITHUB_WORKSPACE/AgentDock-ios-unsigned.zip" Runner.app
+          APP="Agent Dock.app"
+          if [ ! -d "$APP" ]; then APP="Runner.app"; fi
+          zip -r "$GITHUB_WORKSPACE/AgentDock-ios-unsigned.zip" "$APP"
       - uses: actions/upload-artifact@v4
         with:
           name: AgentDock-ios-unsigned
@@ -108,7 +131,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [android, windows, linux, ios]
+    needs: [android, macos, windows, linux, ios]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -122,11 +145,13 @@ jobs:
           body: |
             ## Agent Dock builds
 
+            - **macOS**: unzip `AgentDock-macos.zip` and open `Agent Dock.app`
             - **Android**: install `AgentDock-android.apk` (sideload)
             - **Windows**: unzip `AgentDock-windows-x64.zip` and run `agent_dock.exe`
             - **Linux (Ubuntu)**: `tar -xzf AgentDock-linux-x64.tar.gz` then run `./agent_dock`
-            - **iOS**: `AgentDock-ios-unsigned.zip` is an unsigned `Runner.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
+            - **iOS**: `AgentDock-ios-unsigned.zip` contains unsigned `Agent Dock.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
           files: |
+            artifacts/AgentDock-macos/AgentDock-macos.zip
             artifacts/AgentDock-android/AgentDock-android.apk
             artifacts/AgentDock-windows-x64/AgentDock-windows-x64.zip
             artifacts/AgentDock-linux-x64/AgentDock-linux-x64.tar.gz

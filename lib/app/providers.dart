@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../data/local/app_database.dart';
+import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import '../services/adsm_client.dart';
@@ -449,11 +450,30 @@ enum DesktopRightPanel {
   hosts,
   connect,
   settings,
+  /// Project file browser for the active chat's repo (opened from chat).
+  files,
 }
 
-/// Right-hand panel on macOS / desktop (Automate, Hosts, Connect, Settings).
+/// Args for the desktop project-files right panel.
+class DesktopProjectFilesArgs {
+  const DesktopProjectFilesArgs({
+    required this.host,
+    required this.rootPath,
+    this.title,
+  });
+
+  final Host host;
+  final String rootPath;
+  final String? title;
+}
+
+/// Right-hand panel on macOS / desktop (Automate, Hosts, Connect, Settings, Files).
 final desktopRightPanelProvider =
     StateProvider<DesktopRightPanel>((ref) => DesktopRightPanel.none);
+
+/// Host + path for [DesktopRightPanel.files]; cleared when the panel closes.
+final desktopProjectFilesProvider =
+    StateProvider<DesktopProjectFilesArgs?>((ref) => null);
 
 /// True while the Flutter app is in the resumed lifecycle state.
 final appInForegroundProvider = StateProvider<bool>((ref) => true);
