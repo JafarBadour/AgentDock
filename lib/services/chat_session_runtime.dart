@@ -1349,10 +1349,12 @@ class ChatSessionRuntime extends ChangeNotifier {
       final st = await (_session as AdsmSession).refreshDaemonStatus();
       if (_disposed) return;
       final host = (st ?? '').toLowerCase();
-      if (host == 'running') {
-        activityLabel = activityLabel?.isNotEmpty == true
-            ? activityLabel
-            : 'Working on host…';
+      if (host == 'running' || host == 'waiting_permission') {
+        activityLabel = host == 'waiting_permission'
+            ? 'Waiting for permission'
+            : (activityLabel?.isNotEmpty == true
+                ? activityLabel
+                : 'Working on host…');
         remoteTurnActive = true;
         promptInFlight = true;
         notifyListeners();
@@ -1628,6 +1630,13 @@ class ChatSessionRuntime extends ChangeNotifier {
             _notifyUi(immediate: true);
             if (!closed) _drainOutboundQueue();
           }
+        } else if (st == 'waiting_permission') {
+          sendingToHost = false;
+          remoteTurnActive = true;
+          promptInFlight = true;
+          activityLabel = 'Waiting for permission';
+          _noteHostActivity();
+          _notifyUi(immediate: true);
         } else if (st == 'running') {
           // Host still on a turn — keep busy chrome even when journal events
           // went quiet (HPC polls, long shell). Re-attach after a false idle.

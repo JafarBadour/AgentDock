@@ -14,9 +14,16 @@ import '../../data/secure/safe_log.dart';
 import '../../services/local_host_bootstrap.dart';
 
 class TerminalSessionScreen extends ConsumerStatefulWidget {
-  const TerminalSessionScreen({super.key, required this.hostId});
+  const TerminalSessionScreen({
+    super.key,
+    required this.hostId,
+    this.initialDirectory,
+  });
 
   final String hostId;
+
+  /// Remote path to `cd` into after the shell opens (agent project directory).
+  final String? initialDirectory;
 
   @override
   ConsumerState<TerminalSessionScreen> createState() =>
@@ -151,6 +158,19 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
       _terminal.buffer.clear();
       _terminal.buffer.setCursor(0, 0);
 
+      final cwd = widget.initialDirectory?.trim();
+      if (cwd != null && cwd.isNotEmpty) {
+        final leaf = cwd.split(RegExp(r'[/\\]+')).where((s) => s.isNotEmpty);
+        final name = leaf.isEmpty ? cwd : leaf.last;
+        _title = '${host.displayLabel} · $name';
+        // Interactive login shells start in $HOME — jump to the agent dir.
+        session.write(
+          Uint8List.fromList(
+            utf8.encode('cd ${_shellQuote(cwd)}\n'),
+          ),
+        );
+      }
+
       _terminal.onTitleChange = (title) {
         if (!mounted) return;
         setState(() => _title = title.isEmpty ? host.displayLabel : title);
@@ -237,6 +257,9 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
     if (session == null) return;
     session.write(Uint8List.fromList(utf8.encode(seq)));
   }
+
+  static String _shellQuote(String value) =>
+      "'${value.replaceAll("'", "'\\''")}'";
 
   @override
   void dispose() {

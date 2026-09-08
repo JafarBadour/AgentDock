@@ -191,15 +191,17 @@ class _ToolCallCardState extends State<ToolCallCard> {
       padding: const EdgeInsets.symmetric(vertical: 1),
       child: Material(
         color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: hasDetails ? () => setState(() => _expanded = !_expanded) : null,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: hasDetails
+                    ? () => setState(() => _expanded = !_expanded)
+                    : null,
+                child: Row(
                   children: [
                     Icon(
                       hardFail
@@ -248,7 +250,9 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       ),
                     ),
                     const SizedBox(width: 6),
-                    if (hardFail || softFail || (active && tool.isPollingWait)) ...[
+                    if (hardFail ||
+                        softFail ||
+                        (active && tool.isPollingWait)) ...[
                       Text(
                         tool.statusLabel,
                         style: theme.textTheme.labelSmall?.copyWith(
@@ -271,45 +275,45 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       ),
                   ],
                 ),
-                if (_expanded && hasDetails)
-                  Padding(
-                    padding: const EdgeInsets.only(left: 22, top: 8, bottom: 4),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (tool.locations.isNotEmpty) ...[
-                          _SectionLabel('Paths'),
-                          const SizedBox(height: 4),
-                          ...tool.locations.map(
-                            (p) => Padding(
-                              padding: const EdgeInsets.only(bottom: 2),
-                              child: Text(
-                                p,
-                                style: theme.textTheme.bodySmall?.copyWith(
-                                  fontFamily: 'monospace',
-                                  fontSize: 11,
-                                ),
+              ),
+              if (_expanded && hasDetails)
+                Padding(
+                  padding: const EdgeInsets.only(left: 22, top: 8, bottom: 4),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (tool.locations.isNotEmpty) ...[
+                        _SectionLabel('Paths'),
+                        const SizedBox(height: 4),
+                        ...tool.locations.map(
+                          (p) => Padding(
+                            padding: const EdgeInsets.only(bottom: 2),
+                            child: SelectableText(
+                              p,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                fontFamily: 'monospace',
+                                fontSize: 11,
                               ),
                             ),
                           ),
-                          const SizedBox(height: 8),
-                        ],
-                        if (tool.rawInput?.isNotEmpty ?? false) ...[
-                          _SectionLabel('Input'),
-                          const SizedBox(height: 4),
-                          _CodeBlock(text: tool.rawInput!),
-                          const SizedBox(height: 8),
-                        ],
-                        if (tool.rawOutput?.isNotEmpty ?? false) ...[
-                          _SectionLabel('Output'),
-                          const SizedBox(height: 4),
-                          _CodeBlock(text: tool.rawOutput!),
-                        ],
+                        ),
+                        const SizedBox(height: 8),
                       ],
-                    ),
+                      if (tool.rawInput?.isNotEmpty ?? false) ...[
+                        _SectionLabel('Input'),
+                        const SizedBox(height: 4),
+                        _CodeBlock(text: tool.rawInput!),
+                        const SizedBox(height: 8),
+                      ],
+                      if (tool.rawOutput?.isNotEmpty ?? false) ...[
+                        _SectionLabel('Output'),
+                        const SizedBox(height: 4),
+                        _CodeBlock(text: tool.rawOutput!),
+                      ],
+                    ],
                   ),
-              ],
-            ),
+                ),
+            ],
           ),
         ),
       ),

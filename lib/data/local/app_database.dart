@@ -34,7 +34,7 @@ class AppDatabase {
         p.join((await getApplicationDocumentsDirectory()).path, 'agentic_phone.db');
     return openDatabase(
       path,
-      version: 14,
+      version: 15,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -172,6 +172,30 @@ CREATE TABLE messages (
             'UPDATE chats SET title_updated_at = updated_at '
             'WHERE title_updated_at IS NULL',
           );
+        }
+        if (oldVersion < 15) {
+          // Agents list sorts by updated_at = last user/assistant message.
+          await db.execute('''
+UPDATE chats
+SET updated_at = (
+  SELECT MAX(m.created_at) FROM messages m
+  WHERE m.chat_id = chats.id
+    AND m.role IN ('user', 'assistant')
+)
+WHERE EXISTS (
+  SELECT 1 FROM messages m
+  WHERE m.chat_id = chats.id
+    AND m.role IN ('user', 'assistant')
+)
+AND (
+  updated_at IS NULL
+  OR updated_at < (
+    SELECT MAX(m.created_at) FROM messages m
+    WHERE m.chat_id = chats.id
+      AND m.role IN ('user', 'assistant')
+  )
+)
+''');
         }
       },
     );
@@ -627,6 +651,10 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   Future<void> insertMessage(ChatMessage message) async {
     final db = await database;
     await db.insert('messages', message.toMap());
+    if (message.role == MessageRole.user ||
+        message.role == MessageRole.assistant) {
+      await touchChatActivity(message.chatId, at: message.createdAt);
+    }
   }
 
   Future<void> deleteMessage(String id) async {
@@ -650,11 +678,39 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   /// streams in, so the transcript on disk never lags far behind the screen.
   Future<void> upsertMessage(ChatMessage message) async {
     final db = await database;
+    final existing = await db.query(
+      'messages',
+      columns: ['id'],
+      where: 'id = ?',
+      whereArgs: [message.id],
+      limit: 1,
+    );
     await db.insert(
       'messages',
       message.toMap(),
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+    // Only bump list order on the first write of a user/assistant bubble —
+    // streaming checkpoints must not reshuffle the Agents list every token.
+    if (existing.isEmpty &&
+        (message.role == MessageRole.user ||
+            message.role == MessageRole.assistant)) {
+      await touchChatActivity(message.chatId, at: message.createdAt);
+    }
+  }
+
+  /// Move [chatId] to the top of the Agents list (newest activity first).
+  ///
+  /// Returns true when [updated_at] actually moved forward.
+  Future<bool> touchChatActivity(String chatId, {DateTime? at}) async {
+    final db = await database;
+    final ts = (at ?? DateTime.now()).toUtc().toIso8601String();
+    final n = await db.rawUpdate(
+      'UPDATE chats SET updated_at = ? '
+      'WHERE id = ? AND (updated_at IS NULL OR updated_at < ?)',
+      [ts, chatId, ts],
+    );
+    return n > 0;
   }
 
   /// Replace all messages for a chat (destructive; only for an explicit reset).

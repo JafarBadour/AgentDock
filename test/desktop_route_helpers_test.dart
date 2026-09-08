@@ -17,7 +17,6 @@ void main() {
       expect(isDesktopDetailRoute('/hosts/new'), isTrue);
       expect(isDesktopDetailRoute('/hosts/edit/abc'), isTrue);
       expect(isDesktopDetailRoute('/hosts/terminal/abc'), isTrue);
-      expect(isDesktopDetailRoute('/hosts/abc/repos'), isTrue);
       expect(isDesktopDetailRoute('/automate/new'), isTrue);
       expect(isDesktopDetailRoute('/automate/edit/1'), isTrue);
       expect(isDesktopDetailRoute('/settings/mcp/new'), isTrue);

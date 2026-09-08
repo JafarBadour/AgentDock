@@ -102,9 +102,9 @@ class HostsScreen extends ConsumerWidget {
                         host.id == kLocalThisComputerHostId
                             ? '${host.endpointLabel}\n'
                                 'Enable Remote Login (Sharing) first, then use '
-                                'repos / terminal / agents on this Mac'
+                                'terminal / agents on this Mac'
                             : '${host.endpointLabel}${via ?? ''}\n'
-                                'Tap repos · terminal opens SSH shell',
+                                'Terminal opens an SSH shell',
                       ),
                       isThreeLine: true,
                       trailing: Row(
@@ -138,10 +138,9 @@ class HostsScreen extends ConsumerWidget {
                             onPressed: () =>
                                 context.push('/hosts/edit/${host.id}'),
                           ),
-                          const Icon(Icons.chevron_right),
                         ],
                       ),
-                      onTap: () => context.push('/hosts/${host.id}/repos'),
+                      onTap: () => context.push('/hosts/edit/${host.id}'),
                       onLongPress: () =>
                           context.push('/hosts/edit/${host.id}'),
                     );

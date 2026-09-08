@@ -34,6 +34,8 @@ class MissingToolException implements Exception {
   String toString() => '$tool is not installed on the remote host.';
 }
 
+enum _BundledAdsmPush { ok, noAssets, failed }
+
 /// Why a connection attempt failed, and whether retrying could ever help.
 enum SshFailureKind {
   /// Bad credentials or an unusable key — retrying will never succeed and may
@@ -127,6 +129,26 @@ bool isTransientBridgeErrorText(String text) {
       t.contains('connection reset');
 }
 
+/// Claude/Cursor OAuth or API key rejected — user must re-authenticate.
+bool isAgentAuthFailureText(String text) {
+  final t = text.toLowerCase();
+  return t.contains('authentication_failed') ||
+      t.contains('errorkind\': \'authentication') ||
+      t.contains('"errorkind":"authentication') ||
+      t.contains('oauth access token has expired') ||
+      t.contains('re-authenticate') ||
+      t.contains('reauthenticate') ||
+      (t.contains('401') &&
+          (t.contains('oauth') ||
+              t.contains('token') ||
+              t.contains('unauthorized') ||
+              t.contains('authenticate'))) ||
+      t.contains('not logged in') ||
+      t.contains('please run /login') ||
+      t.contains('claude auth login') ||
+      t.contains('agent login');
+}
+
 /// Caps concurrent exec channels on one connection.
 ///
 /// sshd's `MaxSessions` defaults to 10 channels per network connection. Now
@@ -179,8 +201,29 @@ class SshService {
   Timer? _healthTimer;
   bool _suspended = false;
 
+  /// Hosts whose ADSM already meets [kRequiredAdsmVersion] this process.
+  /// Avoids re-uploading / restarting the daemon on every chat reconnect.
+  final Map<String, String> _adsmVerifiedVersion = {};
+
+  /// Serializes [ensureAdsm] per host so parallel chats cannot double-upgrade.
+  final Map<String, Future<void>> _adsmEnsureInflight = {};
+
   static const _healthInterval = Duration(seconds: 45);
   static const _pingTimeout = Duration(seconds: 6);
+
+  /// True when this app already verified the host at the required ADSM version.
+  bool isAdsmReady(String hostId) {
+    final v = _adsmVerifiedVersion[hostId];
+    return v != null && adsmVersionMeets(v, kRequiredAdsmVersion);
+  }
+
+  void _markAdsmReady(String hostId, String version) {
+    _adsmVerifiedVersion[hostId] = version;
+  }
+
+  void clearAdsmReady(String hostId) {
+    _adsmVerifiedVersion.remove(hostId);
+  }
 
   Future<SshConnectResult> testConnection(Host host) async {
     try {
@@ -231,9 +274,48 @@ class SshService {
   }
 
   /// A dedicated connection the caller owns and must close itself.
-  Future<SSHClient> connectExclusive(Host host) => _createClient(host);
+  Future<SSHClient> connectExclusive(Host host) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await _createClient(host, exclusive: true);
+      } catch (e) {
+        lastError = e;
+        if (!_isRetryableChannelOpenError(e) || attempt == 1) {
+          throw _friendlySshOpenError(e);
+        }
+        SafeLog.d(
+          'SSH exclusive connect retry after channel open failure '
+          'for ${host.displayLabel}',
+          e,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+      }
+    }
+    throw _friendlySshOpenError(lastError ?? StateError('SSH open failed'));
+  }
 
-  Future<SSHClient> _createClient(Host host, {Set<String>? visited}) async {
+  static bool _isRetryableChannelOpenError(Object e) {
+    final t = e.toString().toLowerCase();
+    return e is SSHChannelOpenError ||
+        t.contains('open failed') ||
+        t.contains('sshchannelopenerror') ||
+        t.contains('administratively prohibited');
+  }
+
+  static Object _friendlySshOpenError(Object e) {
+    if (!_isRetryableChannelOpenError(e)) return e;
+    return StateError(
+      'SSH open failed — too many sessions on this host (or its jump host). '
+      'Close unused terminals/agents and retry. ($e)',
+    );
+  }
+
+  Future<SSHClient> _createClient(
+    Host host, {
+    Set<String>? visited,
+    bool exclusive = false,
+  }) async {
     final chain = {...?visited};
     if (!chain.add(host.id)) {
       throw StateError('ProxyJump cycle detected for ${host.displayLabel}');
@@ -275,6 +357,7 @@ class SshService {
     }
 
     final SSHSocket socket;
+    SSHClient? ownedJump;
     if (host.jumpHostId != null && host.jumpHostId!.isNotEmpty) {
       final jumpHost = await _db.getHost(host.jumpHostId!);
       if (jumpHost == null) {
@@ -282,11 +365,30 @@ class SshService {
           'ProxyJump host is missing. Edit this host and pick a jump host again.',
         );
       }
-      // The jump client is pooled too, so its lifetime is managed centrally.
-      final jumpClient = await connect(jumpHost, visited: chain);
-      socket = await jumpClient
-          .forwardLocal(host.hostname, host.port)
-          .timeout(const Duration(seconds: 20));
+      // Long-lived exclusive sessions must not burn direct-tcpip channels on
+      // the shared jump pool (that is what surfaces as "ssh open failed"
+      // when a second agent connects while another is busy).
+      final SSHClient jumpClient;
+      if (exclusive) {
+        ownedJump = await _createClient(
+          jumpHost,
+          visited: chain,
+          exclusive: true,
+        );
+        jumpClient = ownedJump;
+      } else {
+        jumpClient = await connect(jumpHost, visited: chain);
+      }
+      try {
+        socket = await jumpClient
+            .forwardLocal(host.hostname, host.port)
+            .timeout(const Duration(seconds: 20));
+      } catch (e) {
+        try {
+          ownedJump?.close();
+        } catch (_) {}
+        rethrow;
+      }
     } else {
       try {
         socket = await SshNoDelaySocket.connect(
@@ -314,8 +416,23 @@ class SshService {
         onTimeout: () => throw TimeoutException('SSH authentication timed out'),
       );
     } catch (e) {
-      client.close();
+      try {
+        client.close();
+      } catch (_) {}
+      try {
+        ownedJump?.close();
+      } catch (_) {}
       rethrow;
+    }
+    if (ownedJump != null) {
+      final jump = ownedJump;
+      unawaited(
+        client.done.whenComplete(() {
+          try {
+            jump.close();
+          } catch (_) {}
+        }),
+      );
     }
     return client;
   }
@@ -803,12 +920,43 @@ test -x "$HOME/.local/bin/claude-code-acp"
   /// Installs/starts ADSM on the host and verifies it responds at
   /// [kRequiredAdsmVersion] or newer.
   ///
-  /// Prefers uploading the ADSM package bundled with this app (so local
-  /// version bumps work before GitHub catches up). Falls back to curling
-  /// `install-adsm.sh` from GitHub `main`.
+  /// Prefers uploading the ADSM package bundled with this app. GitHub is only
+  /// used when this build has no ADSM assets (should not happen in release).
+  ///
+  /// Set [allowUpgrade] to false on reconnects so we never restart the daemon
+  /// mid-chat — that was killing the shared bridge and causing reconnect loops.
   Future<void> ensureAdsm(
     Host host, {
     void Function(String status)? onProgress,
+    bool allowUpgrade = true,
+  }) async {
+    final prev = _adsmEnsureInflight[host.id];
+    final run = () async {
+      if (prev != null) {
+        try {
+          await prev;
+        } catch (_) {}
+      }
+      await _ensureAdsmBody(
+        host,
+        onProgress: onProgress,
+        allowUpgrade: allowUpgrade,
+      );
+    }();
+    _adsmEnsureInflight[host.id] = run;
+    try {
+      await run;
+    } finally {
+      if (identical(_adsmEnsureInflight[host.id], run)) {
+        _adsmEnsureInflight.remove(host.id);
+      }
+    }
+  }
+
+  Future<void> _ensureAdsmBody(
+    Host host, {
+    void Function(String status)? onProgress,
+    required bool allowUpgrade,
   }) async {
     var client = await connect(host);
     var lastProbe = '';
@@ -960,13 +1108,25 @@ exit 0
         await refreshClient();
       }
       // Ship this app's ADSM first — GitHub main can lag a local version bump.
-      final pushed = await _pushBundledAdsm(
+      final push = await _pushBundledAdsm(
         client,
         hostId: host.id,
         onProgress: onProgress,
       );
-      if (pushed) return;
+      if (push == _BundledAdsmPush.ok) return;
 
+      if (push == _BundledAdsmPush.failed) {
+        throw MissingToolException(
+          'ADSM',
+          'Could not upload the ADSM package bundled with this app '
+          '(v$kRequiredAdsmVersion). GitHub install was skipped because '
+          'main can lag this build and would restart the daemon on every '
+          'retry.\n\nCheck SSH/SFTP to the host and reconnect.\n\n'
+          '# Probe:\n$lastProbe',
+        );
+      }
+
+      // Assets missing from this build — last resort.
       final installed = await _runAgentDockInstallScript(
         client,
         hostId: host.id,
@@ -994,13 +1154,59 @@ exit 0
       }
     }
 
+    Future<bool> waitForRequired({int attempts = 10}) async {
+      for (var i = 0; i < attempts; i++) {
+        await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
+        final state = await probe();
+        if (state.ok &&
+            adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+          _markAdsmReady(host.id, state.version!);
+          onProgress?.call('ADSM ready (v${state.version})');
+          return true;
+        }
+        onProgress?.call(
+          'Waiting for ADSM v$kRequiredAdsmVersion… '
+          '(host reports ${state.version ?? "unknown"})',
+        );
+      }
+      return false;
+    }
+
     onProgress?.call('Checking ADSM…');
     var state = await probe();
 
     // Healthy + new enough → done.
     if (state.ok && adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+      _markAdsmReady(host.id, state.version!);
       onProgress?.call('ADSM ready (v${state.version})');
       return;
+    }
+
+    // Reconnect / soft path: keep a working daemon alive; never pkill.
+    if (!allowUpgrade || isAdsmReady(host.id)) {
+      if (state.ok) {
+        onProgress?.call(
+          'ADSM v${state.version ?? "unknown"} running '
+          '(app prefers v$kRequiredAdsmVersion) — continuing',
+        );
+        return;
+      }
+      if (state.hasBin) {
+        onProgress?.call('Starting ADSM…');
+        state = await probe(); // ensure-running is inside probe path
+        if (state.ok) {
+          if (adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+            _markAdsmReady(host.id, state.version!);
+          }
+          onProgress?.call('ADSM ready (v${state.version ?? "unknown"})');
+          return;
+        }
+      }
+      throw MissingToolException(
+        'ADSM',
+        'ADSM is not running on the host and upgrade was skipped '
+        '(reconnect path).\n\n# Probe:\n$lastProbe',
+      );
     }
 
     // Running but too old (or version unknown on an old build).
@@ -1012,26 +1218,13 @@ exit 0
             'ADSM mismatch — host has v$have, this app needs '
             'v$kRequiredAdsmVersion. Updating…',
       );
-      for (var i = 0; i < 10; i++) {
-        await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
-        state = await probe();
-        if (state.ok &&
-            adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
-          onProgress?.call('ADSM updated to v${state.version}');
-          return;
-        }
-        onProgress?.call(
-          'Waiting for ADSM v$kRequiredAdsmVersion… '
-          '(host reports ${state.version ?? "unknown"})',
-        );
-      }
+      if (await waitForRequired()) return;
       throw MissingToolException(
         'ADSM',
         'ADSM mismatch — cannot run until the host is on '
         'v$kRequiredAdsmVersion (host still reports '
         '${state.version ?? "unknown"}).\n'
-        'Open this agent again to retry the automatic update, or run:\n'
-        '  curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash\n\n'
+        'Open this agent again to retry the automatic update.\n\n'
         '# Probe:\n$lastProbe',
       );
     }
@@ -1044,6 +1237,7 @@ exit 0
         state = await probe();
         if (state.ok &&
             adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+          _markAdsmReady(host.id, state.version!);
           onProgress?.call('ADSM ready (v${state.version})');
           return;
         }
@@ -1060,15 +1254,7 @@ exit 0
               'ADSM mismatch — host has v$have, this app needs '
               'v$kRequiredAdsmVersion. Updating…',
         );
-        for (var i = 0; i < 10; i++) {
-          await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
-          state = await probe();
-          if (state.ok &&
-              adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
-            onProgress?.call('ADSM updated to v${state.version}');
-            return;
-          }
-        }
+        if (await waitForRequired()) return;
       } else if (!state.ok) {
         throw MissingToolException(
           'ADSM',
@@ -1088,16 +1274,9 @@ exit 0
       );
     }
 
-    for (var i = 0; i < 10; i++) {
-      state = await probe();
-      if (state.ok &&
-          adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
-        onProgress?.call('ADSM ready (v${state.version})');
-        return;
-      }
-      await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
-    }
+    if (await waitForRequired()) return;
 
+    state = await probe();
     if (state.ok &&
         !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
       throw MissingToolException(
@@ -1126,42 +1305,173 @@ exit 0
     'transcript.py',
   ];
 
-  /// Upload this app's ADSM package over SFTP and restart the daemon.
-  Future<bool> _pushBundledAdsm(
+  Future<Map<String, Uint8List>> _loadBundledAdsmPayloads() async {
+    final payloads = <String, Uint8List>{};
+    for (final name in _bundledAdsmFiles) {
+      final data = await rootBundle.load('host/adsm/$name');
+      payloads[name] = data.buffer.asUint8List(
+        data.offsetInBytes,
+        data.lengthInBytes,
+      );
+    }
+    return payloads;
+  }
+
+  static const _adsmWrapper = '''
+#!/usr/bin/env bash
+export PYTHONPATH="\$HOME/.local/share/agentdock/host\${PYTHONPATH:+:\$PYTHONPATH}"
+exec python3 -m adsm "\$@"
+''';
+
+  static const _adsmRestartScript = r'''
+set -e
+chmod +x "$HOME/.local/bin/agentdock-adsm"
+export PATH="$HOME/.local/bin:$PATH"
+pkill -f 'python3 -m adsm serve' 2>/dev/null || true
+pkill -f 'python -m adsm serve' 2>/dev/null || true
+sleep 0.3
+rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
+agentdock-adsm ensure-running
+''';
+
+  /// Upload bundled ADSM. Prefer stdin/base64 (reliable over ProxyJump);
+  /// SFTP is a fallback. GitHub is only used when assets are missing.
+  Future<_BundledAdsmPush> _pushBundledAdsm(
     SSHClient client, {
     required String hostId,
     void Function(String status)? onProgress,
   }) async {
     onProgress?.call('Uploading ADSM v$kRequiredAdsmVersion from this app…');
+    late final Map<String, Uint8List> payloads;
     try {
-      final payloads = <String, Uint8List>{};
-      for (final name in _bundledAdsmFiles) {
-        final data = await rootBundle.load('host/adsm/$name');
-        payloads[name] = data.buffer.asUint8List(
-          data.offsetInBytes,
-          data.lengthInBytes,
-        );
+      payloads = await _loadBundledAdsmPayloads();
+    } catch (e) {
+      SafeLog.d('Bundled ADSM assets missing from this build', e);
+      onProgress?.call('App ADSM assets missing — trying GitHub…');
+      return _BundledAdsmPush.noAssets;
+    }
+
+    try {
+      await _pushBundledAdsmViaStdin(
+        client,
+        hostId: hostId,
+        payloads: payloads,
+      );
+      onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
+      return _BundledAdsmPush.ok;
+    } catch (e) {
+      SafeLog.d('ADSM stdin upload failed, trying SFTP', e);
+      onProgress?.call('Retrying ADSM upload over SFTP…');
+    }
+
+    try {
+      await _pushBundledAdsmViaSftp(
+        client,
+        hostId: hostId,
+        payloads: payloads,
+      );
+      onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
+      return _BundledAdsmPush.ok;
+    } catch (e) {
+      SafeLog.d('Bundled ADSM upload failed', e);
+      onProgress?.call('Bundled ADSM upload failed');
+      return _BundledAdsmPush.failed;
+    }
+  }
+
+  Future<void> _runScriptViaStdin(
+    SSHClient client, {
+    required String hostId,
+    required String script,
+    Duration timeout = const Duration(minutes: 2),
+  }) async {
+    final gate = _pool[hostId]?.gate;
+    Future<void> body() async {
+      final session = await client.execute('bash -s');
+      try {
+        session.stdin.add(utf8.encode(script));
+        await session.stdin.close();
+        final chunks = await Future.wait<Uint8List>([
+          _readAll(session.stdout),
+          _readAll(session.stderr),
+        ]).timeout(timeout);
+        await session.done.timeout(const Duration(seconds: 10));
+        final code = session.exitCode ?? 0;
+        if (code != 0) {
+          final err = utf8.decode(chunks[1]).trim();
+          final out = utf8.decode(chunks[0]).trim();
+          final detail = err.isNotEmpty ? err : out;
+          throw Exception(
+            detail.isEmpty ? 'Remote script failed (exit $code)' : detail,
+          );
+        }
+      } on TimeoutException {
+        try {
+          session.close();
+        } catch (_) {}
+        throw TimeoutException('Remote script timed out after $timeout');
       }
+    }
 
-      final homeOut = await _run(
-        client,
-        r'printf %s "$HOME"',
-        hostId: hostId,
-        timeout: const Duration(seconds: 8),
-      );
-      final home = homeOut.trim();
-      if (home.isEmpty) return false;
+    return gate == null ? body() : gate.run(body);
+  }
 
-      final share = '$home/.local/share/agentdock/host/adsm';
-      final binDir = '$home/.local/bin';
-      await _run(
-        client,
-        'mkdir -p ${shellQuote(share)} ${shellQuote(binDir)}',
-        hostId: hostId,
-        timeout: const Duration(seconds: 10),
-      );
+  Future<void> _pushBundledAdsmViaStdin(
+    SSHClient client, {
+    required String hostId,
+    required Map<String, Uint8List> payloads,
+  }) async {
+    final buf = StringBuffer()
+      ..writeln('set -euo pipefail')
+      ..writeln('SHARE="\$HOME/.local/share/agentdock/host/adsm"')
+      ..writeln('BIN="\$HOME/.local/bin"')
+      ..writeln('mkdir -p "\$SHARE" "\$BIN"');
+    for (final entry in payloads.entries) {
+      buf
+        ..writeln('base64 -d > "\$SHARE/${entry.key}" <<\'ADSM_B64\'')
+        ..writeln(base64Encode(entry.value))
+        ..writeln('ADSM_B64');
+    }
+    buf
+      ..writeln('cat > "\$BIN/agentdock-adsm" <<\'ADSM_WRAP\'')
+      ..writeln(_adsmWrapper.trimRight())
+      ..writeln('ADSM_WRAP')
+      ..writeln(_adsmRestartScript);
+    await _runScriptViaStdin(
+      client,
+      hostId: hostId,
+      script: buf.toString(),
+      timeout: const Duration(minutes: 3),
+    );
+  }
 
-      final sftp = await client.sftp();
+  Future<void> _pushBundledAdsmViaSftp(
+    SSHClient client, {
+    required String hostId,
+    required Map<String, Uint8List> payloads,
+  }) async {
+    final homeOut = await _run(
+      client,
+      r'printf %s "$HOME"',
+      hostId: hostId,
+      timeout: const Duration(seconds: 8),
+    );
+    final home = homeOut.trim();
+    if (home.isEmpty) {
+      throw Exception('Could not resolve remote HOME');
+    }
+
+    final share = '$home/.local/share/agentdock/host/adsm';
+    final binDir = '$home/.local/bin';
+    await _run(
+      client,
+      'mkdir -p ${shellQuote(share)} ${shellQuote(binDir)}',
+      hostId: hostId,
+      timeout: const Duration(seconds: 10),
+    );
+
+    final sftp = await client.sftp();
+    try {
       for (final entry in payloads.entries) {
         final remote = '$share/${entry.key}';
         final remoteFile = await sftp.open(
@@ -1177,11 +1487,6 @@ exit 0
         }
       }
 
-      final wrapper = '''
-#!/usr/bin/env bash
-export PYTHONPATH="\$HOME/.local/share/agentdock/host\${PYTHONPATH:+:\$PYTHONPATH}"
-exec python3 -m adsm "\$@"
-''';
       final wrapperPath = '$binDir/agentdock-adsm';
       final wrapperFile = await sftp.open(
         wrapperPath,
@@ -1190,33 +1495,22 @@ exec python3 -m adsm "\$@"
             SftpFileOpenMode.write,
       );
       try {
-        await wrapperFile.writeBytes(Uint8List.fromList(utf8.encode(wrapper)));
+        await wrapperFile.writeBytes(
+          Uint8List.fromList(utf8.encode(_adsmWrapper)),
+        );
       } finally {
         await wrapperFile.close();
       }
-
-      await _run(
-        client,
-        r'''
-set -e
-chmod +x "$HOME/.local/bin/agentdock-adsm"
-export PATH="$HOME/.local/bin:$PATH"
-pkill -f 'python3 -m adsm serve' 2>/dev/null || true
-pkill -f 'python -m adsm serve' 2>/dev/null || true
-sleep 0.3
-rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
-agentdock-adsm ensure-running
-''',
-        hostId: hostId,
-        timeout: const Duration(seconds: 45),
-      );
-      onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
-      return true;
-    } catch (e) {
-      SafeLog.d('Bundled ADSM upload failed', e);
-      onProgress?.call('Bundled ADSM upload failed — trying GitHub…');
-      return false;
+    } finally {
+      sftp.close();
     }
+
+    await _run(
+      client,
+      _adsmRestartScript,
+      hostId: hostId,
+      timeout: const Duration(seconds: 45),
+    );
   }
 
   /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.

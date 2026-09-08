@@ -33,7 +33,7 @@ bool isDesktopPanelRoot(String path) {
       path == '/settings';
 }
 
-/// Nested routes (edit host, schedule, MCP, repos, terminal) that must render
+/// Nested routes (edit host, schedule, MCP, terminal) that must render
 /// via [StatefulNavigationShell] in the center column on desktop.
 bool isDesktopDetailRoute(String path) {
   if (path.startsWith('/agents')) return false;

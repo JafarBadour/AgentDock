@@ -463,22 +463,27 @@ class Worker:
                         await self._refresh_models_unlocked(mcp_servers or [])
                     except Exception as e:  # noqa: BLE001
                         self.last_error = f"refresh_models: {e}"
-                # Must call ACP — assigning self.model_id alone only updates the
-                # UI chip while the live Claude/Cursor session keeps its old model.
-                if model_id:
-                    try:
-                        await self.set_model(model_id)
-                    except Exception as e:  # noqa: BLE001
-                        self.last_error = f"set_model: {e}"
-                        self.model_id = model_id
-                if mode:
-                    try:
-                        await self.set_mode(mode)
-                    except Exception as e:  # noqa: BLE001
-                        self.last_error = f"set_mode: {e}"
-                        self.mode = mode
+                # Never poke mode/model while a prompt is in flight — Claude
+                # rejects app ids like "agent" (Invalid Mode) and the RPC can
+                # race permission auto-allow on the same FIFO.
+                if not self._turn_in_flight():
+                    if model_id:
+                        try:
+                            await self.set_model(model_id)
+                        except Exception as e:  # noqa: BLE001
+                            self.last_error = f"set_model: {e}"
+                            self.model_id = model_id
+                    if mode:
+                        try:
+                            await self.set_mode(mode)
+                        except Exception as e:  # noqa: BLE001
+                            self.last_error = f"set_mode: {e}"
+                            self.mode = mode
 
-            await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+            # Re-ensure must not clobber a live turn back to idle (that used to
+            # desync the phone busy chrome from the host).
+            if not self._turn_in_flight():
+                await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
             await self._emit_event(
                 "session",
                 acpSessionId=self.acp_session_id,
@@ -707,13 +712,20 @@ class Worker:
         if self._fifo_fd is None:
             raise RuntimeError("FIFO not attached")
         data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-        # FIFO may briefly block; retry.
+        # FIFO may briefly block; retry with a hard deadline so a stalled reader
+        # cannot freeze the journal tail (and leave permissions unanswered).
         remaining = data
+        deadline = time.monotonic() + 5.0
         while remaining:
             try:
                 n = os.write(self._fifo_fd, remaining)
                 remaining = remaining[n:]
             except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"FIFO write timed out ({len(data) - len(remaining)}/"
+                        f"{len(data)} bytes)"
+                    )
                 time.sleep(0.01)
 
     async def _write(self, obj: dict[str, Any]) -> None:
@@ -871,10 +883,23 @@ class Worker:
     async def set_mode(self, mode_id: str) -> None:
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
+        resolved = self._resolve_mode_id(mode_id)
+        if not resolved:
+            return
+        # Avoid spamming Claude with ids it rejects (app uses ask/agent/plan).
+        if (
+            self.available_modes
+            and resolved not in self.available_modes
+            and resolved.lower()
+            not in {m.lower() for m in self.available_modes}
+        ):
+            raise RuntimeError(
+                f"Invalid Mode {resolved!r} (available: {self.available_modes})"
+            )
         try:
             await self._request(
                 "session/set_mode",
-                {"sessionId": self.acp_session_id, "modeId": mode_id},
+                {"sessionId": self.acp_session_id, "modeId": resolved},
                 timeout=15.0,
             )
         except Exception as e:  # noqa: BLE001
@@ -886,12 +911,50 @@ class Worker:
                     "sessionId": self.acp_session_id,
                     "configId": "mode",
                     "type": "id",
-                    "value": mode_id,
+                    "value": resolved,
                 },
                 timeout=15.0,
             )
-        self.mode = mode_id
-        await self._emit_event("mode", mode=mode_id)
+        self.mode = resolved
+        await self._emit_event("mode", mode=resolved)
+
+    def _resolve_mode_id(self, mode_id: str) -> str:
+        """Map app modes (ask/agent/plan) onto provider ACP mode ids."""
+        mid = (mode_id or "").strip()
+        if not mid:
+            return mid
+        available = list(self.available_modes or [])
+        by_lower = {m.lower(): m for m in available}
+        if mid.lower() in by_lower:
+            return by_lower[mid.lower()]
+        if self.provider == "claude":
+            # Claude ACP: auto/default/acceptEdits/plan/dontAsk/bypassPermissions
+            if mid.lower() == "agent":
+                prefer = (
+                    "bypassPermissions" if self.full_access else "default"
+                )
+            elif mid.lower() == "ask":
+                prefer = "dontAsk"
+            elif mid.lower() == "plan":
+                prefer = "plan"
+            else:
+                prefer = mid
+            if prefer.lower() in by_lower:
+                return by_lower[prefer.lower()]
+            if self.full_access and "bypasspermissions" in by_lower:
+                return by_lower["bypasspermissions"]
+            if "default" in by_lower:
+                return by_lower["default"]
+            return prefer
+        return mid
+
+    def _turn_in_flight(self) -> bool:
+        if self._turn_task is not None and not self._turn_task.done():
+            return True
+        return self.status in (
+            protocol.STATUS_RUNNING,
+            protocol.STATUS_WAITING_PERMISSION,
+        )
 
     async def set_model(self, model_id: str) -> None:
         if not self.acp_session_id:
@@ -1421,25 +1484,40 @@ class Worker:
             if t:
                 title = str(t)
         if not self._permission_policy_ask:
-            # Auto-allow: prefer allow_always / allow-once style ids.
-            pick = "allow_always"
+            # Auto-allow: always pick an id that exists on the prompt.
+            pick = None
             for o in options:
-                oid = o["optionId"].lower()
-                if "always" in oid:
-                    pick = o["optionId"]
+                oid = str(o.get("optionId") or "")
+                low = oid.lower()
+                if "always" in low:
+                    pick = oid
                     break
-                if "allow" in oid and "reject" not in oid:
-                    pick = o["optionId"]
-            await self._write(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "outcome": {"outcome": "selected", "optionId": pick}
-                    },
-                }
-            )
-            return
+            if pick is None:
+                for o in options:
+                    oid = str(o.get("optionId") or "")
+                    low = oid.lower()
+                    if "allow" in low and "reject" not in low:
+                        pick = oid
+                        break
+            if pick is None and options:
+                pick = str(options[0].get("optionId") or "allow")
+            if not pick:
+                pick = "allow"
+            try:
+                await self._write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "outcome": {"outcome": "selected", "optionId": pick}
+                        },
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                self.last_error = f"auto_allow_permission: {e}"
+                # Fall through to ask-mode UI so the phone can unblock.
+            else:
+                return
 
         rid = str(req_id)
         self._open_permissions[rid] = {

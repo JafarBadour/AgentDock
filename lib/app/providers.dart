@@ -49,6 +49,11 @@ final sshServiceProvider = Provider<SshService>((ref) {
   return service;
 });
 
+/// Shared ADSM NDJSON bridge per host (one SSH for many chats).
+final adsmBridgePoolProvider = Provider<AdsmBridgePool>((ref) {
+  return AdsmBridgePool(ref.watch(sshServiceProvider));
+});
+
 /// Bumped every time a runtime writes something to the local transcript.
 ///
 /// Lets the agents list refresh unread counts as replies land, instead of
@@ -114,7 +119,11 @@ final activeAcpSessionsProvider =
     // Tool updates land many times a second while a turn streams; coalesce them
     // so the agents list is not re-querying SQLite per token.
     Timer? tick;
-    ref.onDispose(() => tick?.cancel());
+    Timer? orderTick;
+    ref.onDispose(() {
+      tick?.cancel();
+      orderTick?.cancel();
+    });
     return ActiveAcpSessions(
       ref.watch(appDatabaseProvider),
       keepAlive: ref.watch(backgroundKeepAliveProvider),
@@ -130,6 +139,12 @@ final activeAcpSessionsProvider =
         tick ??= Timer(const Duration(seconds: 8), () {
           tick = null;
           ref.read(chatActivityTickProvider.notifier).state++;
+        });
+        // Re-sort the Agents list sooner when a chat's updated_at moves
+        // (new user/assistant message). skipLoadingOnReload keeps it smooth.
+        orderTick ??= Timer(const Duration(milliseconds: 900), () {
+          orderTick = null;
+          ref.read(agentsCatalogEpochProvider.notifier).state++;
         });
       },
     );
@@ -470,6 +485,12 @@ class DesktopProjectFilesArgs {
 /// Right-hand panel on macOS / desktop (Automate, Hosts, Connect, Settings, Files).
 final desktopRightPanelProvider =
     StateProvider<DesktopRightPanel>((ref) => DesktopRightPanel.none);
+
+/// Left-sidebar browse mode on macOS: recency agents, directories, or hosts.
+enum AgentsSidebarMode { agents, directories, hosts }
+
+final agentsSidebarModeProvider =
+    StateProvider<AgentsSidebarMode>((ref) => AgentsSidebarMode.agents);
 
 /// Host + path for [DesktopRightPanel.files]; cleared when the panel closes.
 final desktopProjectFilesProvider =

@@ -9,8 +9,6 @@ import '../features/automations/schedule_edit_screen.dart';
 import '../features/connect/connect_screen.dart';
 import '../features/hosts/host_edit_screen.dart';
 import '../features/hosts/hosts_screen.dart';
-import '../features/repos/repo_edit_screen.dart';
-import '../features/repos/repos_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
@@ -97,27 +95,8 @@ final goRouterProvider = Provider<GoRouter>((ref) {
                     path: 'terminal/:hostId',
                     builder: (context, state) => TerminalSessionScreen(
                       hostId: state.pathParameters['hostId']!,
+                      initialDirectory: state.uri.queryParameters['cwd'],
                     ),
-                  ),
-                  GoRoute(
-                    path: ':hostId/repos',
-                    builder: (context, state) =>
-                        ReposScreen(hostId: state.pathParameters['hostId']!),
-                    routes: [
-                      GoRoute(
-                        path: 'new',
-                        builder: (context, state) => RepoEditScreen(
-                          hostId: state.pathParameters['hostId']!,
-                        ),
-                      ),
-                      GoRoute(
-                        path: 'edit/:repoId',
-                        builder: (context, state) => RepoEditScreen(
-                          hostId: state.pathParameters['hostId']!,
-                          repoId: state.pathParameters['repoId'],
-                        ),
-                      ),
-                    ],
                   ),
                 ],
               ),
@@ -155,8 +134,14 @@ final goRouterProvider = Provider<GoRouter>((ref) {
       // Legacy deep link from older builds.
       GoRoute(
         path: '/terminal/session/:hostId',
-        redirect: (context, state) =>
-            '/hosts/terminal/${state.pathParameters['hostId']}',
+        redirect: (context, state) {
+          final id = state.pathParameters['hostId'];
+          final cwd = state.uri.queryParameters['cwd'];
+          final q = (cwd == null || cwd.isEmpty)
+              ? ''
+              : '?${Uri(queryParameters: {'cwd': cwd}).query}';
+          return '/hosts/terminal/$id$q';
+        },
       ),
     ],
   );

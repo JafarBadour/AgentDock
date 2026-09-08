@@ -2,9 +2,13 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../app/app_theme.dart';
+import '../../data/models/agent_provider.dart';
+import '../../features/connect/claude_login_sheet.dart';
 import '../../services/adsm_client.dart';
+import '../../services/ssh_service.dart';
 
 /// Three dots that rise and fade in sequence while the agent is producing a
 /// turn. Deliberately small enough to sit in a list row's leading slot.
@@ -472,18 +476,24 @@ class AdsmHealthSheet extends StatefulWidget {
     super.key,
     required this.session,
     required this.bridgeOpen,
+    this.provider,
     this.onReconnect,
+    this.onReauthed,
   });
 
   final AdsmSession session;
   final bool bridgeOpen;
+  final AgentProvider? provider;
   final VoidCallback? onReconnect;
+  final VoidCallback? onReauthed;
 
   static Future<void> show(
     BuildContext context, {
     required AdsmSession session,
     required bool bridgeOpen,
+    AgentProvider? provider,
     VoidCallback? onReconnect,
+    VoidCallback? onReauthed,
   }) {
     return showModalBottomSheet<void>(
       context: context,
@@ -492,7 +502,9 @@ class AdsmHealthSheet extends StatefulWidget {
       builder: (ctx) => AdsmHealthSheet(
         session: session,
         bridgeOpen: bridgeOpen,
+        provider: provider,
         onReconnect: onReconnect,
+        onReauthed: onReauthed,
       ),
     );
   }
@@ -504,6 +516,7 @@ class AdsmHealthSheet extends StatefulWidget {
 class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
   AdsmHostHealth? _health;
   bool _loading = true;
+  bool _reauthing = false;
 
   @override
   void initState() {
@@ -540,11 +553,65 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
     }
   }
 
+  bool get _authErrorVisible {
+    final err = _health?.agentLastError;
+    return err != null && isAgentAuthFailureText(err);
+  }
+
+  Future<void> _reauth() async {
+    if (_reauthing) return;
+    final provider = widget.provider ?? AgentProvider.claude;
+    final host = widget.session.host;
+
+    if (provider == AgentProvider.claude) {
+      setState(() => _reauthing = true);
+      try {
+        final ok = await ClaudeLoginSheet.show(context, host: host);
+        if (!mounted) return;
+        if (ok == true) {
+          Navigator.pop(context);
+          widget.onReauthed?.call();
+        }
+      } finally {
+        if (mounted) setState(() => _reauthing = false);
+      }
+      return;
+    }
+
+    final goConnect = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Re-authenticate Cursor'),
+        content: const Text(
+          'Cursor ACP uses `agent login` on the host (or a Cursor API key in '
+          'Connect).\n\nOpen Connect to save a key, or run `agent login` from '
+          'Hosts → Terminal on this machine.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Open Connect'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (goConnect == true) {
+      Navigator.pop(context);
+      context.go('/connect');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final h = _health;
     final healthy = h?.healthy ?? false;
+    final provider = widget.provider;
 
     return SafeArea(
       child: Padding(
@@ -572,6 +639,27 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
                     'Host · ${widget.session.host.displayLabel}',
                     style: theme.textTheme.titleMedium,
                   ),
+                ),
+                IconButton(
+                  tooltip: provider == AgentProvider.cursor
+                      ? 'Re-authenticate Cursor'
+                      : 'Re-authenticate Claude',
+                  onPressed: (_loading || _reauthing) ? null : _reauth,
+                  icon: _reauthing
+                      ? SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: theme.colorScheme.primary,
+                          ),
+                        )
+                      : Icon(
+                          Icons.lock_reset_outlined,
+                          color: _authErrorVisible
+                              ? theme.colorScheme.error
+                              : null,
+                        ),
                 ),
                 IconButton(
                   tooltip: 'Refresh',
@@ -646,6 +734,18 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
                     ),
                   ),
                 ),
+            ],
+            if (_authErrorVisible) ...[
+              const SizedBox(height: 12),
+              FilledButton.tonalIcon(
+                onPressed: _reauthing ? null : _reauth,
+                icon: const Icon(Icons.lock_reset_outlined),
+                label: Text(
+                  provider == AgentProvider.cursor
+                      ? 'Re-authenticate Cursor'
+                      : 'Re-authenticate Claude',
+                ),
+              ),
             ],
             if (!widget.bridgeOpen && widget.onReconnect != null) ...[
               const SizedBox(height: 12),

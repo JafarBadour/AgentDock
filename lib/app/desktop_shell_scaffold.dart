@@ -121,12 +121,14 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
     // alone left the center column on Agents/chat and the session never appeared.
     final terminalHostId = terminalHostIdFromPath(path);
     if (terminalHostId != null) {
+      final cwd = widget.state.uri.queryParameters['cwd'];
       return TerminalSessionScreen(
-        key: ValueKey('terminal-$terminalHostId'),
+        key: ValueKey('terminal-$terminalHostId-${cwd ?? ''}'),
         hostId: terminalHostId,
+        initialDirectory: cwd,
       );
     }
-    // Host edit, schedule editor, repos, MCP editor, etc.
+    // Host edit, schedule editor, MCP editor, etc.
     if (isDesktopDetailRoute(path)) {
       return widget.navigationShell;
     }
@@ -240,38 +242,115 @@ class _DesktopSidebarHeader extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final mode = ref.watch(agentsSidebarModeProvider);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(14, 10, 6, 8),
-      child: Row(
+      padding: const EdgeInsets.fromLTRB(10, 10, 6, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Expanded(
-            child: Text(
-              'Agents',
-              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
-            ),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  switch (mode) {
+                    AgentsSidebarMode.agents => 'Agents',
+                    AgentsSidebarMode.directories => 'Directories',
+                    AgentsSidebarMode.hosts => 'Hosts',
+                  },
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'New agent',
+                visualDensity: VisualDensity.compact,
+                onPressed: () {
+                  unawaited(startNewAgentWizard(context: context, ref: ref));
+                },
+                icon: const Icon(Icons.add, size: 18),
+              ),
+              IconButton(
+                tooltip: 'Refresh / sync',
+                visualDensity: VisualDensity.compact,
+                onPressed: () {
+                  ref.invalidate(agentsTreeProvider);
+                  ref.invalidate(agentsSyncProvider);
+                  ref.invalidate(unreadCountsProvider);
+                },
+                icon: const Icon(Icons.refresh, size: 18),
+              ),
+            ],
           ),
-          IconButton(
-            tooltip: 'New agent',
-            visualDensity: VisualDensity.compact,
-            onPressed: () {
-              unawaited(startNewAgentWizard(context: context, ref: ref));
-            },
-            icon: const Icon(Icons.add, size: 18),
-          ),
-          IconButton(
-            tooltip: 'Refresh / sync',
-            visualDensity: VisualDensity.compact,
-            onPressed: () {
-              ref.invalidate(agentsTreeProvider);
-              ref.invalidate(agentsSyncProvider);
-              ref.invalidate(unreadCountsProvider);
-            },
-            icon: const Icon(Icons.refresh, size: 18),
-          ),
+          const SizedBox(height: 8),
+          const _AgentsModeSwitcher(),
         ],
       ),
+    );
+  }
+}
+
+class _AgentsModeSwitcher extends ConsumerWidget {
+  const _AgentsModeSwitcher();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final mode = ref.watch(agentsSidebarModeProvider);
+    final scheme = Theme.of(context).colorScheme;
+    Widget chip(AgentsSidebarMode value, String label, IconData icon) {
+      final selected = mode == value;
+      return Expanded(
+        child: Material(
+          color: selected
+              ? AppColors.accent.withValues(alpha: 0.18)
+              : scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+          borderRadius: BorderRadius.circular(8),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: () =>
+                ref.read(agentsSidebarModeProvider.notifier).state = value,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 7),
+              child: Column(
+                children: [
+                  Icon(
+                    icon,
+                    size: 15,
+                    color: selected
+                        ? AppColors.accent
+                        : scheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    label,
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          fontWeight:
+                              selected ? FontWeight.w700 : FontWeight.w500,
+                          color: selected
+                              ? AppColors.accent
+                              : scheme.onSurfaceVariant,
+                        ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      children: [
+        chip(AgentsSidebarMode.agents, 'Agents', Icons.forum_outlined),
+        const SizedBox(width: 6),
+        chip(
+          AgentsSidebarMode.directories,
+          'Directory',
+          Icons.folder_outlined,
+        ),
+        const SizedBox(width: 6),
+        chip(AgentsSidebarMode.hosts, 'Hosts', Icons.dns_outlined),
+      ],
     );
   }
 }

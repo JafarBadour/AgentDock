@@ -757,14 +757,28 @@ class AgentDockService {
     if (hosts.isEmpty) return null;
     final errors = <String>[];
     var total = 0;
-    await Future.wait(hosts.map((host) async {
-      try {
-        total += await syncHostCatalog(host);
-      } catch (e) {
-        SafeLog.d('agentdock sync ${host.alias} failed', e);
-        errors.add(host.displayLabel);
+    // Cap parallelism — many hosts share one ProxyJump (bastion), and blasting
+    // every catalog sync at once surfaces as "ssh open failed" / create-agent
+    // failures on jumped machines like RTX.
+    const maxConcurrent = 2;
+    var next = 0;
+    Future<void> worker() async {
+      while (true) {
+        final i = next++;
+        if (i >= hosts.length) return;
+        final host = hosts[i];
+        try {
+          total += await syncHostCatalog(host);
+        } catch (e) {
+          SafeLog.d('agentdock sync ${host.alias} failed', e);
+          errors.add(host.displayLabel);
+        }
       }
-    }));
+    }
+
+    await Future.wait([
+      for (var i = 0; i < maxConcurrent && i < hosts.length; i++) worker(),
+    ]);
     if (errors.isEmpty) {
       return total > 0 ? 'Synced $total agent(s) from remote' : null;
     }

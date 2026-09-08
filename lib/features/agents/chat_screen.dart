@@ -70,6 +70,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   String? _connectStatus;
   String? _error;
   bool _showSdkInstallGuide = false;
+  /// Avoid looping ClaudeLoginSheet when the same auth error stays sticky.
+  bool _authReauthPrompted = false;
+  bool _authReauthInFlight = false;
 
   /// True when the last connect attached to an agent that was still running,
   /// so the conversation carried over untouched.
@@ -103,7 +106,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _showSlashMenu = false;
   bool _compressing = false;
   /// Sliding window over the transcript: only a slice stays mounted.
-  final TranscriptWindow _transcriptWindow = TranscriptWindow();
+  final TranscriptWindow _transcriptWindow = TranscriptWindow(pageSize: 30);
   List<ChatBlock>? _cachedBlocks;
   String? _blocksCacheKey;
   DateTime? _lastScrollToEndAt;
@@ -198,8 +201,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
-  bool get _shiftingWindow => _windowShiftBusy;
-  bool _windowShiftBusy = false;
+  bool get _shiftingWindow => _loadingOlderHistory;
+  bool _loadingOlderHistory = false;
   int _blocksLength = 0;
 
   void _syncWindowToBlocks(int total) {
@@ -207,51 +210,70 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _transcriptWindow.sync(total, followOutput: _followOutput);
   }
 
-  void _maybeSlideWindow({required int direction}) {
-    if (!_scroll.hasClients || !mounted) return;
-    final before = _scroll.position.pixels;
-    final beforeMax = _scroll.position.maxScrollExtent;
-    final shifted = _transcriptWindow.tryShift(
-      direction: direction,
-      total: _blocksLength,
-      pixels: before,
-      extentAfter: _scroll.position.extentAfter,
-      maxScrollExtent: beforeMax,
-      now: DateTime.now(),
-      busy: _windowShiftBusy || _programmaticScroll,
-    );
-    if (!shifted) return;
+  /// Grow the mounted transcript toward older history (top edge or tap).
+  void _maybeLoadOlderHistory({bool fromUserTap = false}) {
+    if (!mounted) return;
+    if (_loadingOlderHistory || _programmaticScroll) return;
 
-    final atEnd =
-        _transcriptWindow.start >= _transcriptWindow.maxStartFor(_blocksLength);
-    _windowShiftBusy = true;
+    final hasScroll = _scroll.hasClients;
+    final before = hasScroll ? _scroll.position.pixels : 0.0;
+    final beforeMax = hasScroll ? _scroll.position.maxScrollExtent : 0.0;
+
+    final int added;
+    if (fromUserTap) {
+      added = _transcriptWindow.loadOlder(
+        _blocksLength,
+        now: DateTime.now(),
+        force: true,
+      );
+    } else {
+      if (!hasScroll) return;
+      final startBefore = _transcriptWindow.start;
+      final ok = _transcriptWindow.tryLoadOlderAtTop(
+        total: _blocksLength,
+        pixels: before,
+        maxScrollExtent: beforeMax,
+        now: DateTime.now(),
+        busy: false,
+      );
+      if (!ok) return;
+      added = startBefore - _transcriptWindow.start;
+    }
+    if (added <= 0) return;
+
+    _loadingOlderHistory = true;
     _programmaticScroll = true;
-    setState(() {
-      if (_transcriptWindow.shouldResumeFollow(
-        atEnd: atEnd,
-        nearBottom: _isNearBottom,
-      )) {
-        _followOutput = true;
-        _showJumpToLatest = false;
-      } else if (!atEnd) {
-        _followOutput = false;
-        _showJumpToLatest = true;
-      }
-    });
+    _followOutput = false;
+    if (!_showJumpToLatest) {
+      setState(() => _showJumpToLatest = true);
+    } else {
+      setState(() {});
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
         if (_scroll.hasClients) {
-          final target = _transcriptWindow.paddedScrollTarget(
-            shiftDelta: direction < 0 ? -1 : 1,
+          final target = _transcriptWindow.preserveScrollAfterPrepend(
             beforePixels: before,
             beforeMax: beforeMax,
             afterMax: _scroll.position.maxScrollExtent,
           );
           _scroll.jumpTo(target);
         }
+        if (!mounted) return;
+        final label = added == 1
+            ? 'Loaded 1 earlier message'
+            : 'Loaded $added earlier messages';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(label),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
       } finally {
         _programmaticScroll = false;
-        _windowShiftBusy = false;
+        _loadingOlderHistory = false;
       }
     });
   }
@@ -438,6 +460,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               runtime.hasActiveTools)) {
         _error = null;
         _showSdkInstallGuide = false;
+        _authReauthPrompted = false;
+      }
+      final authProbe = runtime.lastError ?? _error;
+      if (authProbe != null && isAgentAuthFailureText(authProbe)) {
+        _scheduleAuthReauthPrompt(authProbe);
+      } else if (authProbe == null || authProbe.trim().isEmpty) {
+        _authReauthPrompted = false;
       }
       final n = runtime.entries.length;
       if (n != _messageCount) _messageCount = n;
@@ -477,6 +506,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     runtime.resumeOutboundQueue();
     unawaited(runtime.recoverTrailingUserPromptIfStuck());
     unawaited(_prefetchModelCatalogIfNeeded(runtime));
+    final stickyAuth = runtime.lastError ?? _error;
+    if (stickyAuth != null && isAgentAuthFailureText(stickyAuth)) {
+      _scheduleAuthReauthPrompt(stickyAuth);
+    }
   }
 
   /// Coalesce ACP stream notifications — Claude can emit dozens per second.
@@ -646,6 +679,77 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     return _ensureAcpInFlight!;
   }
 
+  void _scheduleAuthReauthPrompt(String errorText) {
+    if (_authReauthPrompted || _authReauthInFlight) return;
+    if (!isAgentAuthFailureText(errorText)) return;
+    _authReauthPrompted = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_promptAuthReauth());
+    });
+  }
+
+  Future<void> _promptAuthReauth({bool fromUser = false}) async {
+    if (!mounted || _authReauthInFlight) return;
+    final chat = _chat;
+    final host = _host;
+    if (chat == null || host == null) return;
+    if (fromUser) _authReauthPrompted = true;
+
+    _authReauthInFlight = true;
+    try {
+      if (chat.provider == AgentProvider.claude) {
+        final ok = await ClaudeLoginSheet.show(context, host: host);
+        if (!mounted) return;
+        if (ok == true) {
+          await _reconnectAfterReauth();
+        }
+        return;
+      }
+
+      final goConnect = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Cursor authentication required'),
+          content: const Text(
+            'The agent reported an auth failure. Save a Cursor API key in '
+            'Connect, or run `agent login` on this host from Hosts → Terminal.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Dismiss'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Open Connect'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return;
+      if (goConnect == true) context.go('/connect');
+    } finally {
+      _authReauthInFlight = false;
+    }
+  }
+
+  Future<void> _reconnectAfterReauth() async {
+    final chat = _chat;
+    if (chat == null) return;
+    setState(() {
+      _error = null;
+      _showSdkInstallGuide = false;
+      _authReauthPrompted = false;
+    });
+    _runtime?.lastError = null;
+    _runtime?.deliveryError = null;
+    await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+    if (!mounted) return;
+    setState(() => _runtime = null);
+    await _ensureAcp();
+  }
+
   /// A closure that can open a transport for this chat at any later time.
   ///
   /// It captures the services directly instead of `ref`, because the runtime
@@ -658,6 +762,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final secureStore = ref.read(secureStoreProvider);
     final db = ref.read(appDatabaseProvider);
     final sessions = ref.read(activeAcpSessionsProvider.notifier);
+    final bridgePool = ref.read(adsmBridgePoolProvider);
     final host = _host!;
     final provider = _chat?.provider ?? AgentProvider.cursor;
     // Fallbacks for the first connect, before a runtime exists.
@@ -682,8 +787,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             : 'Checking Cursor CLI on the remote…',
       );
 
-      // tmux is required for ADSM workers.
-      await ssh.ensureTmux(host, onProgress: status);
+      final adsmReady = ssh.isAdsmReady(host.id);
+
+      // Skip heavy tooling installs on reconnect — they reopen SSH channels and
+      // previously triggered ADSM reinstall → daemon kill → reconnect loops.
+      if (!adsmReady) {
+        await ssh.ensureTmux(host, onProgress: status);
+      }
 
       final binary = switch (provider) {
         AgentProvider.cursor => await ssh.ensureCursorCli(
@@ -706,7 +816,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ),
       };
 
-      await ssh.ensureAdsm(host, onProgress: status).timeout(
+      await ssh.ensureAdsm(
+        host,
+        onProgress: status,
+        // After the first successful verify, never restart the daemon on
+        // reconnect — that was killing the shared bridge every message.
+        allowUpgrade: !adsmReady,
+      ).timeout(
         const Duration(minutes: 5),
         onTimeout: () => throw TimeoutException(
           'Timed out installing/starting ADSM on the remote.',
@@ -721,6 +837,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return AdsmSession.start(
         ssh: ssh,
         secureStore: secureStore,
+        bridgePool: bridgePool,
         host: host,
         cwd: cwd,
         binary: binary,
@@ -1840,6 +1957,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
+  /// Desktop: Enter sends, Shift+Enter inserts a newline.
+  KeyEventResult _composerDesktopEnterKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.enter &&
+        event.logicalKey != LogicalKeyboardKey.numpadEnter) {
+      return KeyEventResult.ignored;
+    }
+    // Let IME finish composition.
+    if (_composer.value.isComposingRangeValid) {
+      return KeyEventResult.ignored;
+    }
+    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
+    final shift = pressed.contains(LogicalKeyboardKey.shiftLeft) ||
+        pressed.contains(LogicalKeyboardKey.shiftRight);
+    if (shift) return KeyEventResult.ignored;
+    if (!_sending && !_compressing) {
+      unawaited(_send());
+    }
+    return KeyEventResult.handled;
+  }
+
   Widget _buildComposerField({
     required ThemeData theme,
     required bool streaming,
@@ -1847,10 +1985,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     int queuedCount = 0,
   }) {
     const fieldRadius = 26.0;
-    final border = OutlineInputBorder(
-      borderRadius: BorderRadius.circular(fieldRadius),
-      borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
-    );
+    final fill = theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.55);
+    final outline = theme.colorScheme.outlineVariant;
 
     final hint = () {
       if (_connecting) return 'Connecting agent…';
@@ -1866,46 +2002,59 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return 'Message agent…';
     }();
 
-    return Stack(
-      clipBehavior: Clip.none,
-      alignment: Alignment.bottomRight,
-      children: [
-        TextField(
-          controller: _composer,
-          minLines: 1,
-          maxLines: 5,
-          enabled: _chat!.provider.isAvailable,
-          decoration: InputDecoration(
-            hintText: hint,
-            filled: true,
-            fillColor: theme.colorScheme.surfaceContainerHighest
-                .withValues(alpha: 0.55),
-            contentPadding: const EdgeInsets.fromLTRB(16, 12, 92, 12),
-            border: border,
-            enabledBorder: border,
-            focusedBorder: border.copyWith(
-              borderSide: BorderSide(color: theme.colorScheme.outline),
+    // Row-inside-pill (not a Stack overlay) so mic/send stay inside the
+    // rounded chrome on desktop density — the old bottomRight Stack let the
+    // send circle hang past the curve.
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: fill,
+        borderRadius: BorderRadius.circular(fieldRadius),
+        border: Border.all(color: outline),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(4, 4, 4, 4),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Expanded(
+              child: Focus(
+                onKeyEvent: useDesktopShell()
+                    ? _composerDesktopEnterKey
+                    : null,
+                child: TextField(
+                  controller: _composer,
+                  minLines: 1,
+                  maxLines: 5,
+                  textInputAction: useDesktopShell()
+                      ? TextInputAction.newline
+                      : TextInputAction.send,
+                  enabled: _chat!.provider.isAvailable,
+                  decoration: InputDecoration(
+                    hintText: hint,
+                    filled: false,
+                    isDense: true,
+                    contentPadding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                    border: InputBorder.none,
+                    enabledBorder: InputBorder.none,
+                    focusedBorder: InputBorder.none,
+                    disabledBorder: InputBorder.none,
+                  ),
+                  onSubmitted: useDesktopShell()
+                      ? null
+                      : (_) {
+                          if (!_sending && !_compressing) {
+                            unawaited(_send());
+                          }
+                        },
+                ),
+              ),
             ),
-          ),
-          onSubmitted: (_) {
-            if (!_sending && !_compressing) {
-              unawaited(_send());
-            }
-          },
+            _buildInlineMicButton(theme: theme),
+            const SizedBox(width: 2),
+            _buildInlinePrimaryButton(theme: theme, streaming: streaming),
+          ],
         ),
-        Padding(
-          padding: const EdgeInsets.only(right: 6, bottom: 6),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              _buildInlineMicButton(theme: theme),
-              const SizedBox(width: 2),
-              _buildInlinePrimaryButton(theme: theme, streaming: streaming),
-            ],
-          ),
-        ),
-      ],
+      ),
     );
   }
 
@@ -2142,7 +2291,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _syncWindowToBlocks(blocks.length);
     final visibleBlocks = _transcriptWindow.visibleSlice(blocks);
     final hiddenOlder = _transcriptWindow.hiddenOlder();
-    final hiddenNewer = _transcriptWindow.hiddenNewer(blocks.length);
     final liveError = runtime?.lastError;
     final deliveryError = runtime?.deliveryError;
     final rawError = _error ?? liveError ?? deliveryError;
@@ -2282,6 +2430,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               },
               icon: const Icon(Icons.folder_open_outlined),
             ),
+          if (_repo != null && _host != null)
+            IconButton(
+              tooltip: 'Terminal in project',
+              onPressed: () {
+                final loc = Uri(
+                  path: '/hosts/terminal/${_host!.id}',
+                  queryParameters: {'cwd': _repo!.remotePath},
+                ).toString();
+                if (useDesktopShell(context)) {
+                  context.go(loc);
+                } else {
+                  context.push(loc);
+                }
+              },
+              icon: const Icon(Icons.terminal),
+            ),
           if (_connecting || reconnecting)
             Padding(
               padding: const EdgeInsets.only(right: 12),
@@ -2321,7 +2485,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             context,
                             session: adsmSession,
                             bridgeOpen: connected,
+                            provider: _chat?.provider,
                             onReconnect: connected ? null : _ensureAcp,
+                            onReauthed: () {
+                              unawaited(_reconnectAfterReauth());
+                            },
                           ),
                         );
                       } else {
@@ -2437,6 +2605,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               },
                         child: const Text('Reconnect'),
                       ),
+                    if (isAgentAuthFailureText(displayError))
+                      TextButton(
+                        onPressed: (_connecting || _authReauthInFlight)
+                            ? null
+                            : () => unawaited(
+                                  _promptAuthReauth(fromUser: true),
+                                ),
+                        child: const Text('Reauth'),
+                      ),
                     IconButton(
                       tooltip: 'Dismiss',
                       icon: Icon(
@@ -2475,7 +2652,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           setState(() => _showJumpToLatest = true);
                         }
                       }
-                      _maybeSlideWindow(direction: -1);
+                      _maybeLoadOlderHistory();
                     } else if (notification.direction ==
                         ScrollDirection.forward) {
                       if (_isNearBottom && !_followOutput) {
@@ -2485,13 +2662,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           setState(() => _showJumpToLatest = false);
                         }
                       }
-                      _maybeSlideWindow(direction: 1);
                     }
                     return false;
                   },
-                  child: GptMarkdownTheme(
-                    gptThemeData: chatGptMarkdownTheme(theme),
-                    child: ListView.builder(
+                  child: SelectionArea(
+                    child: GptMarkdownTheme(
+                      gptThemeData: chatGptMarkdownTheme(theme),
+                      child: ListView.builder(
                   controller: _scroll,
                   padding: const EdgeInsets.all(12),
                   // Keep scroll physics interactive even while the agent streams.
@@ -2501,7 +2678,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   cacheExtent: 600,
                   itemCount: (hiddenOlder > 0 ? 1 : 0) +
                       visibleBlocks.length +
-                      (hiddenNewer > 0 ? 1 : 0) +
                       extra.length,
                   itemBuilder: (context, index) {
                     var cursor = index;
@@ -2510,10 +2686,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         return Padding(
                           padding: const EdgeInsets.only(bottom: 8),
                           child: Center(
-                            child: Text(
-                              '↑ $hiddenOlder earlier',
-                              style: theme.textTheme.labelSmall?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
+                            child: TextButton(
+                              onPressed: _loadingOlderHistory
+                                  ? null
+                                  : () => _maybeLoadOlderHistory(
+                                        fromUserTap: true,
+                                      ),
+                              child: Text(
+                                _loadingOlderHistory
+                                    ? 'Loading earlier…'
+                                    : '↑ $hiddenOlder earlier · tap to load',
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                  color: theme.colorScheme.primary,
+                                ),
                               ),
                             ),
                           ),
@@ -2610,26 +2795,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       );
                     }
                     cursor -= visibleBlocks.length;
-                    if (hiddenNewer > 0) {
-                      if (cursor == 0) {
-                        return Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: Center(
-                            child: Text(
-                              '↓ $hiddenNewer newer (jump to resume)',
-                              style: theme.textTheme.labelSmall?.copyWith(
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ),
-                        );
-                      }
-                      cursor--;
-                    }
                     return extra[cursor];
                   },
                 ),
-                ),
+                    ),
+                  ),
                 ),
                 if (_showJumpToLatest)
                   Positioned(
@@ -2954,15 +3124,15 @@ class _ThinkingFoldState extends State<_ThinkingFold> {
           child: Material(
             color: theme.colorScheme.surfaceContainerHigh.withValues(alpha: 0.55),
             borderRadius: BorderRadius.circular(12),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(12),
-              onTap: () => setState(() => _expanded = !_expanded),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  InkWell(
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => setState(() => _expanded = !_expanded),
+                    child: Row(
                       children: [
                         Icon(
                           Icons.psychology_alt_outlined,
@@ -2991,20 +3161,20 @@ class _ThinkingFoldState extends State<_ThinkingFold> {
                         ),
                       ],
                     ),
-                    if (_expanded) ...[
-                      const SizedBox(height: 8),
-                      MessageBody(
-                        text: widget.text,
-                        dense: true,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          fontStyle: FontStyle.italic,
-                          color: theme.colorScheme.onSurfaceVariant,
-                          height: 1.35,
-                        ),
+                  ),
+                  if (_expanded) ...[
+                    const SizedBox(height: 8),
+                    MessageBody(
+                      text: widget.text,
+                      dense: true,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontStyle: FontStyle.italic,
+                        color: theme.colorScheme.onSurfaceVariant,
+                        height: 1.35,
                       ),
-                    ],
+                    ),
                   ],
-                ),
+                ],
               ),
             ),
           ),

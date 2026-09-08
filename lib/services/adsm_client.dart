@@ -20,6 +20,103 @@ import 'ssh_service.dart';
 
 export 'adsm_version.dart';
 
+/// One long-lived `agentdock-adsm client` SSH bridge per host.
+///
+/// ADSM already multiplexes many chats over a single NDJSON client. Opening a
+/// fresh exclusive SSH per agent exhausts sshd channels (especially via
+/// ProxyJump) and surfaces as `SSHChannelOpenError(...: open failed)`.
+class AdsmBridgePool {
+  AdsmBridgePool(this._ssh);
+
+  final SshService _ssh;
+  final Map<String, _AdsmBridgeEntry> _entries = {};
+  final Map<String, Future<AdsmClient>> _connecting = {};
+
+  /// Borrow the shared bridge for [host]. Pair with [release].
+  Future<AdsmClient> acquire(Host host) async {
+    while (true) {
+      final existing = _entries[host.id];
+      if (existing != null && existing.client.isOpen) {
+        existing.refs++;
+        return existing.client;
+      }
+      if (existing != null) {
+        _entries.remove(host.id);
+      }
+
+      var inflight = _connecting[host.id];
+      if (inflight == null) {
+        late final Future<AdsmClient> created;
+        created = () async {
+          try {
+            return await AdsmClient.connect(_ssh, host);
+          } finally {
+            if (identical(_connecting[host.id], created)) {
+              _connecting.remove(host.id);
+            }
+          }
+        }();
+        _connecting[host.id] = created;
+        inflight = created;
+      }
+
+      final client = await inflight;
+      if (!client.isOpen) {
+        // Stale connect — loop and open a fresh one.
+        continue;
+      }
+      final entry = _entries.putIfAbsent(
+        host.id,
+        () {
+          unawaited(
+            client.done.whenComplete(() {
+              final cur = _entries[host.id];
+              if (cur != null && identical(cur.client, client)) {
+                _entries.remove(host.id);
+              }
+            }),
+          );
+          return _AdsmBridgeEntry(client);
+        },
+      );
+      if (!identical(entry.client, client) || !entry.client.isOpen) {
+        continue;
+      }
+      entry.refs++;
+      return entry.client;
+    }
+  }
+
+  /// Drop a live bridge (e.g. after the host ADSM daemon was restarted).
+  Future<void> drop(String hostId) async {
+    final entry = _entries.remove(hostId);
+    if (entry == null) return;
+    entry.refs = 0;
+    try {
+      await entry.client.close();
+    } catch (_) {}
+  }
+
+  /// Drop one borrower. Closes the SSH bridge when the last chat releases.
+  Future<void> release(String hostId) async {
+    final entry = _entries[hostId];
+    if (entry == null) return;
+    entry.refs--;
+    if (entry.refs > 0) return;
+    _entries.remove(hostId);
+    try {
+      await entry.client.close();
+    } catch (_) {}
+  }
+}
+
+class _AdsmBridgeEntry {
+  _AdsmBridgeEntry(this.client);
+
+  final AdsmClient client;
+  int refs = 0;
+}
+
 /// NDJSON control client for the host ADSM daemon (`agentdock-adsm client`).
 class AdsmClient {
   AdsmClient._(this._sshClient, this._session);
@@ -34,8 +131,14 @@ class AdsmClient {
   StreamSubscription<Uint8List>? _sub;
   bool _open = true;
   int _nextId = 1;
+  final Completer<void> _done = Completer<void>();
 
   Stream<Map<String, dynamic>> get events => _events.stream;
+
+  bool get isOpen => _open;
+
+  /// Completes when the ADSM channel / SSH session ends.
+  Future<void> get done => _done.future;
 
   static Future<AdsmClient> connect(SshService ssh, Host host) async {
     final client = await ssh.connectExclusive(host);
@@ -86,6 +189,7 @@ fi
         if (!_events.isClosed) {
           _events.add({'method': 'closed'});
         }
+        if (!_done.isCompleted) _done.complete();
       },
     );
     _session.stderr.listen((data) {
@@ -225,6 +329,14 @@ fi
       _sshClient.close();
     } catch (_) {}
     _failAll(StateError('ADSM closed'));
+    // Notify borrowers before closing the broadcast — otherwise sessions keep
+    // a dead client while the UI still shows Bridge · Connected.
+    if (!_events.isClosed) {
+      try {
+        _events.add({'method': 'closed'});
+      } catch (_) {}
+    }
+    if (!_done.isCompleted) _done.complete();
     await _events.close();
   }
 }
@@ -277,11 +389,14 @@ class AdsmSession implements AgentSession {
     required this.host,
     required this.chatId,
     required AdsmClient client,
-  }) : _client = client;
+    AdsmBridgePool? bridgePool,
+  })  : _client = client,
+        _bridgePool = bridgePool;
 
   final Host host;
   final String chatId;
   final AdsmClient _client;
+  final AdsmBridgePool? _bridgePool;
 
   final _updates = StreamController<AcpUpdate>.broadcast();
   StreamSubscription<Map<String, dynamic>>? _eventSub;
@@ -384,7 +499,10 @@ class AdsmSession implements AgentSession {
     String? acpId = sessionId;
     String? fetchError;
 
-    if (!bridgeOpen) {
+    // The SSH NDJSON client can die while ChatSessionRuntime still thinks the
+    // bridge is up (missed closed event / shared-pool teardown).
+    final live = bridgeOpen && _client.isOpen;
+    if (!live) {
       return AdsmHostHealth(
         hostLabel: host.displayLabel,
         bridgeOpen: false,
@@ -396,7 +514,9 @@ class AdsmSession implements AgentSession {
         agentStatus: agentStatus,
         agentLastError: agentError,
         acpSessionId: acpId,
-        fetchError: 'Bridge closed — reconnect to refresh',
+        fetchError: _client.isOpen
+            ? 'Bridge closed — reconnect to refresh'
+            : 'ADSM channel closed — tap Reconnect',
       );
     }
 
@@ -407,6 +527,19 @@ class AdsmSession implements AgentSession {
       _client.protocolVersion = pingVersion;
     } catch (e) {
       fetchError = 'Ping failed: $e';
+      if ('$e'.toLowerCase().contains('channel closed') ||
+          '$e'.toLowerCase().contains('adsm closed')) {
+        return AdsmHostHealth(
+          hostLabel: host.displayLabel,
+          bridgeOpen: false,
+          pingVersion: pingVersion,
+          requiredVersion: kRequiredAdsmVersion,
+          agentStatus: agentStatus,
+          agentLastError: agentError,
+          acpSessionId: acpId,
+          fetchError: 'ADSM channel closed — tap Reconnect',
+        );
+      }
     }
 
     try {
@@ -478,55 +611,91 @@ class AdsmSession implements AgentSession {
     PermissionPolicy permissionPolicy = PermissionPolicy.allowAll,
     String? resumeSessionId,
     String? preferredModelId,
+    AdsmBridgePool? bridgePool,
   }) async {
     final apiKey = switch (provider) {
       AgentProvider.cursor => await secureStore.readCursorApiKey(),
       AgentProvider.claude => await secureStore.readAnthropicApiKey(),
     };
 
-    final client = await AdsmClient.connect(ssh, host);
-    final session = AdsmSession._(host: host, chatId: chatId, client: client);
+    final pool = bridgePool;
+    final client = pool != null
+        ? await pool.acquire(host)
+        : await AdsmClient.connect(ssh, host);
+    final session = AdsmSession._(
+      host: host,
+      chatId: chatId,
+      client: client,
+      bridgePool: pool,
+    );
     session.mode = initialMode;
     session.permissionPolicy = permissionPolicy;
-    session._eventSub = client.events.listen(session._onEvent);
-
-    await client.request('session.subscribe', {
-      'chatId': chatId,
-      'afterSeq': 0,
-    });
-
-    final snap = await client.request(
-      'agents.ensure',
-      {
-        'chatId': chatId,
-        'cwd': cwd,
-        'binary': binary,
-        'provider': provider.id,
-        if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
-        'fullAccess': permissionPolicy.fullAccess,
-        'permissionAsk': !permissionPolicy.fullAccess,
-        if (resumeSessionId != null) 'resumeSessionId': resumeSessionId,
-        'mcpServers': mcpServers,
-        'mode': initialMode.id,
-        if (preferredModelId != null && preferredModelId.isNotEmpty)
-          'modelId': preferredModelId,
+    session._eventSub = client.events.listen(
+      session._onEvent,
+      onDone: () {
+        if (!session._updates.isClosed) {
+          session._updates.add(const AcpUpdate.closed());
+        }
       },
-      timeout: const Duration(seconds: 90),
+      onError: (Object e) {
+        SafeLog.d('ADSM event stream error', e);
+        if (!session._updates.isClosed) {
+          session._updates.add(const AcpUpdate.closed());
+        }
+      },
     );
 
-    session._applySnapshot(snap);
-    // If ensure returned RUNNING attach without re-init, treat as resume.
-    final state = snap['status']?.toString();
-    if (state == 'idle' && (resumeSessionId != null || session.sessionId != null)) {
-      session.resumedInPlace = snap['acpSessionId'] == resumeSessionId;
-    }
-    // Pull durable host transcript ASAP — before UI settles on SQLite-only.
     try {
-      session.hostTranscript = await session.pullTranscript();
+      await client.request('session.subscribe', {
+        'chatId': chatId,
+        'afterSeq': 0,
+      });
+
+      final snap = await client.request(
+        'agents.ensure',
+        {
+          'chatId': chatId,
+          'cwd': cwd,
+          'binary': binary,
+          'provider': provider.id,
+          if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+          'fullAccess': permissionPolicy.fullAccess,
+          'permissionAsk': !permissionPolicy.fullAccess,
+          if (resumeSessionId != null) 'resumeSessionId': resumeSessionId,
+          'mcpServers': mcpServers,
+          'mode': initialMode.id,
+          if (preferredModelId != null && preferredModelId.isNotEmpty)
+            'modelId': preferredModelId,
+        },
+        timeout: const Duration(seconds: 90),
+      );
+
+      session._applySnapshot(snap);
+      // If ensure returned RUNNING attach without re-init, treat as resume.
+      final state = snap['status']?.toString();
+      if (state == 'idle' &&
+          (resumeSessionId != null || session.sessionId != null)) {
+        session.resumedInPlace = snap['acpSessionId'] == resumeSessionId;
+      }
+      // Pull durable host transcript ASAP — before UI settles on SQLite-only.
+      try {
+        session.hostTranscript = await session.pullTranscript();
+      } catch (e) {
+        SafeLog.d('ADSM transcript.pull failed', e);
+      }
+      return session;
     } catch (e) {
-      SafeLog.d('ADSM transcript.pull failed', e);
+      await session._eventSub?.cancel();
+      session._eventSub = null;
+      if (pool != null) {
+        await pool.release(host.id);
+      } else {
+        try {
+          await client.close();
+        } catch (_) {}
+      }
+      rethrow;
     }
-    return session;
   }
 
   /// Messages pulled from host `~/.agentdock/messages/<chatId>.jsonl`.
@@ -943,9 +1112,14 @@ class AdsmSession implements AgentSession {
     await _eventSub?.cancel();
     _eventSub = null;
     _finishPrompt();
-    try {
-      await _client.close();
-    } catch (_) {}
+    final pool = _bridgePool;
+    if (pool != null) {
+      await pool.release(host.id);
+    } else {
+      try {
+        await _client.close();
+      } catch (_) {}
+    }
     if (!_updates.isClosed) {
       try {
         _updates.add(const AcpUpdate.closed());

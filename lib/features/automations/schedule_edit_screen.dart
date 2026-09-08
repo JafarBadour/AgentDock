@@ -465,7 +465,7 @@ class _ScheduleEditScreenState extends ConsumerState<ScheduleEditScreen> {
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Text(
-                'No host projects yet — add a host under Hosts first.',
+                'No projects yet — create an agent and pick a folder first.',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),

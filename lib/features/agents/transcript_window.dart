@@ -1,128 +1,107 @@
-/// Sliding viewport over a long transcript: only [size] rows stay mounted.
+/// Tail window over a long transcript: mount the latest [pageSize] rows, and
+/// only grow toward older history when the user asks (top edge / tap).
 ///
-/// Scrolling toward older content decreases [start] and drops newer rows;
-/// scrolling toward newer content increases [start] and drops older ones.
-/// Pure math — no Flutter dependencies — so every branch is unit-testable.
+/// Newer rows are never dropped while reading history — that mid-scroll
+/// sliding is what made the list jump. Jump-to-latest resets back to one page.
 class TranscriptWindow {
   TranscriptWindow({
-    this.size = 100,
-    this.shiftStep = 24,
-    this.edgePx = 80.0,
-    this.cooldown = const Duration(milliseconds: 280),
-  });
+    this.pageSize = 30,
+    this.edgePx = 72.0,
+    this.cooldown = const Duration(milliseconds: 450),
+  }) : visibleCount = pageSize;
 
-  final int size;
-  final int shiftStep;
+  final int pageSize;
   final double edgePx;
   final Duration cooldown;
 
-  int start = 0;
-  bool pinnedToEnd = true;
-  DateTime? lastShiftAt;
+  /// How many trailing rows are currently mounted (grows via [loadOlder]).
+  int visibleCount;
 
-  /// Keep [start] valid for [total] and optionally pin to the latest window.
+  /// True when the viewport should stay glued to the live end.
+  bool pinnedToEnd = true;
+
+  DateTime? lastLoadAt;
+
+  /// Absolute index of the first mounted row (derived from [visibleCount]).
+  int start = 0;
+
+  int startFor(int total) {
+    if (total <= 0) return 0;
+    if (visibleCount >= total) return 0;
+    return total - visibleCount;
+  }
+
+  /// Keep [start] valid for [total]. Following does not shrink an expanded
+  /// history window — only [pinToLatest] resets to one page.
   void sync(int total, {required bool followOutput}) {
-    if (total <= size) {
-      start = 0;
-      pinnedToEnd = true;
-      return;
-    }
-    if (followOutput || pinnedToEnd) {
-      start = total - size;
-      pinnedToEnd = true;
-      return;
-    }
-    final maxStart = total - size;
-    if (start > maxStart) start = maxStart;
-    if (start < 0) start = 0;
+    if (followOutput) pinnedToEnd = true;
+    if (visibleCount < pageSize) visibleCount = pageSize;
+    start = startFor(total);
   }
 
   void pinToLatest(int total) {
     pinnedToEnd = true;
-    start = total > size ? total - size : 0;
+    visibleCount = pageSize;
+    start = startFor(total);
   }
 
-  int maxStartFor(int total) => total <= size ? 0 : total - size;
+  int maxStartFor(int total) => startFor(total);
 
   int endExclusive(int total) {
     if (total <= 0) return 0;
-    final end = start + size;
-    return end > total ? total : end;
+    return total;
   }
 
   int hiddenOlder() => start < 0 ? 0 : start;
 
-  int hiddenNewer(int total) {
-    final end = endExclusive(total);
-    final n = total - end;
-    return n < 0 ? 0 : n;
-  }
+  /// Tail window always includes the newest rows.
+  int hiddenNewer(int total) => 0;
 
   List<T> visibleSlice<T>(List<T> all) {
     if (all.isEmpty) return all;
-    final end = endExclusive(all.length);
-    final from = start.clamp(0, end);
-    return all.sublist(from, end);
+    final from = startFor(all.length);
+    return all.sublist(from);
   }
 
-  /// Attempt a window shift.
+  /// Expand toward older history by up to one [pageSize].
   ///
-  /// [direction]: `-1` toward older (up), `+1` toward newer (down).
-  /// Returns `true` when [start] changed.
-  bool tryShift({
-    required int direction,
+  /// Returns how many rows were added (0 if none / cooldown).
+  int loadOlder(int total, {DateTime? now, bool force = false}) {
+    if (total <= visibleCount) return 0;
+    final n = now ?? DateTime.now();
+    final last = lastLoadAt;
+    if (!force && last != null && n.difference(last) < cooldown) return 0;
+
+    final room = total - visibleCount;
+    final add = room < pageSize ? room : pageSize;
+    visibleCount += add;
+    lastLoadAt = n;
+    pinnedToEnd = false;
+    start = startFor(total);
+    return add;
+  }
+
+  /// Load older history when the user scrolls into the top edge.
+  bool tryLoadOlderAtTop({
     required int total,
     required double pixels,
-    required double extentAfter,
     required double maxScrollExtent,
     required DateTime now,
     bool busy = false,
   }) {
-    if (busy || total <= size) return false;
-    final last = lastShiftAt;
-    if (last != null && now.difference(last) < cooldown) return false;
-    // Short content: edge checks would both fire and thrash.
-    if (maxScrollExtent < edgePx * 2) return false;
-
-    final maxStart = total - size;
-    if (direction < 0 && pixels <= edgePx && start > 0) {
-      final next = start - shiftStep;
-      start = next < 0 ? 0 : (next > maxStart ? maxStart : next);
-      lastShiftAt = now;
-      pinnedToEnd = start >= maxStart;
-      return true;
-    }
-    if (direction > 0 && extentAfter <= edgePx && start < maxStart) {
-      final next = start + shiftStep;
-      start = next > maxStart ? maxStart : next;
-      lastShiftAt = now;
-      pinnedToEnd = start >= maxStart;
-      return true;
-    }
-    return false;
+    if (busy || total <= visibleCount) return false;
+    if (pixels > edgePx) return false;
+    return loadOlder(total, now: now) > 0;
   }
 
-  /// After a shift, park slightly off the edge so we do not re-trigger.
-  double paddedScrollTarget({
-    required int shiftDelta,
+  /// After prepending older rows, keep the same message under the thumb.
+  double preserveScrollAfterPrepend({
     required double beforePixels,
     required double beforeMax,
     required double afterMax,
   }) {
     if (afterMax <= 0) return 0;
     final deltaExtent = afterMax - beforeMax;
-    final target = (beforePixels + deltaExtent).clamp(0.0, afterMax);
-    if (shiftDelta < 0) {
-      return (target + edgePx + 24).clamp(0.0, afterMax);
-    }
-    return (target - edgePx - 24).clamp(0.0, afterMax);
+    return (beforePixels + deltaExtent).clamp(0.0, afterMax);
   }
-
-  /// Resume live follow only when the window reached the end *and* the
-  /// viewport is already near the bottom (do not yank mid-scroll).
-  bool shouldResumeFollow({
-    required bool atEnd,
-    required bool nearBottom,
-  }) =>
-      atEnd && nearBottom;
 }
