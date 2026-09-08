@@ -34,6 +34,15 @@ def _is_acp_method_not_found(exc: BaseException, method: str) -> bool:
     return "-32601" in text or "method not found" in text.lower()
 
 
+def _is_session_not_found(exc: BaseException) -> bool:
+    """Claude/Cursor ACP rejected the session id (often after cancel/restart)."""
+    text = str(exc).lower()
+    return (
+        "session not found" in text
+        or "unknown session" in text
+        or ("-32603" in text and "session" in text)
+    )
+
 def _flatten_config_select_options(options: Any) -> list[dict[str, Any]]:
     """Flatten nested select option groups from ACP configOptions."""
     if not isinstance(options, list):
@@ -289,6 +298,7 @@ class Worker:
         self.binary = ""
         self.full_access = True
         self.acp_session_id: Optional[str] = None
+        self._needs_history_bootstrap = False
         self.model_id: Optional[str] = None
         self.available_models: list[dict[str, Any]] = []
         self._models_via_config_option = False
@@ -802,6 +812,8 @@ class Worker:
         )
         self._apply_modes(result.get("modes"))
         self._persist_session_id()
+        # Fresh ACP sessions have no memory — inject durable chat on next prompt.
+        self._needs_history_bootstrap = True
 
     async def _load_session(
         self, session_id: str, mcp_servers: list[Any]
@@ -1090,6 +1102,71 @@ class Worker:
         if not self.model_id:
             self.model_id = model_id
 
+    def _clear_acp_session(self) -> None:
+        self.acp_session_id = None
+        self._needs_history_bootstrap = True
+        sid_path = self.dir / "acp_session_id"
+        try:
+            sid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _history_bootstrap_prompt(
+        self, *, exclude_message_id: Optional[str] = None
+    ) -> str:
+        """Format recent durable transcript so a fresh session keeps context."""
+        rows = transcript_store.list_messages(self.chat_id)
+        if not rows:
+            return ""
+        budget = 28_000
+        used = 0
+        picked: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            mid = str(row.get("id") or "")
+            if exclude_message_id and mid == exclude_message_id:
+                continue
+            role = str(row.get("role") or "").lower()
+            if role not in ("user", "assistant"):
+                continue
+            content = str(row.get("content") or "").strip()
+            if not content:
+                continue
+            if len(content) > 6_000:
+                content = content[:6_000].rstrip() + "\n…(truncated)"
+            chunk_len = len(content) + 16
+            if used + chunk_len > budget and picked:
+                break
+            picked.append(
+                {"role": role, "content": content}
+            )
+            used += chunk_len
+            if len(picked) >= 40:
+                break
+        picked.reverse()
+        if not picked:
+            return ""
+        lines = []
+        for row in picked:
+            label = "User" if row["role"] == "user" else "Assistant"
+            lines.append(f"{label}:\n{row['content']}")
+        body = "\n\n".join(lines)
+        return (
+            "[Agent Dock] The previous ACP session ended (stop/cancel or "
+            "restart). Here is the recent chat history from this agent so you "
+            "keep full context. Do not re-explore work already covered below "
+            "unless the user asks.\n\n"
+            f"{body}\n\n"
+            "---\n"
+            "Continue from this history. The user's latest message follows."
+        )
+
+    async def _ensure_acp_session(self) -> None:
+        """Mint a session when cancel/crash left us without a usable id."""
+        if self.acp_session_id:
+            return
+        await self._initialize()
+        await self._open_session(mcp_servers=[], resume_session_id=None)
+
     async def prompt(
         self,
         text: str,
@@ -1098,6 +1175,11 @@ class Worker:
         user_message_id: Optional[str] = None,
         user_created_at: Optional[str] = None,
     ) -> dict[str, Any]:
+        if not self.acp_session_id:
+            try:
+                await self._ensure_acp_session()
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"ACP session not ready: {e}") from e
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
         if self._turn_task is not None and not self._turn_task.done():
@@ -1153,14 +1235,7 @@ class Worker:
 
         async def _run_turn() -> None:
             try:
-                result = await self._request(
-                    "session/prompt",
-                    {
-                        "sessionId": self.acp_session_id,
-                        "prompt": blocks,
-                    },
-                    timeout=600.0,
-                )
+                result = await self._prompt_acp(blocks)
                 stop = (
                     result.get("stopReason")
                     if isinstance(result, dict)
@@ -1194,6 +1269,42 @@ class Worker:
             "userMessageId": self._turn_user_id,
             "status": protocol.STATUS_RUNNING,
         }
+
+    async def _prompt_acp(self, blocks: list[dict[str, Any]]) -> Any:
+        """Run session/prompt; on Session not found, mint a new session and retry once."""
+
+        async def _send(payload_blocks: list[dict[str, Any]]) -> Any:
+            use_blocks = list(payload_blocks)
+            if self._needs_history_bootstrap:
+                hist = self._history_bootstrap_prompt(
+                    exclude_message_id=self._turn_user_id
+                )
+                self._needs_history_bootstrap = False
+                if hist:
+                    use_blocks = [{"type": "text", "text": hist}, *use_blocks]
+                    await self._emit_event(
+                        "activity", label="Restoring chat context…"
+                    )
+            return await self._request(
+                "session/prompt",
+                {
+                    "sessionId": self.acp_session_id,
+                    "prompt": use_blocks,
+                },
+                timeout=600.0,
+            )
+
+        try:
+            return await _send(blocks)
+        except Exception as e:  # noqa: BLE001
+            if not _is_session_not_found(e):
+                raise
+            await self._emit_event(
+                "activity", label="Session expired — opening a new one…"
+            )
+            self._clear_acp_session()
+            await self._ensure_acp_session()
+            return await _send(blocks)
 
     def _persist_assistant_turn(self) -> None:
         if self._assistant_persisted:
@@ -1241,6 +1352,10 @@ class Worker:
         await self._emit_event("turn_complete", reason="cancelled")
         await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
         await self._emit_event("status", status=protocol.STATUS_IDLE)
+        # Claude ACP often drops the session after cancel. Clear so the next
+        # prompt mints session/new instead of failing with Session not found.
+        if (self.provider or "").lower() == "claude":
+            self._clear_acp_session()
 
     async def respond_permission(self, request_id: str, option_id: str) -> None:
         pending = self._open_permissions.pop(str(request_id), None)

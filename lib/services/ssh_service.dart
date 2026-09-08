@@ -149,6 +149,14 @@ bool isAgentAuthFailureText(String text) {
       t.contains('agent login');
 }
 
+/// ACP session id is gone (common after Stop/cancel on Claude).
+bool isAcpSessionGoneText(String text) {
+  final t = text.toLowerCase();
+  return t.contains('session not found') ||
+      t.contains('unknown session') ||
+      (t.contains('-32603') && t.contains('session'));
+}
+
 /// Caps concurrent exec channels on one connection.
 ///
 /// sshd's `MaxSessions` defaults to 10 channels per network connection. Now

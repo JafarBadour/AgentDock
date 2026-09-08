@@ -594,6 +594,35 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
   }
 
+  /// Drop a dead ACP resume id and reopen the transport without it.
+  Future<void> _recoverFromGoneAcpSession() async {
+    try {
+      final current = chatMeta ?? await _db.getChat(chatId);
+      if (current != null && current.acpSessionId != null) {
+        chatMeta = current.copyWith(
+          clearAcpSessionId: true,
+          updatedAt: DateTime.now(),
+        );
+        await _db.upsertChat(chatMeta!);
+        onLocalChange?.call(chatId);
+      }
+    } catch (e) {
+      SafeLog.d('clear acp session id failed', e);
+    }
+    if (_session is AdsmSession) {
+      (_session as AdsmSession).sessionId = null;
+    }
+    promptInFlight = false;
+    remoteTurnActive = false;
+    sendingToHost = false;
+    activityLabel = null;
+    notifyListeners();
+    if (!_suspended && sessionFactory != null && !closed) {
+      closed = true;
+      _scheduleReconnect(immediate: true);
+    }
+  }
+
   /// The app is going into the background — stop fighting for a socket the OS
   /// is about to kill. For durable sessions the host agent keeps the turn.
   void suspend() {
@@ -1017,22 +1046,21 @@ class ChatSessionRuntime extends ChangeNotifier {
 
     _skipAutoDrain = true;
     try {
-      if (promptInFlight) {
-        try {
-          await _session.cancel().timeout(const Duration(seconds: 4));
-        } catch (e) {
-          SafeLog.d('cancel before force-run failed', e);
-        }
-        await flushAssistantBuffer();
-        await commitThought();
-        _breakPromptChain();
-        notifyListeners();
-      } else {
-        await _promptTail.timeout(
-          const Duration(seconds: 2),
-          onTimeout: _breakPromptChain,
-        );
+      _ignoreHostRunningUntil =
+          DateTime.now().add(const Duration(seconds: 20));
+      try {
+        await _session.cancel().timeout(const Duration(seconds: 8));
+      } catch (e) {
+        SafeLog.d('cancel before force-run failed', e);
       }
+      await flushAssistantBuffer();
+      await commitThought();
+      _breakPromptChain();
+      promptInFlight = false;
+      remoteTurnActive = false;
+      sendingToHost = false;
+      activityLabel = null;
+      notifyListeners();
     } finally {
       _skipAutoDrain = false;
     }
@@ -1127,6 +1155,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     final epoch = _promptEpoch;
     remoteTurnActive = false;
     _clearHostBusyWatchdog();
+    _ignoreHostRunningUntil = null;
     promptInFlight = true;
     sendingToHost = true;
     deliveryError = null;
@@ -1349,6 +1378,20 @@ class ChatSessionRuntime extends ChangeNotifier {
       final st = await (_session as AdsmSession).refreshDaemonStatus();
       if (_disposed) return;
       final host = (st ?? '').toLowerCase();
+      if (_suppressHostRunning &&
+          (host == 'running' || host == 'waiting_permission')) {
+        // User pressed Stop — do not resurrect busy chrome from a lagging poll.
+        remoteTurnActive = false;
+        promptInFlight = false;
+        sendingToHost = false;
+        activityLabel = null;
+        if (hasActiveTools) {
+          await _finalizeStaleTools(reason: 'watchdog-after-stop');
+        }
+        notifyListeners();
+        if (!closed) _drainOutboundQueue();
+        return;
+      }
       if (host == 'running' || host == 'waiting_permission') {
         activityLabel = host == 'waiting_permission'
             ? 'Waiting for permission'
@@ -1540,14 +1583,24 @@ class ChatSessionRuntime extends ChangeNotifier {
     _hostBusyWatchdog = null;
   }
 
+  /// When set, ignore host `running` status until this time (user pressed Stop).
+  DateTime? _ignoreHostRunningUntil;
+
+  bool get _suppressHostRunning {
+    final until = _ignoreHostRunningUntil;
+    return until != null && DateTime.now().isBefore(until);
+  }
+
   /// User-facing unblock when the UI is stuck on "Agent is working".
   Future<void> unstick() async {
     _clearHostBusyWatchdog();
-    remoteTurnActive = false;
+    // Always cancel — after ADSM prompt-accept, [isPromptActive] is false while
+    // the durable turn (and long shell polls) keep running on the host. Skipping
+    // cancel left Stop as a no-op and "Thinking…" stuck forever.
+    _ignoreHostRunningUntil =
+        DateTime.now().add(const Duration(seconds: 20));
     try {
-      if (_session.isPromptActive) {
-        await _session.cancel().timeout(const Duration(seconds: 3));
-      }
+      await _session.cancel().timeout(const Duration(seconds: 8));
     } catch (e) {
       SafeLog.d('unstick cancel failed', e);
     }
@@ -1558,6 +1611,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     await commitThought();
     _breakPromptChain();
     promptInFlight = false;
+    remoteTurnActive = false;
     sendingToHost = false;
     activityLabel = null;
     lastError = null;
@@ -1631,6 +1685,7 @@ class ChatSessionRuntime extends ChangeNotifier {
             if (!closed) _drainOutboundQueue();
           }
         } else if (st == 'waiting_permission') {
+          if (_suppressHostRunning) break;
           sendingToHost = false;
           remoteTurnActive = true;
           promptInFlight = true;
@@ -1638,6 +1693,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           _noteHostActivity();
           _notifyUi(immediate: true);
         } else if (st == 'running') {
+          if (_suppressHostRunning) break;
           // Host still on a turn — keep busy chrome even when journal events
           // went quiet (HPC polls, long shell). Re-attach after a false idle.
           sendingToHost = false;
@@ -1708,6 +1764,15 @@ class ChatSessionRuntime extends ChangeNotifier {
       case AcpUpdateKind.error:
         final msg = update.text.trim();
         if (msg.isEmpty) break;
+        if (isAcpSessionGoneText(msg)) {
+          // Stale Claude session after Stop/cancel — clear resume id and
+          // soft-reconnect so the next message gets session/new.
+          lastError =
+              'Agent session expired after stop — reconnecting with a fresh session…';
+          unawaited(_recoverFromGoneAcpSession());
+          _notifyUi(immediate: true);
+          break;
+        }
         lastError = msg;
         _notifyUi(immediate: true);
       case AcpUpdateKind.closed:
