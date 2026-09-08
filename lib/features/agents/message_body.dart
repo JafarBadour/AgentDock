@@ -285,7 +285,11 @@ Future<void> openRichLink(String url) async {
 
 /// Renders a chat message as Markdown (tables, code, lists, …)
 /// with GitHub / Jira chips for recognised links.
-class MessageBody extends StatelessWidget {
+///
+/// Finished bubbles freeze the parsed [GptMarkdown] tree so parent
+/// [ChatScreen] rebuilds (streaming ticks, sidebar noise) do not re-parse
+/// every visible message.
+class MessageBody extends StatefulWidget {
   const MessageBody({
     super.key,
     required this.text,
@@ -298,98 +302,137 @@ class MessageBody extends StatelessWidget {
   final bool dense;
 
   @override
+  State<MessageBody> createState() => _MessageBodyState();
+}
+
+class _MessageBodyState extends State<MessageBody> {
+  Widget? _frozen;
+  String? _frozenText;
+  bool? _frozenDense;
+  TextStyle? _frozenStyle;
+
+  static bool _styleEq(TextStyle? a, TextStyle? b) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return false;
+    return a.color == b.color &&
+        a.fontSize == b.fontSize &&
+        a.height == b.height &&
+        a.fontWeight == b.fontWeight &&
+        a.fontStyle == b.fontStyle &&
+        a.fontFamily == b.fontFamily;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (_frozen != null &&
+        _frozenText == widget.text &&
+        _frozenDense == widget.dense &&
+        _styleEq(_frozenStyle, widget.style)) {
+      return _frozen!;
+    }
+    _frozenText = widget.text;
+    _frozenDense = widget.dense;
+    _frozenStyle = widget.style;
+    _frozen = _buildMarkdown(context);
+    return _frozen!;
+  }
+
+  Widget _buildMarkdown(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final base = style ?? theme.textTheme.bodyMedium?.copyWith(height: 1.45);
+    final base =
+        widget.style ?? theme.textTheme.bodyMedium?.copyWith(height: 1.45);
 
-    if (text.isEmpty) {
+    if (widget.text.isEmpty) {
       return Text('…', style: base);
     }
 
-    final mdTheme = GptMarkdownThemeData(
-      brightness: theme.brightness,
-      h1: theme.textTheme.titleLarge?.copyWith(
-        fontWeight: FontWeight.w700,
-        height: 1.25,
-      ),
-      h2: theme.textTheme.titleMedium?.copyWith(
-        fontWeight: FontWeight.w700,
-        height: 1.3,
-      ),
-      h3: theme.textTheme.titleSmall?.copyWith(
-        fontWeight: FontWeight.w600,
-        height: 1.3,
-      ),
-      h4: theme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
-      h5: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
-      h6: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
-      autoAddDividerLineAfterH1: false,
-      linkColor: scheme.primary,
-      linkHoverColor: scheme.primary,
-      hrLineColor: scheme.outlineVariant,
-    );
-
-    return Theme(
-      data: theme.copyWith(
-        extensions: <ThemeExtension<dynamic>>[mdTheme],
-      ),
-      child: GptMarkdown(
-        text,
-        style: base,
-        onLinkTap: (url, _) => openRichLink(url),
-        onCodeCopy: (code) {
-          Clipboard.setData(ClipboardData(text: code));
-        },
-        linkBuilder: (context, span, url, _) {
-          final label = span is TextSpan ? span.toPlainText() : '';
-          final link = classifyLink(
-            url,
-            label.trim().isEmpty ? null : label.trim(),
-          );
-          if (link.kind == RichLinkKind.generic) {
-            return Text.rich(span);
-          }
-          return Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: _LinkChip(link: link, dense: dense),
-          );
-        },
-        styleSheet: GptMarkdownStyleSheet(
-          table: TableStyle(
-            borderColor: scheme.outlineVariant,
-            borderWidth: 0.5,
-            borderRadius: const Radius.circular(8),
-            headerBackground: scheme.surfaceContainerHigh,
-            headerTextStyle: theme.textTheme.labelLarge?.copyWith(
-              fontWeight: FontWeight.w600,
-            ),
-            rowStripeColor: scheme.onSurface.withValues(alpha: 0.04),
-            cellPadding: EdgeInsets.symmetric(
-              horizontal: dense ? 8 : 10,
-              vertical: dense ? 4 : 6,
-            ),
+    // Prefer an ancestor [GptMarkdownTheme] (hoisted at the list) so we do not
+    // wrap every bubble in a new Theme — that forced gpt_markdown to re-parse
+    // on every ChatScreen setState.
+    return GptMarkdown(
+      widget.text,
+      style: base,
+      onLinkTap: (url, _) => openRichLink(url),
+      onCodeCopy: (code) {
+        Clipboard.setData(ClipboardData(text: code));
+      },
+      linkBuilder: (context, span, url, _) {
+        final label = span is TextSpan ? span.toPlainText() : '';
+        final link = classifyLink(
+          url,
+          label.trim().isEmpty ? null : label.trim(),
+        );
+        if (link.kind == RichLinkKind.generic) {
+          return Text.rich(span);
+        }
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: _LinkChip(link: link, dense: widget.dense),
+        );
+      },
+      styleSheet: GptMarkdownStyleSheet(
+        table: TableStyle(
+          borderColor: scheme.outlineVariant,
+          borderWidth: 0.5,
+          borderRadius: const Radius.circular(8),
+          headerBackground: scheme.surfaceContainerHigh,
+          headerTextStyle: theme.textTheme.labelLarge?.copyWith(
+            fontWeight: FontWeight.w600,
           ),
-          codeBlock: CodeBlockStyle(
-            backgroundColor: AppColors.chatInlineCodeBg,
-            borderColor: scheme.outlineVariant.withValues(alpha: 0.35),
-            borderWidth: 0.5,
-            borderRadius: const Radius.circular(8),
-            padding: EdgeInsets.all(dense ? 10 : 12),
-            fontSize: dense ? 12 : 13,
+          rowStripeColor: scheme.onSurface.withValues(alpha: 0.04),
+          cellPadding: EdgeInsets.symmetric(
+            horizontal: widget.dense ? 8 : 10,
+            vertical: widget.dense ? 4 : 6,
           ),
-          heading: const HeadingStyle(
-            showDivider: false,
-            padding: EdgeInsets.only(top: 4, bottom: 2),
-          ),
-          blockQuote: BlockQuoteStyle(
-            barColor: scheme.primary.withValues(alpha: 0.45),
-            barWidth: 3,
-          ),
+        ),
+        codeBlock: CodeBlockStyle(
+          backgroundColor: AppColors.chatInlineCodeBg,
+          borderColor: scheme.outlineVariant.withValues(alpha: 0.35),
+          borderWidth: 0.5,
+          borderRadius: const Radius.circular(8),
+          padding: EdgeInsets.all(widget.dense ? 10 : 12),
+          fontSize: widget.dense ? 12 : 13,
+        ),
+        heading: const HeadingStyle(
+          showDivider: false,
+          padding: EdgeInsets.only(top: 4, bottom: 2),
+        ),
+        blockQuote: BlockQuoteStyle(
+          barColor: scheme.primary.withValues(alpha: 0.45),
+          barWidth: 3,
         ),
       ),
     );
   }
+}
+
+/// Shared markdown theme for the chat list — hoist once so bubbles do not
+/// each install a Theme extension (which re-parses markdown).
+GptMarkdownThemeData chatGptMarkdownTheme(ThemeData theme) {
+  final scheme = theme.colorScheme;
+  return GptMarkdownThemeData(
+    brightness: theme.brightness,
+    h1: theme.textTheme.titleLarge?.copyWith(
+      fontWeight: FontWeight.w700,
+      height: 1.25,
+    ),
+    h2: theme.textTheme.titleMedium?.copyWith(
+      fontWeight: FontWeight.w700,
+      height: 1.3,
+    ),
+    h3: theme.textTheme.titleSmall?.copyWith(
+      fontWeight: FontWeight.w600,
+      height: 1.3,
+    ),
+    h4: theme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+    h5: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+    h6: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+    autoAddDividerLineAfterH1: false,
+    linkColor: scheme.primary,
+    linkHoverColor: scheme.primary,
+    hrLineColor: scheme.outlineVariant,
+  );
 }
 
 class _LinkChip extends StatelessWidget {

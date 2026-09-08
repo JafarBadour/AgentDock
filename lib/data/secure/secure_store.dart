@@ -5,6 +5,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../services/local_host_bootstrap.dart';
 import 'safe_log.dart';
 
 /// Secrets storage.
@@ -89,7 +90,13 @@ class SecureStore {
   /// True when we can open SSH to [hostId]: either a global key or a host password.
   Future<bool> canAuthenticateToHost(String? hostId) async {
     if (hostId != null && await hasHostPassword(hostId)) return true;
-    return hasSshPrivateKey();
+    if (await hasSshPrivateKey()) return true;
+    // Local this-computer host can use ~/.ssh/id_* without Connect.
+    if (hostId == kLocalThisComputerHostId) {
+      final pem = await readDefaultSshPrivateKeyPem();
+      return pem != null && pem.trim().isNotEmpty;
+    }
+    return false;
   }
 
   Future<void> saveCursorApiKey(String? key) async {

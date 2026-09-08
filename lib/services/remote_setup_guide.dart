@@ -33,14 +33,24 @@ command -v claude-code-acp
 tmux -V
 ''';
 
-const kRemoteTmuxSetupGuide = r'''# Install tmux on the remote
-# Debian/Ubuntu:
-sudo apt update && sudo apt install -y tmux
+const kRemoteTmuxSetupGuide = r'''# Install tmux on the remote (required by Agent Dock)
 
-# Fedora:
+# --- HPC / shared clusters (no sudo) ---
+module spider tmux        # see available modules
+module load tmux          # or: module load tools/tmux
+# then confirm:
+tmux -V
+
+# Or conda/mamba in your account:
+# conda install -y -c conda-forge tmux
+
+# --- Debian/Ubuntu (needs sudo) ---
+# sudo apt update && sudo apt install -y tmux
+
+# --- Fedora ---
 # sudo dnf install -y tmux
 
-# macOS:
+# --- macOS ---
 # brew install tmux
 
 tmux -V

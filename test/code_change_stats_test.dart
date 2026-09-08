@@ -123,5 +123,55 @@ void main() {
       );
       expect(CodeChangeStats.fromTool(tool).isEmpty, isTrue);
     });
+
+    test('fromTool result is cached on the same instance', () {
+      const tool = ToolCallState(
+        toolCallId: '5',
+        title: 'Edit',
+        kind: 'edit',
+        rawOutput: '''
+--- a/x.dart
++++ b/x.dart
+@@ -1 +1,2 @@
+ a
++b
+''',
+      );
+      final a = CodeChangeStats.fromTool(tool);
+      final b = CodeChangeStats.fromTool(tool);
+      expect(identical(a, b), isTrue);
+      expect(a.added, 1);
+    });
+
+    test('fromTools aggregates multiple tools', () {
+      const t1 = ToolCallState(
+        toolCallId: 'a',
+        title: 'Edit',
+        kind: 'edit',
+        locations: ['a.dart'],
+        rawOutput: '''
+--- a/a.dart
++++ b/a.dart
+@@ -0,0 +1 @@
++x
+''',
+      );
+      const t2 = ToolCallState(
+        toolCallId: 'b',
+        title: 'Edit',
+        kind: 'edit',
+        locations: ['b.dart'],
+        rawOutput: '''
+--- a/b.dart
++++ b/b.dart
+@@ -1 +0,0 @@
+-y
+''',
+      );
+      final s = CodeChangeStats.fromTools([t1, t2]);
+      expect(s.added, 1);
+      expect(s.removed, 1);
+      expect(s.fileCount, 2);
+    });
   });
 }

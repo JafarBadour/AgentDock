@@ -351,16 +351,17 @@ class AdsmSession implements AgentSession {
         final st = _daemonStatus;
         if (st == null || st.isEmpty) return st;
         // Always re-emit idle/dead so the runtime can finalize stuck tools even
-        // when the string status did not change. For other states, only emit
-        // on change to avoid thrashing the activity chip.
+        // when the string status did not change. Also re-emit running so a
+        // client that cleared local busy chrome mid-turn (watchdog / missed
+        // events) re-attaches instead of looking idle while the host works.
         final changed = st != prev;
-        if (changed || st == 'idle' || st == 'dead') {
+        if (changed || st == 'idle' || st == 'dead' || st == 'running') {
           if (!_updates.isClosed) {
             _updates.add(AcpUpdate.daemonStatus(st));
             if (st == 'idle' || st == 'dead') {
               _updates.add(const AcpUpdate.activity(''));
-            } else if (changed && st == 'running') {
-              _updates.add(const AcpUpdate.activity('Thinking'));
+            } else if (st == 'running' && (changed || prev != 'running')) {
+              _updates.add(const AcpUpdate.activity('Working on host…'));
             }
           }
         }
@@ -849,12 +850,17 @@ class AdsmSession implements AgentSession {
 
   @override
   Future<void> setModel(String modelId) async {
-    final snap = await _client.request('session.set_model', {
-      'chatId': chatId,
-      'modelId': modelId,
-    });
+    // May relaunch the remote tmux worker when the ACP adapter lacks model RPCs.
+    final snap = await _client.request(
+      'session.set_model',
+      {
+        'chatId': chatId,
+        'modelId': modelId,
+      },
+      timeout: const Duration(seconds: 90),
+    );
     _applySnapshot(snap);
-    currentModelId = modelId;
+    currentModelId = snap['modelId']?.toString() ?? modelId;
   }
 
   @override
@@ -914,7 +920,14 @@ class AdsmSession implements AgentSession {
       } catch (e2) {
         SafeLog.d('ADSM model catalog list fallback failed', e2);
       }
+      if (availableModels.isEmpty) rethrow;
     }
+  }
+
+  @override
+  void seedModelCatalog(List<AgentModel> models) {
+    if (availableModels.isNotEmpty || models.isEmpty) return;
+    availableModels = List<AgentModel>.unmodifiable(models);
   }
 
   @override

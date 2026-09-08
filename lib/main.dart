@@ -12,6 +12,9 @@ import 'app/providers.dart';
 import 'app/router.dart';
 import 'app/platform_layout.dart';
 import 'app/wavy_background.dart';
+import 'features/hosts/hosts_screen.dart';
+import 'features/agents/agents_screen.dart';
+import 'services/local_host_bootstrap.dart';
 
 class AgentDockApp extends ConsumerStatefulWidget {
   const AgentDockApp({super.key});
@@ -39,6 +42,15 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       ref.read(scheduleRunnerProvider).start();
       // Keep provider alive so remote deletes tear down ACP sessions.
       ref.read(remoteDeletedChatsPrunerProvider);
+      // Mac / Windows: offer this machine as a host for local agents.
+      unawaited(() async {
+        final host = await ensureLocalThisComputerHost(
+          ref.read(appDatabaseProvider),
+        );
+        if (host == null || !mounted) return;
+        ref.invalidate(hostsListProvider);
+        ref.invalidate(agentsTreeProvider);
+      }());
     });
   }
 
@@ -63,10 +75,7 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       case AppLifecycleState.hidden:
         ref.read(appInForegroundProvider.notifier).state = false;
         unawaited(ref.read(agentDockServiceProvider).flushPendingPushes());
-        if (!ref.read(backgroundKeepAliveProvider).canSurviveBackground) {
-          ref.read(activeAcpSessionsProvider.notifier).suspendAll();
-          ref.read(sshServiceProvider).onAppPaused();
-        }
+        unawaited(_suspendBridgesUnlessKeepAlive());
       case AppLifecycleState.detached:
         ref.read(appInForegroundProvider.notifier).state = false;
         // Hand durable turns to the host, but leave the foreground service up
@@ -77,6 +86,19 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       case AppLifecycleState.inactive:
         break;
     }
+  }
+
+  /// Prefer starting the foreground service over dropping SSH mid-send.
+  Future<void> _suspendBridgesUnlessKeepAlive() async {
+    final keep = ref.read(backgroundKeepAliveProvider);
+    if (keep.canSurviveBackground) return;
+    if (await keep.isEnabled()) {
+      // Notification permission / OEM deny may have left _holding false.
+      if (await keep.ensureRunning()) return;
+    }
+    if (!mounted) return;
+    ref.read(activeAcpSessionsProvider.notifier).suspendAll();
+    ref.read(sshServiceProvider).onAppPaused();
   }
 
   @override

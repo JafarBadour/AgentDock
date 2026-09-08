@@ -192,6 +192,33 @@ void main() {
       expect(script, contains('CLAUDE_ACP_SKIP_PERMISSIONS=true'));
     });
 
+    test('Cursor run script pins --model when preferred', () {
+      final script = AgentRuntimeHost.runScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/cursor-agent',
+        preferredModelId: 'composer-2.5[fast=true]',
+      );
+      expect(script, contains('--model'));
+      expect(script, contains('composer-2.5[fast=true]'));
+      expect(script, contains('--force'));
+    });
+
+    test('Claude bootstrap exports CLAUDE_ACP_MODEL and restarts on change', () {
+      final script = AgentRuntimeHost.ensureScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        tmuxSession: 'ad-abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/claude-code-acp',
+        provider: AgentProvider.claude,
+        preferredModelId: 'opus',
+      );
+      expect(script, contains('CLAUDE_ACP_MODEL'));
+      expect(script, contains('desired_model'));
+      expect(script, contains('WANT_MODEL'));
+      expectParses(script, 'ensure-claude-model.sh');
+    });
+
     test('Claude Ask mode omits skip-permissions env', () {
       final script = AgentRuntimeHost.runScript(
         dir: '/home/me/.agentdock/sessions/abc',

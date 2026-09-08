@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -72,6 +73,14 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
   bool _busy = false;
   String? _status;
   String? _error;
+  int? _downloadReceived;
+  int? _downloadTotal;
+
+  /// When set (desktop embedded), the folder list stays mounted underneath and
+  /// this PDF replaces the panel body until the user goes back.
+  String? _pdfLocalPath;
+  String? _pdfTitle;
+  RemoteFileEntry? _pdfEntry;
 
   @override
   void initState() {
@@ -173,11 +182,25 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     );
   }
 
+  /// Files at or above this size always get a save-location + progress dialog.
+  static const _largeDownloadBytes = 1 << 20; // 1 MiB
+
   Future<String?> _pickSavePath(String fileName) async {
     return FilePicker.saveFile(
       dialogTitle: 'Save $fileName',
       fileName: fileName,
     );
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
   Future<void> _download(
@@ -186,26 +209,31 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
   }) async {
     if (entry.isDirectory) return;
     final remote = SshService.joinRemotePath(_path ?? _root, entry.name);
+    final total = entry.size;
+    // Unknown size or ≥1 MiB / explicit Save as → location picker + progress.
+    final large =
+        total == null || total >= _largeDownloadBytes || askWhere;
+
+    // Large downloads (or explicit Save as): pick location + progress dialog.
+    if (large) {
+      await _downloadWithDialog(entry, remote, total);
+      return;
+    }
 
     String? localPath;
-    if (askWhere) {
+    final dir = await _publicDownloadsDir();
+    if (dir != null) {
+      localPath = await _uniquePathIn(dir, entry.name);
+    } else {
       localPath = await _pickSavePath(entry.name);
       if (localPath == null || localPath.isEmpty) return;
-    } else {
-      final dir = await _publicDownloadsDir();
-      if (dir != null) {
-        localPath = await _uniquePathIn(dir, entry.name);
-      } else {
-        // No public Downloads — let the user pick via the system save sheet
-        // (usually opens in Downloads on Android).
-        localPath = await _pickSavePath(entry.name);
-        if (localPath == null || localPath.isEmpty) return;
-      }
     }
 
     setState(() {
       _busy = true;
       _status = 'Downloading ${entry.name}…';
+      _downloadReceived = 0;
+      _downloadTotal = total;
     });
     try {
       final parent = Directory(p.dirname(localPath));
@@ -216,6 +244,19 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
             widget.host,
             remote,
             localPath,
+            totalBytes: total,
+            onProgress: (received, tot) {
+              if (!mounted) return;
+              setState(() {
+                _downloadReceived = received;
+                _downloadTotal = tot ?? total;
+                final t = _downloadTotal;
+                _status = t != null && t > 0
+                    ? 'Downloading ${entry.name}… '
+                        '${_formatBytes(received)} / ${_formatBytes(t)}'
+                    : 'Downloading ${entry.name}… ${_formatBytes(received)}';
+              });
+            },
           );
       if (!mounted) return;
       setState(() => _status = 'Saved $bytes bytes → $localPath');
@@ -223,24 +264,145 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     } catch (e) {
       SafeLog.d('download failed', e);
       if (!mounted) return;
-      // Direct write to public Downloads can fail on locked-down Android —
-      // offer the system saver as a fallback once.
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Could not write Downloads — pick a location'),
+          action: SnackBarAction(
+            label: 'Save as',
+            onPressed: () => _download(entry, askWhere: true),
+          ),
+        ),
+      );
+      return;
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadReceived = null;
+          _downloadTotal = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _downloadWithDialog(
+    RemoteFileEntry entry,
+    String remote,
+    int? total,
+  ) async {
+    String? suggested;
+    final dir = await _publicDownloadsDir();
+    if (dir != null) {
+      suggested = await _uniquePathIn(dir, entry.name);
+    }
+
+    if (!mounted) return;
+    final savedPath = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => _FileDownloadDialog(
+        fileName: entry.name,
+        sizeLabel: entry.sizeLabel.isNotEmpty
+            ? entry.sizeLabel
+            : (total != null ? _formatBytes(total) : 'Unknown size'),
+        totalBytes: total,
+        initialPath: suggested,
+        pickSavePath: _pickSavePath,
+        onStartDownload: (localPath, onProgress, isCancelled) {
+          return ref.read(sshServiceProvider).downloadRemoteFile(
+                widget.host,
+                remote,
+                localPath,
+                totalBytes: total,
+                multipart: true,
+                onProgress: onProgress,
+                isCancelled: isCancelled,
+              );
+        },
+      ),
+    );
+    if (!mounted || savedPath == null) return;
+    setState(() => _status = 'Saved → $savedPath');
+    _showDownloadedSnack(entry.name, savedPath);
+  }
+
+  Future<void> _saveLocalCopy(
+    String localPath,
+    String fileName, {
+    bool askWhere = false,
+  }) async {
+    // Treat local copies of large PDFs like downloads — ask where + show size.
+    final size = await File(localPath).length();
+    if (size >= _largeDownloadBytes || askWhere) {
+      final dest = await _pickSavePath(fileName);
+      if (dest == null || dest.isEmpty) return;
+      setState(() {
+        _busy = true;
+        _status = 'Saving $fileName…';
+      });
+      try {
+        final parent = Directory(p.dirname(dest));
+        if (!await parent.exists()) {
+          await parent.create(recursive: true);
+        }
+        await File(localPath).copy(dest);
+        if (!mounted) return;
+        setState(() => _status = 'Saved → $dest');
+        _showDownloadedSnack(fileName, dest);
+      } catch (e) {
+        SafeLog.d('save local copy failed', e);
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Save failed: $e')),
+        );
+      } finally {
+        if (mounted) setState(() => _busy = false);
+      }
+      return;
+    }
+
+    String? dest;
+    final dir = await _publicDownloadsDir();
+    if (dir != null) {
+      dest = await _uniquePathIn(dir, fileName);
+    } else {
+      dest = await _pickSavePath(fileName);
+      if (dest == null || dest.isEmpty) return;
+    }
+    setState(() {
+      _busy = true;
+      _status = 'Saving $fileName…';
+    });
+    try {
+      final parent = Directory(p.dirname(dest));
+      if (!await parent.exists()) {
+        await parent.create(recursive: true);
+      }
+      await File(localPath).copy(dest);
+      if (!mounted) return;
+      setState(() => _status = 'Saved → $dest');
+      _showDownloadedSnack(fileName, dest);
+    } catch (e) {
+      SafeLog.d('save local copy failed', e);
+      if (!mounted) return;
       if (!askWhere) {
         setState(() => _busy = false);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Could not write Downloads — pick a location'),
+            content: const Text('Could not write Downloads — pick a location'),
             action: SnackBarAction(
               label: 'Save as',
-              onPressed: () => _download(entry, askWhere: true),
+              onPressed: () =>
+                  _saveLocalCopy(localPath, fileName, askWhere: true),
             ),
           ),
         );
         return;
       }
-      setState(() => _status = 'Download failed: $e');
+      setState(() => _status = 'Save failed: $e');
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Download failed: $e')),
+        SnackBar(content: Text('Save failed: $e')),
       );
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -436,12 +598,24 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     }
   }
 
+  void _closePdf() {
+    setState(() {
+      _pdfLocalPath = null;
+      _pdfTitle = null;
+      _pdfEntry = null;
+      _status = null;
+    });
+  }
+
   Future<void> _viewPdf(RemoteFileEntry entry) async {
     if (entry.isDirectory || !_isPdf(entry.name)) return;
     final remote = SshService.joinRemotePath(_path ?? _root, entry.name);
+    final total = entry.size;
     setState(() {
       _busy = true;
       _status = 'Opening ${entry.name}…';
+      _downloadReceived = 0;
+      _downloadTotal = total;
     });
     try {
       final cache = await getTemporaryDirectory();
@@ -450,13 +624,43 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
             widget.host,
             remote,
             localPath,
+            totalBytes: total,
+            multipart: true,
+            onProgress: (received, tot) {
+              if (!mounted) return;
+              setState(() {
+                _downloadReceived = received;
+                _downloadTotal = tot ?? total;
+                final t = _downloadTotal;
+                _status = t != null && t > 0
+                    ? 'Opening ${entry.name}… '
+                        '${_formatBytes(received)} / ${_formatBytes(t)}'
+                    : 'Opening ${entry.name}… ${_formatBytes(received)}';
+              });
+            },
           );
       if (!mounted) return;
-      setState(() => _status = entry.name);
+      setState(() {
+        _status = entry.name;
+        _busy = false;
+        _downloadReceived = null;
+        _downloadTotal = null;
+      });
+      if (widget.embedded) {
+        setState(() {
+          _pdfLocalPath = localPath;
+          _pdfTitle = entry.name;
+          _pdfEntry = entry;
+        });
+        return;
+      }
       await PdfViewerScreen.open(
         context,
         filePath: localPath,
         title: entry.name,
+        onDownload: () {
+          _saveLocalCopy(localPath, entry.name, askWhere: true);
+        },
       );
     } catch (e) {
       SafeLog.d('pdf open failed', e);
@@ -466,7 +670,13 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         SnackBar(content: Text('Could not open PDF: $e')),
       );
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadReceived = null;
+          _downloadTotal = null;
+        });
+      }
     }
   }
 
@@ -507,16 +717,27 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                   _viewPdf(entry);
                 },
               ),
-            if (!entry.isDirectory) ...[
+            if (!entry.isDirectory && _isPdf(entry.name))
               ListTile(
                 leading: const Icon(Icons.download),
-                title: const Text('Download'),
+                title: const Text('Download PDF'),
                 subtitle: const Text('Save to Downloads'),
                 onTap: () {
                   Navigator.pop(context);
                   _download(entry);
                 },
               ),
+            if (!entry.isDirectory) ...[
+              if (!_isPdf(entry.name))
+                ListTile(
+                  leading: const Icon(Icons.download),
+                  title: const Text('Download'),
+                  subtitle: const Text('Save to Downloads'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _download(entry);
+                  },
+                ),
               ListTile(
                 leading: const Icon(Icons.folder_open),
                 title: const Text('Save as…'),
@@ -566,6 +787,25 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final pdfPath = _pdfLocalPath;
+    final pdfTitle = _pdfTitle;
+    if (pdfPath != null && pdfTitle != null) {
+      return PdfViewerScreen(
+        filePath: pdfPath,
+        title: pdfTitle,
+        embedded: true,
+        onBack: _closePdf,
+        onDownload: () {
+          final entry = _pdfEntry;
+          if (entry != null) {
+            _download(entry);
+          } else {
+            _saveLocalCopy(pdfPath, pdfTitle);
+          }
+        },
+      );
+    }
+
     final parent = _path == null ? null : SshService.parentRemotePath(_path!);
     final canGoUp = parent != null && SshService.isUnderRoot(_root, parent);
     final relative = _path == null
@@ -648,7 +888,14 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         pathBar,
         if (_busy || _status != null)
           LinearProgressIndicator(
-            value: _busy ? null : 1,
+            value: () {
+              final total = _downloadTotal;
+              final received = _downloadReceived;
+              if (_busy && total != null && total > 0 && received != null) {
+                return (received / total).clamp(0.0, 1.0);
+              }
+              return _busy ? null : 1.0;
+            }(),
           ),
         if (_status != null)
           Padding(
@@ -691,21 +938,35 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                               : Text(entry.sizeLabel),
                           trailing: entry.isDirectory
                               ? const Icon(Icons.chevron_right)
-                              : IconButton(
-                                  tooltip: _isPdf(entry.name)
-                                      ? 'View PDF'
-                                      : 'Download to Downloads',
-                                  icon: Icon(
-                                    _isPdf(entry.name)
-                                        ? Icons.visibility_outlined
-                                        : Icons.download,
-                                  ),
-                                  onPressed: _busy
-                                      ? null
-                                      : () => _isPdf(entry.name)
-                                          ? _viewPdf(entry)
-                                          : _download(entry),
-                                ),
+                              : _isPdf(entry.name)
+                                  ? Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        IconButton(
+                                          tooltip: 'Download PDF',
+                                          icon: const Icon(Icons.download),
+                                          onPressed: _busy
+                                              ? null
+                                              : () => _download(entry),
+                                        ),
+                                        IconButton(
+                                          tooltip: 'View PDF',
+                                          icon: const Icon(
+                                            Icons.visibility_outlined,
+                                          ),
+                                          onPressed: _busy
+                                              ? null
+                                              : () => _viewPdf(entry),
+                                        ),
+                                      ],
+                                    )
+                                  : IconButton(
+                                      tooltip: 'Download to Downloads',
+                                      icon: const Icon(Icons.download),
+                                      onPressed: _busy
+                                          ? null
+                                          : () => _download(entry),
+                                    ),
                           onTap: entry.isDirectory
                               ? () => _openDir(entry.name)
                               : _isPdf(entry.name)
@@ -747,6 +1008,258 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         ],
       ),
       body: body,
+    );
+  }
+}
+
+typedef _DownloadStarter = Future<int> Function(
+  String localPath,
+  void Function(int received, int? total) onProgress,
+  bool Function() isCancelled,
+);
+
+/// Choose save path, then multipart-download with a live progress bar.
+class _FileDownloadDialog extends StatefulWidget {
+  const _FileDownloadDialog({
+    required this.fileName,
+    required this.sizeLabel,
+    required this.totalBytes,
+    required this.initialPath,
+    required this.pickSavePath,
+    required this.onStartDownload,
+  });
+
+  final String fileName;
+  final String sizeLabel;
+  final int? totalBytes;
+  final String? initialPath;
+  final Future<String?> Function(String fileName) pickSavePath;
+  final _DownloadStarter onStartDownload;
+
+  @override
+  State<_FileDownloadDialog> createState() => _FileDownloadDialogState();
+}
+
+class _FileDownloadDialogState extends State<_FileDownloadDialog> {
+  late final TextEditingController _pathCtrl;
+  bool _running = false;
+  bool _cancelling = false;
+  int _received = 0;
+  String? _error;
+  String _modeLabel = 'multipart';
+  DateTime? _lastProgressAt;
+  Timer? _stallUiTimer;
+  int _stallSeconds = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _pathCtrl = TextEditingController(text: widget.initialPath ?? '');
+  }
+
+  @override
+  void dispose() {
+    _stallUiTimer?.cancel();
+    _pathCtrl.dispose();
+    super.dispose();
+  }
+
+  String _fmt(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  void _armStallUi() {
+    _stallUiTimer?.cancel();
+    _stallUiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_running || _cancelling) return;
+      final at = _lastProgressAt;
+      if (at == null) return;
+      final idle = DateTime.now().difference(at).inSeconds;
+      if (idle != _stallSeconds) {
+        setState(() => _stallSeconds = idle);
+      }
+    });
+  }
+
+  Future<void> _browse() async {
+    final picked = await widget.pickSavePath(widget.fileName);
+    if (picked == null || picked.isEmpty || !mounted) return;
+    setState(() => _pathCtrl.text = picked);
+  }
+
+  Future<void> _start() async {
+    var path = _pathCtrl.text.trim();
+    if (path.isEmpty) {
+      final picked = await widget.pickSavePath(widget.fileName);
+      if (picked == null || picked.isEmpty || !mounted) return;
+      path = picked;
+      setState(() => _pathCtrl.text = path);
+    }
+    setState(() {
+      _running = true;
+      _cancelling = false;
+      _error = null;
+      _received = 0;
+      _stallSeconds = 0;
+      _modeLabel = 'multipart';
+      _lastProgressAt = DateTime.now();
+    });
+    _armStallUi();
+    try {
+      final parent = Directory(p.dirname(path));
+      if (!await parent.exists()) {
+        await parent.create(recursive: true);
+      }
+      await widget.onStartDownload(
+        path,
+        (received, _) {
+          if (!mounted || _cancelling) return;
+          setState(() {
+            if (received < _received) {
+              // Auto-retry restarted from 0.
+              _modeLabel = 'retry · sequential';
+            }
+            _received = received;
+            _lastProgressAt = DateTime.now();
+            _stallSeconds = 0;
+          });
+        },
+        () => _cancelling,
+      );
+      if (!mounted) return;
+      _stallUiTimer?.cancel();
+      if (_cancelling) {
+        Navigator.of(context).pop();
+        return;
+      }
+      Navigator.of(context).pop(path);
+    } catch (e) {
+      if (!mounted) return;
+      _stallUiTimer?.cancel();
+      final msg = e.toString();
+      if (_cancelling || msg.contains('cancelled')) {
+        Navigator.of(context).pop();
+        return;
+      }
+      setState(() {
+        _running = false;
+        _error = msg.contains('stalled')
+            ? 'Transfer stalled — tap Download to try again'
+            : msg;
+      });
+    }
+  }
+
+  void _cancel() {
+    if (!_running) {
+      Navigator.of(context).pop();
+      return;
+    }
+    setState(() => _cancelling = true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = widget.totalBytes;
+    final progress = total != null && total > 0
+        ? (_received / total).clamp(0.0, 1.0)
+        : null;
+    final stalledHint = _running && _stallSeconds >= 15;
+
+    return AlertDialog(
+      title: const Text('Download'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              widget.fileName,
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              widget.sizeLabel,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Save to',
+              style: Theme.of(context).textTheme.labelMedium,
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _pathCtrl,
+                    enabled: !_running,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      hintText: 'Choose a location…',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Browse',
+                  onPressed: _running ? null : _browse,
+                  icon: const Icon(Icons.folder_open),
+                ),
+              ],
+            ),
+            if (_running) ...[
+              const SizedBox(height: 16),
+              LinearProgressIndicator(value: progress),
+              const SizedBox(height: 8),
+              Text(
+                total != null && total > 0
+                    ? '${_fmt(_received)} / ${_fmt(total)}'
+                        '${progress != null ? ' · ${(progress * 100).toStringAsFixed(0)}%' : ''}'
+                        '${_cancelling ? ' · Cancelling…' : ' · $_modeLabel'}'
+                    : '${_fmt(_received)} downloaded'
+                        '${_cancelling ? ' · Cancelling…' : ' · $_modeLabel'}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              if (stalledHint && !_cancelling) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'No progress for ${_stallSeconds}s — waiting, or Cancel and retry',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                ),
+              ],
+            ],
+            if (_error != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _cancelling ? null : _cancel,
+          child: Text(_running ? 'Cancel' : 'Close'),
+        ),
+        FilledButton(
+          onPressed: _running ? null : _start,
+          child: Text(_error != null ? 'Retry' : 'Download'),
+        ),
+      ],
     );
   }
 }

@@ -1,5 +1,8 @@
 import 'dart:convert';
 
+/// Identity-keyed caches so huge tool JSON is not re-parsed on every rebuild.
+final Expando<String> _toolPreviewCache = Expando<String>('toolPreview');
+
 /// In-memory tool call assembled from ACP tool_call / tool_call_update.
 class ToolCallState {
   const ToolCallState({
@@ -29,14 +32,60 @@ class ToolCallState {
 
   bool get isFailed => status == 'failed' || status == 'error';
 
+  /// Claude ACP marks Bash non-zero exits as `failed` — exit 1 is often
+  /// intentional (`ls missing 2>/dev/null`, checks, etc.), so don't paint the
+  /// whole tool group as a hard failure for those.
+  bool get isSoftFail {
+    if (!isFailed) return false;
+    // Cap scan — full tool blobs can be 100KB+.
+    final out = rawOutput ?? '';
+    final cont = content ?? '';
+    final blob = '${out.length > 2000 ? out.substring(0, 2000) : out} '
+            '${cont.length > 2000 ? cont.substring(0, 2000) : cont}'
+        .toLowerCase();
+    if (blob.contains('permission') ||
+        blob.contains('denied') ||
+        blob.contains('internal error') ||
+        blob.contains('exit code 127') ||
+        blob.contains('command not found')) {
+      return false;
+    }
+    return RegExp(r'exit code 1\b').hasMatch(blob) ||
+        blob.trim() == 'exit code 1';
+  }
+
+  bool get isHardFail => isFailed && !isSoftFail;
+
   bool get isCompleted =>
       status == 'completed' || status == 'success' || status == 'done';
 
+  /// True when this looks like a wait/poll loop (until/sleep/while).
+  bool get isPollingWait {
+    final head = _inputHead.toLowerCase();
+    final t = title.toLowerCase();
+    return head.contains('until ') ||
+        t.startsWith('until ') ||
+        RegExp(r'\bsleep\s+\d').hasMatch(head) ||
+        head.contains('while ') && head.contains('sleep') ||
+        (head.contains('wait') &&
+            (head.contains('epoch') ||
+                head.contains('for ') ||
+                head.contains('until')));
+  }
+
+  /// Head of [rawInput] for cheap scans (never the full 100KB blob).
+  String get _inputHead {
+    final input = rawInput ?? '';
+    return input.length > 400 ? input.substring(0, 400) : input;
+  }
+
   String get statusLabel {
     final s = status.toLowerCase();
+    if (isActive && isPollingWait) return 'Polling';
     if (s == 'in_progress' || s == 'running') return 'Running';
     if (s == 'pending') return 'Pending';
     if (s == 'completed' || s == 'success' || s == 'done') return 'Done';
+    if (isSoftFail) return 'Exit 1';
     if (s == 'failed' || s == 'error') return 'Failed';
     if (s == 'cancelled' || s == 'canceled') return 'Cancelled';
     return status;
@@ -47,16 +96,27 @@ class ToolCallState {
   /// Agents do not always send a title, and the bare fallback rendered as a
   /// row reading just "Tool", which tells the user nothing.
   String get displayTitle {
+    if (isPollingWait) {
+      final desc = _descriptionFromInput();
+      if (desc != null) return desc;
+      return isActive ? 'Waiting on remote job' : 'Waited on remote job';
+    }
     final given = title.trim();
     // Agents sometimes dump a JSON fragment as the title; treat that as missing.
     if (given.isNotEmpty &&
         given.toLowerCase() != 'tool' &&
         !given.startsWith('{') &&
-        !given.startsWith('[')) {
+        !given.startsWith('[') &&
+        // Shell dumps the whole `until …` script as the title — collapse those.
+        !given.toLowerCase().startsWith('until ') &&
+        !given.toLowerCase().startsWith('while ')) {
       return given;
     }
     final k = (kind ?? '').toLowerCase();
-    final blob = '$k ${title.toLowerCase()} ${rawInput ?? ''}'.toLowerCase();
+    // Never scan full rawInput — Claude tool payloads can be 100KB+ JSON and
+    // displayTitle is hit on every list rebuild.
+    final inputHead = _inputHead;
+    final blob = '$k ${title.toLowerCase()} ${inputHead.toLowerCase()}';
     if (blob.contains('websearch') ||
         blob.contains('web_search') ||
         blob.contains('web search') ||
@@ -83,6 +143,21 @@ class ToolCallState {
     }
     if (k.contains('delete')) return 'Deleted a file';
     return 'Tool call';
+  }
+
+  String? _descriptionFromInput() {
+    final input = rawInput?.trim();
+    if (input == null || input.isEmpty) return null;
+    final head = input.length > 4000 ? input.substring(0, 4000) : input;
+    final match = RegExp(
+      '"description"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"',
+    ).firstMatch(head);
+    final raw = match?.group(1);
+    if (raw == null || raw.trim().isEmpty) return null;
+    return raw
+        .replaceAll(r'\"', '"')
+        .replaceAll(r'\n', ' ')
+        .trim();
   }
 
   /// Keys worth surfacing, most specific first.
@@ -123,9 +198,42 @@ class ToolCallState {
 
   /// One-line detail shown next to the title.
   String? get preview {
+    final cached = _toolPreviewCache[this];
+    if (cached != null) return cached.isEmpty ? null : cached;
+    final computed = _computePreview();
+    _toolPreviewCache[this] = computed ?? '';
+    return computed;
+  }
+
+  String? _computePreview() {
     if (locations.isNotEmpty) return _short(locations.first);
     final input = rawInput?.trim();
     if (input == null || input.isEmpty) return null;
+    // Cap decode work — preview only needs the head of huge tool JSON.
+    if (input.length > 8000) {
+      final head = input.substring(0, 8000);
+      // Truncation usually breaks jsonDecode; pull known keys with a light scan.
+      for (final key in _previewKeys) {
+        final match = RegExp(
+          '"$key"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"',
+        ).firstMatch(head);
+        final value = match?.group(1)?.trim();
+        if (value != null && value.isNotEmpty) return _short(value);
+      }
+      final line = head.split('\n').firstWhere(
+            (l) {
+              final t = l.trim();
+              return t.isNotEmpty &&
+                  t != '{' &&
+                  t != '}' &&
+                  t != '[' &&
+                  t != ']';
+            },
+            orElse: () => '',
+          );
+      if (line.isEmpty) return null;
+      return _short(line);
+    }
     // Tool input is usually pretty-printed JSON, whose first line is just "{".
     final fromJson = _previewFromJson(input);
     if (fromJson != null) {

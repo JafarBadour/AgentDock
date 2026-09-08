@@ -310,29 +310,50 @@ class TurnMetricsLabel extends StatelessWidget {
     }
     if (hasTokens) {
       if (children.isNotEmpty) children.add(sep);
-      final used = tokensUsed!;
-      final tokenText = contextSize != null && contextSize! > 0
-          ? '${_compactInt(used)}/${_compactInt(contextSize!)} τ'
-          : '${_compactInt(used)} τ';
+      final tokenText = formatContextUsage(tokensUsed, contextSize) ?? '';
       children.add(
-        TextSpan(text: tokenText, style: style?.copyWith(color: muted)),
+        TextSpan(text: '$tokenText τ', style: style?.copyWith(color: muted)),
       );
     }
-    return Text.rich(
-      TextSpan(style: style?.copyWith(color: muted), children: children),
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
+    return Tooltip(
+      message: hasTokens
+          ? 'Context window from the agent (ACP usage_update).\n'
+              '+/−/φ is code churn this turn.'
+          : 'Code churn this turn (+ added, − removed, φ files).',
+      waitDuration: const Duration(milliseconds: 400),
+      child: Text.rich(
+        TextSpan(style: style?.copyWith(color: muted), children: children),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
     );
   }
 
   static String _compactInt(int n) {
-    if (n.abs() < 1000) return '$n';
-    if (n.abs() < 10000) {
-      final k = n / 1000;
-      final s = k.toStringAsFixed(1);
-      return s.endsWith('.0') ? '${s.substring(0, s.length - 2)}k' : '${s}k';
+    final sign = n < 0 ? '-' : '';
+    final a = n.abs();
+    if (a < 1000) return '$n';
+    if (a < 1000000) {
+      final k = a / 1000;
+      final s =
+          k >= 100 ? k.round().toString() : k.toStringAsFixed(k >= 10 ? 0 : 1);
+      final trimmed = s.endsWith('.0') ? s.substring(0, s.length - 2) : s;
+      return '$sign${trimmed}k';
     }
-    return '${(n / 1000).round()}k';
+    final m = a / 1000000;
+    final s = m >= 10 ? m.round().toString() : m.toStringAsFixed(1);
+    final trimmed = s.endsWith('.0') ? s.substring(0, s.length - 2) : s;
+    return '$sign${trimmed}M';
+  }
+
+  /// Live / persisted context window: `37k/1M (4%)`.
+  static String? formatContextUsage(int? used, int? size) {
+    if (used == null) return null;
+    if (size == null || size <= 0) return '${_compactInt(used)} τ';
+    final pct = ((used / size) * 100).clamp(0, 100);
+    final pctLabel =
+        pct >= 10 ? pct.toStringAsFixed(0) : pct.toStringAsFixed(1);
+    return '${_compactInt(used)}/${_compactInt(size)} ($pctLabel%)';
   }
 }
 

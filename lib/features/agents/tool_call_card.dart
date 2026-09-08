@@ -22,14 +22,18 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   bool _expanded = false;
 
   bool get _anyActive => widget.tools.any((t) => t.isActive);
-  bool get _anyFailed => widget.tools.any((t) => t.isFailed);
+  bool get _hardFails => widget.tools.where((t) => t.isHardFail).isNotEmpty;
+  int get _hardFailCount => widget.tools.where((t) => t.isHardFail).length;
+  int get _softFailCount => widget.tools.where((t) => t.isSoftFail).length;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final count = widget.tools.length;
-    final labelColor = _anyFailed
+    final hard = _hardFails;
+    final softOnly = !hard && _softFailCount > 0;
+    final labelColor = hard
         ? scheme.error
         : scheme.onSurfaceVariant.withValues(alpha: 0.85);
 
@@ -48,11 +52,11 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                 child: Row(
                   children: [
                     Icon(
-                      _anyFailed
+                      hard
                           ? Icons.error_outline
                           : Icons.auto_awesome_outlined,
                       size: 14,
-                      color: _anyFailed
+                      color: hard
                           ? scheme.error
                           : _anyActive
                               ? scheme.primary
@@ -61,7 +65,7 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Shimmer(
-                        enabled: _anyActive,
+                        enabled: false,
                         child: Text(
                           '$count tool calls',
                           style: theme.textTheme.bodySmall?.copyWith(
@@ -72,11 +76,22 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                         ),
                       ),
                     ),
-                    if (_anyFailed) ...[
+                    if (hard) ...[
                       Text(
-                        'Failed',
+                        _hardFailCount == 1
+                            ? 'Failed'
+                            : '$_hardFailCount failed',
                         style: theme.textTheme.labelSmall
                             ?.copyWith(color: scheme.error),
+                      ),
+                      const SizedBox(width: 4),
+                    ] else if (softOnly) ...[
+                      Text(
+                        _softFailCount == 1
+                            ? 'Exit 1'
+                            : '$_softFailCount exit ≠0',
+                        style: theme.textTheme.labelSmall
+                            ?.copyWith(color: scheme.outline),
                       ),
                       const SizedBox(width: 4),
                     ],
@@ -153,9 +168,10 @@ class _ToolCallCardState extends State<ToolCallCard> {
     final tool = widget.tool;
 
     final active = tool.isActive;
-    final failed = tool.isFailed;
+    final hardFail = tool.isHardFail;
+    final softFail = tool.isSoftFail;
 
-    final labelColor = failed
+    final labelColor = hardFail
         ? scheme.error
         : active
             ? scheme.onSurfaceVariant
@@ -186,13 +202,21 @@ class _ToolCallCardState extends State<ToolCallCard> {
                 Row(
                   children: [
                     Icon(
-                      failed ? Icons.error_outline : _kindIcon,
+                      hardFail
+                          ? Icons.error_outline
+                          : softFail
+                              ? Icons.warning_amber_outlined
+                              : (active && tool.isPollingWait)
+                                  ? Icons.hourglass_top_rounded
+                                  : _kindIcon,
                       size: 14,
-                      color: failed
+                      color: hardFail
                           ? scheme.error
-                          : active
-                              ? scheme.primary
-                              : scheme.outline,
+                          : softFail
+                              ? scheme.outline
+                              : active
+                                  ? scheme.primary
+                                  : scheme.outline,
                     ),
                     const SizedBox(width: 8),
                     // Title and detail are one line so they share the width
@@ -200,7 +224,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     // capped at its own slice of the row.
                     Expanded(
                       child: Shimmer(
-                        enabled: active,
+                        enabled: false,
                         child: Text.rich(
                           TextSpan(
                             style: titleStyle,
@@ -224,11 +248,16 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       ),
                     ),
                     const SizedBox(width: 6),
-                    if (failed) ...[
+                    if (hardFail || softFail || (active && tool.isPollingWait)) ...[
                       Text(
                         tool.statusLabel,
-                        style: theme.textTheme.labelSmall
-                            ?.copyWith(color: scheme.error),
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: hardFail
+                              ? scheme.error
+                              : softFail
+                                  ? scheme.outline
+                                  : scheme.primary,
+                        ),
                       ),
                       const SizedBox(width: 4),
                     ],

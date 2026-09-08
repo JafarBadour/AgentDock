@@ -11,6 +11,7 @@ import 'package:xterm/xterm.dart';
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/secure/safe_log.dart';
+import '../../services/local_host_bootstrap.dart';
 
 class TerminalSessionScreen extends ConsumerStatefulWidget {
   const TerminalSessionScreen({super.key, required this.hostId});
@@ -112,6 +113,19 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
       }
       _title = host.displayLabel;
 
+      if (isLocalThisComputerHost(host) && !await isLocalSshPortOpen(host)) {
+        final hint = localThisComputerSshHint();
+        _terminal.write('\r\n$hint\r\n');
+        if (mounted) {
+          setState(() {
+            _connecting = false;
+            _error = hint;
+          });
+          unawaited(openLocalRemoteLoginSettings());
+        }
+        return;
+      }
+
       final ssh = ref.read(sshServiceProvider);
       // Exclusive client so an interactive shell is not fighting ADSM/agent
       // channels on the shared pool connection.
@@ -170,13 +184,20 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
       }
     } catch (e) {
       SafeLog.d('terminal connect failed', e);
-      _terminal.write('\r\nFailed: $e\r\n');
+      final host = await ref.read(appDatabaseProvider).getHost(widget.hostId);
+      final message = host == null
+          ? e.toString()
+          : describeLocalHostConnectError(e, host);
+      _terminal.write('\r\nFailed: $message\r\n');
       await _closeClient();
       if (mounted) {
         setState(() {
           _connecting = false;
-          _error = e.toString();
+          _error = message;
         });
+        if (host != null && isLocalThisComputerHost(host)) {
+          unawaited(openLocalRemoteLoginSettings());
+        }
       }
     }
   }
@@ -287,6 +308,13 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
                     color: Theme.of(context).colorScheme.onErrorContainer,
                   ),
                 ),
+                trailing: widget.hostId == kLocalThisComputerHostId
+                    ? TextButton(
+                        onPressed: () =>
+                            unawaited(openLocalRemoteLoginSettings()),
+                        child: const Text('Open settings'),
+                      )
+                    : null,
               ),
             ),
           Expanded(

@@ -12,6 +12,7 @@ import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'adsm_version.dart';
+import 'local_host_bootstrap.dart';
 import 'remote_setup_guide.dart';
 import 'ssh_no_delay_socket.dart';
 
@@ -243,18 +244,33 @@ class SshService {
 
     List<SSHKeyPair>? pairs;
     if (!usePassword) {
-      final pem = await _secureStore.readSshPrivateKey();
+      var pem = await _secureStore.readSshPrivateKey();
+      // Local this-computer host: fall back to ~/.ssh/id_* so coding on the
+      // same Mac/PC works without pasting a key into Connect first.
+      if ((pem == null || pem.trim().isEmpty) && isLocalThisComputerHost(host)) {
+        pem = await readDefaultSshPrivateKeyPem();
+      }
       if (pem == null || pem.trim().isEmpty) {
         throw StateError(
-          'No SSH private key in Connect, and no password on this host. '
-          'Add a key in Connect or set a password when editing the host.',
+          isLocalThisComputerHost(host)
+              ? 'No SSH key for this computer. Enable Remote Login (Mac) or '
+                  'OpenSSH Server (Windows), then add your key in Connect, '
+                  'or set a password on this host. Default ~/.ssh/id_ed25519 '
+                  'or id_rsa is also tried automatically.'
+              : 'No SSH private key in Connect, and no password on this host. '
+                  'Add a key in Connect or set a password when editing the host.',
         );
       }
       final passphrase = await _secureStore.readSshPassphrase();
       try {
-        pairs = SSHKeyPair.fromPem(pem, passphrase);
+        pairs = SSHKeyPair.fromPem(
+          pem,
+          (passphrase != null && passphrase.isNotEmpty) ? passphrase : null,
+        );
       } catch (e) {
-        throw StateError('Could not parse SSH private key (wrong passphrase?).');
+        throw StateError(
+          'Could not parse SSH private key (wrong passphrase?).',
+        );
       }
     }
 
@@ -272,11 +288,18 @@ class SshService {
           .forwardLocal(host.hostname, host.port)
           .timeout(const Duration(seconds: 20));
     } else {
-      socket = await SshNoDelaySocket.connect(
-        host.hostname,
-        host.port,
-        timeout: const Duration(seconds: 15),
-      );
+      try {
+        socket = await SshNoDelaySocket.connect(
+          host.hostname,
+          host.port,
+          timeout: const Duration(seconds: 15),
+        );
+      } catch (e) {
+        if (isLocalThisComputerHost(host)) {
+          throw StateError(describeLocalHostConnectError(e, host));
+        }
+        rethrow;
+      }
     }
 
     final client = SSHClient(
@@ -425,7 +448,7 @@ class SshService {
     void Function(String status)? onProgress,
   }) async {
     final client = await connect(host);
-    var tmux = await _whichLogin(client, 'tmux', host.id);
+    var tmux = await _resolveTmuxPath(client, host.id);
     if (tmux != null) return;
 
     onProgress?.call('Installing tmux on the remote…');
@@ -434,14 +457,39 @@ class SshService {
         client,
         r'''
 set -e
-if command -v tmux >/dev/null 2>&1; then exit 0; fi
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+if command -v tmux >/dev/null 2>&1; then command -v tmux; exit 0; fi
+
+# Environment modules (common on HPC — no sudo).
+if [ -f /etc/profile.d/modules.sh ]; then . /etc/profile.d/modules.sh; fi
+if [ -f /usr/share/lmod/lmod/init/bash ]; then . /usr/share/lmod/lmod/init/bash; fi
+if command -v module >/dev/null 2>&1; then
+  module load tmux 2>/dev/null || true
+  module load tools/tmux 2>/dev/null || true
+  module load app/tmux 2>/dev/null || true
+  if command -v tmux >/dev/null 2>&1; then command -v tmux; exit 0; fi
+fi
+
+# User-local conda/mamba (also no sudo).
+if command -v conda >/dev/null 2>&1; then
+  conda install -y -c conda-forge tmux </dev/null && command -v tmux && exit 0
+fi
+if command -v mamba >/dev/null 2>&1; then
+  mamba install -y -c conda-forge tmux </dev/null && command -v tmux && exit 0
+fi
+
+# System package managers (need sudo / brew).
 if command -v apt-get >/dev/null 2>&1; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
 elif command -v dnf >/dev/null 2>&1; then
   sudo dnf install -y tmux
+elif command -v yum >/dev/null 2>&1; then
+  sudo yum install -y tmux
 elif command -v brew >/dev/null 2>&1; then
   brew install tmux
+elif command -v zypper >/dev/null 2>&1; then
+  sudo zypper install -y tmux
 else
   echo "no package manager for tmux" >&2
   exit 1
@@ -455,9 +503,44 @@ command -v tmux
       SafeLog.d('tmux auto-install failed', e);
     }
 
-    tmux = await _whichLogin(client, 'tmux', host.id);
+    tmux = await _resolveTmuxPath(client, host.id);
     if (tmux == null) {
       throw MissingToolException('tmux', kRemoteTmuxSetupGuide.trim());
+    }
+  }
+
+  /// Locate tmux via PATH, known paths, and HPC environment modules.
+  Future<String?> _resolveTmuxPath(SSHClient client, String hostId) async {
+    const script = r'''
+set +e
+export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+if command -v tmux >/dev/null 2>&1; then command -v tmux; exit 0; fi
+for p in /usr/bin/tmux /usr/local/bin/tmux /opt/homebrew/bin/tmux \
+         "$HOME/.local/bin/tmux"; do
+  if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
+done
+if [ -f /etc/profile.d/modules.sh ]; then . /etc/profile.d/modules.sh; fi
+if [ -f /usr/share/lmod/lmod/init/bash ]; then . /usr/share/lmod/lmod/init/bash; fi
+if [ -f /usr/share/Modules/init/bash ]; then . /usr/share/Modules/init/bash; fi
+if command -v module >/dev/null 2>&1; then
+  module load tmux 2>/dev/null || true
+  module load tools/tmux 2>/dev/null || true
+  module load app/tmux 2>/dev/null || true
+  if command -v tmux >/dev/null 2>&1; then command -v tmux; exit 0; fi
+fi
+exit 1
+''';
+    try {
+      final out = await _run(
+        client,
+        'bash -lc ${shellQuote(script)}',
+        hostId: hostId,
+        timeout: const Duration(seconds: 25),
+      );
+      final path = out.trim().split('\n').last.trim();
+      return path.isEmpty ? null : path;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -465,7 +548,7 @@ command -v tmux
   Future<bool> hasTmux(Host host) async {
     try {
       final client = await connect(host);
-      return await _whichLogin(client, 'tmux', host.id) != null;
+      return await _resolveTmuxPath(client, host.id) != null;
     } catch (_) {
       return false;
     }
@@ -1355,29 +1438,208 @@ exit 1
   }
 
   /// Download a remote file to [localPath]. Returns bytes written.
+  ///
+  /// Uses a **dedicated** SSH connection (not the pooled ADSM/agent link) so
+  /// agent traffic cannot starve SFTP. Multipart pipelining is used for large
+  /// files; if progress stalls, the transfer is aborted and retried once with
+  /// a single in-flight read (more reliable on some HPC SSHDs).
+  ///
+  /// Always re-stats the remote file for length — directory listing sizes can
+  /// be wrong and previously caused truncated/corrupt archives.
   Future<int> downloadRemoteFile(
     Host host,
     String remotePath,
     String localPath, {
-    void Function(int bytes)? onProgress,
+    void Function(int bytes, int? total)? onProgress,
+    int? totalBytes,
+    bool multipart = true,
+    bool Function()? isCancelled,
   }) async {
     final remote = normalizeRemotePath(remotePath);
-    final client = await connect(host);
-    final sftp = await client.sftp();
-    final file = File(localPath);
-    await file.parent.create(recursive: true);
-    final sink = file.openWrite();
     try {
-      return await sftp.download(
+      return await _downloadRemoteFileOnce(
+        host,
         remote,
-        sink,
+        localPath,
         onProgress: onProgress,
-        closeDestination: true,
+        totalBytes: totalBytes,
+        multipart: multipart,
+        isCancelled: isCancelled,
+        maxPending: multipart ? 8 : 1,
       );
-    } catch (e) {
-      await sink.close();
-      rethrow;
+    } on _DownloadStalled catch (e) {
+      SafeLog.d(
+        'download stalled at ${e.bytesRead}B — retrying sequential '
+        '$remote',
+        e,
+      );
+      if (isCancelled?.call() == true) throw const _DownloadCancelled();
+      onProgress?.call(0, e.total);
+      return _downloadRemoteFileOnce(
+        host,
+        remote,
+        localPath,
+        onProgress: onProgress,
+        totalBytes: e.total ?? totalBytes,
+        multipart: false,
+        isCancelled: isCancelled,
+        maxPending: 1,
+        chunkSize: 128 * 1024,
+      );
     }
+  }
+
+  Future<int> _downloadRemoteFileOnce(
+    Host host,
+    String remote,
+    String localPath, {
+    void Function(int bytes, int? total)? onProgress,
+    int? totalBytes,
+    bool multipart = true,
+    bool Function()? isCancelled,
+    int maxPending = 8,
+    int chunkSize = 64 * 1024,
+  }) async {
+    // Exclusive session: file transfer must not share the ADSM event channel.
+    final client = await connectExclusive(host);
+    final local = File(localPath);
+    await local.parent.create(recursive: true);
+
+    var lastProgressAt = DateTime.now();
+    var lastBytes = 0;
+    var progressTotal = totalBytes;
+    Timer? stallWatch;
+    var stalled = false;
+
+    void armStallWatch() {
+      stallWatch?.cancel();
+      stallWatch = Timer.periodic(const Duration(seconds: 5), (_) {
+        if (isCancelled?.call() == true) {
+          try {
+            client.close();
+          } catch (_) {}
+          return;
+        }
+        final idle = DateTime.now().difference(lastProgressAt);
+        // HPC links can pause between chunks; 45s with zero movement is stuck.
+        if (idle >= const Duration(seconds: 45) && lastBytes > 0) {
+          stalled = true;
+          SafeLog.d(
+            'SFTP download stall ${idle.inSeconds}s at $lastBytes '
+            'of ${progressTotal ?? '?'} — closing exclusive SSH',
+          );
+          try {
+            client.close();
+          } catch (_) {}
+        }
+      });
+    }
+
+    try {
+      final sftp = await client.sftp();
+      final remoteFile = await sftp.open(remote, mode: SftpFileOpenMode.read);
+      try {
+        final attrs = await remoteFile.stat();
+        final actualTotal = attrs.size ?? totalBytes;
+        if (actualTotal == null || actualTotal < 0) {
+          throw StateError('Cannot determine remote file size for $remote');
+        }
+        progressTotal = actualTotal;
+        if (actualTotal == 0) {
+          await local.writeAsBytes(const []);
+          onProgress?.call(0, 0);
+          return 0;
+        }
+
+        onProgress?.call(0, actualTotal);
+        armStallWatch();
+
+        final large = actualTotal >= (1 << 20); // 1 MiB
+        final useMultipart = multipart && large;
+        final pending = useMultipart ? maxPending : 1;
+
+        final raf = await local.open(mode: FileMode.write);
+        try {
+          await raf.truncate(0);
+          final written = await remoteFile.downloadToRandomAccess(
+            raf,
+            length: actualTotal,
+            onProgress: (bytes) {
+              if (isCancelled?.call() == true) {
+                throw const _DownloadCancelled();
+              }
+              if (bytes > lastBytes) {
+                lastBytes = bytes;
+                lastProgressAt = DateTime.now();
+              }
+              onProgress?.call(bytes, actualTotal);
+            },
+            chunkSize: chunkSize,
+            maxPendingRequests: pending,
+          );
+          await raf.flush();
+          await raf.close();
+
+          if (written != actualTotal) {
+            try {
+              await local.delete();
+            } catch (_) {}
+            throw StateError(
+              'Download incomplete: got $written of $actualTotal bytes',
+            );
+          }
+
+          final onDisk = await local.length();
+          if (onDisk != actualTotal) {
+            try {
+              await local.delete();
+            } catch (_) {}
+            throw StateError(
+              'Download size mismatch: file is $onDisk, expected $actualTotal',
+            );
+          }
+
+          return written;
+        } on _DownloadCancelled {
+          try {
+            await raf.close();
+          } catch (_) {}
+          try {
+            if (await local.exists()) await local.delete();
+          } catch (_) {}
+          rethrow;
+        } catch (e) {
+          try {
+            await raf.close();
+          } catch (_) {}
+          try {
+            if (await local.exists()) await local.delete();
+          } catch (_) {}
+          if (stalled || _looksLikeSshDrop(e)) {
+            throw _DownloadStalled(bytesRead: lastBytes, total: actualTotal);
+          }
+          rethrow;
+        }
+      } finally {
+        try {
+          await remoteFile.close();
+        } catch (_) {}
+      }
+    } finally {
+      stallWatch?.cancel();
+      try {
+        client.close();
+      } catch (_) {}
+    }
+  }
+
+  static bool _looksLikeSshDrop(Object e) {
+    final s = e.toString().toLowerCase();
+    return s.contains('closed') ||
+        s.contains('socket') ||
+        s.contains('connection') ||
+        s.contains('broken pipe') ||
+        (s.contains('sftp') && s.contains('error'));
   }
 
   /// Upload local bytes/file to [remotePath] (overwrites).
@@ -1452,6 +1714,7 @@ exit 1
   }
 
   /// `command -v` with an extended PATH (non-login; avoids hanging .bashrc).
+  // ignore: unused_element
   Future<String?> _whichLogin(SSHClient client, String binary, String hostId) async {
     final name = binary.replaceAll("'", '');
     try {
@@ -1523,4 +1786,23 @@ class RemoteFileListing {
 
   final String path;
   final List<RemoteFileEntry> entries;
+}
+
+class _DownloadCancelled implements Exception {
+  const _DownloadCancelled();
+
+  @override
+  String toString() => 'Download cancelled';
+}
+
+class _DownloadStalled implements Exception {
+  const _DownloadStalled({required this.bytesRead, this.total});
+
+  final int bytesRead;
+  final int? total;
+
+  @override
+  String toString() =>
+      'Download stalled after $bytesRead bytes'
+      '${total != null ? ' of $total' : ''}';
 }

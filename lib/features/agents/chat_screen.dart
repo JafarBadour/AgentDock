@@ -19,14 +19,11 @@ import '../../data/models/agent_model.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/chat_message.dart';
-import '../../data/models/code_change_stats.dart';
 import '../../data/models/host.dart';
 import '../../data/models/prompt_image.dart';
 import '../../data/models/repo.dart';
 import '../../data/models/scheduled_job.dart';
-import '../../data/models/thought_message.dart';
 import '../../data/models/tool_call_state.dart';
-import '../../data/models/turn_stats_message.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
@@ -38,10 +35,14 @@ import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
 import '../connect/claude_login_sheet.dart';
+import 'package:gpt_markdown/gpt_markdown.dart';
+
 import 'message_body.dart';
 import 'model_picker_sheet.dart';
 import 'project_files_screen.dart';
 import 'tool_call_card.dart';
+import 'transcript_blocks.dart';
+import 'transcript_window.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   const ChatScreen({super.key, required this.chatId});
@@ -81,6 +82,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   VoidCallback? _runtimeListener;
   Future<void>? _ensureAcpInFlight;
   Timer? _markReadTimer;
+  Timer? _runtimeUiCoalesce;
+  bool _runtimeUiDirty = false;
+  bool _wasWorking = false;
+  int _lastOutboundQueueLen = 0;
   bool _landedAtBottom = false;
   bool _showJumpToLatest = false;
   /// When true, keep the viewport pinned to new agent output.
@@ -88,7 +93,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _followOutput = true;
   bool _programmaticScroll = false;
   int _messageCount = 0;
-  bool _dismissCompressHint = false;
   final List<ChatImageRef> _pendingImages = [];
   bool _pickingImages = false;
   bool _composerHasText = false;
@@ -98,6 +102,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   int _transcribeEpoch = 0;
   bool _showSlashMenu = false;
   bool _compressing = false;
+  /// Sliding window over the transcript: only a slice stays mounted.
+  final TranscriptWindow _transcriptWindow = TranscriptWindow();
+  List<ChatBlock>? _cachedBlocks;
+  String? _blocksCacheKey;
+  DateTime? _lastScrollToEndAt;
+  double _lastScrollMaxExtent = 0;
 
   /// Telegram-style: recording continues after finger-up until stop.
   bool _voiceLocked = false;
@@ -168,18 +178,87 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   void _onScrollOffsetChanged() {
-    if (!_landedAtBottom || _programmaticScroll) return;
+    if (!_landedAtBottom ||
+        _programmaticScroll ||
+        _shiftingWindow) {
+      return;
+    }
     final near = _isNearBottom;
     // User dragged away from the live turn — stop yanking them back.
     if (!near && _followOutput) {
       _followOutput = false;
+      _transcriptWindow.pinnedToEnd = false;
     } else if (near && !_followOutput) {
       _followOutput = true;
+      _transcriptWindow.pinnedToEnd = true;
     }
     final show = !_followOutput;
     if (show != _showJumpToLatest && mounted) {
       setState(() => _showJumpToLatest = show);
     }
+  }
+
+  bool get _shiftingWindow => _windowShiftBusy;
+  bool _windowShiftBusy = false;
+  int _blocksLength = 0;
+
+  void _syncWindowToBlocks(int total) {
+    _blocksLength = total;
+    _transcriptWindow.sync(total, followOutput: _followOutput);
+  }
+
+  void _maybeSlideWindow({required int direction}) {
+    if (!_scroll.hasClients || !mounted) return;
+    final before = _scroll.position.pixels;
+    final beforeMax = _scroll.position.maxScrollExtent;
+    final shifted = _transcriptWindow.tryShift(
+      direction: direction,
+      total: _blocksLength,
+      pixels: before,
+      extentAfter: _scroll.position.extentAfter,
+      maxScrollExtent: beforeMax,
+      now: DateTime.now(),
+      busy: _windowShiftBusy || _programmaticScroll,
+    );
+    if (!shifted) return;
+
+    final atEnd =
+        _transcriptWindow.start >= _transcriptWindow.maxStartFor(_blocksLength);
+    _windowShiftBusy = true;
+    _programmaticScroll = true;
+    setState(() {
+      if (_transcriptWindow.shouldResumeFollow(
+        atEnd: atEnd,
+        nearBottom: _isNearBottom,
+      )) {
+        _followOutput = true;
+        _showJumpToLatest = false;
+      } else if (!atEnd) {
+        _followOutput = false;
+        _showJumpToLatest = true;
+      }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        if (_scroll.hasClients) {
+          final target = _transcriptWindow.paddedScrollTarget(
+            shiftDelta: direction < 0 ? -1 : 1,
+            beforePixels: before,
+            beforeMax: beforeMax,
+            afterMax: _scroll.position.maxScrollExtent,
+          );
+          _scroll.jumpTo(target);
+        }
+      } finally {
+        _programmaticScroll = false;
+        _windowShiftBusy = false;
+      }
+    });
+  }
+
+  void _pinWindowToLatest() {
+    _transcriptWindow.pinToLatest(_blocksLength);
+    _followOutput = true;
   }
 
   /// Paint from SQLite immediately; the network only ever upgrades what is
@@ -282,182 +361,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
-  List<TranscriptEntry> _entriesFromMessages(List<ChatMessage> messages) {
-    final out = <TranscriptEntry>[];
-    for (final m in messages) {
-      if (m.role == MessageRole.tool) {
-        final tool = ToolCallState.tryParseContent(m.content);
-        if (tool != null) {
-          out.add(TranscriptEntry.tool(tool, messageId: m.id));
-          continue;
-        }
-      }
-      out.add(TranscriptEntry.message(m));
-    }
-    return out;
-  }
+  List<TranscriptEntry> _entriesFromMessages(List<ChatMessage> messages) =>
+      entriesFromMessages(messages);
 
-  /// Stable chronological order for the transcript list.
-  static List<TranscriptEntry> _entriesByTime(List<TranscriptEntry> input) {
-    if (input.length < 2) return input;
-    final indexed = [for (var i = 0; i < input.length; i++) (i, input[i])];
-    indexed.sort((a, b) {
-      final at = a.$2.createdAt;
-      final bt = b.$2.createdAt;
-      if (at == null && bt == null) return a.$1.compareTo(b.$1);
-      if (at == null) return 1;
-      if (bt == null) return -1;
-      final byTime = at.compareTo(bt);
-      if (byTime != 0) return byTime;
-      return a.$1.compareTo(b.$1);
-    });
-    return [for (final e in indexed) e.$2];
-  }
-
-  /// Collapse tool spam between user messages into one expandable row.
-  ///
-  /// System (thought) messages fold into the next assistant reply as a
-  /// collapsible "Thinking" section. Turn stats attach to the last block of
-  /// each finished assistant segment.
-  static List<_ChatBlock> _blocksFor(
+  List<ChatBlock> _blocksForMemoized(
     List<TranscriptEntry> entries, {
     bool openTurnActive = false,
   }) {
-    final thinkingByAssistantId = <String, String>{};
-    final pendingThoughts = <String>[];
-    final compact = <TranscriptEntry>[];
-    final orphanBeforeIndex = <int, String>{};
-    final turnStatsAfterIndex = <int, TurnStats>{};
-    String? trailingThinking;
-
-    for (final e in entries) {
-      final role = e.message?.role;
-      if (role == MessageRole.system) {
-        final content = e.message!.content;
-        final stats = TurnStatsMessage.tryParse(content);
-        if (stats != null) {
-          if (compact.isNotEmpty) {
-            turnStatsAfterIndex[compact.length - 1] = stats;
-          }
-          continue;
-        }
-        final body = ThoughtMessage.display(content);
-        if (body.isNotEmpty) pendingThoughts.add(body);
-        continue;
-      }
-      if (role == MessageRole.user) {
-        if (pendingThoughts.isNotEmpty) {
-          orphanBeforeIndex[compact.length] = pendingThoughts.join('\n\n');
-          pendingThoughts.clear();
-        }
-        compact.add(e);
-        continue;
-      }
-      if (role == MessageRole.assistant && pendingThoughts.isNotEmpty) {
-        final id = e.message?.id;
-        if (id != null) {
-          thinkingByAssistantId[id] = pendingThoughts.join('\n\n');
-        }
-        pendingThoughts.clear();
-      }
-      compact.add(e);
+    final key = transcriptBlocksCacheKey(
+      entries,
+      openTurnActive: openTurnActive,
+    );
+    if (_cachedBlocks != null && _blocksCacheKey == key) {
+      return _cachedBlocks!;
     }
-    if (pendingThoughts.isNotEmpty) {
-      trailingThinking = pendingThoughts.join('\n\n');
-    }
-
-    final blocks = <_ChatBlock>[];
-    var i = 0;
-    while (i < compact.length) {
-      final orphan = orphanBeforeIndex[i];
-      if (orphan != null && orphan.isNotEmpty) {
-        blocks.add(_ChatBlock.thinking(orphan));
-      }
-
-      final entry = compact[i];
-      if (entry.message?.role == MessageRole.user) {
-        blocks.add(_ChatBlock.single(entry));
-        i++;
-        continue;
-      }
-
-      final segmentStart = i;
-      final segment = <TranscriptEntry>[];
-      while (i < compact.length &&
-          compact[i].message?.role != MessageRole.user) {
-        // Orphan thoughts are keyed at compact indices; if one sits mid-segment
-        // (shouldn't — only before user), stop so the next loop emits it.
-        if (i != segmentStart && orphanBeforeIndex.containsKey(i)) break;
-        segment.add(compact[i]);
-        i++;
-      }
-
-      TurnStats? persistedStats;
-      for (var j = segmentStart; j < i; j++) {
-        final s = turnStatsAfterIndex[j];
-        if (s != null) persistedStats = s;
-      }
-      final toolsInSeg = [
-        for (final e in segment)
-          if (e.tool != null) e.tool!,
-      ];
-      final computed = CodeChangeStats.fromTools(toolsInSeg);
-      final turnStats = (persistedStats ?? const TurnStats())
-          .mergeComputed(computed);
-
-      final tools = [for (final e in segment) if (e.tool != null) e];
-      final segmentBlocks = <_ChatBlock>[];
-      if (tools.length > 2) {
-        var emittedTools = false;
-        for (final e in segment) {
-          if (e.tool != null) {
-            if (!emittedTools) {
-              segmentBlocks.add(_ChatBlock.tools(tools));
-              emittedTools = true;
-            }
-          } else {
-            final id = e.message?.id;
-            segmentBlocks.add(
-              _ChatBlock.single(
-                e,
-                thinking: e.message?.role == MessageRole.assistant && id != null
-                    ? thinkingByAssistantId[id]
-                    : null,
-              ),
-            );
-          }
-        }
-      } else {
-        for (final e in segment) {
-          final id = e.message?.id;
-          segmentBlocks.add(
-            _ChatBlock.single(
-              e,
-              thinking: e.message?.role == MessageRole.assistant && id != null
-                  ? thinkingByAssistantId[id]
-                  : null,
-            ),
-          );
-        }
-      }
-      final followedByUser = i < compact.length &&
-          compact[i].message?.role == MessageRole.user;
-      final isLastSegment = i >= compact.length;
-      // Code delta + τ only after the command finishes — not mid-stream.
-      final showStats = turnStats.isNotEmpty &&
-          (persistedStats != null ||
-              followedByUser ||
-              (isLastSegment && !openTurnActive));
-      if (segmentBlocks.isNotEmpty && showStats) {
-        final last = segmentBlocks.removeLast();
-        segmentBlocks.add(last.withTurnStats(turnStats));
-      }
-      blocks.addAll(segmentBlocks);
-    }
-
-    if (trailingThinking != null && trailingThinking.isNotEmpty) {
-      blocks.add(_ChatBlock.thinking(trailingThinking));
-    }
+    final blocks = buildTranscriptBlocks(
+      entries,
+      openTurnActive: openTurnActive,
+    );
+    _cachedBlocks = blocks;
+    _blocksCacheKey = key;
     return blocks;
   }
 
@@ -485,6 +408,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     runtime.chatMeta = _chat;
     _mode = runtime.mode;
     _permission = runtime.permissionPolicy;
+    _wasWorking = runtime.isWorking;
     _runtimeListener = () {
       if (!mounted) return;
       if (runtime.chatMeta != null) {
@@ -517,22 +441,76 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
       final n = runtime.entries.length;
       if (n != _messageCount) _messageCount = n;
-      setState(() {});
-      _scrollToEnd();
-      _scheduleMarkRead();
+
+      final working = runtime.isWorking;
+      final turnEnded = _wasWorking && !working;
+      _wasWorking = working;
+      final queueLen = runtime.outboundQueue.length;
+      final queueChanged = queueLen != _lastOutboundQueueLen;
+      _lastOutboundQueueLen = queueLen;
+      final needsImmediate = turnEnded ||
+          queueChanged ||
+          runtime.pendingPermission != null ||
+          (runtime.lastError != null &&
+              !isTransientBridgeErrorText(runtime.lastError!)) ||
+          runtime.deliveryError != null;
+
+      // User scrolled up to read history — don't rebuild/re-layout the whole
+      // transcript (and GptMarkdown) on every Claude token; that is what makes
+      // scrolling feel stuck. Keep a dirty flag and refresh when they jump back.
+      if (!needsImmediate && !_followOutput && working) {
+        _runtimeUiDirty = true;
+        if (!_showJumpToLatest && mounted) {
+          setState(() => _showJumpToLatest = true);
+        }
+        _scheduleMarkRead();
+        return;
+      }
+
+      _scheduleRuntimeUi(immediate: needsImmediate);
     };
     runtime.addListener(_runtimeListener!);
+    _lastOutboundQueueLen = runtime.outboundQueue.length;
     setState(() {});
     _scrollToEnd();
     // Coming back to a chat whose turn already finished should drain the queue.
     runtime.resumeOutboundQueue();
+    unawaited(runtime.recoverTrailingUserPromptIfStuck());
     unawaited(_prefetchModelCatalogIfNeeded(runtime));
   }
 
-  Future<void> _prefetchModelCatalogIfNeeded(ChatSessionRuntime runtime) async {
+  /// Coalesce ACP stream notifications — Claude can emit dozens per second.
+  void _scheduleRuntimeUi({bool immediate = false}) {
+    _runtimeUiDirty = true;
+    if (immediate) {
+      _runtimeUiCoalesce?.cancel();
+      _runtimeUiCoalesce = null;
+      _flushRuntimeUi();
+      return;
+    }
+    if (_runtimeUiCoalesce?.isActive ?? false) return;
+    _runtimeUiCoalesce = Timer(const Duration(milliseconds: 100), () {
+      _runtimeUiCoalesce = null;
+      _flushRuntimeUi();
+    });
+  }
+
+  void _flushRuntimeUi() {
+    if (!mounted || !_runtimeUiDirty) return;
+    _runtimeUiDirty = false;
+    setState(() {});
+    _scrollToEnd();
+    _scheduleMarkRead();
+  }
+
+  Future<void> _prefetchModelCatalogIfNeeded(
+    ChatSessionRuntime runtime, {
+    bool swallowErrors = true,
+  }) async {
     if (runtime.closed ||
         runtime.availableModels.isNotEmpty ||
-        runtime.isWorking) {
+        runtime.promptInFlight ||
+        runtime.sendingToHost) {
       return;
     }
     final host = _host;
@@ -546,7 +524,119 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (mounted) setState(() {});
     } catch (e) {
       SafeLog.d('prefetch model catalog failed', e);
+      if (!swallowErrors) rethrow;
     }
+  }
+
+  Future<void> _pickModel() async {
+    String? connectError;
+    // The model list only exists on a live session, so connect first rather
+    // than showing an empty picker.
+    if ((_runtime?.availableModels ?? const []).isEmpty && !_connecting) {
+      try {
+        await _ensureAcp();
+      } catch (e) {
+        connectError = e.toString();
+        SafeLog.d('connect before model picker failed', e);
+      }
+    }
+    if (!mounted) return;
+
+    var runtime = _runtime ??
+        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+
+    if (runtime != null && !runtime.closed) {
+      try {
+        await _prefetchModelCatalogIfNeeded(runtime, swallowErrors: false);
+        // Session events can land a tick after Connect — retry once if empty.
+        if (runtime.availableModels.isEmpty) {
+          await Future<void>.delayed(const Duration(milliseconds: 600));
+          if (!mounted) return;
+          await _prefetchModelCatalogIfNeeded(runtime, swallowErrors: false);
+        }
+      } catch (e) {
+        connectError ??= e.toString();
+        SafeLog.d('model catalog refresh in picker failed', e);
+      }
+    }
+    if (!mounted) return;
+
+    runtime = _runtime ??
+        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+
+    final models = runtime?.availableModels ?? const <AgentModel>[];
+    if (models.isEmpty) {
+      final connected = runtime != null && !runtime.closed;
+      final detail = connectError ??
+          _error ??
+          runtime?.lastError ??
+          runtime?.deliveryError;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            detail != null && detail.trim().isNotEmpty
+                ? 'Cannot get the model list: $detail'
+                : connected
+                    ? 'No models from the agent yet. Wait for Connect to finish, then try again.'
+                    : 'Connect to the agent first — models load from the live session.',
+          ),
+        ),
+      );
+    }
+
+    final chosen = await ModelPickerSheet.show(
+      context,
+      models: models,
+      selectedId: _selectedModel?.modelId,
+      connected: runtime != null && !runtime.closed,
+    );
+    if (chosen == null || !mounted) return;
+
+    try {
+      if (runtime != null && !runtime.closed) {
+        await runtime.setModel(chosen);
+      } else {
+        // Offline: remember it so the next connect applies it.
+        final chat = _chat;
+        if (chat != null) {
+          final updated =
+              chat.copyWith(modelId: chosen, updatedAt: DateTime.now());
+          await ref.read(appDatabaseProvider).upsertChat(updated);
+          ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
+        }
+      }
+      if (!mounted) return;
+      final confirmed = runtime?.currentModelId ?? chosen;
+      setState(() => _chat = _chat?.copyWith(modelId: confirmed));
+    } catch (e) {
+      SafeLog.d('setModel failed', e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_friendlySetModelError(e))),
+        );
+      }
+    }
+  }
+
+  /// Shorten nested JSON-RPC dumps for the switch-model snackbar.
+  static String _friendlySetModelError(Object e) {
+    final text = e.toString();
+    if (e is AcpModelSwitchUnsupported ||
+        text.contains('AcpModelSwitchUnsupported') ||
+        (text.contains('set_config_option') &&
+            text.contains('set_model') &&
+            text.toLowerCase().contains('method not found'))) {
+      return 'Could not switch model: this agent needs a restart to change '
+          'models. Reconnect and try again, or update claude-agent-acp on the host.';
+    }
+    final compact = text
+        .replaceFirst(RegExp(r'^Exception:\s*'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (compact.length > 160) {
+      return 'Could not switch model: ${compact.substring(0, 157)}…';
+    }
+    return 'Could not switch model: $compact';
   }
 
   Future<void> _ensureAcp() {
@@ -933,78 +1023,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (chosen != null && chosen != _mode) await _setMode(chosen);
   }
 
-  Future<void> _pickModel() async {
-    // The model list only exists on a live session, so connect first rather
-    // than showing an empty picker.
-    if ((_runtime?.availableModels ?? const []).isEmpty && !_connecting) {
-      await _ensureAcp();
-    }
-    if (!mounted) return;
-
-    var runtime = _runtime ??
-        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
-
-    if (runtime != null && !runtime.closed) {
-      await _prefetchModelCatalogIfNeeded(runtime);
-      // Session events can land a tick after Connect — retry once if empty.
-      if (runtime.availableModels.isEmpty) {
-        await Future<void>.delayed(const Duration(milliseconds: 600));
-        if (!mounted) return;
-        await _prefetchModelCatalogIfNeeded(runtime);
-      }
-    }
-    if (!mounted) return;
-
-    runtime = _runtime ??
-        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
-
-    if ((runtime?.availableModels ?? const []).isEmpty) {
-      final connected = runtime != null && !runtime.closed;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            connected
-                ? 'No models from the agent yet. Wait for Connect to finish, then try again.'
-                : 'Connect to the agent first — models load from the live session.',
-          ),
-        ),
-      );
-    }
-
-    final chosen = await ModelPickerSheet.show(
-      context,
-      models: runtime?.availableModels ?? const [],
-      selectedId: _selectedModel?.modelId,
-      connected: runtime != null && !runtime.closed,
-    );
-    if (chosen == null || !mounted) return;
-
-    try {
-      if (runtime != null && !runtime.closed) {
-        await runtime.setModel(chosen);
-      } else {
-        // Offline: remember it so the next connect applies it.
-        final chat = _chat;
-        if (chat != null) {
-          final updated = chat.copyWith(modelId: chosen, updatedAt: DateTime.now());
-          await ref.read(appDatabaseProvider).upsertChat(updated);
-          ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
-        }
-      }
-      if (!mounted) return;
-      final confirmed =
-          runtime?.currentModelId ?? chosen;
-      setState(() => _chat = _chat?.copyWith(modelId: confirmed));
-    } catch (e) {
-      SafeLog.d('setModel failed', e);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not switch model: $e')),
-        );
-      }
-    }
-  }
-
   void _setPermission(PermissionPolicy policy) {
     setState(() => _permission = policy);
     final runtime = _runtime ??
@@ -1148,16 +1166,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ..clear()
             ..addAll(images);
           _showSdkInstallGuide = false;
-          // Bridge blips reconnect underneath — don't sticky-banner them.
           if (!isTransientBridgeError(e)) {
             _error = 'Send failed: $e';
           }
         });
-        if (!isTransientBridgeError(e)) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Send failed: $e')),
-          );
-        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              isTransientBridgeError(e)
+                  ? 'Connection blip — reconnecting and will retry send…'
+                  : 'Send failed: $e',
+            ),
+          ),
+        );
       }
     } finally {
       if (mounted) setState(() => _sending = false);
@@ -1363,14 +1384,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void _scrollToEnd({bool force = false}) {
     // Don't fight the initial landing, and don't yank the view down while the
     // user is scrolled up reading something.
-    if (force) _followOutput = true;
+    if (force) {
+      _pinWindowToLatest();
+      if (mounted) setState(() => _showJumpToLatest = false);
+    }
     if (!force && (!_landedAtBottom || !_followOutput)) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients) return;
       // Re-check: user may have scrolled away since this was scheduled.
       if (!force && !_followOutput) return;
       final max = _scroll.position.maxScrollExtent;
-      if ((_scroll.position.pixels - max).abs() < 1) return;
+      final now = DateTime.now();
+      final lastAt = _lastScrollToEndAt;
+      final grew = max - _lastScrollMaxExtent;
+      // Streaming markdown grows the extent constantly — jumping every flush
+      // fights the trackpad. Only follow when we moved enough or enough time
+      // passed (or the user forced jump-to-latest).
+      if (!force &&
+          grew < 28 &&
+          lastAt != null &&
+          now.difference(lastAt) < const Duration(milliseconds: 140) &&
+          (_scroll.position.pixels - max).abs() < 48) {
+        return;
+      }
+      if ((_scroll.position.pixels - max).abs() < 1) {
+        _lastScrollMaxExtent = max;
+        return;
+      }
+      _lastScrollToEndAt = now;
+      _lastScrollMaxExtent = max;
       _programmaticScroll = true;
       // jumpTo (not animateTo): streaming fires many times per second and
       // stacked animations lock the user out of manual scrolling.
@@ -1383,11 +1425,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       });
     });
   }
-
-  static const _compressMessageThreshold = 3000;
-
-  bool get _shouldSuggestCompress =>
-      !_dismissCompressHint && _messageCount >= _compressMessageThreshold;
 
   Future<void> _renameChat() async {
     final chat = _chat;
@@ -1431,81 +1468,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (mounted) setState(() => _chat = updated);
   }
 
-  /// Wipe phone transcript + remote ACP session so the next Connect is a fresh
-  /// conversation (new session/new under the same agent row).
-  Future<void> _startFreshConversation() async {
-    final chat = _chat;
-    final host = _host;
-    if (chat == null) return;
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Start fresh conversation?'),
-        content: const Text(
-          'Clears this chat’s messages on the phone and restarts the remote '
-          'agent session so context is reset.\n\n'
-          'The agent row stays — same folder and provider. Old transcript is '
-          'removed (not archived).',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Start fresh'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true || !mounted) return;
-
-    final sessions = ref.read(activeAcpSessionsProvider.notifier);
-    await sessions.close(chat.id);
-
-    if (host != null) {
-      try {
-        await ref.read(agentRuntimeHostProvider).stop(host, chat.id);
-      } catch (e) {
-        SafeLog.d('stop remote for fresh chat failed', e);
-      }
-    }
-
-    final db = ref.read(appDatabaseProvider);
-    await db.clearMessages(chat.id);
-    await db.setOutboundQueue(chat.id, const []);
-    final updated = chat.copyWith(
-      clearTmuxSession: true,
-      clearAcpSessionId: true,
-      journalOffset: 0,
-      status: ChatStatus.idle,
-      updatedAt: DateTime.now(),
-      clearLastAutoNumber: true,
-      clearCodeDelta: true,
-      lastReadAt: DateTime.now(),
-    );
-    await db.upsertChat(updated);
-    ref.read(agentDockServiceProvider).schedulePushChat(chat.id);
-    ref.read(chatActivityTickProvider.notifier).state++;
-
-    if (!mounted) return;
-    setState(() {
-      _chat = updated;
-      _dbEntries.clear();
-      _messageCount = 0;
-      _dismissCompressHint = true;
-      _runtime = null;
-      _error = null;
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Fresh conversation ready — tap Connect to start.'),
-      ),
-    );
-  }
-
   @override
   void dispose() {
     // Keep remote ACP alive — only detach UI listener.
@@ -1516,6 +1478,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ref.read(focusedChatIdProvider.notifier).state = null;
     }
     _markReadTimer?.cancel();
+    _runtimeUiCoalesce?.cancel();
     _voiceTick?.cancel();
     _voicePulse.dispose();
     _scroll.removeListener(_onScrollOffsetChanged);
@@ -1881,12 +1844,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     required ThemeData theme,
     required bool streaming,
     required bool connected,
+    int queuedCount = 0,
   }) {
     const fieldRadius = 26.0;
     final border = OutlineInputBorder(
       borderRadius: BorderRadius.circular(fieldRadius),
       borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
     );
+
+    final hint = () {
+      if (_connecting) return 'Connecting agent…';
+      if (queuedCount > 0) {
+        return queuedCount == 1
+            ? '1 follow-up waiting — Force run is above…'
+            : '$queuedCount follow-ups waiting — Force run is above…';
+      }
+      if (streaming) {
+        return 'Agent is busy — send to queue a follow-up…';
+      }
+      if (connected) return 'Message ${_chat!.provider.label} agent…';
+      return 'Message agent…';
+    }();
 
     return Stack(
       clipBehavior: Clip.none,
@@ -1898,13 +1876,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           maxLines: 5,
           enabled: _chat!.provider.isAvailable,
           decoration: InputDecoration(
-            hintText: _connecting
-                ? 'Connecting agent…'
-                : streaming
-                    ? 'Message (queued until Force run)…'
-                    : connected
-                        ? 'Message ${_chat!.provider.label} agent…'
-                        : 'Message agent…',
+            hintText: hint,
             filled: true,
             fillColor: theme.colorScheme.surfaceContainerHighest
                 .withValues(alpha: 0.55),
@@ -2136,11 +2108,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
 
     final theme = Theme.of(context);
-    final guide = (_error ?? '').toUpperCase().contains('ADSM')
-        ? kRemoteAdsmSetupGuide
-        : _chat!.provider == AgentProvider.claude
-            ? kRemoteClaudeSetupGuide
-            : kRemoteCursorSetupGuide;
 
     final runtime = _runtime;
     final adsmSession = runtime?.session is AdsmSession
@@ -2152,21 +2119,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // so filter defensively in case a stale row is still present.
     final rawEntries = runtime?.entries ?? _dbEntries;
     final liveAssistantId = runtime?.liveAssistantMessageId;
+    final liveAssistantText = (runtime?.assistantBuffer ?? '').trim();
     final filtered = [
       for (final e in rawEntries)
         if (e.messageId == null ||
             (!queuedIds.contains(e.messageId) &&
-                e.messageId != liveAssistantId))
+                e.messageId != liveAssistantId &&
+                // Same text as the live bubble (id race / re-stream) — show once.
+                !(liveAssistantText.isNotEmpty &&
+                    e.message?.role == MessageRole.assistant &&
+                    e.message!.content.trim() == liveAssistantText)))
           e,
     ];
-    // System thoughts are folded into assistant bubbles by [_blocksFor].
-    final entries = _entriesByTime(filtered);
+    // System thoughts are folded into assistant bubbles by [buildTranscriptBlocks].
+    final entries = entriesByTime(filtered);
     final thoughtBuffer = runtime?.thoughtBuffer ?? '';
     final assistantBuffer = runtime?.assistantBuffer ?? '';
     // Composer no longer locks for the whole turn — only the live buffer
     // counts as "working" for the agent bubble.
     final streaming = runtime?.isWorking ?? false;
-    final blocks = _blocksFor(entries, openTurnActive: streaming);
+    final blocks = _blocksForMemoized(entries, openTurnActive: streaming);
+    _syncWindowToBlocks(blocks.length);
+    final visibleBlocks = _transcriptWindow.visibleSlice(blocks);
+    final hiddenOlder = _transcriptWindow.hiddenOlder();
+    final hiddenNewer = _transcriptWindow.hiddenNewer(blocks.length);
     final liveError = runtime?.lastError;
     final deliveryError = runtime?.deliveryError;
     final rawError = _error ?? liveError ?? deliveryError;
@@ -2175,6 +2151,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // SingleChildScrollView collapsed the title to 0px — empty red strip).
     final displayError =
         (trimmedError == null || trimmedError.isEmpty) ? null : trimmedError;
+    final guide = () {
+      final err = (displayError ?? '').toLowerCase();
+      if (err.contains('tmux')) return kRemoteTmuxSetupGuide;
+      if (err.contains('adsm')) return kRemoteAdsmSetupGuide;
+      return _chat!.provider == AgentProvider.claude
+          ? kRemoteClaudeSetupGuide
+          : kRemoteCursorSetupGuide;
+    }();
     final connected = runtime != null && !runtime.closed;
     final reconnecting = runtime?.reconnecting ?? false;
     final remoteRunning = runtime?.remoteTurnActive == true;
@@ -2186,12 +2170,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               if (e.tool?.isActive ?? false) e.tool!,
           ];
     final activeTools = activeToolEntries.length;
+    final pollingTools = [
+      for (final t in activeToolEntries)
+        if (t.isPollingWait) t,
+    ];
+    final isPolling = pollingTools.isNotEmpty;
     final activityLabel = runtime?.activityLabel;
     final statusLabel = switch (true) {
       _ when reconnecting => ' · reconnecting…',
       _ when remoteRunning && !connected => ' · running on host',
       _ when sending =>
         ' · ${activityLabel?.isNotEmpty == true ? activityLabel! : 'Sending to host…'}',
+      _ when streaming && isPolling =>
+        ' · Polling · ${pollingTools.first.displayTitle}',
       _ when streaming && activityLabel != null && activityLabel.isNotEmpty =>
         ' · $activityLabel',
       _ when streaming && activeTools == 1 =>
@@ -2360,7 +2351,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   _ToolbarChip(
                     icon: Icons.auto_awesome_outlined,
                     label: _selectedModel?.name ?? 'Model',
-                    detail: _selectedModel?.badges.join(' · '),
+                    detail: () {
+                      final usage = TurnMetricsLabel.formatContextUsage(
+                        runtime?.usageTokensUsed,
+                        runtime?.usageContextSize,
+                      );
+                      if (usage != null) return usage;
+                      final badges = _selectedModel?.badges.join(' · ');
+                      return (badges != null && badges.isNotEmpty)
+                          ? badges
+                          : null;
+                    }(),
                     opensMenu: true,
                     onTap: _pickModel,
                   ),
@@ -2381,7 +2382,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ),
             ),
           ),
-          if (displayError != null && _showSdkInstallGuide)
+          if (displayError != null &&
+              (_showSdkInstallGuide ||
+                  displayError.toLowerCase().contains('tmux') ||
+                  displayError.toLowerCase().contains('not installed')))
             ConstrainedBox(
               constraints: BoxConstraints(
                 maxHeight: MediaQuery.sizeOf(context).height * 0.38,
@@ -2457,109 +2461,174 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               children: [
                 NotificationListener<UserScrollNotification>(
                   onNotification: (notification) {
-                    if (_programmaticScroll || !_landedAtBottom) return false;
+                    if (_programmaticScroll ||
+                        _shiftingWindow ||
+                        !_landedAtBottom) {
+                      return false;
+                    }
                     // reverse = toward older messages (top); stop auto-follow.
                     if (notification.direction == ScrollDirection.reverse) {
                       if (_followOutput) {
                         _followOutput = false;
+                        _transcriptWindow.pinnedToEnd = false;
                         if (!_showJumpToLatest && mounted) {
                           setState(() => _showJumpToLatest = true);
                         }
                       }
+                      _maybeSlideWindow(direction: -1);
                     } else if (notification.direction ==
-                            ScrollDirection.forward &&
-                        _isNearBottom) {
-                      if (!_followOutput) {
+                        ScrollDirection.forward) {
+                      if (_isNearBottom && !_followOutput) {
                         _followOutput = true;
+                        _transcriptWindow.pinnedToEnd = true;
                         if (_showJumpToLatest && mounted) {
                           setState(() => _showJumpToLatest = false);
                         }
                       }
+                      _maybeSlideWindow(direction: 1);
                     }
                     return false;
                   },
-                  child: ListView.builder(
+                  child: GptMarkdownTheme(
+                    gptThemeData: chatGptMarkdownTheme(theme),
+                    child: ListView.builder(
                   controller: _scroll,
                   padding: const EdgeInsets.all(12),
                   // Keep scroll physics interactive even while the agent streams.
                   physics: const AlwaysScrollableScrollPhysics(),
-                  itemCount: blocks.length + extra.length,
+                  // Prefetch more rows so scrolling history doesn't hitch on
+                  // markdown layout for each newly revealed bubble.
+                  cacheExtent: 600,
+                  itemCount: (hiddenOlder > 0 ? 1 : 0) +
+                      visibleBlocks.length +
+                      (hiddenNewer > 0 ? 1 : 0) +
+                      extra.length,
                   itemBuilder: (context, index) {
-                    if (index >= blocks.length) {
-                      return extra[index - blocks.length];
-                    }
-                    final block = blocks[index];
-                    final prevAt =
-                        index > 0 ? blocks[index - 1].createdAt : null;
-                    final at = block.createdAt;
-                    final showDate = at != null &&
-                        (prevAt == null ||
-                            prevAt.year != at.year ||
-                            prevAt.month != at.month ||
-                            prevAt.day != at.day);
-
-                    final Widget body;
-                    final tools = block.tools;
-                    if (block.thinkingOnly != null) {
-                      body = _ThinkingFold(text: block.thinkingOnly!);
-                    } else if (tools != null) {
-                      body = ToolCallGroupCard(
-                        tools: [for (final e in tools) e.tool!],
-                      );
-                    } else if (block.entry!.tool != null) {
-                      body = ToolCallCard(tool: block.entry!.tool!);
-                    } else {
-                      final m = block.entry!.message!;
-                      final bubble = _Bubble(
-                        role: m.role,
-                        text: m.content,
-                        at: m.createdAt,
-                      );
-                      final thinking = block.thinking;
-                      if (thinking != null && thinking.isNotEmpty) {
-                        body = Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            _ThinkingFold(text: thinking),
-                            bubble,
-                          ],
-                        );
-                      } else {
-                        body = bubble;
-                      }
-                    }
-                    final stats = block.turnStats;
-                    final withStats = stats != null && stats.isNotEmpty
-                        ? Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              body,
-                              Padding(
-                                padding: const EdgeInsets.only(
-                                  left: 6,
-                                  top: 2,
-                                  bottom: 4,
-                                ),
-                                child: TurnMetricsLabel(
-                                  added: stats.added,
-                                  removed: stats.removed,
-                                  files: stats.files,
-                                  tokensUsed: stats.tokensUsed,
-                                  contextSize: stats.contextSize,
-                                ),
+                    var cursor = index;
+                    if (hiddenOlder > 0) {
+                      if (cursor == 0) {
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Center(
+                            child: Text(
+                              '↑ $hiddenOlder earlier',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
                               ),
+                            ),
+                          ),
+                        );
+                      }
+                      cursor--;
+                    }
+                    if (cursor < visibleBlocks.length) {
+                      final historyIndex = cursor;
+                      final absoluteIndex =
+                          _transcriptWindow.start + historyIndex;
+                      final block = visibleBlocks[historyIndex];
+                      final prevAt = historyIndex > 0
+                          ? visibleBlocks[historyIndex - 1].createdAt
+                          : null;
+                      final at = block.createdAt;
+                      final showDate = at != null &&
+                          (prevAt == null ||
+                              prevAt.year != at.year ||
+                              prevAt.month != at.month ||
+                              prevAt.day != at.day);
+
+                      final Widget body;
+                      final tools = block.tools;
+                      if (block.thinkingOnly != null) {
+                        body = _ThinkingFold(text: block.thinkingOnly!);
+                      } else if (tools != null) {
+                        body = ToolCallGroupCard(
+                          tools: [for (final e in tools) e.tool!],
+                        );
+                      } else if (block.entry!.tool != null) {
+                        body = ToolCallCard(tool: block.entry!.tool!);
+                      } else {
+                        final m = block.entry!.message!;
+                        final bubble = _Bubble(
+                          role: m.role,
+                          text: m.content,
+                          at: m.createdAt,
+                        );
+                        final thinking = block.thinking;
+                        if (thinking != null && thinking.isNotEmpty) {
+                          body = Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              _ThinkingFold(text: thinking),
+                              bubble,
                             ],
-                          )
-                        : body;
-                    if (!showDate) return withStats;
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        _DateChip(at),
-                        withStats,
-                      ],
-                    );
+                          );
+                        } else {
+                          body = bubble;
+                        }
+                      }
+                      final stats = block.turnStats;
+                      final withStats = stats != null && stats.isNotEmpty
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                body,
+                                Padding(
+                                  padding: const EdgeInsets.only(
+                                    left: 6,
+                                    top: 2,
+                                    bottom: 4,
+                                  ),
+                                  child: TurnMetricsLabel(
+                                    added: stats.added,
+                                    removed: stats.removed,
+                                    files: stats.files,
+                                  ),
+                                ),
+                              ],
+                            )
+                          : body;
+                      final keyed = KeyedSubtree(
+                        key: ValueKey(
+                          block.thinkingOnly != null
+                              ? 'think-$absoluteIndex-${block.thinkingOnly.hashCode}'
+                              : tools != null
+                                  ? 'tools-$absoluteIndex-${tools.length}-'
+                                      '${tools.first.messageId ?? tools.first.createdAt}'
+                                  : block.entry!.messageId ??
+                                      block.entry!.tool?.toolCallId ??
+                                      'e-$absoluteIndex',
+                        ),
+                        child: RepaintBoundary(child: withStats),
+                      );
+                      if (!showDate) return keyed;
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _DateChip(at),
+                          keyed,
+                        ],
+                      );
+                    }
+                    cursor -= visibleBlocks.length;
+                    if (hiddenNewer > 0) {
+                      if (cursor == 0) {
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Center(
+                            child: Text(
+                              '↓ $hiddenNewer newer (jump to resume)',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        );
+                      }
+                      cursor--;
+                    }
+                    return extra[cursor];
                   },
+                ),
                 ),
                 ),
                 if (_showJumpToLatest)
@@ -2574,7 +2643,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         shape: const CircleBorder(),
                         child: IconButton(
                           tooltip: 'Jump to latest',
-                          onPressed: () => _scrollToEnd(force: true),
+                          onPressed: () {
+                            _pinWindowToLatest();
+                            _flushRuntimeUi();
+                            _scrollToEnd(force: true);
+                          },
                           icon: Icon(
                             Icons.keyboard_arrow_down_rounded,
                             color: theme.colorScheme.onPrimaryContainer,
@@ -2586,42 +2659,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ],
             ),
           ),
-          if (_shouldSuggestCompress)
-            Material(
-              color: theme.colorScheme.secondaryContainer.withValues(alpha: 0.55),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.compress,
-                      size: 18,
-                      color: theme.colorScheme.onSecondaryContainer,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Chat is getting large ($_messageCount messages). '
-                        'Start fresh to reset agent context.',
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: theme.colorScheme.onSecondaryContainer,
-                        ),
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: () => unawaited(_startFreshConversation()),
-                      child: const Text('Fresh'),
-                    ),
-                    IconButton(
-                      tooltip: 'Dismiss',
-                      onPressed: () =>
-                          setState(() => _dismissCompressHint = true),
-                      icon: const Icon(Icons.close, size: 18),
-                    ),
-                  ],
-                ),
-              ),
-            ),
           if (queue.isNotEmpty)
             _OutboundQueueBar(
               queue: queue,
@@ -2660,6 +2697,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               fontWeight: FontWeight.w500,
                               fontFeatures: const [FontFeature.tabularFigures()],
                             );
+                            // Polling waits are the thing users confuse with
+                            // "stuck" — surface that above explore totals.
+                            if (isPolling) {
+                              final label =
+                                  '${pollingTools.first.displayTitle} · Polling';
+                              final text = label.endsWith('…') ||
+                                      label.endsWith('...')
+                                  ? label
+                                  : '$label…';
+                              return Text(text, style: style);
+                            }
                             if (explore != null && explore.isNotEmpty) {
                               return ExploreStatsLabel(
                                 files: explore.fileCount,
@@ -2668,18 +2716,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 showEllipsis: true,
                               );
                             }
-                            final label = sending
-                                ? (activityLabel?.isNotEmpty == true
-                                    ? activityLabel!
-                                    : 'Sending to host…')
-                                : (activityLabel != null &&
-                                        activityLabel.isNotEmpty)
-                                    ? activityLabel
-                                    : activeTools == 1
-                                        ? activeToolEntries.first.displayTitle
-                                        : activeTools > 1
-                                            ? 'Working · $activeTools tools'
-                                            : 'Thinking';
+                            final String label;
+                            if (sending) {
+                              label = activityLabel?.isNotEmpty == true
+                                  ? activityLabel!
+                                  : 'Sending to host…';
+                            } else if (activityLabel != null &&
+                                activityLabel.isNotEmpty) {
+                              label = activityLabel;
+                            } else if (activeTools == 1) {
+                              label = activeToolEntries.first.displayTitle;
+                            } else if (activeTools > 1) {
+                              label = 'Working · $activeTools tools';
+                            } else {
+                              label = 'Thinking';
+                            }
                             final text =
                                 label.endsWith('…') || label.endsWith('...')
                                     ? label
@@ -2798,6 +2849,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               theme: theme,
                               streaming: streaming,
                               connected: connected,
+                              queuedCount: queue.length,
                             ),
                           ],
                         ),
@@ -2823,23 +2875,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (label == null || label.isEmpty) {
       return const SizedBox.shrink();
     }
+    final usage = TurnMetricsLabel.formatContextUsage(
+      _runtime?.usageTokensUsed,
+      _runtime?.usageContextSize,
+    );
+    final line = usage == null ? label : '$label\n$usage';
     return Tooltip(
-      message: 'Model: $label',
+      message: usage == null
+          ? 'Model: $label'
+          : 'Model: $label\nContext: $usage',
       child: InkWell(
         borderRadius: BorderRadius.circular(6),
         onTap: _pickModel,
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 56),
+          constraints: const BoxConstraints(maxWidth: 72),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(2, 0, 2, 4),
             child: Text(
-              label,
-              maxLines: 1,
+              line,
+              maxLines: 2,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.center,
               style: theme.textTheme.labelSmall?.copyWith(
                 color: theme.colorScheme.primary.withValues(alpha: 0.9),
                 fontWeight: FontWeight.w500,
+                height: 1.15,
               ),
             ),
           ),
@@ -2847,50 +2907,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ),
     );
   }
-}
-
-/// One paint unit in the transcript list: a message, a lone tool, a
-/// collapsed run of consecutive tools, or a standalone thinking fold.
-class _ChatBlock {
-  const _ChatBlock._({
-    this.entry,
-    this.tools,
-    this.thinking,
-    this.thinkingOnly,
-    this.turnStats,
-  });
-
-  factory _ChatBlock.single(TranscriptEntry entry, {String? thinking}) =>
-      _ChatBlock._(entry: entry, thinking: thinking);
-
-  factory _ChatBlock.tools(List<TranscriptEntry> tools) =>
-      _ChatBlock._(tools: tools);
-
-  factory _ChatBlock.thinking(String text) =>
-      _ChatBlock._(thinkingOnly: text);
-
-  final TranscriptEntry? entry;
-  final List<TranscriptEntry>? tools;
-
-  /// Reasoning attached above an assistant [entry].
-  final String? thinking;
-
-  /// Standalone thinking row (no assistant text yet / orphan).
-  final String? thinkingOnly;
-
-  /// Per-command `+X -Y · Z φ · N τ` footer after this block.
-  final TurnStats? turnStats;
-
-  _ChatBlock withTurnStats(TurnStats stats) => _ChatBlock._(
-        entry: entry,
-        tools: tools,
-        thinking: thinking,
-        thinkingOnly: thinkingOnly,
-        turnStats: stats,
-      );
-
-  DateTime? get createdAt =>
-      tools?.first.createdAt ?? entry?.createdAt;
 }
 
 /// Collapsible agent reasoning — collapsed by default after the turn ends.
@@ -3611,7 +3627,7 @@ class _ToolbarChip extends StatelessWidget {
               Icon(icon, size: 16, color: foreground),
               const SizedBox(width: 7),
               ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 180),
+                constraints: const BoxConstraints(maxWidth: 220),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,

@@ -34,9 +34,15 @@ class DesktopShellScaffold extends ConsumerStatefulWidget {
 }
 
 class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
-  static const _leftWidth = 300.0;
-  static const _rightWidth = 400.0;
   static const _railWidth = 52.0;
+  static const _minLeft = 200.0;
+  static const _maxLeft = 520.0;
+  static const _minRight = 280.0;
+  static const _maxRight = 800.0;
+  static const _minCenter = 280.0;
+
+  double _leftWidth = 300;
+  double _rightWidth = 400;
 
   @override
   void initState() {
@@ -91,6 +97,24 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
     ref.read(desktopProjectFilesProvider.notifier).state = null;
   }
 
+  void _resizeLeft(double dx, double totalWidth, bool rightOpen) {
+    final right = rightOpen ? _rightWidth : 0.0;
+    final maxLeft = (totalWidth - _railWidth - right - _minCenter)
+        .clamp(_minLeft, _maxLeft);
+    setState(() {
+      _leftWidth = (_leftWidth + dx).clamp(_minLeft, maxLeft);
+    });
+  }
+
+  void _resizeRight(double dx, double totalWidth) {
+    final maxRight =
+        (totalWidth - _railWidth - _leftWidth - _minCenter).clamp(_minRight, _maxRight);
+    // Handle is the left edge of the right panel: drag left → wider panel.
+    setState(() {
+      _rightWidth = (_rightWidth - dx).clamp(_minRight, maxRight);
+    });
+  }
+
   Widget _centerColumn(String path, String? chatId) {
     // Terminal is opened from the embedded Hosts panel (outside the hosts
     // branch navigator). Render it here directly — relying on navigationShell
@@ -118,6 +142,8 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
     final chatId = chatIdFromRoute(widget.state);
     final panel = ref.watch(desktopRightPanelProvider);
     final scheme = Theme.of(context).colorScheme;
+    final totalWidth = MediaQuery.sizeOf(context).width;
+    final rightOpen = panel != DesktopRightPanel.none;
 
     return Material(
       color: scheme.surfaceContainerLow,
@@ -156,10 +182,14 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
               ],
             ),
           ),
-          const VerticalDivider(width: 1),
+          _PanelResizeHandle(
+            onDrag: (dx) => _resizeLeft(dx, totalWidth, rightOpen),
+          ),
           Expanded(child: _centerColumn(path, chatId)),
-          if (panel != DesktopRightPanel.none) ...[
-            const VerticalDivider(width: 1),
+          if (rightOpen) ...[
+            _PanelResizeHandle(
+              onDrag: (dx) => _resizeRight(dx, totalWidth),
+            ),
             SizedBox(
               width: _rightWidth,
               child: ColoredBox(
@@ -172,6 +202,34 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
             ),
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// Drag handle between desktop columns.
+class _PanelResizeHandle extends StatelessWidget {
+  const _PanelResizeHandle({required this.onDrag});
+
+  final ValueChanged<double> onDrag;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: (details) => onDrag(details.delta.dx),
+        child: SizedBox(
+          width: 5,
+          child: Center(
+            child: Container(
+              width: 1,
+              color: scheme.outlineVariant.withValues(alpha: 0.8),
+            ),
+          ),
+        ),
       ),
     );
   }

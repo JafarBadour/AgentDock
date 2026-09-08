@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
+import '../../services/local_host_bootstrap.dart';
 
 final hostsListProvider = FutureProvider.autoDispose<List<Host>>((ref) {
   return ref.watch(appDatabaseProvider).listHosts();
@@ -93,15 +94,29 @@ class HostsScreen extends ConsumerWidget {
                     final via =
                         jump == null ? null : ' via ${jump.displayLabel}';
                     return ListTile(
+                      leading: host.id == kLocalThisComputerHostId
+                          ? const Icon(Icons.computer_outlined)
+                          : null,
                       title: Text(host.displayLabel),
                       subtitle: Text(
-                        '${host.endpointLabel}${via ?? ''}\n'
-                        'Tap repos · terminal opens SSH shell',
+                        host.id == kLocalThisComputerHostId
+                            ? '${host.endpointLabel}\n'
+                                'Enable Remote Login (Sharing) first, then use '
+                                'repos / terminal / agents on this Mac'
+                            : '${host.endpointLabel}${via ?? ''}\n'
+                                'Tap repos · terminal opens SSH shell',
                       ),
                       isThreeLine: true,
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
+                          if (host.id == kLocalThisComputerHostId)
+                            IconButton(
+                              tooltip: 'Open Remote Login settings',
+                              icon: const Icon(Icons.settings_outlined),
+                              onPressed: () =>
+                                  openLocalRemoteLoginSettings(),
+                            ),
                           IconButton(
                             tooltip: 'Open terminal',
                             icon: const Icon(Icons.terminal),

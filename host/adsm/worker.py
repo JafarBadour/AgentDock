@@ -23,6 +23,17 @@ def _shell_quote(s: str) -> str:
     return shlex.quote(s)
 
 
+def _is_acp_method_not_found(exc: BaseException, method: str) -> bool:
+    """True when [exc] is JSON-RPC method-not-found for [method].
+
+    Errors may be nested (`-32000` wrapping `-32601`) by SSH/tmux bridges.
+    """
+    text = str(exc)
+    if method not in text:
+        return False
+    return "-32601" in text or "method not found" in text.lower()
+
+
 def _flatten_config_select_options(options: Any) -> list[dict[str, Any]]:
     """Flatten nested select option groups from ACP configOptions."""
     if not isinstance(options, list):
@@ -87,8 +98,12 @@ def _run_script(
     binary: str,
     provider: str,
     full_access: bool,
+    model_id: Optional[str] = None,
 ) -> str:
     q = _shell_quote
+    model_flag = ""
+    if provider != "claude" and model_id:
+        model_flag = f"--model {q(model_id)} "
     if provider == "claude":
         agent_args = ""
         skip_perms = (
@@ -96,7 +111,9 @@ def _run_script(
         )
     else:
         agent_args = (
-            "--force --approve-mcps --trust acp" if full_access else "acp"
+            f"{model_flag}--force --approve-mcps --trust acp"
+            if full_access
+            else f"{model_flag}acp"
         )
         skip_perms = ""
     exec_line = q(binary) if not agent_args else f"{q(binary)} {agent_args}"
@@ -128,12 +145,25 @@ exec {exec_line}
 """
 
 
-def _env_file(provider: str, api_key: Optional[str]) -> Optional[str]:
-    if not api_key:
+def _env_file(
+    provider: str,
+    api_key: Optional[str],
+    model_id: Optional[str] = None,
+) -> Optional[str]:
+    lines: list[str] = []
+    if api_key:
+        if provider == "claude":
+            lines.append(f"ANTHROPIC_API_KEY={_shell_quote(api_key)}")
+            lines.append("export ANTHROPIC_API_KEY")
+        else:
+            lines.append(f"CURSOR_API_KEY={_shell_quote(api_key)}")
+            lines.append("export CURSOR_API_KEY")
+    if provider == "claude" and model_id:
+        lines.append(f"CLAUDE_ACP_MODEL={_shell_quote(model_id)}")
+        lines.append("export CLAUDE_ACP_MODEL")
+    if not lines:
         return None
-    if provider == "claude":
-        return f"ANTHROPIC_API_KEY={_shell_quote(api_key)}\nexport ANTHROPIC_API_KEY\n"
-    return f"CURSOR_API_KEY={_shell_quote(api_key)}\nexport CURSOR_API_KEY\n"
+    return "\n".join(lines) + "\n"
 
 
 def ensure_tmux_worker(
@@ -144,6 +174,7 @@ def ensure_tmux_worker(
     provider: str = "cursor",
     api_key: Optional[str] = None,
     full_access: bool = True,
+    model_id: Optional[str] = None,
 ) -> tuple[str, int]:
     """Start or adopt tmux worker. Returns (state, journal_size)."""
     dir_path = paths.session_dir(chat_id)
@@ -157,6 +188,7 @@ def ensure_tmux_worker(
         binary=binary,
         provider=provider,
         full_access=full_access,
+        model_id=model_id,
     )
     (dir_path / "run.sh").write_text(run_sh, encoding="utf-8")
     os.chmod(dir_path / "run.sh", 0o755)
@@ -170,8 +202,15 @@ def ensure_tmux_worker(
     want = "1" if full_access else "0"
     marker = dir_path / "full_access"
     have = marker.read_text(encoding="utf-8").strip() if marker.exists() else ""
+    model_marker = dir_path / "desired_model"
+    want_model = model_id or ""
+    have_model = (
+        model_marker.read_text(encoding="utf-8").strip()
+        if model_marker.exists()
+        else ""
+    )
 
-    env_body = _env_file(provider, api_key)
+    env_body = _env_file(provider, api_key, model_id)
 
     def _write_env() -> None:
         if env_body is None:
@@ -190,6 +229,7 @@ def ensure_tmux_worker(
     def _start() -> None:
         _write_env()
         marker.write_text(want, encoding="utf-8")
+        model_marker.write_text(want_model, encoding="utf-8")
         r = subprocess.run(
             [
                 "tmux",
@@ -213,7 +253,7 @@ def ensure_tmux_worker(
             )
 
     if _tmux_alive():
-        if have == want:
+        if have == want and have_model == want_model:
             state = "RUNNING"
         else:
             subprocess.run(
@@ -331,6 +371,7 @@ class Worker:
                 provider=provider,
                 api_key=api_key,
                 full_access=full_access,
+                model_id=model_id,
             )
 
             await self._attach_pipes()
@@ -344,12 +385,62 @@ class Worker:
             )
             effective = resume_session_id or (stored or None)
 
-            if freshly:
-                await self._initialize()
-                await self._open_session(
-                    mcp_servers=mcp_servers or [],
-                    resume_session_id=effective,
+            # Process is up but we have no session id to address it — recycle
+            # so initialize + session/new can mint one. Otherwise set_mode /
+            # set_model / model catalog all fail with "ACP session not ready".
+            if not freshly and not effective:
+                await self._detach_fifo()
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "tmux",
+                        "kill-session",
+                        "-t",
+                        paths.tmux_session_name(self.chat_id),
+                    ],
+                    capture_output=True,
                 )
+                state, _size = await asyncio.to_thread(
+                    ensure_tmux_worker,
+                    chat_id=self.chat_id,
+                    cwd=cwd,
+                    binary=binary,
+                    provider=provider,
+                    api_key=api_key,
+                    full_access=full_access,
+                    model_id=model_id,
+                )
+                await self._attach_pipes()
+                freshly = True
+                effective = None
+
+            if freshly:
+                try:
+                    await self._initialize()
+                    await self._open_session(
+                        mcp_servers=mcp_servers or [],
+                        resume_session_id=effective,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    self.last_error = f"open_session: {e}"
+                    await self._set_status(
+                        self.chat_id, protocol.STATUS_ERROR, str(e)
+                    )
+                    await self._emit_event(
+                        "status", status=protocol.STATUS_ERROR
+                    )
+                    return self.snapshot()
+
+                if not self.acp_session_id:
+                    self.last_error = (
+                        "ACP session/new returned no session id "
+                        "(agent may still be starting — reconnect)"
+                    )
+                    await self._set_status(
+                        self.chat_id, protocol.STATUS_ERROR, self.last_error
+                    )
+                    return self.snapshot()
+
                 if mode:
                     try:
                         await self.set_mode(mode)
@@ -424,6 +515,25 @@ class Worker:
                 sid = sid_path.read_text(encoding="utf-8").strip() or None
                 self.acp_session_id = sid
         if not sid:
+            # No addressable session — mint one so the model picker has a catalogue.
+            try:
+                await self._initialize()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await self._new_session(mcp_servers)
+            except Exception as e:  # noqa: BLE001
+                self.last_error = f"refresh_models new: {e}"
+            self._persist_catalog()
+            await self._emit_event(
+                "session",
+                acpSessionId=self.acp_session_id,
+                models=self.available_models,
+                modes=self.available_modes,
+                mode=self.mode,
+                modelId=self.model_id,
+                loadSession=self.load_session,
+            )
             return self.snapshot()
 
         # session/load needs an initialized ACP peer; after a daemon restart
@@ -498,7 +608,7 @@ class Worker:
             self.load_session = bool(data.get("loadSession"))
 
     async def _attach_pipes(self) -> None:
-        if self._attached and self._fifo_write is not None:
+        if self._attached and self._fifo_fd is not None:
             return
         fifo = self.dir / "in"
         journal = self.dir / "out.jsonl"
@@ -521,6 +631,23 @@ class Worker:
         if self._tail_task is None or self._tail_task.done():
             self._tail_task = asyncio.create_task(self._tail_journal())
         self._attached = True
+
+    async def _detach_fifo(self) -> None:
+        """Close the write end so a recycled tmux worker can reopen cleanly."""
+        if self._fifo_fd is not None:
+            try:
+                os.close(self._fifo_fd)
+            except OSError:
+                pass
+            self._fifo_fd = None
+        self._fifo_write = None
+        self._attached = False
+        self._buffer = ""
+        self._epoch = hex(int(time.time() * 1e6))[2:]
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(RuntimeError("agent FIFO recycled"))
+        self._pending.clear()
 
     async def _tail_journal(self) -> None:
         journal = self.dir / "out.jsonl"
@@ -744,23 +871,39 @@ class Worker:
     async def set_mode(self, mode_id: str) -> None:
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
-        await self._request(
-            "session/set_mode",
-            {"sessionId": self.acp_session_id, "modeId": mode_id},
-            timeout=15.0,
-        )
+        try:
+            await self._request(
+                "session/set_mode",
+                {"sessionId": self.acp_session_id, "modeId": mode_id},
+                timeout=15.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            if not _is_acp_method_not_found(e, "session/set_mode"):
+                raise
+            await self._request(
+                "session/set_config_option",
+                {
+                    "sessionId": self.acp_session_id,
+                    "configId": "mode",
+                    "type": "id",
+                    "value": mode_id,
+                },
+                timeout=15.0,
+            )
         self.mode = mode_id
         await self._emit_event("mode", mode=mode_id)
 
     async def set_model(self, model_id: str) -> None:
         if not self.acp_session_id:
             raise RuntimeError("ACP session not ready")
-        if self.provider == "claude" or self._models_via_config_option:
+
+        async def via_config_option() -> None:
             result = await self._request(
                 "session/set_config_option",
                 {
                     "sessionId": self.acp_session_id,
                     "configId": "model",
+                    "type": "id",
                     "value": model_id,
                 },
                 timeout=15.0,
@@ -774,13 +917,51 @@ class Worker:
                 result.get("configOptions") or result.get("config_options")
             )
             self.model_id = confirmed or model_id
-        else:
+            self._models_via_config_option = True
+
+        async def via_set_model() -> None:
             await self._request(
                 "session/set_model",
                 {"sessionId": self.acp_session_id, "modelId": model_id},
                 timeout=15.0,
             )
             self.model_id = model_id
+            self._models_via_config_option = False
+
+        prefer_config = (
+            self.provider == "claude" or self._models_via_config_option
+        )
+        switched = False
+        if prefer_config:
+            try:
+                await via_config_option()
+                switched = True
+            except Exception as e:  # noqa: BLE001
+                if not _is_acp_method_not_found(e, "session/set_config_option"):
+                    raise
+                try:
+                    await via_set_model()
+                    switched = True
+                except Exception as e2:  # noqa: BLE001
+                    if not _is_acp_method_not_found(e2, "session/set_model"):
+                        raise
+        else:
+            try:
+                await via_set_model()
+                switched = True
+            except Exception as e:  # noqa: BLE001
+                if not _is_acp_method_not_found(e, "session/set_model"):
+                    raise
+                try:
+                    await via_config_option()
+                    switched = True
+                except Exception as e2:  # noqa: BLE001
+                    if not _is_acp_method_not_found(e2, "session/set_config_option"):
+                        raise
+
+        if not switched:
+            await self._relaunch_for_model(model_id)
+
         self._persist_catalog()
         await self._emit_event(
             "session",
@@ -791,6 +972,60 @@ class Worker:
             modelId=self.model_id,
             loadSession=self.load_session,
         )
+
+    async def _relaunch_for_model(self, model_id: str) -> None:
+        """Old ACP adapters lack model RPCs — restart with startup model flags."""
+        self.model_id = model_id
+        await self._detach_fifo()
+
+        tmux = paths.tmux_session_name(self.chat_id)
+        await asyncio.to_thread(
+            subprocess.run,
+            ["tmux", "kill-session", "-t", tmux],
+            capture_output=True,
+        )
+        await asyncio.to_thread(
+            ensure_tmux_worker,
+            chat_id=self.chat_id,
+            cwd=self.cwd,
+            binary=self.binary,
+            provider=self.provider,
+            api_key=None,
+            full_access=self.full_access,
+            model_id=model_id,
+        )
+        await self._attach_pipes()
+        await self._initialize()
+        # Fresh session so startup --model / CLAUDE_ACP_MODEL apply cleanly.
+        await self._open_session(mcp_servers=[], resume_session_id=None)
+        self._persist_session_id()
+        # Prefer the id we asked for when the agent omits currentModelId.
+        if not self.model_id:
+            self.model_id = model_id
+        # One more RPC attempt in case the restarted binary is newer.
+        try:
+            if self.provider == "claude" or self._models_via_config_option:
+                result = await self._request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": self.acp_session_id,
+                        "configId": "model",
+                        "type": "id",
+                        "value": model_id,
+                    },
+                    timeout=15.0,
+                )
+                self._apply_config_options(
+                    result.get("configOptions") or result.get("config_options")
+                )
+                confirmed = current_model_from_config_options(
+                    result.get("configOptions") or result.get("config_options")
+                )
+                self.model_id = confirmed or model_id
+        except Exception:  # noqa: BLE001
+            pass
+        if not self.model_id:
+            self.model_id = model_id
 
     async def prompt(
         self,

@@ -19,6 +19,10 @@ abstract class AgentSession {
   bool get isPromptActive;
   bool get resumedInPlace;
 
+  /// Seed a previously cached catalogue when the live agent has not advertised
+  /// models yet (resume-in-place / brief disconnect).
+  void seedModelCatalog(List<AgentModel> models);
+
   Future<void> prompt(
     String text, {
     List<PromptImage> images = const [],

@@ -56,7 +56,8 @@ class AgentRuntimeHost {
   }
 
   /// Start the agent for [chatId] if it isn't already running with the same
-  /// [fullAccess] mode. A mode mismatch restarts the process (journal kept).
+  /// [fullAccess] mode (and preferred model). A mismatch restarts the process
+  /// (journal kept).
   Future<RemoteAgentSession> ensure({
     required Host host,
     required String chatId,
@@ -65,6 +66,7 @@ class AgentRuntimeHost {
     AgentProvider provider = AgentProvider.cursor,
     String? apiKey,
     bool fullAccess = true,
+    String? preferredModelId,
   }) async {
     final home = await _ssh.remoteHomeDirectory(host);
     final dir = dirForChat(home, chatId);
@@ -78,6 +80,7 @@ class AgentRuntimeHost {
       provider: provider,
       apiKey: apiKey,
       fullAccess: fullAccess,
+      preferredModelId: preferredModelId,
     );
 
     final out = await _ssh.exec(host, 'sh -c ${SshService.shellQuote(script)}');
@@ -87,7 +90,8 @@ class AgentRuntimeHost {
 
     SafeLog.d(
       'agent runtime $tmux state=$state journal=$size '
-      'provider=${provider.id} fullAccess=$fullAccess',
+      'provider=${provider.id} fullAccess=$fullAccess '
+      'model=${preferredModelId ?? "-"}',
     );
     return RemoteAgentSession(
       dir: dir,
@@ -185,6 +189,7 @@ class AgentRuntimeHost {
     AgentProvider provider = AgentProvider.cursor,
     String? apiKey,
     bool fullAccess = true,
+    String? preferredModelId,
   }) {
     final q = SshService.shellQuote;
     final scriptB64 = base64Encode(
@@ -195,12 +200,19 @@ class AgentRuntimeHost {
           binary: binary,
           provider: provider,
           fullAccess: fullAccess,
+          preferredModelId: preferredModelId,
         ),
       ),
     );
     final want = fullAccess ? '1' : '0';
     final marker = '$dir/full_access';
-    final envBody = _envFileContents(provider: provider, apiKey: apiKey);
+    final modelMarker = '$dir/desired_model';
+    final wantModel = preferredModelId ?? '';
+    final envBody = _envFileContents(
+      provider: provider,
+      apiKey: apiKey,
+      preferredModelId: preferredModelId,
+    );
 
     return <String>[
       'set -e',
@@ -211,13 +223,16 @@ class AgentRuntimeHost {
       'touch ${q('$dir/out.jsonl')}',
       'WANT=$want',
       'HAVE=\$(cat ${q(marker)} 2>/dev/null || true)',
+      'WANT_MODEL=${q(wantModel)}',
+      'HAVE_MODEL=\$(cat ${q(modelMarker)} 2>/dev/null || true)',
       'if tmux has-session -t ${q(tmuxSession)} 2>/dev/null; then',
-      '  if [ "\$HAVE" = "\$WANT" ]; then',
+      '  if [ "\$HAVE" = "\$WANT" ] && [ "\$HAVE_MODEL" = "\$WANT_MODEL" ]; then',
       '    printf RUNNING',
       '  else',
-      // Full access ↔ Ask changed: recycle the process, keep journal + session id.
+      // Full access ↔ Ask or preferred model changed: recycle process, keep journal.
       '    tmux kill-session -t ${q(tmuxSession)} 2>/dev/null || true',
       '    printf %s "\$WANT" > ${q(marker)}',
+      '    printf %s "\$WANT_MODEL" > ${q(modelMarker)}',
       if (envBody != null) ...[
         '    umask 077',
         '    printf %s ${q(envBody)} > ${q('$dir/env')}',
@@ -229,6 +244,7 @@ class AgentRuntimeHost {
       'else',
       '  : > ${q('$dir/out.jsonl')}',
       '  printf %s "\$WANT" > ${q(marker)}',
+      '  printf %s "\$WANT_MODEL" > ${q(modelMarker)}',
       if (envBody != null) ...[
         '  umask 077',
         '  printf %s ${q(envBody)} > ${q('$dir/env')}',
@@ -246,6 +262,7 @@ class AgentRuntimeHost {
   static String? _envFileContents({
     required AgentProvider provider,
     String? apiKey,
+    String? preferredModelId,
   }) {
     final lines = <String>[];
     if (apiKey != null && apiKey.isNotEmpty) {
@@ -258,6 +275,14 @@ class AgentRuntimeHost {
           lines.add('export ANTHROPIC_API_KEY');
       }
     }
+    if (provider == AgentProvider.claude &&
+        preferredModelId != null &&
+        preferredModelId.isNotEmpty) {
+      lines.add(
+        'CLAUDE_ACP_MODEL=${SshService.shellQuote(preferredModelId)}',
+      );
+      lines.add('export CLAUDE_ACP_MODEL');
+    }
     if (lines.isEmpty) return null;
     return '${lines.join('\n')}\n';
   }
@@ -269,12 +294,20 @@ class AgentRuntimeHost {
     required String binary,
     AgentProvider provider = AgentProvider.cursor,
     bool fullAccess = true,
+    String? preferredModelId,
   }) {
     final q = SshService.shellQuote;
+    final modelFlag =
+        (provider == AgentProvider.cursor &&
+                preferredModelId != null &&
+                preferredModelId.isNotEmpty)
+            ? '--model ${q(preferredModelId)} '
+            : '';
     final agentArgs = switch (provider) {
       // Shift+Tab "full access" in the interactive Cursor CLI.
-      AgentProvider.cursor =>
-        fullAccess ? '--force --approve-mcps --trust acp' : 'acp',
+      AgentProvider.cursor => fullAccess
+          ? '${modelFlag}--force --approve-mcps --trust acp'
+          : '${modelFlag}acp',
       // Zed's claude-code-acp speaks ACP on stdio with no subcommand.
       AgentProvider.claude => '',
     };

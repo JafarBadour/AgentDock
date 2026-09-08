@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/local/app_database.dart';
@@ -98,6 +99,10 @@ class ChatSessionRuntime extends ChangeNotifier {
   final List<TranscriptEntry> entries = [];
   final Map<String, String> _toolMessageIds = {};
   final _random = Random();
+
+  /// Serializes tool upserts so parallel tool_call / tool_call_update events
+  /// cannot insert two SQLite rows for the same toolCallId.
+  Future<void> _toolUpsertTail = Future<void>.value();
 
   String assistantBuffer = '';
   String thoughtBuffer = '';
@@ -216,6 +221,10 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// True while we intentionally recycle the host for Ask ↔ Full access.
   bool _restartingForPolicy = false;
 
+  /// User message was accepted locally but not confirmed delivered to the host.
+  /// Kept sticky across reconnect so we retry instead of silently dropping it.
+  bool _needsRedelivery = false;
+
   /// True while a silent reconnect is pending or running.
   bool reconnecting = false;
   int reconnectAttempts = 0;
@@ -226,6 +235,32 @@ class ChatSessionRuntime extends ChangeNotifier {
   DateTime? _lastHostActivityAt;
   bool _disposed = false;
   bool _suspended = false;
+
+  /// Coalesce high-frequency ACP updates so agents sidebar / chat listeners
+  /// are not rebuilt on every token.
+  Timer? _uiNotifyCoalesce;
+  bool _uiNotifyDirty = false;
+
+  /// Push UI listeners. High-rate stream events use a short coalesce window;
+  /// structural / error / permission changes flush immediately.
+  void _notifyUi({bool immediate = false}) {
+    if (_disposed) return;
+    if (immediate) {
+      _uiNotifyCoalesce?.cancel();
+      _uiNotifyCoalesce = null;
+      _uiNotifyDirty = false;
+      notifyListeners();
+      return;
+    }
+    _uiNotifyDirty = true;
+    if (_uiNotifyCoalesce?.isActive ?? false) return;
+    _uiNotifyCoalesce = Timer(const Duration(milliseconds: 64), () {
+      _uiNotifyCoalesce = null;
+      if (_disposed || !_uiNotifyDirty) return;
+      _uiNotifyDirty = false;
+      notifyListeners();
+    });
+  }
 
   AgentSession get session => _session;
   AgentSessionMode get mode => _session.mode;
@@ -245,13 +280,49 @@ class ChatSessionRuntime extends ChangeNotifier {
     entries.clear();
     _toolMessageIds.clear();
     final queuedIds = {for (final m in outboundQueue) m.id};
+    final seenToolIds = <String>{};
     for (final m in messages) {
       if (queuedIds.contains(m.id)) continue;
       if (m.role == MessageRole.tool) {
         final tool = ToolCallState.tryParseContent(m.content);
         if (tool != null) {
+          final tid = tool.toolCallId;
+          if (seenToolIds.contains(tid)) {
+            // Prefer the later row (usually a richer status/output update).
+            final index =
+                entries.indexWhere((e) => e.tool?.toolCallId == tid);
+            if (index >= 0) {
+              final prev = entries[index].tool!;
+              final orphanId = entries[index].messageId;
+              entries[index] = TranscriptEntry.tool(
+                prev.merge(
+                  title: tool.title,
+                  kind: tool.kind,
+                  status: tool.status,
+                  locations: tool.locations.isEmpty ? null : tool.locations,
+                  rawInput: tool.rawInput,
+                  rawOutput: tool.rawOutput,
+                  content: tool.content,
+                ),
+                messageId: m.id,
+                createdAt: entries[index].createdAt ?? m.createdAt,
+              );
+              _toolMessageIds[tid] = m.id;
+              if (orphanId != null && orphanId != m.id) {
+                unawaited(() async {
+                  try {
+                    await _db.deleteMessage(orphanId);
+                  } catch (e) {
+                    SafeLog.d('delete dup tool on load failed', e);
+                  }
+                }());
+              }
+            }
+            continue;
+          }
+          seenToolIds.add(tid);
           entries.add(TranscriptEntry.tool(tool, messageId: m.id));
-          _toolMessageIds[tool.toolCallId] = m.id;
+          _toolMessageIds[tid] = m.id;
           continue;
         }
       }
@@ -434,7 +505,11 @@ class ChatSessionRuntime extends ChangeNotifier {
       promptInFlight = false;
       sendingToHost = false;
       activityLabel = null;
-      deliveryError = null;
+      // Do not clear deliveryError while a failed send still needs retry —
+      // that was the "error then nothing" bug.
+      if (!_needsRedelivery && outboundQueue.isEmpty) {
+        deliveryError = null;
+      }
       if (hasActiveTools) {
         unawaited(_finalizeStaleTools(reason: 'reconnect-daemon-$hostStatus'));
       }
@@ -451,7 +526,51 @@ class ChatSessionRuntime extends ChangeNotifier {
     // Pick up anything that was waiting while the socket was down.
     if (!remoteTurnActive && !promptInFlight) {
       resumeOutboundQueue();
+      unawaited(recoverTrailingUserPromptIfStuck());
     }
+  }
+
+  /// If the transcript ends on a user bubble, the host is idle, and nothing is
+  /// queued — the last send likely failed after the bubble was painted. Re-queue
+  /// it once so reconnect actually delivers instead of "error then silence".
+  Future<void> recoverTrailingUserPromptIfStuck() async {
+    if (_disposed ||
+        closed ||
+        promptInFlight ||
+        remoteTurnActive ||
+        outboundQueue.isNotEmpty ||
+        _session.isPromptActive) {
+      return;
+    }
+    ChatMessage? lastUser;
+    for (var i = entries.length - 1; i >= 0; i--) {
+      final e = entries[i];
+      if (e.tool != null) return;
+      final m = e.message;
+      if (m == null) continue;
+      if (m.role == MessageRole.system) continue;
+      if (m.role == MessageRole.assistant) return;
+      if (m.role == MessageRole.user) {
+        lastUser = m;
+        break;
+      }
+    }
+    if (lastUser == null) return;
+    // Avoid racing a send that just landed.
+    if (DateTime.now().difference(lastUser.createdAt) <
+        const Duration(seconds: 12)) {
+      return;
+    }
+    SafeLog.d(
+      'recovering undelivered trailing user message '
+      '${lastUser.id} chat=$chatId',
+    );
+    _needsRedelivery = true;
+    deliveryError =
+        'Last message may not have reached the host. Retrying…';
+    await _requeueUndeliveredUser(lastUser.id);
+    notifyListeners();
+    resumeOutboundQueue();
   }
 
   /// Store the live ACP session id so the next launch can resume this
@@ -488,13 +607,32 @@ class ChatSessionRuntime extends ChangeNotifier {
     _assistantPersistTimer = null;
     unawaited(_writeAssistantProgress());
 
+    // If we were mid-delivery, park the user bubble so resume can re-send.
+    if (sendingToHost && !_needsRedelivery) {
+      ChatMessage? lastUser;
+      for (var i = entries.length - 1; i >= 0; i--) {
+        final m = entries[i].message;
+        if (m == null) continue;
+        if (m.role == MessageRole.user) {
+          lastUser = m;
+          break;
+        }
+        if (m.role == MessageRole.assistant) break;
+      }
+      if (lastUser != null) {
+        _needsRedelivery = true;
+        unawaited(_requeueUndeliveredUser(lastUser.id));
+      }
+    }
+
     final durable = _session.transport == AcpTransport.durable;
-    if (durable && (promptInFlight || _session.isPromptActive)) {
+    if (durable && (promptInFlight || _session.isPromptActive || sendingToHost)) {
       // Hand the turn to the host: complete the local await so the UI unlocks,
       // then tear down only the SSH ADSM client channel. Daemon + tmux keep working.
       remoteTurnActive = true;
       _session.handOffPrompt();
       promptInFlight = false;
+      sendingToHost = false;
       closed = true;
       unawaited(_session.close());
     } else if (durable && !closed) {
@@ -513,6 +651,10 @@ class ChatSessionRuntime extends ChangeNotifier {
       // Drop the "tap Reconnect" notice; we are about to do it automatically.
       lastError = null;
       _scheduleReconnect(immediate: true);
+    } else if (!closed) {
+      // Bridge survived background — still flush anything parked while paused.
+      resumeOutboundQueue();
+      unawaited(recoverTrailingUserPromptIfStuck());
     }
   }
 
@@ -557,11 +699,13 @@ class ChatSessionRuntime extends ChangeNotifier {
         SafeLog.d('reconnect attempt $reconnectAttempts failed', e);
         if (classifySshFailure(e).isFatal) {
           reconnecting = false;
-          // Keep this short — MissingToolException used to dump the whole
-          // install script into lastError and overflow the chat screen.
-          lastError = e is MissingToolException
-              ? 'Cannot reconnect: ${e.tool} is not installed on the remote.'
-              : 'Cannot reconnect: $e';
+          if (e is MissingToolException) {
+            lastError =
+                'Cannot reconnect: ${e.tool} is not installed on the remote.\n\n'
+                '${e.installHint}';
+          } else {
+            lastError = 'Cannot reconnect: $e';
+          }
           notifyListeners();
           return;
         }
@@ -633,14 +777,74 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   /// Load the model catalogue when we resumed an agent that was already running.
   Future<void> ensureModelCatalog(List<Map<String, dynamic>> mcpServers) async {
-    if (isWorking) return;
+    // Only skip during an active prompt send — sticky remoteTurnActive / tools
+    // used to block the catalogue forever ("cannot get the model list").
+    if (promptInFlight || sendingToHost) return;
+    if (availableModels.isEmpty) {
+      await _restoreCachedModelCatalog();
+    }
     await _session.ensureModelCatalog(mcpServers: mcpServers);
+    await _persistCachedModelCatalog();
     notifyListeners();
+  }
+
+  static String _modelCatalogPrefsKey(String chatId) => 'model_catalog_$chatId';
+
+  Future<void> _persistCachedModelCatalog() async {
+    final models = availableModels;
+    if (models.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded = jsonEncode([
+        for (final m in models)
+          {
+            'modelId': m.modelId,
+            'name': m.name,
+          },
+      ]);
+      await prefs.setString(_modelCatalogPrefsKey(chatId), encoded);
+    } catch (e) {
+      SafeLog.d('persist model catalog cache failed', e);
+    }
+  }
+
+  Future<void> _restoreCachedModelCatalog() async {
+    if (availableModels.isNotEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_modelCatalogPrefsKey(chatId));
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return;
+      final models = <AgentModel>[
+        for (final item in decoded)
+          if (item is Map)
+            AgentModel.fromJson(Map<String, dynamic>.from(item)),
+      ];
+      if (models.isEmpty) return;
+      _session.seedModelCatalog(models);
+    } catch (e) {
+      SafeLog.d('restore model catalog cache failed', e);
+    }
   }
 
   /// Switch model and remember it, so reconnects and restarts keep the choice.
   Future<void> setModel(String modelId) async {
-    await _session.setModel(modelId);
+    try {
+      await _session.setModel(modelId);
+    } on AcpModelSwitchUnsupported {
+      SafeLog.d(
+        'agent lacks in-session model RPCs; restarting with model=$modelId',
+      );
+      await _persistModelPreference(modelId);
+      await _restartSessionForModel(modelId);
+      return;
+    }
+    await _persistModelPreference(modelId);
+    notifyListeners();
+  }
+
+  Future<void> _persistModelPreference(String modelId) async {
     final meta = chatMeta;
     if (meta != null) {
       chatMeta = meta.copyWith(modelId: modelId, updatedAt: DateTime.now());
@@ -654,7 +858,51 @@ class ChatSessionRuntime extends ChangeNotifier {
         onLocalChange?.call(chatId);
       }
     }
+    await _persistCachedModelCatalog();
+  }
+
+  /// Relaunch the durable agent so startup `--model` / `CLAUDE_ACP_MODEL` apply.
+  Future<void> _restartSessionForModel(String modelId) async {
+    final factory = sessionFactory;
+    if (factory == null) {
+      throw StateError(
+        'Cannot switch model: agent does not support in-session model '
+        'changes and no reconnect factory is available.',
+      );
+    }
+
+    _restartingForPolicy = true;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    reconnecting = true;
     notifyListeners();
+    try {
+      await _session.close();
+      closed = true;
+      final session = await factory();
+      replaceSession(session);
+      // Fresh process should already be on [modelId]; keep local chip in sync.
+      if (session.currentModelId == null || session.currentModelId!.isEmpty) {
+        // Seed from preference when the agent omitted currentModelId.
+        try {
+          await session.setModel(modelId);
+        } on AcpModelSwitchUnsupported {
+          // Startup flags/env already applied the model.
+        } catch (e) {
+          SafeLog.d('post-restart setModel skipped', e);
+        }
+      }
+    } catch (e) {
+      SafeLog.d('model switch restart failed', e);
+      lastError = 'Could not switch model: $e';
+      reconnecting = false;
+      notifyListeners();
+      rethrow;
+    } finally {
+      _restartingForPolicy = false;
+      reconnecting = false;
+      notifyListeners();
+    }
   }
 
   Future<void> prompt(String text, {List<ChatImageRef> images = const []}) =>
@@ -727,6 +975,12 @@ class ChatSessionRuntime extends ChangeNotifier {
     await commitThought();
 
     await appendUserMessage(message);
+    // Claim the turn *before* the async gap so an Android lifecycle pause
+    // cannot idle-close the bridge and orphan the bubble (phone "unresponsive").
+    promptInFlight = true;
+    sendingToHost = true;
+    activityLabel = 'Sending to host…';
+    notifyListeners();
     // Do not await the turn — the composer must unlock as soon as the
     // message is accepted. The runtime keeps driving the prompt.
     unawaited(
@@ -853,7 +1107,23 @@ class ChatSessionRuntime extends ChangeNotifier {
     String? userMessageId,
     DateTime? userCreatedAt,
   }) async {
-    if (_disposed || closed) return;
+    if (_disposed) return;
+    if (closed) {
+      // Bubble may already be in the transcript — park it for reconnect instead
+      // of silently returning (common when Android pauses mid-send).
+      if (userMessageId != null) {
+        _needsRedelivery = true;
+        await _requeueUndeliveredUser(userMessageId);
+      }
+      promptInFlight = false;
+      sendingToHost = false;
+      activityLabel = null;
+      notifyListeners();
+      if (!_suspended && sessionFactory != null) {
+        _scheduleReconnect(immediate: true);
+      }
+      return;
+    }
     final epoch = _promptEpoch;
     remoteTurnActive = false;
     _clearHostBusyWatchdog();
@@ -915,6 +1185,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       // Delivered — leave Thinking until turn_complete / idle clears busy.
       sendingToHost = false;
       deliveryError = null;
+      _needsRedelivery = false;
       activityLabel = 'Thinking';
       promptInFlight = true;
       remoteTurnActive = true;
@@ -965,6 +1236,10 @@ class ChatSessionRuntime extends ChangeNotifier {
           promptInFlight = false;
           remoteTurnActive = false;
           _clearHostBusyWatchdog();
+          _needsRedelivery = true;
+          if (userMessageId != null) {
+            await _requeueUndeliveredUser(userMessageId);
+          }
           notifyListeners();
           if (!closed) _drainOutboundQueue();
         } else if (closed && !transportFailed) {
@@ -985,6 +1260,28 @@ class ChatSessionRuntime extends ChangeNotifier {
           notifyListeners();
         }
       }
+    }
+  }
+
+  /// Move a failed prompt back onto the outbound queue so reconnect / Force
+  /// run can deliver it. Keeps the DB row; only the in-memory transcript moves.
+  Future<void> _requeueUndeliveredUser(String messageId) async {
+    ChatMessage? msg;
+    for (final e in entries) {
+      if (e.messageId == messageId && e.message != null) {
+        msg = e.message;
+        break;
+      }
+    }
+    if (msg == null) return;
+    entries.removeWhere((e) => e.messageId == messageId);
+    if (!outboundQueue.any((m) => m.id == messageId)) {
+      outboundQueue.insert(0, msg);
+    }
+    try {
+      await _persistOutboundQueue();
+    } catch (e) {
+      SafeLog.d('persist requeue after failed delivery failed', e);
     }
   }
 
@@ -1016,90 +1313,119 @@ class ChatSessionRuntime extends ChangeNotifier {
     _hostBusyWatchdog = Timer(const Duration(seconds: 20), () {
       if (_disposed) return;
       if (!isWorking) return;
+      unawaited(_hostBusyWatchdogTick());
+    });
+  }
 
-      final silentFor = _lastHostActivityAt == null
-          ? const Duration(days: 1)
-          : DateTime.now().difference(_lastHostActivityAt!);
+  Future<void> _hostBusyWatchdogTick() async {
+    if (_disposed || !isWorking) return;
 
-      final durable = _session.transport == AcpTransport.durable;
-      // Explore/edit turns often go quiet between tool batches; durable host
-      // work must not be cancelled after a short pause. Once an assistant
-      // reply is already on screen, leftover in_progress rows are almost
-      // always stale UI — clear them much sooner.
-      final answered = _turnHasAssistantReply;
-      final toolStaleAfter = answered
-          ? const Duration(seconds: 25)
-          : (durable
-              ? const Duration(minutes: 3)
-              : const Duration(seconds: 45));
-      final promptStaleAfter = answered
-          ? const Duration(seconds: 40)
-          : (durable
-              ? const Duration(minutes: 4)
-              : const Duration(seconds: 90));
+    final silentFor = _lastHostActivityAt == null
+        ? const Duration(days: 1)
+        : DateTime.now().difference(_lastHostActivityAt!);
 
-      if (hasActiveTools) {
-        if (silentFor >= toolStaleAfter) {
-          unawaited(_finalizeStaleTools(reason: 'watchdog-silent-tools'));
-        } else {
-          _armHostBusyWatchdog();
-        }
-        return;
-      }
+    final durable = _session.transport == AcpTransport.durable;
+    // Mid-turn assistant text ("let me check…") is normal before more tools.
+    // Only treat leftover in_progress rows as stale quickly on non-durable
+    // bridges; on ADSM, ask the host before clearing busy chrome.
+    final answered = _turnHasAssistantReply;
+    final toolStaleAfter = durable
+        ? (answered
+            ? const Duration(minutes: 2)
+            : const Duration(minutes: 3))
+        : (answered
+            ? const Duration(seconds: 25)
+            : const Duration(seconds: 45));
+    final promptStaleAfter = durable
+        ? (answered
+            ? const Duration(minutes: 3)
+            : const Duration(minutes: 4))
+        : (answered
+            ? const Duration(seconds: 40)
+            : const Duration(seconds: 90));
 
-      // Stuck in delivery (SSH/ADSM never acked) — fail fast vs long Thinking.
-      if (sendingToHost && silentFor >= const Duration(seconds: 25)) {
-        SafeLog.d(
-          'watchdog: delivery stall ${silentFor.inSeconds}s chat=$chatId',
-        );
-        unawaited(_watchdogUnstickPrompt());
-        return;
-      }
-
-      // Hung on "Thinking" with no tools and no host events.
-      if (_session.isPromptActive && silentFor >= promptStaleAfter) {
-        SafeLog.d(
-          'watchdog: silent prompt ${silentFor.inSeconds}s chat=$chatId — unstick',
-        );
-        unawaited(_watchdogUnstickPrompt());
-        return;
-      }
-
-      // Sticky remoteTurnActive with silence: host likely finished while we
-      // missed turn_complete. Clear after a short durable grace period.
-      if (remoteTurnActive &&
-          !_session.isPromptActive &&
-          silentFor >=
-              (durable
-                  ? const Duration(seconds: 45)
-                  : const Duration(seconds: 25))) {
-        SafeLog.d(
-          'watchdog: clear sticky remoteTurnActive after '
-          '${silentFor.inSeconds}s silence chat=$chatId',
-        );
-        remoteTurnActive = false;
-        promptInFlight = false;
-        sendingToHost = false;
-        activityLabel = null;
+    // Durable: if the host still says running, keep the busy strip and wait.
+    if (durable && _session is AdsmSession) {
+      final st = await (_session as AdsmSession).refreshDaemonStatus();
+      if (_disposed) return;
+      final host = (st ?? '').toLowerCase();
+      if (host == 'running') {
+        activityLabel = activityLabel?.isNotEmpty == true
+            ? activityLabel
+            : 'Working on host…';
+        remoteTurnActive = true;
+        promptInFlight = true;
         notifyListeners();
-        if (!closed) _drainOutboundQueue();
-        return;
-      }
-
-      // Still awaiting a live local prompt — keep polling.
-      if (_session.isPromptActive) {
         _armHostBusyWatchdog();
         return;
       }
+      if (host == 'idle' || host == 'dead') {
+        // refreshDaemonStatus already emitted idle/dead — nothing more here.
+        return;
+      }
+    }
 
-      // Silence after reconnect: host likely finished while we were away.
+    if (hasActiveTools) {
+      if (silentFor >= toolStaleAfter) {
+        await _finalizeStaleTools(reason: 'watchdog-silent-tools');
+      } else {
+        _armHostBusyWatchdog();
+      }
+      return;
+    }
+
+    // Stuck in delivery (SSH/ADSM never acked) — fail fast vs long Thinking.
+    if (sendingToHost && silentFor >= const Duration(seconds: 25)) {
+      SafeLog.d(
+        'watchdog: delivery stall ${silentFor.inSeconds}s chat=$chatId',
+      );
+      await _watchdogUnstickPrompt();
+      return;
+    }
+
+    // Hung on "Thinking" with no tools and no host events.
+    if (_session.isPromptActive && silentFor >= promptStaleAfter) {
+      SafeLog.d(
+        'watchdog: silent prompt ${silentFor.inSeconds}s chat=$chatId — unstick',
+      );
+      await _watchdogUnstickPrompt();
+      return;
+    }
+
+    // Sticky remoteTurnActive with silence: host likely finished while we
+    // missed turn_complete. Clear after a short durable grace period.
+    if (remoteTurnActive &&
+        !_session.isPromptActive &&
+        silentFor >=
+            (durable
+                ? const Duration(minutes: 2)
+                : const Duration(seconds: 25))) {
+      SafeLog.d(
+        'watchdog: clear sticky remoteTurnActive after '
+        '${silentFor.inSeconds}s silence chat=$chatId',
+      );
       remoteTurnActive = false;
       promptInFlight = false;
       sendingToHost = false;
       activityLabel = null;
       notifyListeners();
       if (!closed) _drainOutboundQueue();
-    });
+      return;
+    }
+
+    // Still awaiting a live local prompt — keep polling.
+    if (_session.isPromptActive) {
+      _armHostBusyWatchdog();
+      return;
+    }
+
+    // Silence after reconnect: host likely finished while we were away.
+    remoteTurnActive = false;
+    promptInFlight = false;
+    sendingToHost = false;
+    activityLabel = null;
+    notifyListeners();
+    if (!closed) _drainOutboundQueue();
   }
 
   /// True when this turn already produced visible progress (answer / tools).
@@ -1152,7 +1478,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     final wasSending = sendingToHost;
     promptInFlight = false;
     // Always clear local busy chrome. Leaving remoteTurnActive stuck the
-    // composer on "Thinking / queued until Force run" forever after a pause.
+    // composer on "Thinking / Agent is busy" forever after a pause.
     remoteTurnActive = false;
     sendingToHost = false;
     activityLabel = null;
@@ -1277,13 +1603,13 @@ class ChatSessionRuntime extends ChangeNotifier {
           // forever after the answer already landed).
           _armHostBusyWatchdog();
         }
-        notifyListeners();
+        _notifyUi();
       case AcpUpdateKind.promptAccepted:
         sendingToHost = false;
         deliveryError = null;
         activityLabel = 'Thinking';
         _noteHostActivity();
-        notifyListeners();
+        _notifyUi(immediate: true);
       case AcpUpdateKind.daemonStatus:
         final st = update.text.trim().toLowerCase();
         if (st == 'idle' || st == 'dead') {
@@ -1299,17 +1625,23 @@ class ChatSessionRuntime extends ChangeNotifier {
             unawaited(_finalizeStaleTools(reason: 'daemon-$st'));
           } else {
             promptInFlight = false;
-            notifyListeners();
+            _notifyUi(immediate: true);
             if (!closed) _drainOutboundQueue();
           }
         } else if (st == 'running') {
+          // Host still on a turn — keep busy chrome even when journal events
+          // went quiet (HPC polls, long shell). Re-attach after a false idle.
           sendingToHost = false;
-          activityLabel ??= 'Thinking';
+          remoteTurnActive = true;
+          promptInFlight = true;
+          activityLabel = activityLabel?.isNotEmpty == true
+              ? activityLabel
+              : 'Working on host…';
           _noteHostActivity();
-          notifyListeners();
+          _notifyUi();
         }
       case AcpUpdateKind.mode:
-        notifyListeners();
+        _notifyUi(immediate: true);
       case AcpUpdateKind.delta:
         _noteHostActivity();
         if (lastError != null || deliveryError != null) {
@@ -1321,11 +1653,15 @@ class ChatSessionRuntime extends ChangeNotifier {
           unawaited(commitThought());
         }
         assistantBuffer += update.text;
+        // Assign id immediately so the live bubble and the checkpointed row
+        // share one identity (avoids double-painting when id was still null).
+        _assistantMessageId ??= const Uuid().v4();
+        _assistantStartedAt ??= DateTime.now();
         if (update.text.trim().isNotEmpty) {
           onAssistantText?.call(update.text);
         }
         _scheduleAssistantPersist();
-        notifyListeners();
+        _notifyUi();
       case AcpUpdateKind.thought:
         _noteHostActivity();
         if (lastError != null || deliveryError != null) {
@@ -1337,7 +1673,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           unawaited(flushAssistantBuffer());
         }
         thoughtBuffer += update.text;
-        notifyListeners();
+        _notifyUi();
       case AcpUpdateKind.tool:
         final tool = update.tool;
         if (tool == null) break;
@@ -1359,12 +1695,12 @@ class ChatSessionRuntime extends ChangeNotifier {
       case AcpUpdateKind.permission:
         pendingPermission = update.permissionRequest;
         activityLabel = 'Waiting for permission';
-        notifyListeners();
+        _notifyUi(immediate: true);
       case AcpUpdateKind.error:
         final msg = update.text.trim();
         if (msg.isEmpty) break;
         lastError = msg;
-        notifyListeners();
+        _notifyUi(immediate: true);
       case AcpUpdateKind.closed:
         // Unlock the composer immediately — a hanging prompt would otherwise
         // keep the spinner up while reconnect runs underneath.
@@ -1382,7 +1718,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           if (!_suspended && !_restartingForPolicy) _scheduleReconnect();
         }
         // No "tap Reconnect" nag — auto-reconnect handles it when possible.
-        notifyListeners();
+        _notifyUi(immediate: true);
       case AcpUpdateKind.usage:
         if (update.tokensUsed != null) {
           usageTokensUsed = update.tokensUsed;
@@ -1390,7 +1726,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (update.contextSize != null) {
           usageContextSize = update.contextSize;
         }
-        notifyListeners();
+        _notifyUi();
       case AcpUpdateKind.turnComplete:
         // Flush streaming buffers once the host turn ends, then record
         // per-command code delta + token footer.
@@ -1410,10 +1746,10 @@ class ChatSessionRuntime extends ChangeNotifier {
           unawaited(_finalizeStaleTools(reason: 'turnComplete'));
         } else if (!_session.isPromptActive) {
           promptInFlight = false;
-          notifyListeners();
+          _notifyUi(immediate: true);
           if (!closed) _drainOutboundQueue();
         } else {
-          notifyListeners();
+          _notifyUi(immediate: true);
         }
         break;
     }
@@ -1534,7 +1870,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       // A checkpointed row with no final text would be an empty bubble.
       _assistantMessageId = null;
       _assistantStartedAt = null;
-      notifyListeners();
+      _notifyUi();
       return;
     }
     final message = _assistantSnapshot(text);
@@ -1550,7 +1886,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     } finally {
       _writesInFlight--;
     }
-    notifyListeners();
+    _notifyUi(immediate: true);
   }
 
   /// Keep the live answer in [entries] as it grows so the bubble does not
@@ -1580,8 +1916,9 @@ class ChatSessionRuntime extends ChangeNotifier {
     final text = assistantBuffer.trim();
     if (text.isEmpty) return;
     final message = _assistantSnapshot(text);
-    _upsertAssistantEntry(message);
-    notifyListeners();
+    // Disk checkpoint only — do not mutate [entries] while the live buffer is
+    // painting. Updating entries every 700ms invalidated the transcript block
+    // cache and re-parsed every visible GptMarkdown bubble.
     _writesInFlight++;
     try {
       await _db.upsertMessage(message);
@@ -1593,7 +1930,84 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
   }
 
-  Future<void> _upsertTool(ToolCallState tool) async {
+  Future<void> _upsertTool(ToolCallState tool) {
+    final run = _toolUpsertTail.then((_) => _upsertToolUnlocked(tool));
+    _toolUpsertTail = run.catchError((Object e) {
+      SafeLog.d('tool upsert failed', e);
+    });
+    return run;
+  }
+
+  Future<void> _upsertToolUnlocked(ToolCallState tool) async {
+    // Collapse any duplicate in-memory rows for this tool (legacy race).
+    final dupIndexes = <int>[
+      for (var i = 0; i < entries.length; i++)
+        if (entries[i].tool?.toolCallId == tool.toolCallId) i,
+    ];
+    if (dupIndexes.length > 1) {
+      final keep = dupIndexes.first;
+      var mergedTool = entries[keep].tool!;
+      final orphanIds = <String>[];
+      for (var d = 1; d < dupIndexes.length; d++) {
+        final idx = dupIndexes[d];
+        final other = entries[idx].tool!;
+        mergedTool = mergedTool.merge(
+          title: other.title,
+          kind: other.kind,
+          status: other.status,
+          locations: other.locations.isEmpty ? null : other.locations,
+          rawInput: other.rawInput,
+          rawOutput: other.rawOutput,
+          content: other.content,
+        );
+        final oid = entries[idx].messageId;
+        if (oid != null) orphanIds.add(oid);
+      }
+      for (var d = dupIndexes.length - 1; d >= 1; d--) {
+        entries.removeAt(dupIndexes[d]);
+      }
+      for (final oid in orphanIds) {
+        try {
+          await _db.deleteMessage(oid);
+        } catch (e) {
+          SafeLog.d('delete dup tool row failed', e);
+        }
+      }
+      final keepId = entries[keep].messageId ?? _toolMessageIds[tool.toolCallId];
+      entries[keep] = TranscriptEntry.tool(
+        mergedTool.merge(
+          title: tool.title,
+          kind: tool.kind,
+          status: tool.status,
+          locations: tool.locations.isEmpty ? null : tool.locations,
+          rawInput: tool.rawInput,
+          rawOutput: tool.rawOutput,
+          content: tool.content,
+        ),
+        messageId: keepId,
+        createdAt: entries[keep].createdAt,
+      );
+      if (keepId != null) {
+        _toolMessageIds[tool.toolCallId] = keepId;
+        try {
+          await _db.updateMessage(
+            ChatMessage(
+              id: keepId,
+              chatId: chatId,
+              role: MessageRole.tool,
+              content: jsonEncode(entries[keep].tool!.toJson()),
+              createdAt: DateTime.now(),
+            ),
+          );
+        } catch (e) {
+          SafeLog.d('update merged tool failed', e);
+        }
+      }
+      _scheduleCodeDeltaPersist();
+      _notifyUi();
+      return;
+    }
+
     final index = entries.indexWhere((e) => e.tool?.toolCallId == tool.toolCallId);
     if (index >= 0) {
       final prev = entries[index].tool!;
@@ -1628,7 +2042,8 @@ class ChatSessionRuntime extends ChangeNotifier {
         }
       }
     } else {
-      final msgId = const Uuid().v4();
+      final existingId = _toolMessageIds[tool.toolCallId];
+      final msgId = existingId ?? const Uuid().v4();
       _toolMessageIds[tool.toolCallId] = msgId;
       entries.add(TranscriptEntry.tool(tool, messageId: msgId));
       final message = ChatMessage(
@@ -1639,14 +2054,18 @@ class ChatSessionRuntime extends ChangeNotifier {
         createdAt: DateTime.now(),
       );
       try {
-        await _db.insertMessage(message);
+        if (existingId != null) {
+          await _db.updateMessage(message);
+        } else {
+          await _db.insertMessage(message);
+        }
         onLocalChange?.call(chatId);
       } catch (e) {
         SafeLog.d('insert tool message failed', e);
       }
     }
     _scheduleCodeDeltaPersist();
-    notifyListeners();
+    _notifyUi();
   }
 
   void _scheduleCodeDeltaPersist() {
@@ -1710,6 +2129,8 @@ class ChatSessionRuntime extends ChangeNotifier {
     _disposed = true;
     _retryTimer?.cancel();
     _retryTimer = null;
+    _uiNotifyCoalesce?.cancel();
+    _uiNotifyCoalesce = null;
     _clearHostBusyWatchdog();
     _assistantPersistTimer?.cancel();
     _assistantPersistTimer = null;

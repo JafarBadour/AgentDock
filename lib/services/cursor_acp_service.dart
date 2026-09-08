@@ -16,6 +16,19 @@ import 'agent_runtime_host.dart';
 import 'agent_session.dart';
 import 'ssh_service.dart';
 
+/// Thrown when the agent advertises models but implements neither
+/// `session/set_config_option` nor `session/set_model`.
+class AcpModelSwitchUnsupported implements Exception {
+  AcpModelSwitchUnsupported(this.modelId);
+
+  final String modelId;
+
+  @override
+  String toString() =>
+      'ACP agent cannot switch model in-session (missing set_config_option '
+      'and set_model) for $modelId';
+}
+
 /// What the remote agent told us it can do, from the `initialize` response.
 class AcpAgentCapabilities {
   const AcpAgentCapabilities({this.loadSession = false});
@@ -244,6 +257,7 @@ class AcpSession implements AgentSession {
       provider: provider,
       apiKey: apiKey,
       fullAccess: permissionPolicy.fullAccess,
+      preferredModelId: preferredModelId,
     );
 
     var effectiveSessionId = resumeSessionId;
@@ -263,6 +277,7 @@ class AcpSession implements AgentSession {
         provider: provider,
         apiKey: apiKey,
         fullAccess: permissionPolicy.fullAccess,
+        preferredModelId: preferredModelId,
       );
       effectiveSessionId = null;
     }
@@ -543,9 +558,16 @@ class AcpSession implements AgentSession {
       );
     } catch (e) {
       SafeLog.d('session/load for model catalog failed', e);
+      rethrow;
     } finally {
       _replaying = false;
     }
+  }
+
+  @override
+  void seedModelCatalog(List<AgentModel> models) {
+    if (availableModels.isNotEmpty || models.isEmpty) return;
+    availableModels = List<AgentModel>.unmodifiable(models);
   }
 
   /// Resume [resumeSessionId] when the agent supports it, otherwise start new.
@@ -670,13 +692,21 @@ class AcpSession implements AgentSession {
   /// Only ids the agent advertised are accepted; it rejects anything else with
   /// "Invalid model value", so callers must pass a [AgentModel.modelId]
   /// straight from [availableModels].
+  ///
+  /// Some agents advertise models via `configOptions` but never implement
+  /// `session/set_config_option` (JSON-RPC -32601). Others only implement
+  /// that method. Try the preferred path, then fall back to the other. When
+  /// neither exists, throw [AcpModelSwitchUnsupported] so the runtime can
+  /// relaunch the agent with the model baked into startup flags/env.
   Future<void> setModel(String modelId) async {
     if (sessionId == null) throw StateError('ACP session not ready');
-    if (_modelViaConfigOption) {
+
+    Future<void> viaConfigOption() async {
       final previous = currentModelId;
       final result = await _request('session/set_config_option', {
         'sessionId': sessionId,
         'configId': 'model',
+        'type': 'id',
         'value': modelId,
       });
       _applyConfigOptions(
@@ -690,13 +720,63 @@ class AcpSession implements AgentSession {
           currentModelId == previous) {
         currentModelId = modelId;
       }
-    } else {
+      _modelViaConfigOption = true;
+    }
+
+    Future<void> viaSetModel() async {
       await _request('session/set_model', {
         'sessionId': sessionId,
         'modelId': modelId,
       });
       currentModelId = modelId;
+      _modelViaConfigOption = false;
     }
+
+    if (_modelViaConfigOption) {
+      try {
+        await viaConfigOption();
+        return;
+      } catch (e) {
+        if (!_isAcpMethodNotFound(e, 'session/set_config_option')) rethrow;
+        SafeLog.d(
+          'session/set_config_option unsupported; falling back to set_model',
+          e,
+        );
+        try {
+          await viaSetModel();
+          return;
+        } catch (e2) {
+          if (!_isAcpMethodNotFound(e2, 'session/set_model')) rethrow;
+          throw AcpModelSwitchUnsupported(modelId);
+        }
+      }
+    }
+
+    try {
+      await viaSetModel();
+    } catch (e) {
+      if (!_isAcpMethodNotFound(e, 'session/set_model')) rethrow;
+      SafeLog.d(
+        'session/set_model unsupported; falling back to set_config_option',
+        e,
+      );
+      try {
+        await viaConfigOption();
+      } catch (e2) {
+        if (!_isAcpMethodNotFound(e2, 'session/set_config_option')) rethrow;
+        throw AcpModelSwitchUnsupported(modelId);
+      }
+    }
+  }
+
+  /// True when [error] is JSON-RPC method-not-found for [method].
+  ///
+  /// Errors may be nested (`-32000` wrapping `-32601`) by SSH/tmux bridges.
+  static bool _isAcpMethodNotFound(Object error, String method) {
+    final text = error.toString();
+    if (!text.contains(method)) return false;
+    return text.contains('-32601') ||
+        text.toLowerCase().contains('method not found');
   }
 
   void _applyModes(Object? modes) {
@@ -836,7 +916,10 @@ class AcpSession implements AgentSession {
     final timeout = switch (method) {
       'initialize' || 'session/new' => const Duration(seconds: 25),
       'session/load' => const Duration(seconds: 60),
-      'session/set_mode' || 'session/set_model' => const Duration(seconds: 15),
+      'session/set_mode' ||
+      'session/set_model' ||
+      'session/set_config_option' =>
+        const Duration(seconds: 15),
       // Silence budget: agent may work for a long time, but once it goes quiet
       // after producing output we settle much sooner (see soft settle below).
       'session/prompt' => const Duration(minutes: 5),

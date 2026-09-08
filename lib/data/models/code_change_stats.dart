@@ -2,6 +2,10 @@ import 'dart:convert';
 
 import 'tool_call_state.dart';
 
+/// Avoid re-walking 100KB diffs on every transcript rebuild.
+final Expando<CodeChangeStats> _toolCodeStatsCache =
+    Expando<CodeChangeStats>('toolCodeStats');
+
 /// Local calendar day key for daily stat rollovers (`YYYY-MM-DD`).
 String codeDeltaLocalDayKey([DateTime? when]) {
   final d = when ?? DateTime.now();
@@ -82,6 +86,14 @@ class CodeChangeStats {
   }
 
   static CodeChangeStats fromTool(ToolCallState tool) {
+    final cached = _toolCodeStatsCache[tool];
+    if (cached != null) return cached;
+    final computed = _fromToolUncached(tool);
+    _toolCodeStatsCache[tool] = computed;
+    return computed;
+  }
+
+  static CodeChangeStats _fromToolUncached(ToolCallState tool) {
     if (!_looksLikeCodeChange(tool)) {
       if (_isEditKind(tool) && tool.locations.isNotEmpty) {
         return CodeChangeStats(files: _pathsFrom(tool));
