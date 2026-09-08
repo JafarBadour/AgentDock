@@ -165,7 +165,22 @@ class _ChannelGate {
     if (_active >= limit) {
       final waiter = Completer<void>();
       _waiting.add(waiter);
-      await waiter.future;
+      try {
+        await waiter.future.timeout(
+          const Duration(seconds: 45),
+          onTimeout: () {
+            _waiting.remove(waiter);
+            throw TimeoutException(
+              'SSH channel gate timed out — too many commands in flight',
+            );
+          },
+        );
+      } catch (e) {
+        if (!waiter.isCompleted) {
+          _waiting.remove(waiter);
+        }
+        rethrow;
+      }
     }
     _active++;
     try {
@@ -205,6 +220,9 @@ class SshService {
   /// Avoids re-uploading / restarting the daemon on every chat reconnect.
   final Map<String, String> _adsmVerifiedVersion = {};
 
+  /// Cached absolute paths for Cursor / Claude binaries per host.
+  final Map<String, String> _toolPathCache = {};
+
   /// Serializes [ensureAdsm] per host so parallel chats cannot double-upgrade.
   final Map<String, Future<void>> _adsmEnsureInflight = {};
 
@@ -223,6 +241,14 @@ class SshService {
 
   void clearAdsmReady(String hostId) {
     _adsmVerifiedVersion.remove(hostId);
+  }
+
+  String? cachedCursorCli(String hostId) => _toolPathCache['cursor:$hostId'];
+
+  String? cachedClaudeAcp(String hostId) => _toolPathCache['claude:$hostId'];
+
+  void _cacheToolPath(String key, String path) {
+    _toolPathCache[key] = path;
   }
 
   Future<SshConnectResult> testConnection(Host host) async {
@@ -676,9 +702,25 @@ exit 1
     Host host, {
     void Function(String status)? onProgress,
   }) async {
-    final client = await connect(host);
+    final cached = cachedCursorCli(host.id);
+    if (cached != null) {
+      onProgress?.call('Cursor CLI ready');
+      return cached;
+    }
+
+    onProgress?.call('Looking for Cursor CLI…');
+    final client = await connect(host).timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => throw TimeoutException(
+        'SSH connect timed out while looking for Cursor CLI',
+      ),
+    );
     var path = await _resolveCursorCliPath(client, host.id);
-    if (path != null) return path;
+    if (path != null) {
+      _cacheToolPath('cursor:${host.id}', path);
+      onProgress?.call('Cursor CLI ready');
+      return path;
+    }
 
     onProgress?.call('Installing Cursor CLI on the remote (this can take a few minutes)…');
     final installed = await _runAgentDockInstallScript(
@@ -717,6 +759,7 @@ command -v cursor-agent >/dev/null || command -v agent >/dev/null
         kRemoteCursorSetupGuide.trim(),
       );
     }
+    _cacheToolPath('cursor:${host.id}', path);
     onProgress?.call('Cursor CLI ready');
     return path;
   }
@@ -861,9 +904,25 @@ test -x "$HOME/.local/bin/claude-code-acp"
     Host host, {
     void Function(String status)? onProgress,
   }) async {
-    final client = await connect(host);
+    final cached = cachedClaudeAcp(host.id);
+    if (cached != null) {
+      onProgress?.call('Claude ACP ready');
+      return cached;
+    }
+
+    onProgress?.call('Looking for Claude ACP…');
+    final client = await connect(host).timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => throw TimeoutException(
+        'SSH connect timed out while looking for Claude ACP',
+      ),
+    );
     var path = await _resolveClaudeAcpPath(client, host.id);
-    if (path != null) return path;
+    if (path != null) {
+      _cacheToolPath('claude:${host.id}', path);
+      onProgress?.call('Claude ACP ready');
+      return path;
+    }
 
     onProgress?.call(
       'First Claude setup on this host — usually 3–8 minutes…',
@@ -878,6 +937,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
       );
       path = await _resolveClaudeAcpPath(client, host.id);
       if (path != null) {
+        _cacheToolPath('claude:${host.id}', path);
         onProgress?.call('Claude ACP ready');
         return path;
       }
@@ -913,6 +973,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
         kRemoteClaudeSetupGuide.trim(),
       );
     }
+    _cacheToolPath('claude:${host.id}', path);
     onProgress?.call('Claude ACP ready');
     return path;
   }
@@ -1549,33 +1610,7 @@ curl -fsSL ${shellQuote(url)} | bash
   }
 
   Future<String?> _resolveClaudeAcpPath(SSHClient client, String hostId) async {
-    try {
-      final homeOut = await _run(
-        client,
-        r'printf %s "$HOME"',
-        hostId: hostId,
-        timeout: const Duration(seconds: 8),
-      );
-      final home = homeOut.trim();
-      if (home.isNotEmpty) {
-        final sftp = await client.sftp();
-        for (final rel in [
-          '.local/bin/claude-code-acp',
-          '.local/bin/claude-agent-acp',
-          '.npm-global/bin/claude-code-acp',
-          '.npm-global/bin/claude-agent-acp',
-        ]) {
-          final full = '$home/$rel';
-          try {
-            await sftp.stat(full);
-            return full;
-          } catch (_) {}
-        }
-      }
-    } catch (e) {
-      SafeLog.d('SFTP Claude ACP probe failed, trying which', e);
-    }
-
+    // Shell only — SFTP probes through ProxyJump often hang with no timeout.
     const script = r'''
 set +e
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
@@ -1611,61 +1646,55 @@ exit 1
       return path.isEmpty ? null : path;
     } catch (e) {
       SafeLog.d('resolve Claude ACP path failed', e);
+      // Exit 1 / not found → null. Dead transport → rethrow.
+      final t = e.toString().toLowerCase();
+      if (t.contains('timed out') ||
+          t.contains('transport') ||
+          t.contains('channel') ||
+          t.contains('connection') ||
+          t.contains('broken pipe') ||
+          t.contains('socket')) {
+        rethrow;
+      }
       return null;
     }
   }
 
   Future<String?> _resolveCursorCliPath(SSHClient client, String hostId) async {
-    // Fast path: SFTP stat known install locations (no bash).
-    try {
-      final homeOut = await _run(
-        client,
-        r'printf %s "$HOME"',
-        hostId: hostId,
-        timeout: const Duration(seconds: 8),
-      );
-      final home = homeOut.trim();
-      if (home.isNotEmpty) {
-        final sftp = await client.sftp();
-        for (final rel in [
-          '.local/bin/cursor-agent',
-          '.local/bin/agent',
-          '.cursor/bin/cursor-agent',
-          '.cursor/bin/agent',
-        ]) {
-          final full = '$home/$rel';
-          try {
-            await sftp.stat(full);
-            return full;
-          } catch (_) {}
-        }
-      }
-    } catch (e) {
-      SafeLog.d('SFTP Cursor probe failed, trying test -x', e);
-      // Fall through to the shell probe; only give up if that fails too.
-    }
-
-    // Fallback: one short shell test (stdout+stderr read in parallel).
+    // Shell only — SFTP probes through ProxyJump often hang with no timeout
+    // and left the UI stuck on "Checking Cursor CLI…".
     const script =
+        r'export PATH="$HOME/.local/bin:$HOME/.cursor/bin:/usr/local/bin:$PATH"; '
         r'for p in "$HOME/.local/bin/cursor-agent" "$HOME/.local/bin/agent" '
         r'"$HOME/.cursor/bin/cursor-agent" "$HOME/.cursor/bin/agent" '
         r'/usr/local/bin/cursor-agent /usr/local/bin/agent; '
-        r'do [ -x "$p" ] && printf %s "$p" && exit 0; done; exit 1';
+        r'do [ -x "$p" ] && printf %s "$p" && exit 0; done; '
+        r'command -v cursor-agent 2>/dev/null && exit 0; '
+        r'command -v agent 2>/dev/null && exit 0; '
+        r'exit 1';
     try {
       final out = await _run(
         client,
         'sh -c ${shellQuote(script)}',
         hostId: hostId,
-        timeout: const Duration(seconds: 8),
+        timeout: const Duration(seconds: 15),
       );
-      final path = out.trim();
+      final path = out.trim().split('\n').last.trim();
       return path.isEmpty ? null : path;
     } catch (e) {
       SafeLog.d('resolve Cursor CLI path failed', e);
-      // A clean "not found" arrives as empty stdout above, not as an
-      // exception. Anything thrown here is a dead transport — rethrow so
-      // reconnect retries instead of claiming the CLI is missing.
-      rethrow;
+      final t = e.toString().toLowerCase();
+      if (t.contains('timed out') ||
+          t.contains('transport') ||
+          t.contains('channel') ||
+          t.contains('connection') ||
+          t.contains('broken pipe') ||
+          t.contains('socket') ||
+          t.contains('gate timed out')) {
+        rethrow;
+      }
+      // Clean "not found" (exit 1) — try install path.
+      return null;
     }
   }
 

@@ -795,26 +795,37 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         await ssh.ensureTmux(host, onProgress: status);
       }
 
-      final binary = switch (provider) {
-        AgentProvider.cursor => await ssh.ensureCursorCli(
-              host,
-              onProgress: status,
-            ).timeout(
-              const Duration(minutes: 8),
-              onTimeout: () => throw TimeoutException(
-                'Timed out installing/finding Cursor CLI on the remote.',
-              ),
-            ),
-        AgentProvider.claude => await ssh.ensureClaudeAcpBinary(
-              host,
-              onProgress: status,
-            ).timeout(
-              const Duration(minutes: 12),
-              onTimeout: () => throw TimeoutException(
-                'Timed out installing/finding Claude ACP on the remote.',
-              ),
-            ),
-      };
+      final String binary;
+      switch (provider) {
+        case AgentProvider.cursor:
+          final cached = ssh.cachedCursorCli(host.id);
+          if (adsmReady && cached != null) {
+            binary = cached;
+          } else {
+            binary = await ssh
+                .ensureCursorCli(host, onProgress: status)
+                .timeout(
+                  Duration(minutes: adsmReady ? 1 : 8),
+                  onTimeout: () => throw TimeoutException(
+                    'Timed out installing/finding Cursor CLI on the remote.',
+                  ),
+                );
+          }
+        case AgentProvider.claude:
+          final cached = ssh.cachedClaudeAcp(host.id);
+          if (adsmReady && cached != null) {
+            binary = cached;
+          } else {
+            binary = await ssh
+                .ensureClaudeAcpBinary(host, onProgress: status)
+                .timeout(
+                  Duration(minutes: adsmReady ? 1 : 12),
+                  onTimeout: () => throw TimeoutException(
+                    'Timed out installing/finding Claude ACP on the remote.',
+                  ),
+                );
+          }
+      }
 
       await ssh.ensureAdsm(
         host,
