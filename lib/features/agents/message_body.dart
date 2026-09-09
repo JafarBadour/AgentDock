@@ -288,18 +288,23 @@ Future<void> openRichLink(String url) async {
 ///
 /// Finished bubbles freeze the parsed [GptMarkdown] tree so parent
 /// [ChatScreen] rebuilds (streaming ticks, sidebar noise) do not re-parse
-/// every visible message.
+/// every visible message. Live/streaming text uses plain [Text] — re-parsing
+/// markdown on every token is what made scrolling feel stuck mid-turn.
 class MessageBody extends StatefulWidget {
   const MessageBody({
     super.key,
     required this.text,
     this.style,
     this.dense = false,
+    this.live = false,
   });
 
   final String text;
   final TextStyle? style;
   final bool dense;
+
+  /// When true, skip markdown parsing (streaming / in-progress text).
+  final bool live;
 
   @override
   State<MessageBody> createState() => _MessageBodyState();
@@ -324,6 +329,21 @@ class _MessageBodyState extends State<MessageBody> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final base =
+        widget.style ?? theme.textTheme.bodyMedium?.copyWith(height: 1.45);
+
+    if (widget.text.isEmpty) {
+      return Text('…', style: base);
+    }
+
+    // Streaming: plain selectable text — no GptMarkdown re-parse per token.
+    if (widget.live) {
+      return SelectionArea(
+        child: Text(widget.text, style: base),
+      );
+    }
+
     if (_frozen != null &&
         _frozenText == widget.text &&
         _frozenDense == widget.dense &&
@@ -333,19 +353,19 @@ class _MessageBodyState extends State<MessageBody> {
     _frozenText = widget.text;
     _frozenDense = widget.dense;
     _frozenStyle = widget.style;
-    _frozen = _buildMarkdown(context);
+    // Per-bubble selection — a list-wide SelectionArea made scroll hit-testing
+    // pathologically expensive on desktop.
+    _frozen = RepaintBoundary(
+      child: SelectionArea(
+        child: _buildMarkdown(context, base),
+      ),
+    );
     return _frozen!;
   }
 
-  Widget _buildMarkdown(BuildContext context) {
+  Widget _buildMarkdown(BuildContext context, TextStyle? base) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final base =
-        widget.style ?? theme.textTheme.bodyMedium?.copyWith(height: 1.45);
-
-    if (widget.text.isEmpty) {
-      return Text('…', style: base);
-    }
 
     // Prefer an ancestor [GptMarkdownTheme] (hoisted at the list) so we do not
     // wrap every bubble in a new Theme — that forced gpt_markdown to re-parse

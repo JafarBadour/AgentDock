@@ -130,6 +130,7 @@ class AdsmClient {
   final _buffer = StringBuffer();
   StreamSubscription<Uint8List>? _sub;
   bool _open = true;
+  bool _drainingStdout = false;
   int _nextId = 1;
   final Completer<void> _done = Completer<void>();
 
@@ -167,17 +168,7 @@ fi
     _sub = _session.stdout.listen(
       (data) {
         _buffer.write(utf8.decode(data, allowMalformed: true));
-        var content = _buffer.toString();
-        var index = content.indexOf('\n');
-        while (index >= 0) {
-          final line = content.substring(0, index).trim();
-          content = content.substring(index + 1);
-          if (line.isNotEmpty) _onLine(line);
-          index = content.indexOf('\n');
-        }
-        _buffer
-          ..clear()
-          ..write(content);
+        unawaited(_drainStdout());
       },
       onError: (Object e) {
         SafeLog.d('ADSM stdout error', e);
@@ -196,6 +187,42 @@ fi
       final text = utf8.decode(data, allowMalformed: true).trim();
       if (text.isNotEmpty) SafeLog.d('ADSM stderr: $text');
     });
+  }
+
+  /// Parse NDJSON off the critical path in batches so a tool-spam burst cannot
+  /// freeze scrolling / panel switches on the UI isolate.
+  Future<void> _drainStdout() async {
+    if (_drainingStdout) return;
+    _drainingStdout = true;
+    try {
+      var processed = 0;
+      while (_open || _buffer.isNotEmpty) {
+        var content = _buffer.toString();
+        final index = content.indexOf('\n');
+        if (index < 0) {
+          _buffer
+            ..clear()
+            ..write(content);
+          break;
+        }
+        final line = content.substring(0, index).trim();
+        _buffer
+          ..clear()
+          ..write(content.substring(index + 1));
+        if (line.isNotEmpty) _onLine(line);
+        processed++;
+        // Yield every batch so frames can paint between JSON decode spikes.
+        if (processed % 24 == 0) {
+          await Future<void>.delayed(Duration.zero);
+        }
+      }
+    } finally {
+      _drainingStdout = false;
+      // More data may have arrived while we yielded.
+      if (_buffer.toString().contains('\n')) {
+        unawaited(_drainStdout());
+      }
+    }
   }
 
   void _onLine(String line) {
@@ -438,6 +465,9 @@ class AdsmSession implements AgentSession {
   @override
   Stream<AcpUpdate> get updates => _updates.stream;
 
+  /// Shared ADSM client this session rides on (for coalescing `agents.list`).
+  AdsmClient get bridgeClient => _client;
+
   /// Host-authoritative status when known (`idle` / `running` / …).
   String? get daemonStatus => _daemonStatus;
 
@@ -447,7 +477,13 @@ class AdsmSession implements AgentSession {
   /// Pull this worker's status from `agents.list` and push it through the same
   /// update path as live daemon events — clears sticky "Exploring / Thinking"
   /// when the host already went idle.
-  Future<String?> refreshDaemonStatus() async {
+  ///
+  /// Prefer [ActiveAcpSessions] polling once per bridge via [applyAgentsList]
+  /// so N open chats do not each hammer `agents.list`.
+  ///
+  /// Set [forceEmit] when the UI must re-sync even if status is unchanged
+  /// (watchdog clearing sticky tools). Periodic polls keep it false.
+  Future<String?> refreshDaemonStatus({bool forceEmit = false}) async {
     if (_updates.isClosed) return _daemonStatus;
     try {
       final list = await _client.request(
@@ -455,35 +491,53 @@ class AdsmSession implements AgentSession {
         {},
         timeout: const Duration(seconds: 8),
       );
-      final agents = list['agents'];
-      if (agents is! List) return _daemonStatus;
-      for (final raw in agents) {
-        if (raw is! Map) continue;
-        if (raw['chatId']?.toString() != chatId) continue;
-        final snap = Map<String, dynamic>.from(raw);
-        final prev = _daemonStatus;
-        _applySnapshot(snap);
-        final st = _daemonStatus;
-        if (st == null || st.isEmpty) return st;
-        // Always re-emit idle/dead so the runtime can finalize stuck tools even
-        // when the string status did not change. Also re-emit running so a
-        // client that cleared local busy chrome mid-turn (watchdog / missed
-        // events) re-attaches instead of looking idle while the host works.
-        final changed = st != prev;
-        if (changed || st == 'idle' || st == 'dead' || st == 'running') {
-          if (!_updates.isClosed) {
-            _updates.add(AcpUpdate.daemonStatus(st));
-            if (st == 'idle' || st == 'dead') {
-              _updates.add(const AcpUpdate.activity(''));
-            } else if (st == 'running' && (changed || prev != 'running')) {
-              _updates.add(const AcpUpdate.activity('Working on host…'));
-            }
-          }
-        }
-        return st;
-      }
+      return applyAgentsList(list, forceEmit: forceEmit);
     } catch (e) {
       SafeLog.d('ADSM status poll failed chat=$chatId', e);
+    }
+    return _daemonStatus;
+  }
+
+  /// Apply a shared `agents.list` result to this session (no extra RPC).
+  String? applyAgentsList(
+    Map<String, dynamic> list, {
+    bool forceEmit = false,
+  }) {
+    if (_updates.isClosed) return _daemonStatus;
+    final agents = list['agents'];
+    if (agents is! List) return _daemonStatus;
+    for (final raw in agents) {
+      if (raw is! Map) continue;
+      if (raw['chatId']?.toString() != chatId) continue;
+      final snap = Map<String, dynamic>.from(raw);
+      final prev = _daemonStatus;
+      _applySnapshot(snap);
+      final st = _daemonStatus;
+      if (st == null || st.isEmpty) return st;
+      final changed = st != prev;
+      // Only notify the UI when status actually changes — re-emitting idle /
+      // running every 15s rebuilt every ListenableBuilder row and fought
+      // scrolling. Watchdogs pass [forceEmit] when they need a sticky clear.
+      if (changed || forceEmit) {
+        if (!_updates.isClosed) {
+          _updates.add(AcpUpdate.daemonStatus(st));
+          if (st == 'idle' || st == 'dead' || st == 'error') {
+            _updates.add(const AcpUpdate.activity(''));
+          } else if (changed &&
+              (st == 'running' ||
+                  st == 'starting' ||
+                  st == 'waiting_permission')) {
+            _updates.add(
+              AcpUpdate.activity(
+                st == 'waiting_permission'
+                    ? 'Waiting for permission'
+                    : 'Working on host…',
+              ),
+            );
+          }
+        }
+      }
+      return st;
     }
     return _daemonStatus;
   }
@@ -979,12 +1033,7 @@ class AdsmSession implements AgentSession {
       // Legacy host: RPC waited for the whole turn.
       _finishPrompt();
     } catch (e) {
-      final msg = e.toString().toLowerCase();
-      // Host already took the prompt (ack lost / double-send / retry).
-      if (msg.contains('already running')) {
-        _emitDelivered('');
-        return;
-      }
+      // Host mid-turn / transport errors — do not fake a delivery ack.
       _finishPrompt();
       rethrow;
     }

@@ -321,7 +321,13 @@ class ChatSessionRuntime extends ChangeNotifier {
             continue;
           }
           seenToolIds.add(tid);
-          entries.add(TranscriptEntry.tool(tool, messageId: m.id));
+          entries.add(
+            TranscriptEntry.tool(
+              tool,
+              messageId: m.id,
+              createdAt: m.createdAt,
+            ),
+          );
           _toolMessageIds[tid] = m.id;
           continue;
         }
@@ -497,24 +503,37 @@ class ChatSessionRuntime extends ChangeNotifier {
     reconnectAttempts = 0;
     // A reconnect must not inherit a hung prompt chain from the dead socket.
     _breakPromptChain();
-    // Prefer host snapshot: if ADSM says idle, do not resurrect sticky Thinking.
-    final hostStatus =
-        session is AdsmSession ? session.daemonStatus : null;
-    if (hostStatus == 'idle' || hostStatus == 'dead') {
-      remoteTurnActive = false;
-      promptInFlight = false;
-      sendingToHost = false;
-      activityLabel = null;
-      // Do not clear deliveryError while a failed send still needs retry —
-      // that was the "error then nothing" bug.
-      if (!_needsRedelivery && outboundQueue.isEmpty) {
-        deliveryError = null;
-      }
-      if (hasActiveTools) {
-        unawaited(_finalizeStaleTools(reason: 'reconnect-daemon-$hostStatus'));
-      }
+    // Prefer host snapshot (async refresh) so sticky tools clear after reconnect.
+    if (session is AdsmSession) {
+      unawaited(
+        session.refreshDaemonStatus(forceEmit: true).then((hostStatus) {
+          if (_disposed) return;
+          final st = (hostStatus ?? '').toLowerCase();
+          if (st == 'idle' || st == 'dead' || st == 'error') {
+            remoteTurnActive = false;
+            promptInFlight = false;
+            sendingToHost = false;
+            activityLabel = null;
+            if (!_needsRedelivery && outboundQueue.isEmpty) {
+              deliveryError = null;
+            }
+            if (hasActiveTools) {
+              unawaited(_finalizeStaleTools(reason: 'reconnect-daemon-$st'));
+            }
+            notifyListeners();
+            if (!closed) resumeOutboundQueue();
+          } else if (st == 'running' ||
+              st == 'waiting_permission' ||
+              st == 'starting') {
+            remoteTurnActive = true;
+            promptInFlight = true;
+            _armHostBusyWatchdog();
+            notifyListeners();
+          }
+        }),
+      );
     } else if (remoteTurnActive) {
-      // A turn handed off to the host may still be running.
+      // Non-ADSM: a turn handed off may still be running.
       promptInFlight = true;
       _armHostBusyWatchdog();
     }
@@ -964,7 +983,12 @@ class ChatSessionRuntime extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
 
-    if (promptInFlight || (closed && sessionFactory != null)) {
+    // Queue while the host turn is live — barging in used to clear busy chrome
+    // and hit "already running", leaving the bubble in the transcript unsent.
+    if (promptInFlight ||
+        remoteTurnActive ||
+        sendingToHost ||
+        (closed && sessionFactory != null)) {
       outboundQueue.add(message);
       _writesInFlight++;
       try {
@@ -982,12 +1006,6 @@ class ChatSessionRuntime extends ChangeNotifier {
         _scheduleReconnect(immediate: true);
       }
       return;
-    }
-
-    // Stale "running on host" after reconnect — user is starting a new turn.
-    if (remoteTurnActive) {
-      remoteTurnActive = false;
-      _clearHostBusyWatchdog();
     }
 
     // A previous Force run / cancel may have left the chain wedged. Never park
@@ -1235,6 +1253,20 @@ class ChatSessionRuntime extends ChangeNotifier {
       // Late failure from a session that Force-run / reconnect already replaced.
       if (epoch != _promptEpoch) {
         transportFailed = true;
+      } else if (e.toString().toLowerCase().contains('already running')) {
+        // Host still on the previous turn — park the bubble and wait.
+        SafeLog.d('prompt deferred: host still running chat=$chatId');
+        remoteTurnActive = true;
+        promptInFlight = true;
+        sendingToHost = false;
+        activityLabel = 'Working on host…';
+        _needsRedelivery = true;
+        if (userMessageId != null) {
+          await _requeueUndeliveredUser(userMessageId);
+        }
+        _armHostBusyWatchdog();
+        notifyListeners();
+        return;
       } else if (isTransientBridgeError(e)) {
         // Quiet reconnect — do not leave "Bad state: ADSM channel closed" up.
         lastError = null;
@@ -1373,13 +1405,19 @@ class ChatSessionRuntime extends ChangeNotifier {
             ? const Duration(seconds: 40)
             : const Duration(seconds: 90));
 
-    // Durable: if the host still says running, keep the busy strip and wait.
+    // Durable: host status is authoritative. Never unlock the composer while
+    // the daemon still says running — that left "Thinking" folds + follow-ups
+    // that looked sent but hit "already running" and never ran.
     if (durable && _session is AdsmSession) {
-      final st = await (_session as AdsmSession).refreshDaemonStatus();
+      final st = await (_session as AdsmSession).refreshDaemonStatus(
+        forceEmit: true,
+      );
       if (_disposed) return;
       final host = (st ?? '').toLowerCase();
       if (_suppressHostRunning &&
-          (host == 'running' || host == 'waiting_permission')) {
+          (host == 'running' ||
+              host == 'waiting_permission' ||
+              host == 'starting')) {
         // User pressed Stop — do not resurrect busy chrome from a lagging poll.
         remoteTurnActive = false;
         promptInFlight = false;
@@ -1392,7 +1430,9 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (!closed) _drainOutboundQueue();
         return;
       }
-      if (host == 'running' || host == 'waiting_permission') {
+      if (host == 'running' ||
+          host == 'waiting_permission' ||
+          host == 'starting') {
         activityLabel = host == 'waiting_permission'
             ? 'Waiting for permission'
             : (activityLabel?.isNotEmpty == true
@@ -1404,10 +1444,27 @@ class ChatSessionRuntime extends ChangeNotifier {
         _armHostBusyWatchdog();
         return;
       }
-      if (host == 'idle' || host == 'dead') {
-        // refreshDaemonStatus already emitted idle/dead — nothing more here.
+      if (host == 'idle' || host == 'dead' || host == 'error') {
+        // refreshDaemonStatus already emitted status — nothing more here.
         return;
       }
+      // Poll failed / unknown — keep waiting; do not fake-idle the UI.
+      if (sendingToHost && silentFor >= const Duration(seconds: 45)) {
+        SafeLog.d(
+          'watchdog: delivery stall ${silentFor.inSeconds}s '
+          '(host status unknown) chat=$chatId',
+        );
+        await _watchdogUnstickPrompt();
+        return;
+      }
+      activityLabel = activityLabel?.isNotEmpty == true
+          ? activityLabel
+          : 'Working on host…';
+      remoteTurnActive = true;
+      promptInFlight = true;
+      notifyListeners();
+      _armHostBusyWatchdog();
+      return;
     }
 
     if (hasActiveTools) {
@@ -1438,13 +1495,10 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
 
     // Sticky remoteTurnActive with silence: host likely finished while we
-    // missed turn_complete. Clear after a short durable grace period.
+    // missed turn_complete. Clear after a short grace period (non-durable).
     if (remoteTurnActive &&
         !_session.isPromptActive &&
-        silentFor >=
-            (durable
-                ? const Duration(minutes: 2)
-                : const Duration(seconds: 25))) {
+        silentFor >= const Duration(seconds: 25)) {
       SafeLog.d(
         'watchdog: clear sticky remoteTurnActive after '
         '${silentFor.inSeconds}s silence chat=$chatId',
@@ -1505,39 +1559,34 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   Future<void> _watchdogUnstickPrompt() async {
     final hadProgress = _turnHasProgress;
-    final durable = _session.transport == AcpTransport.durable;
+    final wasSending = sendingToHost;
 
-    // Durable host may still be working offline from our event stream. Prefer
-    // unlocking the UI over cancelling a live explore/edit turn.
-    if (!hadProgress || !durable) {
-      try {
-        await _session.cancel().timeout(const Duration(seconds: 5));
-      } catch (e) {
-        SafeLog.d('watchdog prompt cancel failed', e);
-      }
+    // Always cancel — leaving a durable turn "unlocked" in the UI while the
+    // host kept running made follow-ups look sent and then hang forever.
+    try {
+      await _session.cancel().timeout(const Duration(seconds: 5));
+    } catch (e) {
+      SafeLog.d('watchdog prompt cancel failed', e);
     }
 
     await flushAssistantBuffer();
     await commitThought();
     _breakPromptChain();
-    final wasSending = sendingToHost;
     promptInFlight = false;
-    // Always clear local busy chrome. Leaving remoteTurnActive stuck the
-    // composer on "Thinking / Agent is busy" forever after a pause.
     remoteTurnActive = false;
     sendingToHost = false;
     activityLabel = null;
-    if (hadProgress) {
-      lastError = null;
-      deliveryError = null;
-    } else if (wasSending) {
+    if (wasSending && !hadProgress) {
       deliveryError =
           'Could not reach the host. Check the connection and send again.';
       lastError = deliveryError;
-    } else {
+    } else if (!hadProgress) {
       lastError =
           'Agent went quiet with no reply (often a large image or a stuck turn). '
           'Tap Stop if it hangs again, or resend with a smaller screenshot.';
+    } else {
+      lastError = null;
+      deliveryError = null;
     }
     notifyListeners();
     if (!closed) _drainOutboundQueue();
@@ -1668,7 +1717,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         _notifyUi(immediate: true);
       case AcpUpdateKind.daemonStatus:
         final st = update.text.trim().toLowerCase();
-        if (st == 'idle' || st == 'dead') {
+        if (st == 'idle' || st == 'dead' || st == 'error') {
           // Host is done — even if some tool rows never got a terminal status.
           _clearHostBusyWatchdog();
           sendingToHost = false;
@@ -1677,6 +1726,9 @@ class ChatSessionRuntime extends ChangeNotifier {
           if (_session.isPromptActive && _session is AdsmSession) {
             (_session as AdsmSession).handOffPrompt();
           }
+          // Idle can arrive without turn_complete (missed journal) — flush so
+          // we do not leave a shimmering Thinking fold while status says live.
+          unawaited(_flushTurnBuffers());
           if (hasActiveTools) {
             unawaited(_finalizeStaleTools(reason: 'daemon-$st'));
           } else {
@@ -1692,7 +1744,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           activityLabel = 'Waiting for permission';
           _noteHostActivity();
           _notifyUi(immediate: true);
-        } else if (st == 'running') {
+        } else if (st == 'running' || st == 'starting') {
           if (_suppressHostRunning) break;
           // Host still on a turn — keep busy chrome even when journal events
           // went quiet (HPC polls, long shell). Re-attach after a false idle.

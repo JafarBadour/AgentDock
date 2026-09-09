@@ -45,6 +45,7 @@ final sshServiceProvider = Provider<SshService>((ref) {
     ref.watch(secureStoreProvider),
     ref.watch(appDatabaseProvider),
   );
+  unawaited(service.loadPersistedCaches());
   ref.onDispose(service.dispose);
   return service;
 });
@@ -140,9 +141,9 @@ final activeAcpSessionsProvider =
           tick = null;
           ref.read(chatActivityTickProvider.notifier).state++;
         });
-        // Re-sort the Agents list sooner when a chat's updated_at moves
-        // (new user/assistant message). skipLoadingOnReload keeps it smooth.
-        orderTick ??= Timer(const Duration(milliseconds: 900), () {
+        // Re-sort Agents list only every few seconds — 900ms during tool
+        // streams was SQLite-reloading the sidebar while you scrolled.
+        orderTick ??= Timer(const Duration(seconds: 4), () {
           orderTick = null;
           ref.read(agentsCatalogEpochProvider.notifier).state++;
         });
@@ -173,46 +174,73 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
   final Map<String, int> _pendingOffsets = {};
   final Map<String, Timer> _transcriptPushTimers = {};
   Timer? _adsmStatusPoll;
+  Timer? _adsmStatusPollSoon;
   bool _adsmStatusPollInFlight = false;
 
   /// How often to ask ADSM for authoritative worker status across all live
-  /// bridges. Cheap (`agents.list`) and keeps sticky UI in sync with the host.
-  static const _adsmStatusPollInterval = Duration(seconds: 15);
+  /// bridges. One `agents.list` per shared bridge — not per chat.
+  static const _adsmStatusPollInterval = Duration(seconds: 30);
 
   ChatSessionRuntime? get(String chatId) => state[chatId];
 
   AgentSession? sessionFor(String chatId) => state[chatId]?.session;
 
-  void _syncAdsmStatusPoll() {
+  void _syncAdsmStatusPoll({bool kickSoon = false}) {
     final hasAdsm = state.values.any(
       (r) => !r.closed && r.session is AdsmSession,
     );
     if (!hasAdsm) {
       _adsmStatusPoll?.cancel();
       _adsmStatusPoll = null;
+      _adsmStatusPollSoon?.cancel();
+      _adsmStatusPollSoon = null;
       return;
     }
-    if (_adsmStatusPoll != null) return;
-    // Immediate pass, then every interval — sticky chrome should not wait
-    // a full period after connect / resume.
-    unawaited(_pollAllAdsmStatuses());
-    _adsmStatusPoll = Timer.periodic(_adsmStatusPollInterval, (_) {
-      unawaited(_pollAllAdsmStatuses());
-    });
+    if (_adsmStatusPoll == null) {
+      _adsmStatusPoll = Timer.periodic(_adsmStatusPollInterval, (_) {
+        unawaited(_pollAllAdsmStatuses());
+      });
+    }
+    // Coalesce transport-ready storms (N chats reconnecting on one host)
+    // instead of firing N immediate agents.list sweeps that jank the UI.
+    if (kickSoon) {
+      _adsmStatusPollSoon ??= Timer(const Duration(seconds: 2), () {
+        _adsmStatusPollSoon = null;
+        unawaited(_pollAllAdsmStatuses());
+      });
+    }
   }
 
   Future<void> _pollAllAdsmStatuses() async {
     if (_adsmStatusPollInFlight) return;
     _adsmStatusPollInFlight = true;
     try {
-      final sessions = <AdsmSession>[
-        for (final runtime in state.values)
-          if (!runtime.closed && runtime.session is AdsmSession)
-            runtime.session as AdsmSession,
-      ];
-      // Parallel per bridge — each session owns its own ADSM SSH client.
+      final byBridge = <AdsmClient, List<AdsmSession>>{};
+      for (final runtime in state.values) {
+        if (runtime.closed || runtime.session is! AdsmSession) continue;
+        // Skip sessions mid-reconnect — their bridge is about to be replaced.
+        if (runtime.reconnecting) continue;
+        final session = runtime.session as AdsmSession;
+        byBridge.putIfAbsent(session.bridgeClient, () => []).add(session);
+      }
       await Future.wait(
-        sessions.map((s) => s.refreshDaemonStatus()),
+        byBridge.entries.map((entry) async {
+          final client = entry.key;
+          final sessions = entry.value;
+          if (!client.isOpen) return;
+          try {
+            final list = await client.request(
+              'agents.list',
+              {},
+              timeout: const Duration(seconds: 8),
+            );
+            for (final session in sessions) {
+              session.applyAgentsList(list, forceEmit: false);
+            }
+          } catch (e) {
+            SafeLog.d('ADSM status poll for bridge failed', e);
+          }
+        }),
         eagerError: false,
       );
     } catch (e) {
@@ -256,9 +284,10 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       existing.replaceSession(session);
       // Host/DB may have advanced while the bridge was down.
       unawaited(existing.pullHostTranscriptAndSync());
-      state = {...state};
+      // Do NOT copy the map here — identity churn rebuilt Agents sidebar +
+      // ChatScreen on every reconnect while the runtime instance is unchanged.
       _syncKeepAlive();
-      _syncAdsmStatusPoll();
+      _syncAdsmStatusPoll(kickSoon: true);
       return existing;
     }
 
@@ -292,18 +321,17 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     // Push any local-only rows up so the host stays complete.
     unawaited(runtime.pushTranscriptToHost());
     _syncKeepAlive();
-    _syncAdsmStatusPoll();
+    _syncAdsmStatusPoll(kickSoon: true);
     return runtime;
   }
 
   void _onTransportReady(String chatId) {
     if (!state.containsKey(chatId)) return;
-    // Auto-reconnect calls replaceSession without attach — bump map identity
-    // so ChatScreen rebinds after a closed/reconnecting stretch.
-    state = {...state};
+    // Runtime instance is stable across reconnect — ChatScreen already listens
+    // to it. Copying the Riverpod map was rebuilding the whole Agents list.
     unawaited(state[chatId]?.syncTranscriptFromDb());
     _syncKeepAlive();
-    _syncAdsmStatusPoll();
+    _syncAdsmStatusPoll(kickSoon: true);
   }
 
   void _syncKeepAlive() {
@@ -335,7 +363,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       _pendingOffsets.remove(chatId);
       try {
         await _db.setJournalOffset(chatId, bytes);
-        onLocalChange?.call(chatId);
+        // Journal watermark is not a catalog/order change — skip onLocalChange
+        // so Agents sidebar does not reload SQLite during streaming.
       } catch (e) {
         SafeLog.d('persist journal offset failed', e);
       }
@@ -381,6 +410,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     _transcriptPushTimers.clear();
     _adsmStatusPoll?.cancel();
     _adsmStatusPoll = null;
+    _adsmStatusPollSoon?.cancel();
+    _adsmStatusPollSoon = null;
     for (final runtime in state.values) {
       await runtime.disposeRuntime();
     }
@@ -400,6 +431,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     _transcriptPushTimers.clear();
     _adsmStatusPoll?.cancel();
     _adsmStatusPoll = null;
+    _adsmStatusPollSoon?.cancel();
+    _adsmStatusPollSoon = null;
     super.dispose();
   }
 }

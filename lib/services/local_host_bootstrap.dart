@@ -61,8 +61,9 @@ Future<String> localComputerDisplayName() async {
 /// Ensure a Host entry for the machine Agent Dock is running on (Mac / Windows).
 ///
 /// Uses `127.0.0.1` so agents/ADSM talk to the local SSH daemon (Remote Login
-/// on macOS, OpenSSH Server on Windows). Idempotent — does not overwrite an
-/// existing row the user may have edited.
+/// on macOS, OpenSSH Server on Windows). The in-app terminal for this host uses
+/// a local PTY instead (like VS Code) and does not need SSH.
+/// Idempotent — does not overwrite an existing row the user may have edited.
 Future<Host?> ensureLocalThisComputerHost(AppDatabase db) async {
   if (!isDesktopLocalHostPlatform) return null;
 
@@ -133,17 +134,24 @@ Future<bool> isLocalSshPortOpen(Host host) async {
 }
 
 /// Human guidance when local SSH is refused / unreachable.
+///
+/// Agents still need SSH to This Mac/PC. The in-app terminal does not — it
+/// uses a local PTY (same approach as VS Code).
 String localThisComputerSshHint() {
   if (Platform.isMacOS) {
-    return 'Remote Login is off on this Mac, so Agent Dock cannot reach '
+    return 'Remote Login is off on this Mac, so agents cannot reach '
         '127.0.0.1:22.\n\n'
         'Enable it: System Settings → General → Sharing → Remote Login '
         '(allow your user).\n\n'
-        'Then reconnect. The terminal uses the same SSH path as agents.';
+        'The Terminal button still works without Remote Login '
+        '(local shell, like VS Code).';
   }
   if (Platform.isWindows) {
-    return 'OpenSSH Server is not accepting connections on 127.0.0.1:22.\n\n'
-        'Install/start OpenSSH Server in Optional Features, then reconnect.';
+    return 'OpenSSH Server is not accepting connections on 127.0.0.1:22, '
+        'so agents cannot run on This PC.\n\n'
+        'Install/start OpenSSH Server in Optional Features, then reconnect.\n\n'
+        'The Terminal button still works without OpenSSH '
+        '(local shell, like VS Code).';
   }
   return 'Local SSH on 127.0.0.1:22 refused the connection.';
 }

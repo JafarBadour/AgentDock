@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/host.dart';
@@ -255,8 +256,39 @@ class SshService {
 
   String? cachedClaudeAcp(String hostId) => _toolPathCache['claude:$hostId'];
 
+  static const _toolPathPrefsKey = 'ssh_tool_path_cache_v1';
+
+  /// Load Cursor/Claude absolute paths saved from prior connects.
+  Future<void> loadPersistedCaches() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_toolPathPrefsKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      for (final e in decoded.entries) {
+        final v = e.value;
+        if (e.key is String && v is String && v.isNotEmpty) {
+          _toolPathCache[e.key as String] = v;
+        }
+      }
+    } catch (e) {
+      SafeLog.d('load tool path cache failed', e);
+    }
+  }
+
   void _cacheToolPath(String key, String path) {
     _toolPathCache[key] = path;
+    unawaited(_persistToolPathCache());
+  }
+
+  Future<void> _persistToolPathCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_toolPathPrefsKey, jsonEncode(_toolPathCache));
+    } catch (e) {
+      SafeLog.d('persist tool path cache failed', e);
+    }
   }
 
   Future<SshConnectResult> testConnection(Host host) async {
@@ -598,7 +630,13 @@ class SshService {
     Host host, {
     void Function(String status)? onProgress,
   }) async {
-    final client = await connect(host);
+    onProgress?.call('Checking tmux…');
+    final client = await connect(host).timeout(
+      const Duration(seconds: 25),
+      onTimeout: () => throw TimeoutException(
+        'SSH connect timed out while checking tmux',
+      ),
+    );
     var tmux = await _resolveTmuxPath(client, host.id);
     if (tmux != null) return;
 
@@ -1618,50 +1656,47 @@ curl -fsSL ${shellQuote(url)} | bash
   }
 
   Future<String?> _resolveClaudeAcpPath(SSHClient client, String hostId) async {
-    // Shell only — SFTP probes through ProxyJump often hang with no timeout.
+    // Fast path: known install locations only — never source nvm (that hangs
+    // on some hosts and left the UI stuck on "Checking Claude…").
     const script = r'''
 set +e
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
-for name in claude-code-acp claude-agent-acp; do
-  if command -v "$name" >/dev/null 2>&1; then
-    command -v "$name"
-    exit 0
-  fi
-done
-for p in "$HOME/.local/bin/claude-code-acp" \
-         "$HOME/.local/bin/claude-agent-acp" \
-         "$HOME/.npm-global/bin/claude-code-acp" \
-         "$HOME/.npm-global/bin/claude-agent-acp" \
-         /usr/local/bin/claude-code-acp \
-         /usr/local/bin/claude-agent-acp; do
+for p in \
+  "$HOME/.local/bin/claude-code-acp" \
+  "$HOME/.local/bin/claude-agent-acp" \
+  "$HOME/.npm-global/bin/claude-code-acp" \
+  "$HOME/.npm-global/bin/claude-agent-acp" \
+  /usr/local/bin/claude-code-acp \
+  /usr/local/bin/claude-agent-acp; do
   if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
 done
 for p in "$HOME"/.nvm/versions/node/*/bin/claude-code-acp \
          "$HOME"/.nvm/versions/node/*/bin/claude-agent-acp; do
   if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
 done
+command -v claude-code-acp 2>/dev/null && exit 0
+command -v claude-agent-acp 2>/dev/null && exit 0
 exit 1
 ''';
     try {
       final out = await _run(
         client,
-        'bash -lc ${shellQuote(script)}',
+        'sh -c ${shellQuote(script)}',
         hostId: hostId,
-        timeout: const Duration(seconds: 20),
+        timeout: const Duration(seconds: 12),
       );
       final path = out.trim().split('\n').last.trim();
       return path.isEmpty ? null : path;
     } catch (e) {
       SafeLog.d('resolve Claude ACP path failed', e);
-      // Exit 1 / not found → null. Dead transport → rethrow.
       final t = e.toString().toLowerCase();
       if (t.contains('timed out') ||
           t.contains('transport') ||
           t.contains('channel') ||
           t.contains('connection') ||
           t.contains('broken pipe') ||
-          t.contains('socket')) {
+          t.contains('socket') ||
+          t.contains('gate timed out')) {
         rethrow;
       }
       return null;
@@ -1717,11 +1752,22 @@ exit 1
   }
 
   /// Absolute home directory for the SSH user (no trailing slash, except `/`).
+  ///
+  /// For This Mac / This PC on desktop, uses local `$HOME` — no SSH
+  /// (same idea as the local PTY terminal).
   Future<String> remoteHomeDirectory(Host host) async {
+    if (_preferLocalFs(host)) {
+      final home = Platform.environment['HOME'] ??
+          Platform.environment['USERPROFILE'] ??
+          '/';
+      return normalizeRemotePath(home.replaceAll(r'\', '/'));
+    }
     final out = await exec(host, 'printf %s "\$HOME"');
     final home = out.trim();
     if (home.isEmpty) return '/';
-    return home.endsWith('/') && home != '/' ? home.substring(0, home.length - 1) : home;
+    return home.endsWith('/') && home != '/'
+        ? home.substring(0, home.length - 1)
+        : home;
   }
 
   /// List directories (and symlink-to-dir) under [path] via SFTP.
@@ -1736,8 +1782,11 @@ exit 1
     );
   }
 
-  /// List files and directories under [path] via SFTP.
+  /// List files and directories under [path] via SFTP (or local FS on This Mac/PC).
   Future<RemoteFileListing> listRemoteEntries(Host host, String path) async {
+    if (_preferLocalFs(host)) {
+      return _listLocalEntries(path);
+    }
     final normalized = normalizeRemotePath(path);
     final client = await connect(host);
     final sftp = await client.sftp();
@@ -1759,13 +1808,72 @@ exit 1
         ),
       );
     }
+    _sortRemoteEntries(entries);
+    return RemoteFileListing(path: normalized, entries: entries);
+  }
+
+  bool _preferLocalFs(Host host) =>
+      isDesktopLocalHostPlatform && isLocalThisComputerHost(host);
+
+  Future<RemoteFileListing> _listLocalEntries(String path) async {
+    final normalized = normalizeRemotePath(path.replaceAll(r'\', '/'));
+    final dir = Directory(normalized);
+    if (!await dir.exists()) {
+      throw FileSystemException('Directory not found', normalized);
+    }
+    final entries = <RemoteFileEntry>[];
+    await for (final entity in dir.list(followLinks: false)) {
+      // Directory.uri ends with `/`, so pathSegments.last is often "".
+      final name = _localBasename(entity.path);
+      if (name.isEmpty || name == '.' || name == '..') continue;
+      final isLink = entity is Link;
+      var isDirectory = entity is Directory;
+      int? size;
+      if (entity is File) {
+        try {
+          size = await entity.length();
+        } catch (_) {}
+      }
+      DateTime? modifiedAt;
+      try {
+        modifiedAt = (await entity.stat()).modified;
+        if (isLink) {
+          try {
+            final targetType = await FileSystemEntity.type(entity.path);
+            isDirectory = targetType == FileSystemEntityType.directory;
+          } catch (_) {}
+        }
+      } catch (_) {}
+      entries.add(
+        RemoteFileEntry(
+          name: name,
+          isDirectory: isDirectory,
+          isSymlink: isLink,
+          size: size,
+          modifiedAt: modifiedAt,
+        ),
+      );
+    }
+    _sortRemoteEntries(entries);
+    return RemoteFileListing(path: normalized, entries: entries);
+  }
+
+  void _sortRemoteEntries(List<RemoteFileEntry> entries) {
     entries.sort((a, b) {
       if (a.isDirectory != b.isDirectory) {
         return a.isDirectory ? -1 : 1;
       }
       return a.name.toLowerCase().compareTo(b.name.toLowerCase());
     });
-    return RemoteFileListing(path: normalized, entries: entries);
+  }
+
+  static String _localBasename(String path) {
+    final normalized = path.replaceAll(r'\', '/');
+    final trimmed = normalized.endsWith('/') && normalized.length > 1
+        ? normalized.substring(0, normalized.length - 1)
+        : normalized;
+    final i = trimmed.lastIndexOf('/');
+    return i < 0 ? trimmed : trimmed.substring(i + 1);
   }
 
   /// Download a remote file to [localPath]. Returns bytes written.
@@ -1787,6 +1895,14 @@ exit 1
     bool Function()? isCancelled,
   }) async {
     final remote = normalizeRemotePath(remotePath);
+    if (_preferLocalFs(host)) {
+      final src = File(remote);
+      final len = await src.length();
+      onProgress?.call(0, len);
+      await src.copy(localPath);
+      onProgress?.call(len, len);
+      return len;
+    }
     try {
       return await _downloadRemoteFileOnce(
         host,
@@ -1981,6 +2097,11 @@ exit 1
     void Function(int bytes)? onProgress,
   }) async {
     final remote = normalizeRemotePath(remotePath);
+    if (_preferLocalFs(host)) {
+      await File(localPath).copy(remote);
+      onProgress?.call(await File(remote).length());
+      return;
+    }
     final bytes = await File(localPath).readAsBytes();
     final client = await connect(host);
     final sftp = await client.sftp();
@@ -2000,6 +2121,10 @@ exit 1
 
   Future<void> mkdirRemote(Host host, String remotePath) async {
     final remote = normalizeRemotePath(remotePath);
+    if (_preferLocalFs(host)) {
+      await Directory(remote).create(recursive: true);
+      return;
+    }
     final client = await connect(host);
     final sftp = await client.sftp();
     await sftp.mkdir(remote);
@@ -2007,6 +2132,15 @@ exit 1
 
   Future<void> removeRemoteFile(Host host, String remotePath) async {
     final remote = normalizeRemotePath(remotePath);
+    if (_preferLocalFs(host)) {
+      final type = await FileSystemEntity.type(remote);
+      if (type == FileSystemEntityType.directory) {
+        await Directory(remote).delete(recursive: false);
+      } else {
+        await File(remote).delete();
+      }
+      return;
+    }
     final client = await connect(host);
     final sftp = await client.sftp();
     await sftp.remove(remote);

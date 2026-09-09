@@ -121,8 +121,8 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
               ? MediaQuery(
                   data: MediaQuery.of(context).copyWith(
                     textScaler: MediaQuery.textScalerOf(context).clamp(
-                      minScaleFactor: 0.85,
-                      maxScaleFactor: 1.05,
+                      minScaleFactor: 0.9,
+                      maxScaleFactor: 1.1,
                     ),
                   ),
                   child: body,

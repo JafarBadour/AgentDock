@@ -90,7 +90,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _wasWorking = false;
   int _lastOutboundQueueLen = 0;
   bool _landedAtBottom = false;
-  bool _showJumpToLatest = false;
+  /// Jump-to-latest FAB — ValueNotifier so toggling it never setStates the
+  /// whole chat (that used to re-run build() on every scroll threshold cross).
+  final ValueNotifier<bool> _showJumpToLatest = ValueNotifier(false);
   /// When true, keep the viewport pinned to new agent output.
   /// Cleared as soon as the user scrolls away from the bottom.
   bool _followOutput = true;
@@ -105,8 +107,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   int _transcribeEpoch = 0;
   bool _showSlashMenu = false;
   bool _compressing = false;
-  /// Sliding window over the transcript: only a slice stays mounted.
-  final TranscriptWindow _transcriptWindow = TranscriptWindow(pageSize: 30);
+  /// Sliding window over the transcript: mount a page, grow upward, trim
+  /// older pages when scrolling back to the live end.
+  final TranscriptWindow _transcriptWindow = TranscriptWindow(
+    pageSize: 300,
+    softMax: 370,
+  );
   List<ChatBlock>? _cachedBlocks;
   String? _blocksCacheKey;
   DateTime? _lastScrollToEndAt;
@@ -156,7 +162,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           !saved.contains('\n') &&
           !saved.contains(' ');
     }
-    _scroll.addListener(_onScrollOffsetChanged);
+    // No ScrollController listener — it fired on every pixel and setState'd the
+    // whole chat. Follow / jump-to-latest uses UserScrollNotification only.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(focusedChatIdProvider.notifier).state = widget.chatId;
     });
@@ -180,24 +187,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
-  void _onScrollOffsetChanged() {
-    if (!_landedAtBottom ||
-        _programmaticScroll ||
-        _shiftingWindow) {
-      return;
-    }
-    final near = _isNearBottom;
-    // User dragged away from the live turn — stop yanking them back.
-    if (!near && _followOutput) {
-      _followOutput = false;
-      _transcriptWindow.pinnedToEnd = false;
-    } else if (near && !_followOutput) {
-      _followOutput = true;
-      _transcriptWindow.pinnedToEnd = true;
-    }
-    final show = !_followOutput;
-    if (show != _showJumpToLatest && mounted) {
-      setState(() => _showJumpToLatest = show);
+  void _setFollowOutput(bool follow) {
+    _followOutput = follow;
+    _transcriptWindow.pinnedToEnd = follow;
+    final showJump = !follow;
+    if (_showJumpToLatest.value != showJump) {
+      _showJumpToLatest.value = showJump;
     }
   }
 
@@ -243,12 +238,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     _loadingOlderHistory = true;
     _programmaticScroll = true;
-    _followOutput = false;
-    if (!_showJumpToLatest) {
-      setState(() => _showJumpToLatest = true);
-    } else {
-      setState(() {});
-    }
+    _setFollowOutput(false);
+    setState(() {}); // mount the newly prepended history slice
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
@@ -260,7 +251,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           );
           _scroll.jumpTo(target);
         }
-        if (!mounted) return;
+        if (!mounted || !fromUserTap) return;
         final label = added == 1
             ? 'Loaded 1 earlier message'
             : 'Loaded $added earlier messages';
@@ -278,9 +269,50 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     });
   }
 
+  /// Drop older pages when scrolling back to the live end (past [softMax]).
+  void _maybeTrimOlderHistory() {
+    if (!mounted) return;
+    if (_loadingOlderHistory || _programmaticScroll) return;
+    if (!_scroll.hasClients) return;
+
+    final before = _scroll.position.pixels;
+    final beforeMax = _scroll.position.maxScrollExtent;
+    final startBefore = _transcriptWindow.start;
+    final ok = _transcriptWindow.tryTrimOlderNearBottom(
+      total: _blocksLength,
+      pixels: before,
+      maxScrollExtent: beforeMax,
+      now: DateTime.now(),
+      busy: false,
+    );
+    if (!ok) return;
+    final dropped = _transcriptWindow.start - startBefore;
+    if (dropped <= 0) return;
+
+    _loadingOlderHistory = true;
+    _programmaticScroll = true;
+    setState(() {});
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        if (_scroll.hasClients) {
+          final target = _transcriptWindow.preserveScrollAfterTrim(
+            beforePixels: before,
+            beforeMax: beforeMax,
+            afterMax: _scroll.position.maxScrollExtent,
+          );
+          _scroll.jumpTo(target);
+        }
+      } finally {
+        _programmaticScroll = false;
+        _loadingOlderHistory = false;
+      }
+    });
+  }
+
   void _pinWindowToLatest() {
     _transcriptWindow.pinToLatest(_blocksLength);
-    _followOutput = true;
+    _setFollowOutput(true);
   }
 
   /// Paint from SQLite immediately; the network only ever upgrades what is
@@ -489,9 +521,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       // scrolling feel stuck. Keep a dirty flag and refresh when they jump back.
       if (!needsImmediate && !_followOutput && working) {
         _runtimeUiDirty = true;
-        if (!_showJumpToLatest && mounted) {
-          setState(() => _showJumpToLatest = true);
-        }
+        _setFollowOutput(false);
         _scheduleMarkRead();
         return;
       }
@@ -788,50 +818,55 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       );
 
       final adsmReady = ssh.isAdsmReady(host.id);
+      final cachedBinary = switch (provider) {
+        AgentProvider.cursor => ssh.cachedCursorCli(host.id),
+        AgentProvider.claude => ssh.cachedClaudeAcp(host.id),
+      };
 
-      // Skip heavy tooling installs on reconnect — they reopen SSH channels and
-      // previously triggered ADSM reinstall → daemon kill → reconnect loops.
-      if (!adsmReady) {
-        await ssh.ensureTmux(host, onProgress: status);
+      // Skip tmux install probe when we already know the agent binary — cold
+      // reconnects used to hang here forever on ProxyJump SSH.
+      if (!adsmReady && cachedBinary == null) {
+        await ssh.ensureTmux(host, onProgress: status).timeout(
+          const Duration(seconds: 45),
+          onTimeout: () => throw TimeoutException(
+            'Timed out checking tmux on the remote.',
+          ),
+        );
       }
 
       final String binary;
-      switch (provider) {
-        case AgentProvider.cursor:
-          final cached = ssh.cachedCursorCli(host.id);
-          if (adsmReady && cached != null) {
-            binary = cached;
-          } else {
-            binary = await ssh
-                .ensureCursorCli(host, onProgress: status)
-                .timeout(
-                  Duration(minutes: adsmReady ? 1 : 8),
-                  onTimeout: () => throw TimeoutException(
-                    'Timed out installing/finding Cursor CLI on the remote.',
-                  ),
-                );
-          }
-        case AgentProvider.claude:
-          final cached = ssh.cachedClaudeAcp(host.id);
-          if (adsmReady && cached != null) {
-            binary = cached;
-          } else {
-            binary = await ssh
-                .ensureClaudeAcpBinary(host, onProgress: status)
-                .timeout(
-                  Duration(minutes: adsmReady ? 1 : 12),
-                  onTimeout: () => throw TimeoutException(
-                    'Timed out installing/finding Claude ACP on the remote.',
-                  ),
-                );
-          }
+      if (cachedBinary != null) {
+        binary = cachedBinary;
+        status(
+          provider == AgentProvider.claude
+              ? 'Claude ACP ready'
+              : 'Cursor CLI ready',
+        );
+      } else {
+        binary = switch (provider) {
+          AgentProvider.cursor => await ssh
+              .ensureCursorCli(host, onProgress: status)
+              .timeout(
+                const Duration(minutes: 8),
+                onTimeout: () => throw TimeoutException(
+                  'Timed out installing/finding Cursor CLI on the remote.',
+                ),
+              ),
+          AgentProvider.claude => await ssh
+              .ensureClaudeAcpBinary(host, onProgress: status)
+              .timeout(
+                const Duration(seconds: 90),
+                onTimeout: () => throw TimeoutException(
+                  'Timed out finding Claude ACP on the remote. '
+                  'Open Hosts → terminal and check `claude-code-acp`.',
+                ),
+              ),
+        };
       }
 
       await ssh.ensureAdsm(
         host,
         onProgress: status,
-        // After the first successful verify, never restart the daemon on
-        // reconnect — that was killing the shared bridge every message.
         allowUpgrade: !adsmReady,
       ).timeout(
         const Duration(minutes: 5),
@@ -1493,10 +1528,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _landAtBottom(framesLeft: framesLeft - 1);
       } else {
         _landedAtBottom = true;
-        _followOutput = true;
-        if (mounted && _showJumpToLatest) {
-          setState(() => _showJumpToLatest = false);
-        }
+        _setFollowOutput(true);
       }
     });
   }
@@ -1514,7 +1546,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // user is scrolled up reading something.
     if (force) {
       _pinWindowToLatest();
-      if (mounted) setState(() => _showJumpToLatest = false);
+      _setFollowOutput(true);
     }
     if (!force && (!_landedAtBottom || !_followOutput)) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1545,9 +1577,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       // jumpTo (not animateTo): streaming fires many times per second and
       // stacked animations lock the user out of manual scrolling.
       _scroll.jumpTo(max);
-      if (mounted && _showJumpToLatest) {
-        setState(() => _showJumpToLatest = false);
-      }
+      _setFollowOutput(true);
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _programmaticScroll = false;
       });
@@ -1609,7 +1639,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _runtimeUiCoalesce?.cancel();
     _voiceTick?.cancel();
     _voicePulse.dispose();
-    _scroll.removeListener(_onScrollOffsetChanged);
+    _showJumpToLatest.dispose();
     _composer.removeListener(_onComposerChanged);
     _syncComposerDraft();
     if (_recordingVoice) {
@@ -2249,8 +2279,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   @override
   Widget build(BuildContext context) {
-    // Rebuild when runtime map changes (attach/detach).
-    final live = ref.watch(activeAcpSessionsProvider)[widget.chatId];
+    // Only rebuild this chat when *this* runtime attaches/detaches — not when
+    // unrelated chats reconnect and the session map is rewritten.
+    final live = ref.watch(
+      activeAcpSessionsProvider.select((m) => m[widget.chatId]),
+    );
     if (live != null && live != _runtime) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _bindRuntime(live);
@@ -2362,8 +2395,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         extra.add(
           _ThinkingFold(
             text: thoughtBuffer,
-            streaming: true,
-            initiallyExpanded: true,
+            streaming: streaming,
+            initiallyExpanded: streaming,
           ),
         );
       }
@@ -2656,37 +2689,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     }
                     // reverse = toward older messages (top); stop auto-follow.
                     if (notification.direction == ScrollDirection.reverse) {
-                      if (_followOutput) {
-                        _followOutput = false;
-                        _transcriptWindow.pinnedToEnd = false;
-                        if (!_showJumpToLatest && mounted) {
-                          setState(() => _showJumpToLatest = true);
-                        }
-                      }
+                      if (_followOutput) _setFollowOutput(false);
                       _maybeLoadOlderHistory();
                     } else if (notification.direction ==
                         ScrollDirection.forward) {
                       if (_isNearBottom && !_followOutput) {
-                        _followOutput = true;
-                        _transcriptWindow.pinnedToEnd = true;
-                        if (_showJumpToLatest && mounted) {
-                          setState(() => _showJumpToLatest = false);
-                        }
+                        _setFollowOutput(true);
                       }
+                      // Past softMax (~370): ditch oldest page when heading down.
+                      _maybeTrimOlderHistory();
                     }
                     return false;
                   },
-                  child: SelectionArea(
-                    child: GptMarkdownTheme(
+                  child: GptMarkdownTheme(
                       gptThemeData: chatGptMarkdownTheme(theme),
                       child: ListView.builder(
                   controller: _scroll,
-                  padding: const EdgeInsets.all(12),
+                  // Cursor-like side margins so text isn't edge-to-edge.
+                  padding: const EdgeInsets.fromLTRB(40, 12, 40, 16),
                   // Keep scroll physics interactive even while the agent streams.
                   physics: const AlwaysScrollableScrollPhysics(),
-                  // Prefetch more rows so scrolling history doesn't hitch on
-                  // markdown layout for each newly revealed bubble.
-                  cacheExtent: 600,
+                  cacheExtent: 280,
                   itemCount: (hiddenOlder > 0 ? 1 : 0) +
                       visibleBlocks.length +
                       extra.length,
@@ -2809,34 +2832,38 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     return extra[cursor];
                   },
                 ),
-                    ),
                   ),
                 ),
-                if (_showJumpToLatest)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 12,
-                    child: Center(
-                      child: Material(
-                        elevation: 3,
-                        color: theme.colorScheme.primaryContainer,
-                        shape: const CircleBorder(),
-                        child: IconButton(
-                          tooltip: 'Jump to latest',
-                          onPressed: () {
-                            _pinWindowToLatest();
-                            _flushRuntimeUi();
-                            _scrollToEnd(force: true);
-                          },
-                          icon: Icon(
-                            Icons.keyboard_arrow_down_rounded,
-                            color: theme.colorScheme.onPrimaryContainer,
+                ValueListenableBuilder<bool>(
+                  valueListenable: _showJumpToLatest,
+                  builder: (context, showJump, _) {
+                    if (!showJump) return const SizedBox.shrink();
+                    return Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 12,
+                      child: Center(
+                        child: Material(
+                          elevation: 3,
+                          color: theme.colorScheme.primaryContainer,
+                          shape: const CircleBorder(),
+                          child: IconButton(
+                            tooltip: 'Jump to latest',
+                            onPressed: () {
+                              _pinWindowToLatest();
+                              _flushRuntimeUi();
+                              _scrollToEnd(force: true);
+                            },
+                            icon: Icon(
+                              Icons.keyboard_arrow_down_rounded,
+                              color: theme.colorScheme.onPrimaryContainer,
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                  ),
+                    );
+                  },
+                ),
               ],
             ),
           ),
@@ -3302,11 +3329,12 @@ class _Bubble extends StatelessWidget {
             child: _BubbleImages(refs: imageRefs),
           ),
         if (streaming && bodyText.isEmpty && imageRefs.isEmpty)
-          MessageBody(text: '…', style: bodyStyle)
+          MessageBody(text: '…', style: bodyStyle, live: true)
         else if (bodyText.isNotEmpty || (streaming && bodyText.isEmpty))
           MessageBody(
             text: streaming && bodyText.isEmpty ? '…' : bodyText,
             style: bodyStyle,
+            live: streaming,
           ),
         if (!streaming && (at != null || bodyText.trim().isNotEmpty))
           Padding(
@@ -3364,26 +3392,31 @@ class _Bubble extends StatelessWidget {
     if (isUser) {
       return Align(
         alignment: Alignment.centerLeft,
-        child: Container(
-          width: double.infinity,
-          margin: const EdgeInsets.only(top: 10, bottom: 6),
-          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-          decoration: BoxDecoration(
-            color: AppColors.bubbleUser,
-            borderRadius: BorderRadius.circular(14),
-            border: queued
-                ? Border.all(
-                    color: theme.colorScheme.primary.withValues(alpha: 0.45),
-                  )
-                : null,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.sizeOf(context).width * 0.92,
           ),
-          child: column,
+          child: Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 10, bottom: 6),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+            decoration: BoxDecoration(
+              color: AppColors.bubbleUser,
+              borderRadius: BorderRadius.circular(14),
+              border: queued
+                  ? Border.all(
+                      color: theme.colorScheme.primary.withValues(alpha: 0.45),
+                    )
+                  : null,
+            ),
+            child: column,
+          ),
         ),
       );
     }
 
     return Padding(
-      padding: const EdgeInsets.only(top: 8, bottom: 10),
+      padding: const EdgeInsets.only(top: 8, bottom: 10, left: 4, right: 4),
       child: column,
     );
   }

@@ -221,7 +221,9 @@ class _RemoteBrowserScreenState extends ConsumerState<RemoteBrowserScreen> {
                 padding: const EdgeInsets.all(12),
                 child: Text(
                   _error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer),
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onErrorContainer,
+                  ),
                 ),
               ),
             ),

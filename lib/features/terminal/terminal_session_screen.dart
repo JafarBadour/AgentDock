@@ -1,15 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_pty/flutter_pty.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
+import '../../data/models/host.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/local_host_bootstrap.dart';
 
@@ -22,7 +25,7 @@ class TerminalSessionScreen extends ConsumerStatefulWidget {
 
   final String hostId;
 
-  /// Remote path to `cd` into after the shell opens (agent project directory).
+  /// Working directory after the shell opens (agent project directory).
   final String? initialDirectory;
 
   @override
@@ -34,11 +37,18 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   final _terminal = Terminal(maxLines: 10000);
   final _terminalController = TerminalController();
 
+  /// Local PTY (VS Code-style) for This Mac / This PC — no SSH / Remote Login.
+  Pty? _pty;
+  StreamSubscription<Uint8List>? _ptyOutSub;
+
+  /// SSH interactive shell for real remote hosts.
   SSHClient? _client;
   SSHSession? _session;
   StreamSubscription<List<int>>? _stdoutSub;
   StreamSubscription<List<int>>? _stderrSub;
+
   bool _connecting = true;
+  bool _usingLocalPty = false;
   bool _hasSelection = false;
   String? _error;
   String _title = 'Terminal';
@@ -110,6 +120,7 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
     setState(() {
       _connecting = true;
       _error = null;
+      _usingLocalPty = false;
     });
     _terminal.write('Connecting…\r\n');
 
@@ -120,88 +131,14 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
       }
       _title = host.displayLabel;
 
-      if (isLocalThisComputerHost(host) && !await isLocalSshPortOpen(host)) {
-        final hint = localThisComputerSshHint();
-        _terminal.write('\r\n$hint\r\n');
-        if (mounted) {
-          setState(() {
-            _connecting = false;
-            _error = hint;
-          });
-          unawaited(openLocalRemoteLoginSettings());
-        }
+      // Same idea as VS Code’s integrated terminal: spawn a local shell via
+      // forkpty / ConPTY. No Remote Login / OpenSSH Server required.
+      if (isDesktopLocalHostPlatform && isLocalThisComputerHost(host)) {
+        await _connectLocalPty(host);
         return;
       }
 
-      final ssh = ref.read(sshServiceProvider);
-      // Exclusive client so an interactive shell is not fighting ADSM/agent
-      // channels on the shared pool connection.
-      final client = await ssh.connectExclusive(host).timeout(
-        const Duration(seconds: 25),
-        onTimeout: () => throw TimeoutException('SSH connect timed out'),
-      );
-      _client = client;
-      final session = await client
-          .shell(
-            pty: SSHPtyConfig(
-              type: 'xterm-256color',
-              width: _terminal.viewWidth > 0 ? _terminal.viewWidth : 80,
-              height: _terminal.viewHeight > 0 ? _terminal.viewHeight : 24,
-            ),
-          )
-          .timeout(
-            const Duration(seconds: 20),
-            onTimeout: () => throw TimeoutException('Opening shell timed out'),
-          );
-      _session = session;
-
-      _terminal.buffer.clear();
-      _terminal.buffer.setCursor(0, 0);
-
-      final cwd = widget.initialDirectory?.trim();
-      if (cwd != null && cwd.isNotEmpty) {
-        final leaf = cwd.split(RegExp(r'[/\\]+')).where((s) => s.isNotEmpty);
-        final name = leaf.isEmpty ? cwd : leaf.last;
-        _title = '${host.displayLabel} · $name';
-        // Interactive login shells start in $HOME — jump to the agent dir.
-        session.write(
-          Uint8List.fromList(
-            utf8.encode('cd ${_shellQuote(cwd)}\n'),
-          ),
-        );
-      }
-
-      _terminal.onTitleChange = (title) {
-        if (!mounted) return;
-        setState(() => _title = title.isEmpty ? host.displayLabel : title);
-      };
-
-      _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
-        try {
-          session.resizeTerminal(width, height, pixelWidth, pixelHeight);
-        } catch (e) {
-          SafeLog.d('resizeTerminal failed', e);
-        }
-      };
-
-      _terminal.onOutput = (data) {
-        session.write(Uint8List.fromList(utf8.encode(data)));
-      };
-
-      _stdoutSub = session.stdout.listen(
-        (data) => _terminal.write(utf8.decode(data, allowMalformed: true)),
-        onError: (Object e) => SafeLog.d('terminal stdout error', e),
-        onDone: () {
-          _terminal.write('\r\n[session closed]\r\n');
-        },
-      );
-      _stderrSub = session.stderr.listen(
-        (data) => _terminal.write(utf8.decode(data, allowMalformed: true)),
-      );
-
-      if (mounted) {
-        setState(() => _connecting = false);
-      }
+      await _connectSsh(host);
     } catch (e) {
       SafeLog.d('terminal connect failed', e);
       final host = await ref.read(appDatabaseProvider).getHost(widget.hostId);
@@ -209,17 +146,179 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
           ? e.toString()
           : describeLocalHostConnectError(e, host);
       _terminal.write('\r\nFailed: $message\r\n');
-      await _closeClient();
+      await _disconnect();
       if (mounted) {
         setState(() {
           _connecting = false;
           _error = message;
         });
-        if (host != null && isLocalThisComputerHost(host)) {
-          unawaited(openLocalRemoteLoginSettings());
-        }
       }
     }
+  }
+
+  Future<void> _connectLocalPty(Host host) async {
+    final shell = _localShellExecutable();
+    final rows = _terminal.viewHeight > 0 ? _terminal.viewHeight : 24;
+    final cols = _terminal.viewWidth > 0 ? _terminal.viewWidth : 80;
+    final cwd = widget.initialDirectory?.trim();
+    final workingDirectory = (cwd != null && cwd.isNotEmpty) ? cwd : null;
+
+    final pty = Pty.start(
+      shell,
+      arguments: Platform.isWindows ? const <String>[] : const ['-l'],
+      workingDirectory: workingDirectory,
+      environment: {
+        ...Platform.environment,
+        'TERM': 'xterm-256color',
+        'COLORTERM': 'truecolor',
+      },
+      rows: rows,
+      columns: cols,
+    );
+    _pty = pty;
+    _usingLocalPty = true;
+
+    _terminal.buffer.clear();
+    _terminal.buffer.setCursor(0, 0);
+
+    if (workingDirectory != null) {
+      final leaf =
+          workingDirectory.split(RegExp(r'[/\\]+')).where((s) => s.isNotEmpty);
+      final name = leaf.isEmpty ? workingDirectory : leaf.last;
+      _title = '${host.displayLabel} · $name';
+    }
+
+    _terminal.onTitleChange = (title) {
+      if (!mounted) return;
+      setState(() => _title = title.isEmpty ? host.displayLabel : title);
+    };
+
+    _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      try {
+        pty.resize(height, width);
+      } catch (e) {
+        SafeLog.d('local pty resize failed', e);
+      }
+    };
+
+    _terminal.onOutput = (data) {
+      pty.write(Uint8List.fromList(utf8.encode(data)));
+    };
+
+    _ptyOutSub = pty.output.listen(
+      (data) => _terminal.write(utf8.decode(data, allowMalformed: true)),
+      onError: (Object e) => SafeLog.d('local pty output error', e),
+      onDone: () {
+        _terminal.write('\r\n[session closed]\r\n');
+      },
+    );
+
+    unawaited(
+      pty.exitCode.then((code) {
+        _terminal.write('\r\n[exit $code]\r\n');
+      }),
+    );
+
+    if (mounted) {
+      setState(() {
+        _connecting = false;
+        _error = null;
+      });
+    }
+  }
+
+  Future<void> _connectSsh(Host host) async {
+    if (isLocalThisComputerHost(host) && !await isLocalSshPortOpen(host)) {
+      final hint = localThisComputerSshHint();
+      _terminal.write('\r\n$hint\r\n');
+      if (mounted) {
+        setState(() {
+          _connecting = false;
+          _error = hint;
+        });
+        unawaited(openLocalRemoteLoginSettings());
+      }
+      return;
+    }
+
+    final ssh = ref.read(sshServiceProvider);
+    // Exclusive client so an interactive shell is not fighting ADSM/agent
+    // channels on the shared pool connection.
+    final client = await ssh.connectExclusive(host).timeout(
+      const Duration(seconds: 25),
+      onTimeout: () => throw TimeoutException('SSH connect timed out'),
+    );
+    _client = client;
+    final session = await client
+        .shell(
+          pty: SSHPtyConfig(
+            type: 'xterm-256color',
+            width: _terminal.viewWidth > 0 ? _terminal.viewWidth : 80,
+            height: _terminal.viewHeight > 0 ? _terminal.viewHeight : 24,
+          ),
+        )
+        .timeout(
+          const Duration(seconds: 20),
+          onTimeout: () => throw TimeoutException('Opening shell timed out'),
+        );
+    _session = session;
+
+    _terminal.buffer.clear();
+    _terminal.buffer.setCursor(0, 0);
+
+    final cwd = widget.initialDirectory?.trim();
+    if (cwd != null && cwd.isNotEmpty) {
+      final leaf = cwd.split(RegExp(r'[/\\]+')).where((s) => s.isNotEmpty);
+      final name = leaf.isEmpty ? cwd : leaf.last;
+      _title = '${host.displayLabel} · $name';
+      // Interactive login shells start in $HOME — jump to the agent dir.
+      session.write(
+        Uint8List.fromList(
+          utf8.encode('cd ${_shellQuote(cwd)}\n'),
+        ),
+      );
+    }
+
+    _terminal.onTitleChange = (title) {
+      if (!mounted) return;
+      setState(() => _title = title.isEmpty ? host.displayLabel : title);
+    };
+
+    _terminal.onResize = (width, height, pixelWidth, pixelHeight) {
+      try {
+        session.resizeTerminal(width, height, pixelWidth, pixelHeight);
+      } catch (e) {
+        SafeLog.d('resizeTerminal failed', e);
+      }
+    };
+
+    _terminal.onOutput = (data) {
+      session.write(Uint8List.fromList(utf8.encode(data)));
+    };
+
+    _stdoutSub = session.stdout.listen(
+      (data) => _terminal.write(utf8.decode(data, allowMalformed: true)),
+      onError: (Object e) => SafeLog.d('terminal stdout error', e),
+      onDone: () {
+        _terminal.write('\r\n[session closed]\r\n');
+      },
+    );
+    _stderrSub = session.stderr.listen(
+      (data) => _terminal.write(utf8.decode(data, allowMalformed: true)),
+    );
+
+    if (mounted) {
+      setState(() => _connecting = false);
+    }
+  }
+
+  static String _localShellExecutable() {
+    if (Platform.isWindows) {
+      return Platform.environment['COMSPEC'] ?? 'powershell.exe';
+    }
+    final shell = Platform.environment['SHELL']?.trim();
+    if (shell != null && shell.isNotEmpty) return shell;
+    return '/bin/zsh';
   }
 
   Future<void> _closeClient() async {
@@ -234,13 +333,20 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   Future<void> _disconnect() async {
     await _stdoutSub?.cancel();
     await _stderrSub?.cancel();
+    await _ptyOutSub?.cancel();
     _stdoutSub = null;
     _stderrSub = null;
+    _ptyOutSub = null;
     try {
       _session?.close();
     } catch (_) {}
     _session = null;
+    try {
+      _pty?.kill();
+    } catch (_) {}
+    _pty = null;
     await _closeClient();
+    _usingLocalPty = false;
   }
 
   void _closeScreen() {
@@ -253,9 +359,15 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   }
 
   void _sendKey(String seq) {
+    final bytes = Uint8List.fromList(utf8.encode(seq));
+    final pty = _pty;
+    if (pty != null) {
+      pty.write(bytes);
+      return;
+    }
     final session = _session;
     if (session == null) return;
-    session.write(Uint8List.fromList(utf8.encode(seq)));
+    session.write(bytes);
   }
 
   static String _shellQuote(String value) =>
@@ -331,7 +443,9 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
                     color: Theme.of(context).colorScheme.onErrorContainer,
                   ),
                 ),
-                trailing: widget.hostId == kLocalThisComputerHostId
+                // Local PTY never needs Remote Login — only SSH paths do.
+                trailing: (!_usingLocalPty &&
+                        widget.hostId == kLocalThisComputerHostId)
                     ? TextButton(
                         onPressed: () =>
                             unawaited(openLocalRemoteLoginSettings()),

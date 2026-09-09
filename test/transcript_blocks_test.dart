@@ -200,6 +200,36 @@ void main() {
       expect(groups.single.tools, hasLength(3));
     });
 
+    test('tool runs stay interleaved with assistant text', () {
+      final blocks = buildTranscriptBlocks([
+        _user('u1'),
+        _tool('t1'),
+        _tool('t2'),
+        _tool('t3'),
+        _assistant('a1', 'mid'),
+        _tool('t4'),
+        _tool('t5'),
+        _tool('t6'),
+        _assistant('a2', 'end'),
+      ]);
+      // user, tools×3, assistant, tools×3, assistant
+      expect(blocks.map((b) {
+        if (b.entry?.message?.role == MessageRole.user) return 'u';
+        if (b.entry?.message?.role == MessageRole.assistant) {
+          return b.entry!.message!.content;
+        }
+        if (b.tools != null) return 'tools:${b.tools!.length}';
+        if (b.entry?.tool != null) return 'tool';
+        return '?';
+      }).toList(), [
+        'u',
+        'tools:3',
+        'mid',
+        'tools:3',
+        'end',
+      ]);
+    });
+
     test('persisted turn stats attach after finished segment', () {
       final blocks = buildTranscriptBlocks([
         _user('u1'),
@@ -267,6 +297,7 @@ void main() {
         'status': 'completed',
         'rawInput': '{"command": "ls"}',
       };
+      final toolAt = DateTime(2026, 3, 1, 10);
       final messages = [
         _msg('u1', MessageRole.user, 'run ls'),
         _msg(
@@ -274,6 +305,7 @@ void main() {
           MessageRole.tool,
           // ignore: prefer_interpolation_to_compose_strings
           '{"toolCallId":"tc1","title":"Bash","kind":"execute","status":"completed","rawInput":"{\\"command\\":\\"ls\\"}"}',
+          at: toolAt,
         ),
         _msg('a1', MessageRole.assistant, 'done'),
       ];
@@ -281,6 +313,7 @@ void main() {
       expect(entries, hasLength(3));
       expect(entries[1].tool?.toolCallId, 'tc1');
       expect(entries[1].messageId, 't1');
+      expect(entries[1].createdAt, toolAt);
       expect(toolJson['toolCallId'], 'tc1');
     });
 

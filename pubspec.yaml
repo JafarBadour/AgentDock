@@ -37,6 +37,7 @@ dependencies:
   speech_to_text: ^7.4.0
   pdfrx: ^2.4.7
   sqflite_common_ffi: ^2.4.0+3
+  flutter_pty: ^0.4.2
 
 dev_dependencies:
   flutter_test:

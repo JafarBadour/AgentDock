@@ -4,59 +4,34 @@ import 'package:flutter/material.dart';
 
 import 'app_theme.dart';
 
-/// Slow, layered sine waves behind the whole app shell.
-class WavyBackground extends StatefulWidget {
+/// Layered sine-wave backdrop behind the app shell.
+///
+/// Intentionally static — a forever-ticking full-window [CustomPaint] was
+/// fighting chat list scrolling on macOS (continuous layer invalidation).
+class WavyBackground extends StatelessWidget {
   const WavyBackground({super.key, required this.child});
 
   final Widget child;
-
-  @override
-  State<WavyBackground> createState() => _WavyBackgroundState();
-}
-
-class _WavyBackgroundState extends State<WavyBackground>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 28),
-    )..repeat();
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
     return Stack(
       fit: StackFit.expand,
       children: [
-        RepaintBoundary(
-          child: AnimatedBuilder(
-            animation: _controller,
-            builder: (context, _) {
-              return CustomPaint(
-                painter: _WavyPainter(phase: _controller.value * 2 * math.pi),
-                size: Size.infinite,
-              );
-            },
+        const RepaintBoundary(
+          child: CustomPaint(
+            painter: _WavyPainter(phase: 0.85),
+            size: Size.infinite,
           ),
         ),
-        widget.child,
+        child,
       ],
     );
   }
 }
 
 class _WavyPainter extends CustomPainter {
-  _WavyPainter({required this.phase});
+  const _WavyPainter({required this.phase});
 
   final double phase;
 

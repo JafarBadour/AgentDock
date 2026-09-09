@@ -51,6 +51,17 @@ class ChatBlock {
 /// Stable chronological order for the transcript list.
 List<TranscriptEntry> entriesByTime(List<TranscriptEntry> input) {
   if (input.length < 2) return input;
+  // Entries are almost always append-ordered — skip the O(n log n) sort.
+  var needsSort = false;
+  for (var i = 1; i < input.length; i++) {
+    final a = input[i - 1].createdAt;
+    final b = input[i].createdAt;
+    if (a != null && b != null && a.isAfter(b)) {
+      needsSort = true;
+      break;
+    }
+  }
+  if (!needsSort) return input;
   final indexed = [for (var i = 0; i < input.length; i++) (i, input[i])];
   indexed.sort((a, b) {
     final at = a.$2.createdAt;
@@ -171,41 +182,40 @@ List<ChatBlock> buildTranscriptBlocks(
     final turnStats =
         (persistedStats ?? const TurnStats()).mergeComputed(computed);
 
-    final tools = [for (final e in segment) if (e.tool != null) e];
     final segmentBlocks = <ChatBlock>[];
-    if (tools.length > 2) {
-      var emittedTools = false;
-      for (final e in segment) {
-        if (e.tool != null) {
-          if (!emittedTools) {
-            segmentBlocks.add(ChatBlock.tools(tools));
-            emittedTools = true;
-          }
-        } else {
-          final id = e.message?.id;
-          segmentBlocks.add(
-            ChatBlock.single(
-              e,
-              thinking: e.message?.role == MessageRole.assistant && id != null
-                  ? thinkingByAssistantId[id]
-                  : null,
-            ),
-          );
+    // Keep tools interleaved with assistant text. Collapse only consecutive
+    // tool runs (not every tool in the whole turn into one end clump).
+    final toolRun = <TranscriptEntry>[];
+
+    void flushToolRun() {
+      if (toolRun.isEmpty) return;
+      if (toolRun.length > 2) {
+        segmentBlocks.add(ChatBlock.tools(List<TranscriptEntry>.from(toolRun)));
+      } else {
+        for (final e in toolRun) {
+          segmentBlocks.add(ChatBlock.single(e));
         }
       }
-    } else {
-      for (final e in segment) {
-        final id = e.message?.id;
-        segmentBlocks.add(
-          ChatBlock.single(
-            e,
-            thinking: e.message?.role == MessageRole.assistant && id != null
-                ? thinkingByAssistantId[id]
-                : null,
-          ),
-        );
-      }
+      toolRun.clear();
     }
+
+    for (final e in segment) {
+      if (e.tool != null) {
+        toolRun.add(e);
+        continue;
+      }
+      flushToolRun();
+      final id = e.message?.id;
+      segmentBlocks.add(
+        ChatBlock.single(
+          e,
+          thinking: e.message?.role == MessageRole.assistant && id != null
+              ? thinkingByAssistantId[id]
+              : null,
+        ),
+      );
+    }
+    flushToolRun();
     final followedByUser = i < compact.length &&
         compact[i].message?.role == MessageRole.user;
     final isLastSegment = i >= compact.length;
@@ -233,7 +243,13 @@ List<TranscriptEntry> entriesFromMessages(List<ChatMessage> messages) {
     if (m.role == MessageRole.tool) {
       final tool = ToolCallState.tryParseContent(m.content);
       if (tool != null) {
-        out.add(TranscriptEntry.tool(tool, messageId: m.id));
+        out.add(
+          TranscriptEntry.tool(
+            tool,
+            messageId: m.id,
+            createdAt: m.createdAt,
+          ),
+        );
         continue;
       }
     }

@@ -154,7 +154,7 @@ ThemeData buildAppTheme({bool dense = false}) {
       ),
       hintStyle: TextStyle(
         color: AppColors.mist.withValues(alpha: 0.45),
-        fontSize: dense ? 12.5 : null,
+        fontSize: dense ? 13 : null,
       ),
     ),
     floatingActionButtonTheme: const FloatingActionButtonThemeData(
@@ -165,7 +165,7 @@ ThemeData buildAppTheme({bool dense = false}) {
       backgroundColor: AppColors.surfaceHigh.withValues(alpha: 0.96),
       contentTextStyle: TextStyle(
         color: AppColors.mist,
-        fontSize: dense ? 12.5 : null,
+        fontSize: dense ? 13 : null,
       ),
       behavior: SnackBarBehavior.floating,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -184,7 +184,7 @@ ThemeData buildAppTheme({bool dense = false}) {
   );
 }
 
-/// Cursor-like desktop type scale (Material defaults are ~2–4px larger).
+/// Cursor-like desktop type scale (~13px body, matching Cursor chat/sidebar).
 TextTheme _desktopTextTheme(TextTheme base) {
   TextStyle? scale(TextStyle? s, double size, {double height = 1.35}) =>
       s?.copyWith(fontSize: size, height: height, letterSpacing: 0);
@@ -196,14 +196,14 @@ TextTheme _desktopTextTheme(TextTheme base) {
     headlineLarge: scale(base.headlineLarge, 20, height: 1.25),
     headlineMedium: scale(base.headlineMedium, 17, height: 1.3),
     headlineSmall: scale(base.headlineSmall, 15, height: 1.3),
-    titleLarge: scale(base.titleLarge, 14.5, height: 1.3),
-    titleMedium: scale(base.titleMedium, 13, height: 1.3),
-    titleSmall: scale(base.titleSmall, 12, height: 1.3),
-    bodyLarge: scale(base.bodyLarge, 13, height: 1.4),
-    bodyMedium: scale(base.bodyMedium, 12.5, height: 1.4),
-    bodySmall: scale(base.bodySmall, 11.5, height: 1.35),
-    labelLarge: scale(base.labelLarge, 12, height: 1.25),
-    labelMedium: scale(base.labelMedium, 11, height: 1.25),
-    labelSmall: scale(base.labelSmall, 10.5, height: 1.2),
+    titleLarge: scale(base.titleLarge, 15, height: 1.3),
+    titleMedium: scale(base.titleMedium, 13.5, height: 1.3),
+    titleSmall: scale(base.titleSmall, 12.5, height: 1.3),
+    bodyLarge: scale(base.bodyLarge, 13.5, height: 1.45),
+    bodyMedium: scale(base.bodyMedium, 13, height: 1.45),
+    bodySmall: scale(base.bodySmall, 12, height: 1.4),
+    labelLarge: scale(base.labelLarge, 12.5, height: 1.25),
+    labelMedium: scale(base.labelMedium, 11.5, height: 1.25),
+    labelSmall: scale(base.labelSmall, 11, height: 1.2),
   );
 }

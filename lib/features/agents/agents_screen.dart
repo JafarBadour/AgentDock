@@ -333,7 +333,18 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
           ? async.valueOrNull
           : (async.isLoading ? 'Syncing agents from remotes…' : null)),
     );
-    final runtimes = ref.watch(activeAcpSessionsProvider);
+    // Watch presence (chat ids), not map identity — reconnect used to copy the
+    // whole map and rebuild this list while SSH was still busy.
+    final presence = ref.watch(
+      activeAcpSessionsProvider.select(
+        (m) => Set<String>.of(m.keys),
+      ),
+    );
+    final runtimes = {
+      for (final id in presence)
+        if (ref.read(activeAcpSessionsProvider)[id] != null)
+          id: ref.read(activeAcpSessionsProvider)[id]!,
+    };
     final mode = widget.embedded
         ? ref.watch(agentsSidebarModeProvider)
         : AgentsSidebarMode.agents;
