@@ -2534,6 +2534,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             onReauthed: () {
                               unawaited(_reconnectAfterReauth());
                             },
+                            onStopped: () {
+                              unawaited(() async {
+                                final chat = _chat;
+                                if (chat == null) return;
+                                await ref
+                                    .read(activeAcpSessionsProvider.notifier)
+                                    .close(chat.id);
+                                if (mounted) {
+                                  setState(() {
+                                    _runtime = null;
+                                    _error = null;
+                                  });
+                                }
+                              }());
+                            },
                           ),
                         );
                       } else {

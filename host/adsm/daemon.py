@@ -10,8 +10,19 @@ import sys
 from typing import Any, Optional
 
 from . import paths, protocol, scheduler
+from . import process_hygiene
 from . import transcript as transcript_store
 from .worker import Worker
+
+
+# Idle workers (tmux + Claude/Cursor) are stopped after this many seconds so
+# hosts like the Switzerland bastion do not keep multi‑hundred‑MB agent
+# processes warm forever. ACP session ids stay on disk for resume.
+_IDLE_STOP_SECONDS = 15 * 60
+_MAINTENANCE_EVERY = 60
+# Stream chunks are fanned out live but must not accumulate in RAM.
+_EVENT_LOG_SKIP_KINDS = frozenset({"text", "thought", "activity"})
+_EVENT_LOG_MAX = 200
 
 
 class Daemon:
@@ -25,6 +36,15 @@ class Daemon:
         self._chunk_bufs: dict[tuple[int, Any], dict[str, Any]] = {}
         self._server: Optional[asyncio.AbstractServer] = None
         self.scheduler = scheduler.Scheduler(self)
+        # Set by run_serve(); daemon.shutdown flips it to exit cleanly.
+        self._stop_event: Optional[asyncio.Event] = None
+
+    def request_shutdown(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        # Also stop accepting new connections so clients disconnect promptly.
+        if self._server is not None:
+            self._server.close()
 
     async def start(self) -> None:
         paths.ensure_layout()
@@ -78,9 +98,76 @@ class Daemon:
                     )
 
         self.scheduler.start()
+        asyncio.create_task(self._maintenance_loop())
 
         async with self._server:
             await self._server.serve_forever()
+
+    async def _maintenance_loop(self) -> None:
+        """Reap leaked Claude children, idle workers, and oversized journals."""
+        while True:
+            try:
+                await asyncio.sleep(_MAINTENANCE_EVERY)
+                await self._run_maintenance()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(f"ADSM maintenance error: {e}", flush=True)
+
+    async def _run_maintenance(self) -> None:
+        import time
+
+        now = time.monotonic()
+        # 1) Kill leaked Claude SDK children under each live tmux worker.
+        for chat_id, w in list(self.workers.items()):
+            tmux = paths.tmux_session_name(chat_id)
+            try:
+                killed = await asyncio.to_thread(
+                    process_hygiene.reap_claude_children_for_tmux, tmux
+                )
+                if killed:
+                    print(
+                        f"ADSM maintenance: reaped {killed} stale claude "
+                        f"process(es) for {chat_id}",
+                        flush=True,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            # Trim journals so tails cannot balloon.
+            journal = paths.session_dir(chat_id) / "out.jsonl"
+            try:
+                await asyncio.to_thread(process_hygiene.trim_journal_file, journal)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 2) Stop idle workers (keep files / acp_session_id for resume).
+        for chat_id, w in list(self.workers.items()):
+            if w.status in (
+                protocol.STATUS_RUNNING,
+                protocol.STATUS_WAITING_PERMISSION,
+                protocol.STATUS_STARTING,
+                protocol.STATUS_DEAD,
+            ):
+                continue
+            idle_for = now - getattr(w, "last_activity", now)
+            if idle_for < _IDLE_STOP_SECONDS:
+                continue
+            try:
+                print(
+                    f"ADSM maintenance: stopping idle worker {chat_id} "
+                    f"(idle {int(idle_for)}s)",
+                    flush=True,
+                )
+                await w.stop(delete_files=False)
+            except Exception as e:  # noqa: BLE001
+                print(f"ADSM idle stop failed {chat_id}: {e}", flush=True)
+
+        # 3) Bound in-memory event logs.
+        for chat_id, log in list(self._event_log.items()):
+            if len(log) > _EVENT_LOG_MAX:
+                del log[:-_EVENT_LOG_MAX]
+            if not log and chat_id not in self.workers:
+                self._event_log.pop(chat_id, None)
 
     async def _set_status(
         self, chat_id: str, status: str, error: Optional[str]
@@ -142,9 +229,11 @@ class Daemon:
             k: v for k, v in payload.items() if k not in ("chatId", "kind")
         })
         log = self._event_log.setdefault(chat_id, [])
-        log.append(event)
-        if len(log) > 5000:
-            del log[:1000]
+        # Live-broadcast everything; only retain durable kinds in RAM.
+        if kind not in _EVENT_LOG_SKIP_KINDS:
+            log.append(event)
+            if len(log) > _EVENT_LOG_MAX:
+                del log[:-_EVENT_LOG_MAX]
 
         dead: list[asyncio.StreamWriter] = []
         targets = set(self._global_subscribers)
@@ -254,6 +343,11 @@ class Daemon:
                     "seq": self._seq,
                     "version": protocol.VERSION,
                 }
+            elif method == "daemon.shutdown":
+                result = {"ok": True, "pid": os.getpid()}
+                # Reply first, then tear down so the client gets the ack.
+                loop = asyncio.get_running_loop()
+                loop.call_soon(self.request_shutdown)
             elif method == "agents.list":
                 result = {
                     "agents": [w.snapshot() for w in self.workers.values()]
@@ -557,6 +651,7 @@ async def run_serve() -> None:
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
+    daemon._stop_event = stop
 
     def _stop(*_args: Any) -> None:
         stop.set()

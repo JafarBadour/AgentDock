@@ -20,6 +20,7 @@ def main(argv: list[str] | None = None) -> int:
         "client", help="Stdio NDJSON proxy to the daemon socket (for SSH)"
     )
     sub.add_parser("status", help="Ping the daemon and print status")
+    sub.add_parser("stop", help="Shut down the ADSM daemon if it is running")
     p_ensure = sub.add_parser("ensure-running", help="Start daemon if needed")
     p_ensure.add_argument(
         "--python",
@@ -38,6 +39,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_client())
     if args.cmd == "status":
         return asyncio.run(_status())
+    if args.cmd == "stop":
+        return asyncio.run(_stop())
     if args.cmd == "ensure-running":
         return _ensure_running(args.python)
     return 1
@@ -143,6 +146,75 @@ async def _status() -> int:
     print(line.decode("utf-8", "replace").rstrip())
     writer.close()
     await writer.wait_closed()
+    return 0
+
+
+def _force_kill() -> None:
+    import subprocess
+
+    subprocess.run(
+        ["pkill", "-f", "python3 -m adsm serve"],
+        check=False,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["pkill", "-f", "python -m adsm serve"],
+        check=False,
+        capture_output=True,
+    )
+    sock = paths.socket_path()
+    if sock.exists():
+        try:
+            sock.unlink()
+        except OSError:
+            pass
+    pid = paths.pid_path()
+    if pid.exists():
+        try:
+            pid.unlink()
+        except OSError:
+            pass
+
+
+async def _stop() -> int:
+    """Ask the daemon to exit; fall back to pkill if the socket is stale."""
+    sock = paths.socket_path()
+    if sock.exists():
+        try:
+            reader, writer = await asyncio.open_unix_connection(
+                path=str(sock),
+                limit=protocol.STREAM_LIMIT,
+            )
+            try:
+                writer.write(
+                    protocol.encode(
+                        {"id": 1, "method": "daemon.shutdown", "params": {}}
+                    )
+                )
+                await writer.drain()
+                try:
+                    await asyncio.wait_for(reader.readline(), timeout=3.0)
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:  # noqa: BLE001
+                    pass
+            for _ in range(20):
+                if not await _ping_ok():
+                    print("ADSM stopped")
+                    return 0
+                await asyncio.sleep(0.1)
+        except Exception:  # noqa: BLE001
+            pass
+
+    await asyncio.to_thread(_force_kill)
+    if await _ping_ok():
+        print("ADSM still running after stop", file=sys.stderr)
+        return 1
+    print("ADSM stopped")
     return 0
 
 

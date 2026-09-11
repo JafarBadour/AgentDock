@@ -101,8 +101,8 @@ class HostsScreen extends ConsumerWidget {
                       subtitle: Text(
                         host.id == kLocalThisComputerHostId
                             ? '${host.endpointLabel}\n'
-                                'Enable Remote Login (Sharing) first, then use '
-                                'terminal / agents on this Mac'
+                                'Terminal, browse, and agents run locally '
+                                '(no Remote Login needed)'
                             : '${host.endpointLabel}${via ?? ''}\n'
                                 'Terminal opens an SSH shell',
                       ),

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
@@ -16,6 +17,7 @@ import '../data/secure/secure_store.dart';
 import 'agent_session.dart';
 import 'adsm_version.dart';
 import 'cursor_acp_service.dart';
+import 'local_host_bootstrap.dart';
 import 'ssh_service.dart';
 
 export 'adsm_version.dart';
@@ -119,20 +121,60 @@ class _AdsmBridgeEntry {
 
 /// NDJSON control client for the host ADSM daemon (`agentdock-adsm client`).
 class AdsmClient {
-  AdsmClient._(this._sshClient, this._session);
+  AdsmClient._ssh(this._sshClient, this._session) : _process = null;
+
+  AdsmClient._local(this._process)
+      : _sshClient = null,
+        _session = null;
 
   /// Dedicated SSH connection — not pooled, so periodic pool health checks
   /// cannot tear down a long-lived ADSM bridge mid-turn.
-  final SSHClient _sshClient;
-  final SSHSession _session;
+  final SSHClient? _sshClient;
+  final SSHSession? _session;
+
+  /// Local `agentdock-adsm client` process for This Mac/PC (no SSH).
+  final Process? _process;
+
   final _pending = <Object, Completer<Map<String, dynamic>>>{};
   final _events = StreamController<Map<String, dynamic>>.broadcast();
   final _buffer = StringBuffer();
-  StreamSubscription<Uint8List>? _sub;
+  StreamSubscription<List<int>>? _sub;
   bool _open = true;
   bool _drainingStdout = false;
   int _nextId = 1;
   final Completer<void> _done = Completer<void>();
+
+  StreamSubscription? _stderrSub;
+
+  void _writeStdin(List<int> data) {
+    final process = _process;
+    if (process != null) {
+      process.stdin.add(data);
+      return;
+    }
+    _session!.stdin.add(Uint8List.fromList(data));
+  }
+
+  Future<void> _closeStdin() async {
+    final process = _process;
+    if (process != null) {
+      await process.stdin.close();
+      return;
+    }
+    await _session!.stdin.close();
+  }
+
+  Stream<List<int>> get _stdout {
+    final process = _process;
+    if (process != null) return process.stdout;
+    return _session!.stdout;
+  }
+
+  Stream<List<int>> get _stderr {
+    final process = _process;
+    if (process != null) return process.stderr;
+    return _session!.stderr;
+  }
 
   Stream<Map<String, dynamic>> get events => _events.stream;
 
@@ -141,10 +183,7 @@ class AdsmClient {
   /// Completes when the ADSM channel / SSH session ends.
   Future<void> get done => _done.future;
 
-  static Future<AdsmClient> connect(SshService ssh, Host host) async {
-    final client = await ssh.connectExclusive(host);
-    final session = await client.execute(
-      r'''
+  static const _clientLaunch = r'''
 export PATH="$HOME/.local/bin:$PATH"
 if command -v agentdock-adsm >/dev/null 2>&1; then
   exec agentdock-adsm client
@@ -154,18 +193,52 @@ else
   echo "agentdock-adsm not found" >&2
   exit 127
 fi
-''',
-    );
-    final adsm = AdsmClient._(client, session);
+''';
+
+  static Future<AdsmClient> connect(SshService ssh, Host host) async {
+    if (isDesktopLocalHostPlatform && isLocalThisComputerHost(host)) {
+      return _connectLocal();
+    }
+    final client = await ssh.connectExclusive(host);
+    final session = await client.execute(_clientLaunch);
+    final adsm = AdsmClient._ssh(client, session);
     adsm._listen();
     // Warm ping — also learns protocol version for wire chunking.
-    final pong = await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    final pong =
+        await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    adsm.protocolVersion = pong['version']?.toString();
+    return adsm;
+  }
+
+  static Future<AdsmClient> _connectLocal() async {
+    final home = Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        '';
+    final path = [
+      if (home.isNotEmpty) '$home/.local/bin',
+      if (Platform.isMacOS) '/opt/homebrew/bin',
+      '/usr/local/bin',
+      Platform.environment['PATH'] ?? '',
+    ].where((s) => s.isNotEmpty).join(Platform.isWindows ? ';' : ':');
+    final process = await Process.start(
+      Platform.isWindows ? 'bash' : '/bin/bash',
+      ['-lc', _clientLaunch],
+      workingDirectory: home.isEmpty ? null : home,
+      environment: {
+        ...Platform.environment,
+        'PATH': path,
+      },
+    );
+    final adsm = AdsmClient._local(process);
+    adsm._listen();
+    final pong =
+        await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
     adsm.protocolVersion = pong['version']?.toString();
     return adsm;
   }
 
   void _listen() {
-    _sub = _session.stdout.listen(
+    _sub = _stdout.listen(
       (data) {
         _buffer.write(utf8.decode(data, allowMalformed: true));
         unawaited(_drainStdout());
@@ -183,7 +256,7 @@ fi
         if (!_done.isCompleted) _done.complete();
       },
     );
-    _session.stderr.listen((data) {
+    _stderrSub = _stderr.listen((data) {
       final text = utf8.decode(data, allowMalformed: true).trim();
       if (text.isNotEmpty) SafeLog.d('ADSM stderr: $text');
     });
@@ -310,7 +383,7 @@ fi
   void _writeRequest(Object id, String payload) {
     final bytes = utf8.encode(payload);
     if (!_supportsWireChunks || bytes.length <= chunkSoftLimit) {
-      _session.stdin.add(utf8.encode('$payload\n'));
+      _writeStdin(utf8.encode('$payload\n'));
       return;
     }
     final b64 = base64Encode(bytes);
@@ -330,7 +403,7 @@ fi
           'data': b64.substring(start, end),
         },
       });
-      _session.stdin.add(utf8.encode('$chunkLine\n'));
+      _writeStdin(utf8.encode('$chunkLine\n'));
     }
   }
 
@@ -346,14 +419,19 @@ fi
     _open = false;
     await _sub?.cancel();
     _sub = null;
+    await _stderrSub?.cancel();
+    _stderrSub = null;
     try {
-      await _session.stdin.close();
+      await _closeStdin();
     } catch (_) {}
     try {
-      _session.close();
+      _session?.close();
     } catch (_) {}
     try {
-      _sshClient.close();
+      _sshClient?.close();
+    } catch (_) {}
+    try {
+      _process?.kill();
     } catch (_) {}
     _failAll(StateError('ADSM closed'));
     // Notify borrowers before closing the broadcast — otherwise sessions keep

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from . import paths, protocol
+from . import process_hygiene
 from . import transcript as transcript_store
 
 EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
@@ -328,6 +329,11 @@ class Worker:
         self._journal_pos = 0
         # Background ACP turn after early `session.prompt` accept reply.
         self._turn_task: Optional[asyncio.Task[None]] = None
+        # Used by the daemon idle reaper (monotonic seconds).
+        self.last_activity = time.monotonic()
+
+    def touch_activity(self) -> None:
+        self.last_activity = time.monotonic()
 
     @property
     def dir(self) -> Path:
@@ -814,6 +820,7 @@ class Worker:
         self._persist_session_id()
         # Fresh ACP sessions have no memory — inject durable chat on next prompt.
         self._needs_history_bootstrap = True
+        self._reap_stale_claude_children()
 
     async def _load_session(
         self, session_id: str, mcp_servers: list[Any]
@@ -839,6 +846,23 @@ class Worker:
             self._persist_session_id()
         finally:
             self._replaying = False
+        self._reap_stale_claude_children()
+
+    def _reap_stale_claude_children(self) -> None:
+        """Drop leaked Claude SDK processes left behind by session/new cycles."""
+        try:
+            killed = process_hygiene.reap_claude_children_for_tmux(
+                paths.tmux_session_name(self.chat_id)
+            )
+            if killed:
+                # Best-effort log into the session journal via stderr of daemon.
+                print(
+                    f"ADSM reap: killed {killed} stale claude child(ren) "
+                    f"for {self.chat_id}",
+                    flush=True,
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _persist_session_id(self) -> None:
         if not self.acp_session_id:
@@ -1175,6 +1199,7 @@ class Worker:
         user_message_id: Optional[str] = None,
         user_created_at: Optional[str] = None,
     ) -> dict[str, Any]:
+        self.touch_activity()
         if not self.acp_session_id:
             try:
                 await self._ensure_acp_session()
@@ -1391,6 +1416,8 @@ class Worker:
             await self._set_status(self.chat_id, protocol.STATUS_RUNNING, None)
 
     async def _emit_event(self, kind: str, **payload: Any) -> None:
+        if kind not in ("text", "thought", "activity"):
+            self.touch_activity()
         await self._emit({"chatId": self.chat_id, "kind": kind, **payload})
 
     async def _handle_acp_line(self, line: str) -> None:

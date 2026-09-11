@@ -209,6 +209,68 @@ class _PooledHost {
   final _ChannelGate gate = _ChannelGate(6);
 }
 
+/// Quick host resource snapshot for the ADSM status sheet.
+class HostSystemMetrics {
+  const HostSystemMetrics({
+    this.cpuPercent,
+    this.memUsedBytes,
+    this.memTotalBytes,
+    this.diskFreeBytes,
+    this.diskTotalBytes,
+    this.error,
+  });
+
+  final double? cpuPercent;
+  final int? memUsedBytes;
+  final int? memTotalBytes;
+  final int? diskFreeBytes;
+  final int? diskTotalBytes;
+  final String? error;
+
+  bool get hasAny =>
+      cpuPercent != null ||
+      memTotalBytes != null ||
+      diskFreeBytes != null;
+
+  String get cpuLabel {
+    final c = cpuPercent;
+    if (c == null) return '—';
+    return '${c.toStringAsFixed(c >= 10 ? 0 : 1)}%';
+  }
+
+  String get memoryLabel {
+    final used = memUsedBytes;
+    final total = memTotalBytes;
+    if (used == null || total == null || total <= 0) return '—';
+    final pct = (100.0 * used / total).clamp(0, 100);
+    return '${_fmtBytes(used)} / ${_fmtBytes(total)} '
+        '(${pct.toStringAsFixed(0)}%)';
+  }
+
+  String get diskFreeLabel {
+    final free = diskFreeBytes;
+    final total = diskTotalBytes;
+    if (free == null) return '—';
+    if (total == null || total <= 0) return _fmtBytes(free);
+    final pct = (100.0 * free / total).clamp(0, 100);
+    return '${_fmtBytes(free)} free of ${_fmtBytes(total)} '
+        '(${pct.toStringAsFixed(0)}%)';
+  }
+
+  static String _fmtBytes(int bytes) {
+    const kb = 1024.0;
+    const mb = kb * 1024;
+    const gb = mb * 1024;
+    const tb = gb * 1024;
+    final b = bytes.toDouble();
+    if (b >= tb) return '${(b / tb).toStringAsFixed(1)} TB';
+    if (b >= gb) return '${(b / gb).toStringAsFixed(1)} GB';
+    if (b >= mb) return '${(b / mb).toStringAsFixed(0)} MB';
+    if (b >= kb) return '${(b / kb).toStringAsFixed(0)} KB';
+    return '$bytes B';
+  }
+}
+
 /// SSH client wrapper. Secrets come from [SecureStore] only for the duration
 /// of a connection attempt — never logged.
 ///
@@ -250,6 +312,159 @@ class SshService {
 
   void clearAdsmReady(String hostId) {
     _adsmVerifiedVersion.remove(hostId);
+  }
+
+  /// Stop the ADSM daemon on [host] (local shell or SSH). Clears ready cache.
+  Future<void> stopAdsm(Host host) async {
+    clearAdsmReady(host.id);
+    await exec(
+      host,
+      r'''
+set +e
+export PATH="$HOME/.local/bin:$PATH"
+if command -v agentdock-adsm >/dev/null 2>&1; then
+  agentdock-adsm stop 2>/dev/null || true
+fi
+pkill -f 'python3 -m adsm serve' 2>/dev/null || true
+pkill -f 'python -m adsm serve' 2>/dev/null || true
+rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
+rm -f "$HOME/.agentdock/adsm.pid" 2>/dev/null || true
+exit 0
+''',
+      timeout: const Duration(seconds: 20),
+    );
+  }
+
+  /// CPU / memory / free disk on [host]. Hard-capped at [timeout] (default 1s).
+  Future<HostSystemMetrics> fetchHostSystemMetrics(
+    Host host, {
+    Duration timeout = const Duration(seconds: 1),
+  }) async {
+    try {
+      final out = await exec(
+        host,
+        _hostMetricsScript,
+        timeout: timeout,
+      );
+      return _parseHostSystemMetrics(out);
+    } on TimeoutException {
+      return const HostSystemMetrics(error: 'Timed out (>1s)');
+    } catch (e) {
+      SafeLog.d('host system metrics failed', e);
+      return HostSystemMetrics(error: '$e');
+    }
+  }
+
+  static const _hostMetricsScript = r'''
+set +e
+python3 - <<'PY'
+import os, re, shutil, subprocess, sys
+
+def emit(k, v):
+    if v is None:
+        return
+    print(f"{k}={v}")
+
+# --- disk (root) ---
+try:
+    u = shutil.disk_usage("/")
+    emit("DISK_FREE", u.free)
+    emit("DISK_TOTAL", u.total)
+except Exception:
+    pass
+
+# --- memory ---
+try:
+    if sys.platform == "darwin":
+        total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+        vm = subprocess.check_output(["vm_stat"], text=True)
+        m = re.search(r"page size of (\d+)", vm)
+        page = int(m.group(1)) if m else 4096
+        def pages(label):
+            mm = re.search(rf"{re.escape(label)}:\s+(\d+)", vm)
+            return int(mm.group(1)) if mm else 0
+        # Approx used: active + wired + compressed (fallback speculative).
+        used_pages = (
+            pages("Pages active")
+            + pages("Pages wired down")
+            + pages("Pages occupied by compressor")
+        )
+        if used_pages <= 0:
+            used_pages = total // page - pages("Pages free") - pages("Pages speculative")
+        used = max(0, min(total, used_pages * page))
+        emit("MEM_USED", used)
+        emit("MEM_TOTAL", total)
+    elif os.path.exists("/proc/meminfo"):
+        info = {}
+        with open("/proc/meminfo", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    info[parts[0][:-1]] = int(parts[1]) * 1024
+        total = info.get("MemTotal")
+        avail = info.get("MemAvailable")
+        if total:
+            emit("MEM_TOTAL", total)
+            if avail is not None:
+                emit("MEM_USED", max(0, total - avail))
+except Exception:
+    pass
+
+# --- cpu (sum of process %cpu / ncpu; fast, no sleep sample) ---
+try:
+    ncpu = os.cpu_count() or 1
+    out = subprocess.check_output(["ps", "-A", "-o", "%cpu="], text=True, stderr=subprocess.DEVNULL)
+    s = 0.0
+    for tok in out.split():
+        try:
+            s += float(tok)
+        except ValueError:
+            pass
+    pct = max(0.0, min(100.0, s / float(ncpu)))
+    emit("CPU_PCT", f"{pct:.1f}")
+except Exception:
+    pass
+PY
+exit 0
+''';
+
+  static HostSystemMetrics _parseHostSystemMetrics(String out) {
+    double? cpu;
+    int? memUsed;
+    int? memTotal;
+    int? diskFree;
+    int? diskTotal;
+    for (final line in out.split('\n')) {
+      final t = line.trim();
+      final i = t.indexOf('=');
+      if (i <= 0) continue;
+      final key = t.substring(0, i);
+      final val = t.substring(i + 1).trim();
+      switch (key) {
+        case 'CPU_PCT':
+          cpu = double.tryParse(val);
+        case 'MEM_USED':
+          memUsed = int.tryParse(val);
+        case 'MEM_TOTAL':
+          memTotal = int.tryParse(val);
+        case 'DISK_FREE':
+          diskFree = int.tryParse(val);
+        case 'DISK_TOTAL':
+          diskTotal = int.tryParse(val);
+      }
+    }
+    if (cpu == null &&
+        memTotal == null &&
+        diskFree == null) {
+      return const HostSystemMetrics(error: 'No metrics returned');
+    }
+    return HostSystemMetrics(
+      cpuPercent: cpu,
+      memUsedBytes: memUsed,
+      memTotalBytes: memTotal,
+      diskFreeBytes: diskFree,
+      diskTotalBytes: diskTotal,
+    );
   }
 
   String? cachedCursorCli(String hostId) => _toolPathCache['cursor:$hostId'];
@@ -569,9 +784,65 @@ class SshService {
     _startHealthTimer();
   }
 
-  Future<String> exec(Host host, String command) async {
+  Future<String> exec(
+    Host host,
+    String command, {
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    if (_preferLocalFs(host)) {
+      return _execLocal(command, timeout: timeout);
+    }
     final client = await connect(host);
-    return _run(client, command, hostId: host.id);
+    return _run(client, command, hostId: host.id, timeout: timeout);
+  }
+
+  /// Run a shell command on This Mac/PC without SSH (same machine as the app).
+  Future<String> _execLocal(
+    String command, {
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    final home = Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'];
+    final pathPrefix = [
+      if (home != null && home.isNotEmpty) '$home/.local/bin',
+      if (Platform.isMacOS) '/opt/homebrew/bin',
+      '/usr/local/bin',
+      Platform.environment['PATH'] ?? '',
+    ].where((s) => s.isNotEmpty).join(':');
+    final env = <String, String>{
+      ...Platform.environment,
+      'PATH': pathPrefix,
+    };
+    late final ProcessResult result;
+    try {
+      result = await Process.run(
+        Platform.isWindows ? 'bash' : '/bin/bash',
+        ['-lc', command],
+        workingDirectory:
+            home != null && home.isNotEmpty ? home : null,
+        environment: env,
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      ).timeout(timeout);
+    } on TimeoutException {
+      throw TimeoutException('Local command timed out after $timeout');
+    } on ProcessException catch (e) {
+      throw StateError(
+        Platform.isWindows
+            ? 'Could not run bash on This PC ($e). Install Git Bash '
+                'or enable OpenSSH Server for agents.'
+            : 'Could not run local shell: $e',
+      );
+    }
+    if (result.exitCode != 0) {
+      final err = (result.stderr as String).trim();
+      throw Exception(
+        err.isEmpty
+            ? 'Command failed (exit ${result.exitCode})'
+            : err,
+      );
+    }
+    return result.stdout as String;
   }
 
   Future<String> _run(
@@ -631,19 +902,17 @@ class SshService {
     void Function(String status)? onProgress,
   }) async {
     onProgress?.call('Checking tmux…');
-    final client = await connect(host).timeout(
-      const Duration(seconds: 25),
-      onTimeout: () => throw TimeoutException(
-        'SSH connect timed out while checking tmux',
-      ),
-    );
-    var tmux = await _resolveTmuxPath(client, host.id);
+    var tmux = await _resolveTmuxPathOnHost(host);
     if (tmux != null) return;
 
-    onProgress?.call('Installing tmux on the remote…');
+    onProgress?.call(
+      _preferLocalFs(host)
+          ? 'Installing tmux…'
+          : 'Installing tmux on the remote…',
+    );
     try {
-      await _run(
-        client,
+      await exec(
+        host,
         r'''
 set -e
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
@@ -685,21 +954,20 @@ else
 fi
 command -v tmux
 ''',
-        hostId: host.id,
         timeout: const Duration(minutes: 5),
       );
     } catch (e) {
       SafeLog.d('tmux auto-install failed', e);
     }
 
-    tmux = await _resolveTmuxPath(client, host.id);
+    tmux = await _resolveTmuxPathOnHost(host);
     if (tmux == null) {
       throw MissingToolException('tmux', kRemoteTmuxSetupGuide.trim());
     }
   }
 
   /// Locate tmux via PATH, known paths, and HPC environment modules.
-  Future<String?> _resolveTmuxPath(SSHClient client, String hostId) async {
+  Future<String?> _resolveTmuxPathOnHost(Host host) async {
     const script = r'''
 set +e
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
@@ -720,10 +988,9 @@ fi
 exit 1
 ''';
     try {
-      final out = await _run(
-        client,
+      final out = await exec(
+        host,
         'bash -lc ${shellQuote(script)}',
-        hostId: hostId,
         timeout: const Duration(seconds: 25),
       );
       final path = out.trim().split('\n').last.trim();
@@ -736,8 +1003,7 @@ exit 1
   /// True when tmux exists, without throwing.
   Future<bool> hasTmux(Host host) async {
     try {
-      final client = await connect(host);
-      return await _resolveTmuxPath(client, host.id) != null;
+      return await _resolveTmuxPathOnHost(host) != null;
     } catch (_) {
       return false;
     }
@@ -755,31 +1021,28 @@ exit 1
     }
 
     onProgress?.call('Looking for Cursor CLI…');
-    final client = await connect(host).timeout(
-      const Duration(seconds: 30),
-      onTimeout: () => throw TimeoutException(
-        'SSH connect timed out while looking for Cursor CLI',
-      ),
-    );
-    var path = await _resolveCursorCliPath(client, host.id);
+    var path = await _resolveCursorCliPathOnHost(host);
     if (path != null) {
       _cacheToolPath('cursor:${host.id}', path);
       onProgress?.call('Cursor CLI ready');
       return path;
     }
 
-    onProgress?.call('Installing Cursor CLI on the remote (this can take a few minutes)…');
-    final installed = await _runAgentDockInstallScript(
-      client,
-      hostId: host.id,
+    onProgress?.call(
+      _preferLocalFs(host)
+          ? 'Installing Cursor CLI (this can take a few minutes)…'
+          : 'Installing Cursor CLI on the remote (this can take a few minutes)…',
+    );
+    final installed = await _runAgentDockInstallScriptOnHost(
+      host,
       scriptName: 'cursor-acp.sh',
       onProgress: onProgress,
     );
     if (!installed) {
       onProgress?.call('Trying Cursor official installer…');
       try {
-        await _run(
-          client,
+        await exec(
+          host,
           r'''
 set -e
 export PATH="$HOME/.local/bin:$HOME/.cursor/bin:$PATH"
@@ -790,7 +1053,6 @@ if command -v agent >/dev/null 2>&1 && ! command -v cursor-agent >/dev/null 2>&1
 fi
 command -v cursor-agent >/dev/null || command -v agent >/dev/null
 ''',
-          hostId: host.id,
           timeout: const Duration(minutes: 5),
         );
       } catch (e) {
@@ -798,7 +1060,7 @@ command -v cursor-agent >/dev/null || command -v agent >/dev/null
       }
     }
 
-    path = await _resolveCursorCliPath(client, host.id);
+    path = await _resolveCursorCliPathOnHost(host);
     if (path == null) {
       throw MissingToolException(
         'Cursor Agent CLI / SDK',
@@ -945,6 +1207,32 @@ test -x "$HOME/.local/bin/claude-code-acp"
     );
   }
 
+  Future<void> _tryClaudeInlineInstallOnHost(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    if (_preferLocalFs(host)) {
+      onProgress?.call('Installing Claude ACP adapter (npm)…');
+      await exec(
+        host,
+        _claudeInlineInstall,
+        timeout: const Duration(minutes: 12),
+      );
+      return;
+    }
+    final client = await connect(host).timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => throw TimeoutException(
+        'SSH connect timed out while installing Claude ACP',
+      ),
+    );
+    await _tryClaudeInlineInstall(
+      client,
+      hostId: host.id,
+      onProgress: onProgress,
+    );
+  }
+
   /// Resolves the Claude ACP adapter, installing Claude Code + adapter if needed.
   Future<String> ensureClaudeAcpBinary(
     Host host, {
@@ -957,13 +1245,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
     }
 
     onProgress?.call('Looking for Claude ACP…');
-    final client = await connect(host).timeout(
-      const Duration(seconds: 30),
-      onTimeout: () => throw TimeoutException(
-        'SSH connect timed out while looking for Claude ACP',
-      ),
-    );
-    var path = await _resolveClaudeAcpPath(client, host.id);
+    var path = await _resolveClaudeAcpPathOnHost(host);
     if (path != null) {
       _cacheToolPath('claude:${host.id}', path);
       onProgress?.call('Claude ACP ready');
@@ -976,12 +1258,8 @@ test -x "$HOME/.local/bin/claude-code-acp"
 
     // Fast path: npm/nvm only (tmux + ADSM are handled separately).
     try {
-      await _tryClaudeInlineInstall(
-        client,
-        hostId: host.id,
-        onProgress: onProgress,
-      );
-      path = await _resolveClaudeAcpPath(client, host.id);
+      await _tryClaudeInlineInstallOnHost(host, onProgress: onProgress);
+      path = await _resolveClaudeAcpPathOnHost(host);
       if (path != null) {
         _cacheToolPath('claude:${host.id}', path);
         onProgress?.call('Claude ACP ready');
@@ -992,9 +1270,8 @@ test -x "$HOME/.local/bin/claude-code-acp"
       onProgress?.call('Inline install failed — trying full setup script…');
     }
 
-    final installed = await _runAgentDockInstallScript(
-      client,
-      hostId: host.id,
+    final installed = await _runAgentDockInstallScriptOnHost(
+      host,
       scriptName: 'claude-acp.sh',
       onProgress: onProgress,
       timeout: const Duration(minutes: 15),
@@ -1002,17 +1279,13 @@ test -x "$HOME/.local/bin/claude-code-acp"
     if (!installed) {
       onProgress?.call('Retrying npm install…');
       try {
-        await _tryClaudeInlineInstall(
-          client,
-          hostId: host.id,
-          onProgress: onProgress,
-        );
+        await _tryClaudeInlineInstallOnHost(host, onProgress: onProgress);
       } catch (e) {
         SafeLog.d('claude ACP inline install retry failed', e);
       }
     }
 
-    path = await _resolveClaudeAcpPath(client, host.id);
+    path = await _resolveClaudeAcpPathOnHost(host);
     if (path == null) {
       throw MissingToolException(
         'Claude Code ACP adapter',
@@ -1065,13 +1338,31 @@ test -x "$HOME/.local/bin/claude-code-acp"
     void Function(String status)? onProgress,
     required bool allowUpgrade,
   }) async {
-    var client = await connect(host);
+    final local = _preferLocalFs(host);
+    SSHClient? client;
+    if (!local) {
+      client = await connect(host);
+    }
     var lastProbe = '';
 
     Future<SSHClient> refreshClient() async {
+      if (local) {
+        throw StateError('Local This Mac/PC has no SSH client to refresh');
+      }
       invalidate(host.id);
       client = await connect(host);
-      return client;
+      return client!;
+    }
+
+    Future<String> runCmd(
+      String command, {
+      Duration timeout = const Duration(seconds: 35),
+    }) async {
+      if (local) {
+        return _execLocal(command, timeout: timeout);
+      }
+      if (client!.isClosed) await refreshClient();
+      return _run(client!, command, hostId: host.id, timeout: timeout);
     }
 
     bool transportDead(Object e) {
@@ -1084,9 +1375,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
 
     Future<({bool ok, bool hasBin, String? version, String raw})> probe() async {
       try {
-        if (client.isClosed) await refreshClient();
-        final out = await _run(
-          client,
+        final out = await runCmd(
           r'''
 set +e
 export PATH="$HOME/.local/bin:$PATH"
@@ -1173,7 +1462,6 @@ fi
 "$BIN" status 2>/dev/null | head -1 || true
 exit 0
 ''',
-          hostId: host.id,
           timeout: const Duration(seconds: 35),
         );
         lastProbe = out.trim();
@@ -1211,15 +1499,17 @@ exit 0
 
     Future<void> installOrUpgrade({required String reason}) async {
       onProgress?.call(reason);
-      if (client.isClosed || transportDead(lastProbe)) {
+      if (!local && (client!.isClosed || transportDead(lastProbe))) {
         await refreshClient();
       }
       // Ship this app's ADSM first — GitHub main can lag a local version bump.
-      final push = await _pushBundledAdsm(
-        client,
-        hostId: host.id,
-        onProgress: onProgress,
-      );
+      final push = local
+          ? await _pushBundledAdsmLocal(onProgress: onProgress)
+          : await _pushBundledAdsm(
+              client!,
+              hostId: host.id,
+              onProgress: onProgress,
+            );
       if (push == _BundledAdsmPush.ok) return;
 
       if (push == _BundledAdsmPush.failed) {
@@ -1234,17 +1524,15 @@ exit 0
       }
 
       // Assets missing from this build — last resort.
-      final installed = await _runAgentDockInstallScript(
-        client,
-        hostId: host.id,
+      final installed = await _runAgentDockInstallScriptOnHost(
+        host,
         scriptName: 'install-adsm.sh',
         onProgress: onProgress,
       );
       if (!installed) {
         onProgress?.call('Starting ADSM…');
         try {
-          await _run(
-            client,
+          await runCmd(
             r'''
 set +e
 export PATH="$HOME/.local/bin:$PATH"
@@ -1252,7 +1540,6 @@ command -v agentdock-adsm >/dev/null || exit 1
 agentdock-adsm ensure-running
 exit 0
 ''',
-            hostId: host.id,
             timeout: const Duration(seconds: 45),
           );
         } catch (e) {
@@ -1410,6 +1697,7 @@ exit 0
     'cli.py',
     'scheduler.py',
     'transcript.py',
+    'process_hygiene.py',
   ];
 
   Future<Map<String, Uint8List>> _loadBundledAdsmPayloads() async {
@@ -1440,6 +1728,49 @@ sleep 0.3
 rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
 agentdock-adsm ensure-running
 ''';
+
+  /// Install bundled ADSM onto This Mac/PC via local filesystem (no SSH).
+  Future<_BundledAdsmPush> _pushBundledAdsmLocal({
+    void Function(String status)? onProgress,
+  }) async {
+    onProgress?.call('Installing ADSM v$kRequiredAdsmVersion…');
+    late final Map<String, Uint8List> payloads;
+    try {
+      payloads = await _loadBundledAdsmPayloads();
+    } catch (e) {
+      SafeLog.d('Bundled ADSM assets missing from this build', e);
+      onProgress?.call('App ADSM assets missing — trying GitHub…');
+      return _BundledAdsmPush.noAssets;
+    }
+
+    try {
+      final home = Platform.environment['HOME'] ??
+          Platform.environment['USERPROFILE'];
+      if (home == null || home.isEmpty) {
+        throw StateError('HOME is not set');
+      }
+      final share = Directory('$home/.local/share/agentdock/host/adsm');
+      final binDir = Directory('$home/.local/bin');
+      await share.create(recursive: true);
+      await binDir.create(recursive: true);
+      for (final entry in payloads.entries) {
+        await File('${share.path}/${entry.key}').writeAsBytes(entry.value);
+      }
+      final wrapper = File('${binDir.path}/agentdock-adsm');
+      await wrapper.writeAsString(_adsmWrapper);
+      await Process.run('chmod', ['+x', wrapper.path]);
+      await _execLocal(
+        _adsmRestartScript,
+        timeout: const Duration(seconds: 45),
+      );
+      onProgress?.call('ADSM v$kRequiredAdsmVersion installed');
+      return _BundledAdsmPush.ok;
+    } catch (e) {
+      SafeLog.d('Bundled ADSM local install failed', e);
+      onProgress?.call('Bundled ADSM install failed');
+      return _BundledAdsmPush.failed;
+    }
+  }
 
   /// Upload bundled ADSM. Prefer stdin/base64 (reliable over ProxyJump);
   /// SFTP is a fallback. GitHub is only used when assets are missing.
@@ -1623,6 +1954,53 @@ agentdock-adsm ensure-running
   /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.
   ///
   /// Returns false when the download/run failed so callers can try a fallback.
+  Future<bool> _runAgentDockInstallScriptOnHost(
+    Host host, {
+    required String scriptName,
+    void Function(String status)? onProgress,
+    Duration timeout = const Duration(minutes: 10),
+  }) async {
+    if (_preferLocalFs(host)) {
+      final url = '$kAgentDockScriptsBase/$scriptName';
+      onProgress?.call('Running $scriptName…');
+      try {
+        await exec(
+          host,
+          '''
+set -e
+export AGENTDOCK_SKIP_TMUX=1
+export AGENTDOCK_SKIP_ADSM=1
+export PATH="\$HOME/.local/bin:\$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"
+[ -s "\$HOME/.nvm/nvm.sh" ] && . "\$HOME/.nvm/nvm.sh"
+curl -fsSL ${shellQuote(url)} | bash
+''',
+          timeout: timeout,
+        );
+        return true;
+      } catch (e) {
+        SafeLog.d('Agent Dock install script $scriptName failed (local)', e);
+        onProgress?.call('Install script failed — trying fallback…');
+        return false;
+      }
+    }
+    final client = await connect(host).timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => throw TimeoutException(
+        'SSH connect timed out while running $scriptName',
+      ),
+    );
+    return _runAgentDockInstallScript(
+      client,
+      hostId: host.id,
+      scriptName: scriptName,
+      onProgress: onProgress,
+      timeout: timeout,
+    );
+  }
+
+  /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.
+  ///
+  /// Returns false when the download/run failed so callers can try a fallback.
   Future<bool> _runAgentDockInstallScript(
     SSHClient client, {
     required String hostId,
@@ -1655,7 +2033,7 @@ curl -fsSL ${shellQuote(url)} | bash
     }
   }
 
-  Future<String?> _resolveClaudeAcpPath(SSHClient client, String hostId) async {
+  Future<String?> _resolveClaudeAcpPathOnHost(Host host) async {
     // Fast path: known install locations only — never source nvm (that hangs
     // on some hosts and left the UI stuck on "Checking Claude…").
     const script = r'''
@@ -1679,10 +2057,9 @@ command -v claude-agent-acp 2>/dev/null && exit 0
 exit 1
 ''';
     try {
-      final out = await _run(
-        client,
+      final out = await exec(
+        host,
         'sh -c ${shellQuote(script)}',
-        hostId: hostId,
         timeout: const Duration(seconds: 12),
       );
       final path = out.trim().split('\n').last.trim();
@@ -1703,7 +2080,7 @@ exit 1
     }
   }
 
-  Future<String?> _resolveCursorCliPath(SSHClient client, String hostId) async {
+  Future<String?> _resolveCursorCliPathOnHost(Host host) async {
     // Shell only — SFTP probes through ProxyJump often hang with no timeout
     // and left the UI stuck on "Checking Cursor CLI…".
     const script =
@@ -1716,10 +2093,9 @@ exit 1
         r'command -v agent 2>/dev/null && exit 0; '
         r'exit 1';
     try {
-      final out = await _run(
-        client,
+      final out = await exec(
+        host,
         'sh -c ${shellQuote(script)}',
-        hostId: hostId,
         timeout: const Duration(seconds: 15),
       );
       final path = out.trim().split('\n').last.trim();
@@ -1742,8 +2118,20 @@ exit 1
   }
 
   Future<bool> remotePathExists(Host host, String path) async {
+    final normalized = normalizeRemotePath(path.replaceAll(r'\', '/'));
+    if (_preferLocalFs(host)) {
+      try {
+        return await Directory(normalized).exists();
+      } catch (e) {
+        SafeLog.d('localPathExists failed', e);
+        return false;
+      }
+    }
     try {
-      final out = await exec(host, 'test -d ${shellQuote(path)} && echo OK || true');
+      final out = await exec(
+        host,
+        'test -d ${shellQuote(normalized)} && echo OK || true',
+      );
       return out.trim() == 'OK';
     } catch (e) {
       SafeLog.d('remotePathExists failed', e);

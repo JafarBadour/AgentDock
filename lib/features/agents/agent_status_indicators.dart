@@ -2,10 +2,13 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../app/app_theme.dart';
+import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
+import '../../data/secure/safe_log.dart';
 import '../../features/connect/claude_login_sheet.dart';
 import '../../services/adsm_client.dart';
 import '../../services/ssh_service.dart';
@@ -471,7 +474,7 @@ class AutoNumberBadge extends StatelessWidget {
 }
 
 /// Bottom sheet: ADSM version + daemon health for the current host.
-class AdsmHealthSheet extends StatefulWidget {
+class AdsmHealthSheet extends ConsumerStatefulWidget {
   const AdsmHealthSheet({
     super.key,
     required this.session,
@@ -479,6 +482,7 @@ class AdsmHealthSheet extends StatefulWidget {
     this.provider,
     this.onReconnect,
     this.onReauthed,
+    this.onStopped,
   });
 
   final AdsmSession session;
@@ -487,6 +491,9 @@ class AdsmHealthSheet extends StatefulWidget {
   final VoidCallback? onReconnect;
   final VoidCallback? onReauthed;
 
+  /// Called after ADSM was stopped and the sheet closes.
+  final VoidCallback? onStopped;
+
   static Future<void> show(
     BuildContext context, {
     required AdsmSession session,
@@ -494,6 +501,7 @@ class AdsmHealthSheet extends StatefulWidget {
     AgentProvider? provider,
     VoidCallback? onReconnect,
     VoidCallback? onReauthed,
+    VoidCallback? onStopped,
   }) {
     return showModalBottomSheet<void>(
       context: context,
@@ -505,18 +513,21 @@ class AdsmHealthSheet extends StatefulWidget {
         provider: provider,
         onReconnect: onReconnect,
         onReauthed: onReauthed,
+        onStopped: onStopped,
       ),
     );
   }
 
   @override
-  State<AdsmHealthSheet> createState() => _AdsmHealthSheetState();
+  ConsumerState<AdsmHealthSheet> createState() => _AdsmHealthSheetState();
 }
 
-class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
+class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
   AdsmHostHealth? _health;
+  HostSystemMetrics? _metrics;
   bool _loading = true;
   bool _reauthing = false;
+  bool _stopping = false;
 
   @override
   void initState() {
@@ -526,31 +537,48 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
 
   Future<void> _refresh() async {
     setState(() => _loading = true);
+    final ssh = ref.read(sshServiceProvider);
+    final host = widget.session.host;
+
+    final healthFuture = widget.session.fetchHostHealth(
+      bridgeOpen: widget.bridgeOpen,
+    );
+    final metricsFuture = ssh.fetchHostSystemMetrics(
+      host,
+      timeout: const Duration(seconds: 1),
+    );
+
+    AdsmHostHealth? health;
+    Object? healthError;
     try {
-      final h = await widget.session.fetchHostHealth(
-        bridgeOpen: widget.bridgeOpen,
-      );
-      if (mounted) {
-        setState(() {
-          _health = h;
-          _loading = false;
-        });
-      }
+      health = await healthFuture;
     } catch (e) {
-      if (mounted) {
-        setState(() {
-          _health = AdsmHostHealth(
-            hostLabel: widget.session.host.displayLabel,
-            bridgeOpen: widget.bridgeOpen,
-            pingVersion: widget.session.protocolVersion,
-            requiredVersion: kRequiredAdsmVersion,
-            agentStatus: widget.session.daemonStatus,
-            fetchError: '$e',
-          );
-          _loading = false;
-        });
-      }
+      healthError = e;
     }
+    HostSystemMetrics? metrics;
+    try {
+      metrics = await metricsFuture;
+    } catch (e) {
+      metrics = HostSystemMetrics(error: '$e');
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _metrics = metrics;
+      if (health != null) {
+        _health = health;
+      } else {
+        _health = AdsmHostHealth(
+          hostLabel: host.displayLabel,
+          bridgeOpen: widget.bridgeOpen,
+          pingVersion: widget.session.protocolVersion,
+          requiredVersion: kRequiredAdsmVersion,
+          agentStatus: widget.session.daemonStatus,
+          fetchError: '$healthError',
+        );
+      }
+      _loading = false;
+    });
   }
 
   bool get _authErrorVisible {
@@ -606,12 +634,76 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
     }
   }
 
+  Future<void> _stopAdsm() async {
+    if (_stopping) return;
+    final host = widget.session.host;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Turn off ADSM?'),
+        content: Text(
+          'Stops the ADSM daemon on ${host.displayLabel}. '
+          'Open chats disconnect until you reconnect '
+          '(ADSM starts again automatically then).',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            child: const Text('Turn off'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    setState(() => _stopping = true);
+    try {
+      final ssh = ref.read(sshServiceProvider);
+      final pool = ref.read(adsmBridgePoolProvider);
+      await ssh.stopAdsm(host);
+      try {
+        await pool.drop(host.id);
+      } catch (e) {
+        SafeLog.d('ADSM bridge drop after stop failed', e);
+      }
+      try {
+        await widget.session.close();
+      } catch (e) {
+        SafeLog.d('ADSM session close after stop failed', e);
+      }
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      Navigator.pop(context);
+      widget.onStopped?.call();
+      messenger.showSnackBar(
+        SnackBar(content: Text('ADSM stopped on ${host.displayLabel}')),
+      );
+    } catch (e) {
+      SafeLog.d('stop ADSM failed', e);
+      if (mounted) {
+        setState(() => _stopping = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not stop ADSM: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final h = _health;
     final healthy = h?.healthy ?? false;
     final provider = widget.provider;
+    final busy = _loading || _reauthing || _stopping;
 
     return SafeArea(
       child: Padding(
@@ -644,7 +736,7 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
                   tooltip: provider == AgentProvider.cursor
                       ? 'Re-authenticate Cursor'
                       : 'Re-authenticate Claude',
-                  onPressed: (_loading || _reauthing) ? null : _reauth,
+                  onPressed: busy ? null : _reauth,
                   icon: _reauthing
                       ? SizedBox(
                           width: 20,
@@ -663,7 +755,7 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
                 ),
                 IconButton(
                   tooltip: 'Refresh',
-                  onPressed: _loading ? null : _refresh,
+                  onPressed: busy ? null : _refresh,
                   icon: _loading
                       ? SizedBox(
                           width: 20,
@@ -735,10 +827,34 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
                   ),
                 ),
             ],
+            if (_metrics != null) ...[
+              const SizedBox(height: 4),
+              _HealthRow(
+                label: 'CPU',
+                value: _metrics!.cpuPercent != null
+                    ? _metrics!.cpuLabel
+                    : (_metrics!.error ?? '—'),
+                ok: _metrics!.cpuPercent != null,
+              ),
+              _HealthRow(
+                label: 'Memory',
+                value: _metrics!.memTotalBytes != null
+                    ? _metrics!.memoryLabel
+                    : (_metrics!.error ?? '—'),
+                ok: _metrics!.memTotalBytes != null,
+              ),
+              _HealthRow(
+                label: 'Disk free',
+                value: _metrics!.diskFreeBytes != null
+                    ? _metrics!.diskFreeLabel
+                    : (_metrics!.error ?? '—'),
+                ok: _metrics!.diskFreeBytes != null,
+              ),
+            ],
             if (_authErrorVisible) ...[
               const SizedBox(height: 12),
               FilledButton.tonalIcon(
-                onPressed: _reauthing ? null : _reauth,
+                onPressed: busy ? null : _reauth,
                 icon: const Icon(Icons.lock_reset_outlined),
                 label: Text(
                   provider == AgentProvider.cursor
@@ -750,14 +866,41 @@ class _AdsmHealthSheetState extends State<AdsmHealthSheet> {
             if (!widget.bridgeOpen && widget.onReconnect != null) ...[
               const SizedBox(height: 12),
               FilledButton.icon(
-                onPressed: () {
-                  Navigator.pop(context);
-                  widget.onReconnect!();
-                },
+                onPressed: busy
+                    ? null
+                    : () {
+                        Navigator.pop(context);
+                        widget.onReconnect!();
+                      },
                 icon: const Icon(Icons.link),
                 label: const Text('Reconnect'),
               ),
             ],
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: busy ? null : _stopAdsm,
+              icon: _stopping
+                  ? SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: theme.colorScheme.error,
+                      ),
+                    )
+                  : Icon(
+                      Icons.power_settings_new,
+                      color: theme.colorScheme.error,
+                    ),
+              label: Text(
+                _stopping ? 'Turning off…' : 'Turn off ADSM',
+                style: TextStyle(color: theme.colorScheme.error),
+              ),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: theme.colorScheme.error,
+                side: BorderSide(color: theme.colorScheme.error),
+              ),
+            ),
           ],
         ),
       ),

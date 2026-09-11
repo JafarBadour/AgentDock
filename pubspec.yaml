@@ -67,3 +67,4 @@ flutter:
     - host/adsm/cli.py
     - host/adsm/scheduler.py
     - host/adsm/transcript.py
+    - host/adsm/process_hygiene.py

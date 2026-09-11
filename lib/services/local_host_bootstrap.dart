@@ -135,23 +135,21 @@ Future<bool> isLocalSshPortOpen(Host host) async {
 
 /// Human guidance when local SSH is refused / unreachable.
 ///
-/// Agents still need SSH to This Mac/PC. The in-app terminal does not — it
-/// uses a local PTY (same approach as VS Code).
+/// Agents on This Mac/PC now use a local shell + ADSM process (like the
+/// Terminal button). SSH / Remote Login is only needed for true remote hosts.
 String localThisComputerSshHint() {
   if (Platform.isMacOS) {
-    return 'Remote Login is off on this Mac, so agents cannot reach '
-        '127.0.0.1:22.\n\n'
-        'Enable it: System Settings → General → Sharing → Remote Login '
-        '(allow your user).\n\n'
-        'The Terminal button still works without Remote Login '
-        '(local shell, like VS Code).';
+    return 'Could not reach 127.0.0.1:22 (Remote Login appears off).\n\n'
+        'Agents and Terminal on This Mac usually do not need Remote Login '
+        'anymore — reopen Agent Dock and try again.\n\n'
+        'If you still need SSH for something else: System Settings → General → '
+        'Sharing → Remote Login (allow your user).';
   }
   if (Platform.isWindows) {
-    return 'OpenSSH Server is not accepting connections on 127.0.0.1:22, '
-        'so agents cannot run on This PC.\n\n'
-        'Install/start OpenSSH Server in Optional Features, then reconnect.\n\n'
-        'The Terminal button still works without OpenSSH '
-        '(local shell, like VS Code).';
+    return 'Could not reach 127.0.0.1:22 (OpenSSH Server appears off).\n\n'
+        'Agents and Terminal on This PC usually do not need OpenSSH '
+        'anymore — reopen Agent Dock and try again.\n\n'
+        'If you still need SSH: install/start OpenSSH Server in Optional Features.';
   }
   return 'Local SSH on 127.0.0.1:22 refused the connection.';
 }
