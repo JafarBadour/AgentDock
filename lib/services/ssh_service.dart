@@ -127,7 +127,10 @@ bool isTransientBridgeErrorText(String text) {
       t.contains('connection closed') ||
       t.contains('transport is closed') ||
       t.contains('broken pipe') ||
-      t.contains('connection reset');
+      t.contains('connection reset') ||
+      // Host idle-reaper closed the worker FIFO; ADSM revive / reconnect fixes it.
+      t.contains('fifo not attached') ||
+      t.contains('agent fifo recycled');
 }
 
 /// Claude/Cursor OAuth or API key rejected — user must re-authenticate.

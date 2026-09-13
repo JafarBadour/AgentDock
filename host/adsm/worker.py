@@ -335,6 +335,70 @@ class Worker:
     def touch_activity(self) -> None:
         self.last_activity = time.monotonic()
 
+    def _hydrate_launch_fields(self) -> None:
+        """Fill cwd/binary/provider from the on-disk agent record when missing."""
+        if self.cwd and self.binary:
+            return
+        rec = paths.agent_record_path(self.chat_id)
+        if not rec.exists():
+            return
+        try:
+            data = json.loads(rec.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(data, dict):
+            return
+        if not self.cwd:
+            self.cwd = str(data.get("cwd") or "")
+        if not self.binary:
+            self.binary = str(data.get("binary") or "")
+        if not self.provider or self.provider == "cursor":
+            prov = data.get("provider")
+            if prov:
+                self.provider = str(prov)
+        if not self.acp_session_id:
+            sid = data.get("acp_session_id") or data.get("acpSessionId")
+            if sid:
+                self.acp_session_id = str(sid)
+        if not self.model_id:
+            mid = data.get("model_id") or data.get("modelId")
+            if mid:
+                self.model_id = str(mid)
+
+    async def _revive_transport(self) -> None:
+        """Re-attach / restart tmux after idle-stop or daemon adopt left FIFO cold.
+
+        Idle maintenance calls [stop] (kills tmux, closes FIFO) but keeps the
+        ACP session id on disk. The phone still looks "live" and sends
+        `session.prompt`, which used to fail with "FIFO not attached".
+        """
+        alive = await asyncio.to_thread(self._tmux_alive)
+        if self._fifo_fd is not None and alive:
+            return
+        if self._fifo_fd is not None and not alive:
+            await self._detach_fifo()
+
+        self._hydrate_launch_fields()
+        if not self.cwd or not self.binary:
+            raise RuntimeError(
+                "FIFO not attached — reopen this chat to reconnect the agent"
+            )
+
+        # Full ensure restarts tmux if needed, attaches the FIFO, and reloads
+        # the ACP session. Safe to call from prompt/cancel before any write.
+        await self.ensure(
+            cwd=self.cwd,
+            binary=self.binary,
+            provider=self.provider or "cursor",
+            api_key=None,
+            full_access=self.full_access,
+            resume_session_id=self.acp_session_id,
+            mcp_servers=[],
+            mode=self.mode,
+            model_id=self.model_id,
+            permission_ask=self._permission_policy_ask,
+        )
+
     @property
     def dir(self) -> Path:
         return paths.session_dir(self.chat_id)
@@ -1188,6 +1252,11 @@ class Worker:
         """Mint a session when cancel/crash left us without a usable id."""
         if self.acp_session_id:
             return
+        alive = await asyncio.to_thread(self._tmux_alive)
+        if self._fifo_fd is None or not alive:
+            await self._revive_transport()
+            if self.acp_session_id:
+                return
         await self._initialize()
         await self._open_session(mcp_servers=[], resume_session_id=None)
 
@@ -1200,6 +1269,10 @@ class Worker:
         user_created_at: Optional[str] = None,
     ) -> dict[str, Any]:
         self.touch_activity()
+        try:
+            await self._revive_transport()
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"FIFO not attached: {e}") from e
         if not self.acp_session_id:
             try:
                 await self._ensure_acp_session()
@@ -1704,6 +1777,13 @@ class Worker:
 
             shutil.rmtree(self.dir, ignore_errors=True)
         await self._set_status(self.chat_id, protocol.STATUS_DEAD, None)
+        # Phone must learn the host stopped the worker (idle reaper) — otherwise
+        # it keeps "live" chrome and the next prompt hits a cold FIFO.
+        await self._emit_event("status", status=protocol.STATUS_DEAD)
+        await self._emit_event(
+            "activity",
+            label="Agent paused on host — will resume on next message",
+        )
 
 
 def _extract_text(update: dict[str, Any]) -> Optional[str]:

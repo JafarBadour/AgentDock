@@ -1825,6 +1825,17 @@ class ChatSessionRuntime extends ChangeNotifier {
           _notifyUi(immediate: true);
           break;
         }
+        if (isTransientBridgeErrorText(msg)) {
+          // e.g. "FIFO not attached" after host idle-stop — quiet reconnect.
+          lastError = null;
+          deliveryError = 'Host agent paused — reconnecting…';
+          if (!closed && sessionFactory != null && !_suspended) {
+            closed = true;
+            _scheduleReconnect(immediate: true);
+          }
+          _notifyUi(immediate: true);
+          break;
+        }
         lastError = msg;
         _notifyUi(immediate: true);
       case AcpUpdateKind.closed:
