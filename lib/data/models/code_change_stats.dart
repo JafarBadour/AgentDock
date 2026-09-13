@@ -238,8 +238,21 @@ class CodeChangeStats {
     final files = <String>{};
     for (final blob in blobs) {
       files.addAll(_pathsFromDiffHeaders(blob));
+      // Only count +/- inside @@ hunks. Scanning whole JSON/tool blobs for
+      // leading +/- inflated churn (and beat the real edit via "richest signal").
+      var inHunk = false;
       for (final line in blob.split('\n')) {
-        if (line.startsWith('+++') || line.startsWith('---')) continue;
+        if (line.startsWith('@@')) {
+          inHunk = true;
+          continue;
+        }
+        if (line.startsWith('diff ') ||
+            line.startsWith('---') ||
+            line.startsWith('+++')) {
+          inHunk = false;
+          continue;
+        }
+        if (!inHunk) continue;
         if (line.startsWith('+')) {
           added++;
         } else if (line.startsWith('-')) {
@@ -280,10 +293,12 @@ class CodeChangeStats {
             'content',
           ]);
           if (oldText != null || newText != null) {
-            // Replace-style edit: count both sides as the hunk size.
+            // ACP often ships full-file oldText/newText for a tiny edit.
+            // Diff the lines — do not treat |old| / |new| as removed / added.
             if (oldText != null && newText != null) {
-              removed += _lineCount(oldText);
-              added += _lineCount(newText);
+              final d = _diffLineCounts(oldText, newText);
+              removed += d.removed;
+              added += d.added;
             } else if (newText != null) {
               added += _lineCount(newText);
             } else if (oldText != null) {
@@ -324,8 +339,9 @@ class CodeChangeStats {
       final oldText = map['oldText']?.toString() ?? map['old_text']?.toString();
       final newText = map['newText']?.toString() ?? map['new_text']?.toString();
       if (oldText != null && newText != null) {
-        removed += _lineCount(oldText);
-        added += _lineCount(newText);
+        final d = _diffLineCounts(oldText, newText);
+        removed += d.removed;
+        added += d.added;
         return;
       }
       final diffText = map['diff']?.toString() ?? map['text']?.toString();
@@ -367,14 +383,92 @@ class CodeChangeStats {
 
   static int _lineCount(String text) {
     if (text.isEmpty) return 0;
-    var n = 0;
-    for (final _ in text.split('\n')) {
-      n++;
+    return _lines(text).length;
+  }
+
+  /// Split into logical lines; drop the empty segment from a trailing newline.
+  static List<String> _lines(String text) {
+    if (text.isEmpty) return const [];
+    final parts = text.split('\n');
+    if (text.endsWith('\n') && parts.isNotEmpty) {
+      return parts.sublist(0, parts.length - 1);
     }
-    // Trailing newline alone should not invent an extra empty line for ""
-    // after split — Dart split keeps a trailing empty for "a\n".
-    if (text.endsWith('\n') && n > 0) n--;
-    return n == 0 ? 1 : n;
+    return parts;
+  }
+
+  /// Line churn between [oldText] and [newText].
+  ///
+  /// Trims a shared prefix/suffix (typical of ACP full-file before/after), then
+  /// counts the remaining hunks. For large dissimilar middles, falls back to a
+  /// bounded LCS so moved blocks are not double-counted as delete+add of the
+  /// whole file.
+  static ({int added, int removed}) _diffLineCounts(
+    String oldText,
+    String newText,
+  ) {
+    if (oldText == newText) return (added: 0, removed: 0);
+    if (oldText.isEmpty) return (added: _lineCount(newText), removed: 0);
+    if (newText.isEmpty) return (added: 0, removed: _lineCount(oldText));
+
+    final a = _lines(oldText);
+    final b = _lines(newText);
+    if (a.isEmpty && b.isEmpty) return (added: 0, removed: 0);
+    if (a.isEmpty) return (added: b.length, removed: 0);
+    if (b.isEmpty) return (added: 0, removed: a.length);
+
+    var start = 0;
+    final minLen = a.length < b.length ? a.length : b.length;
+    while (start < minLen && a[start] == b[start]) {
+      start++;
+    }
+    var endA = a.length;
+    var endB = b.length;
+    while (endA > start && endB > start && a[endA - 1] == b[endB - 1]) {
+      endA--;
+      endB--;
+    }
+
+    final oldMid = endA - start;
+    final newMid = endB - start;
+    if (oldMid == 0) return (added: newMid, removed: 0);
+    if (newMid == 0) return (added: 0, removed: oldMid);
+
+    // Small hunk: exact LCS. Large rewrite: treat as replace of the mid slice
+    // (already stripped of unchanged head/tail — the ACP full-file case).
+    const lcsCap = 400;
+    if (oldMid > lcsCap || newMid > lcsCap) {
+      return (added: newMid, removed: oldMid);
+    }
+
+    final oldSlice = a.sublist(start, endA);
+    final newSlice = b.sublist(start, endB);
+    final common = _lcsLength(oldSlice, newSlice);
+    return (added: newMid - common, removed: oldMid - common);
+  }
+
+  static int _lcsLength(List<String> a, List<String> b) {
+    final n = a.length;
+    final m = b.length;
+    if (n == 0 || m == 0) return 0;
+    // Two-row DP to keep memory flat.
+    var prev = List<int>.filled(m + 1, 0);
+    var cur = List<int>.filled(m + 1, 0);
+    for (var i = 1; i <= n; i++) {
+      for (var j = 1; j <= m; j++) {
+        if (a[i - 1] == b[j - 1]) {
+          cur[j] = prev[j - 1] + 1;
+        } else {
+          final up = prev[j];
+          final left = cur[j - 1];
+          cur[j] = up > left ? up : left;
+        }
+      }
+      final tmp = prev;
+      prev = cur;
+      cur = tmp;
+      cur.fillRange(0, m + 1, 0);
+    }
+    return prev[m];
   }
 
   static String _shortPath(String path) {

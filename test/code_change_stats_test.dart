@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:agent_dock/data/models/code_change_stats.dart';
 import 'package:agent_dock/data/models/tool_call_state.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -93,8 +95,9 @@ void main() {
 ''',
       );
       final s = CodeChangeStats.fromTool(tool);
-      expect(s.removed, 3);
-      expect(s.added, 5);
+      // Shared prefix a/b/c — only the appended lines count.
+      expect(s.removed, 0);
+      expect(s.added, 2);
       expect(s.files, contains(contains('foo.dart')));
     });
 
@@ -108,9 +111,49 @@ void main() {
 ''',
       );
       final s = CodeChangeStats.fromTool(tool);
-      expect(s.removed, 2);
-      expect(s.added, 3);
+      expect(s.removed, 0);
+      expect(s.added, 1);
       expect(s.fileCount, 1);
+    });
+
+    test('full-file ACP oldText/newText only counts the real hunk', () {
+      final prefix = List.generate(500, (i) => 'keep $i').join('\n');
+      final suffix = List.generate(500, (i) => 'tail $i').join('\n');
+      final oldText = '$prefix\nold line\n$suffix';
+      final newText = '$prefix\nnew line\nextra\n$suffix';
+      final tool = ToolCallState(
+        toolCallId: 'full',
+        title: 'Edit',
+        kind: 'edit',
+        content: jsonEncode([
+          {
+            'type': 'diff',
+            'path': 'lib/huge.dart',
+            'oldText': oldText,
+            'newText': newText,
+          },
+        ]),
+      );
+      final s = CodeChangeStats.fromTool(tool);
+      expect(s.removed, 1);
+      expect(s.added, 2);
+      expect(s.fileCount, 1);
+      // Must not report ~1000+/-1000 for a one-line swap.
+      expect(s.added + s.removed, lessThan(10));
+    });
+
+    test('ignores +/- outside unified-diff hunks in JSON blobs', () {
+      const tool = ToolCallState(
+        toolCallId: 'json-noise',
+        title: 'Edit',
+        kind: 'edit',
+        rawInput: '''
+{"note":"-not a diff","path":"lib/a.dart","old_string":"x","new_string":"y"}
+''',
+      );
+      final s = CodeChangeStats.fromTool(tool);
+      expect(s.removed, 1);
+      expect(s.added, 1);
     });
 
     test('ignores read tools', () {
