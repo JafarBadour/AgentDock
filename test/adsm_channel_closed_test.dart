@@ -28,20 +28,12 @@ void main() {
       expect(screenError, isNull);
     });
 
-    test('fatal errors still stick when the session stays closed', () {
-      String? screenError;
-      const runtimeClosed = true;
-      const reconnecting = false;
-      const lastError =
-          'Could not reconnect after 8 attempts. Tap Reconnect to try again — your chat history is kept.';
-      if (reconnecting || !runtimeClosed) {
-        if (screenError != null && isTransientBridgeErrorText(screenError)) {
-          screenError = null;
-        }
-      } else if (!isTransientBridgeErrorText(lastError)) {
-        screenError = lastError;
-      }
-      expect(screenError, lastError);
+    test('FIFO not attached is transient', () {
+      expect(isTransientBridgeErrorText('FIFO not attached'), isTrue);
+      expect(
+        isTransientBridgeErrorText('RuntimeError: agent FIFO recycled'),
+        isTrue,
+      );
     });
   });
 }

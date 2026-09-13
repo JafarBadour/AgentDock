@@ -837,10 +837,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final String binary;
       if (cachedBinary != null) {
         binary = cachedBinary;
+        // Do not say "ready" here — ADSM attach can still hang, and that
+        // label next to the header spinner made chats look connected while
+        // the composer stayed locked on [_connecting].
         status(
           provider == AgentProvider.claude
-              ? 'Claude ACP ready'
-              : 'Cursor CLI ready',
+              ? 'Claude ACP found…'
+              : 'Cursor CLI found…',
         );
       } else {
         binary = switch (provider) {
@@ -864,6 +867,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         };
       }
 
+      status(adsmReady ? 'Connecting to ADSM…' : 'Starting ADSM…');
       await ssh.ensureAdsm(
         host,
         onProgress: status,
@@ -1652,7 +1656,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   Future<void> _startVoiceHold() async {
     if (_sending ||
-        _connecting ||
         _recordingVoice ||
         _voiceStarting ||
         !_chat!.provider.isAvailable) {
@@ -2104,7 +2107,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     required ThemeData theme,
     required bool streaming,
   }) {
-    final busy = _connecting || _sending || _compressing;
+    // Only block on an in-flight send/compress. [_connecting] used to freeze
+    // the button as a spinner for the whole SSH/ADSM bring-up (often stuck on
+    // a misleading "Claude ACP ready"), so users could type but never send.
+    // [_send] still awaits [_ensureAcp] before delivering.
+    final busy = _sending || _compressing;
     final hasPayload = _composerHasText || _pendingImages.isNotEmpty;
     final isStop = streaming && !hasPayload;
     final isQueue = streaming && hasPayload;
@@ -2176,7 +2183,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Widget _buildInlineMicButton({required ThemeData theme}) {
-    final busy = _connecting || _sending || _compressing;
+    final busy = _sending || _compressing;
 
     if (_voiceLocked && _recordingVoice) {
       return Tooltip(
@@ -3043,8 +3050,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               minWidth: 40,
                               minHeight: 36,
                             ),
-                            onPressed: _connecting ||
-                                    _pickingImages ||
+                            onPressed: _pickingImages ||
                                     !_chat!.provider.isAvailable
                                 ? null
                                 : () => unawaited(_pickImages()),
