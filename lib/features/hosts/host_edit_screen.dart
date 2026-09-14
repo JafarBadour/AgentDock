@@ -237,7 +237,7 @@ class _HostEditScreenState extends ConsumerState<HostEditScreen> {
             },
             decoration: InputDecoration(
               labelText: 'Password (optional)',
-              hintText: passwordHint ?? 'Leave empty to use SSH key from Connect',
+              hintText: passwordHint ?? 'Leave empty to use SSH key from Settings',
               helperText: _hasStoredPassword && !_passwordDirty
                   ? 'Clear the field and save to remove password auth'
                   : 'If set, this host uses password auth (no SSH key needed)',

@@ -340,7 +340,12 @@ class _MessageBodyState extends State<MessageBody> {
     // Streaming: plain selectable text — no GptMarkdown re-parse per token.
     if (widget.live) {
       return SelectionArea(
-        child: Text(widget.text, style: base),
+        child: Text(
+          widget.text,
+          style: base,
+          textAlign: TextAlign.start,
+          textDirection: TextDirection.ltr,
+        ),
       );
     }
 
@@ -373,6 +378,8 @@ class _MessageBodyState extends State<MessageBody> {
     return GptMarkdown(
       widget.text,
       style: base,
+      textAlign: TextAlign.start,
+      textDirection: TextDirection.ltr,
       onLinkTap: (url, _) => openRichLink(url),
       onCodeCopy: (code) {
         Clipboard.setData(ClipboardData(text: code));

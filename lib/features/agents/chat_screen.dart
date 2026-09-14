@@ -743,7 +743,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           title: const Text('Cursor authentication required'),
           content: const Text(
             'The agent reported an auth failure. Save a Cursor API key in '
-            'Connect, or run `agent login` on this host from Hosts → Terminal.',
+            'Settings, or run `agent login` on this host from Hosts → Terminal.',
           ),
           actions: [
             TextButton(
@@ -752,13 +752,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ),
             FilledButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Open Connect'),
+              child: const Text('Open Settings'),
             ),
           ],
         ),
       );
       if (!mounted) return;
-      if (goConnect == true) context.go('/connect');
+      if (goConnect == true) context.go('/settings');
     } finally {
       _authReauthInFlight = false;
     }
@@ -873,9 +873,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         onProgress: status,
         allowUpgrade: !adsmReady,
       ).timeout(
-        const Duration(minutes: 5),
+        adsmReady
+            ? const Duration(seconds: 75)
+            : const Duration(minutes: 3),
         onTimeout: () => throw TimeoutException(
-          'Timed out installing/starting ADSM on the remote.',
+          adsmReady
+              ? 'Timed out connecting to ADSM on ${host.displayLabel}. '
+                  'Check SSH / ProxyJump, then retry.'
+              : 'Timed out installing/starting ADSM on the remote.',
         ),
       );
 
@@ -902,10 +907,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         const Duration(seconds: 90),
         onTimeout: () => throw TimeoutException(
           provider == AgentProvider.claude
-              ? 'Connect timed out. Set ANTHROPIC_API_KEY in Connect or run '
-                  '`claude login` on the remote, then Connect again.'
+              ? 'Connect timed out. Set ANTHROPIC_API_KEY in Settings or run '
+                  '`claude login` on the remote, then try again.'
               : 'Connect timed out. Try `agent login` on the remote from Hosts → terminal, '
-                  'then Connect again.',
+                  'then try again.',
         ),
       );
     };
@@ -924,13 +929,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         setState(() {
           _error =
               'No SSH credentials for this host. Add a password on the host, '
-              'or an SSH key in Connect.';
+              'or an SSH key in Settings.';
           _showSdkInstallGuide = false;
         });
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-              'Add a host password or an SSH key in Connect first.',
+              'Add a host password or an SSH key in Settings first.',
             ),
           ),
         );
@@ -977,7 +982,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if ((apiKey == null || apiKey.isEmpty) && mounted) {
         setState(() {
           _connectStatus =
-              'Preparing Claude… (save ANTHROPIC_API_KEY in Connect, or run '
+              'Preparing Claude… (save ANTHROPIC_API_KEY in Settings, or run '
               '`claude login` on the host)';
         });
       }
@@ -1019,7 +1024,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   _connecting = false;
                   _connectStatus = null;
                   _error =
-                      'Claude sign-in required. Open Connect → Sign in to Claude, '
+                      'Claude sign-in required. Open Settings → Sign in to Claude, '
                       'or save ANTHROPIC_API_KEY.';
                 });
               }
@@ -2727,8 +2732,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       gptThemeData: chatGptMarkdownTheme(theme),
                       child: ListView.builder(
                   controller: _scroll,
-                  // Cursor-like side margins so text isn't edge-to-edge.
-                  padding: const EdgeInsets.fromLTRB(40, 12, 40, 16),
+                  // Desktop: Cursor-like side margins. Phone: tighter inset so
+                  // bubbles aren't pushed inward like a desktop column.
+                  padding: EdgeInsets.fromLTRB(
+                    useDesktopShell(context) ? 40 : 16,
+                    12,
+                    useDesktopShell(context) ? 40 : 16,
+                    16,
+                  ),
                   // Keep scroll physics interactive even while the agent streams.
                   physics: const AlwaysScrollableScrollPhysics(),
                   cacheExtent: 280,
@@ -3304,6 +3315,7 @@ class _Bubble extends StatelessWidget {
 
     final column = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: useDesktopShell(context) ? MainAxisSize.max : MainAxisSize.min,
       children: [
         if (!isUser && streaming)
           Padding(
@@ -3361,7 +3373,15 @@ class _Bubble extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: Row(
-              mainAxisAlignment: MainAxisAlignment.end,
+              // Desktop Cursor-style: meta hugs the trailing edge of a
+              // full-width pill. Phone: keep meta with the text (start) so
+              // it does not look right-justified across the screen.
+              mainAxisAlignment: useDesktopShell(context)
+                  ? MainAxisAlignment.end
+                  : MainAxisAlignment.start,
+              mainAxisSize: useDesktopShell(context)
+                  ? MainAxisSize.max
+                  : MainAxisSize.min,
               children: [
                 if (!queued && bodyText.trim().isNotEmpty) ...[
                   IconButton(
@@ -3411,14 +3431,17 @@ class _Bubble extends StatelessWidget {
     );
 
     if (isUser) {
+      final desktop = useDesktopShell(context);
       return Align(
         alignment: Alignment.centerLeft,
         child: ConstrainedBox(
           constraints: BoxConstraints(
-            maxWidth: MediaQuery.sizeOf(context).width * 0.92,
+            maxWidth: MediaQuery.sizeOf(context).width * (desktop ? 0.92 : 0.88),
           ),
           child: Container(
-            width: double.infinity,
+            // Full-width pill on desktop; shrink-wrap on phone so short
+            // messages don't stretch timestamps to the screen's right edge.
+            width: desktop ? double.infinity : null,
             margin: const EdgeInsets.only(top: 10, bottom: 6),
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
             decoration: BoxDecoration(

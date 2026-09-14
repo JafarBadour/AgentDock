@@ -19,6 +19,7 @@ import '../services/mcp_deploy_service.dart';
 import '../services/schedule_runner.dart';
 import '../services/schedule_sync_service.dart';
 import '../services/ssh_service.dart';
+import '../services/ssh_socks_service.dart';
 
 final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
 
@@ -46,6 +47,16 @@ final sshServiceProvider = Provider<SshService>((ref) {
     ref.watch(appDatabaseProvider),
   );
   unawaited(service.loadPersistedCaches());
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final sshSocksServiceProvider = ChangeNotifierProvider<SshSocksService>((ref) {
+  final service = SshSocksService(
+    ref.watch(sshServiceProvider),
+    notifications: ref.watch(localNotificationServiceProvider),
+    keepAlive: ref.watch(backgroundKeepAliveProvider),
+  );
   ref.onDispose(service.dispose);
   return service;
 });
@@ -496,7 +507,7 @@ enum DesktopRightPanel {
   none,
   automate,
   hosts,
-  connect,
+  vpn,
   settings,
   /// Project file browser for the active chat's repo (opened from chat).
   files,
@@ -515,7 +526,7 @@ class DesktopProjectFilesArgs {
   final String? title;
 }
 
-/// Right-hand panel on macOS / desktop (Automate, Hosts, Connect, Settings, Files).
+/// Right-hand panel on macOS / desktop (Automate, Hosts, VPN, Settings, Files).
 final desktopRightPanelProvider =
     StateProvider<DesktopRightPanel>((ref) => DesktopRightPanel.none);
 

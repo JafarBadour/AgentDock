@@ -7,10 +7,21 @@ import '../../app/providers.dart';
 import '../../data/secure/safe_log.dart';
 import 'claude_login_sheet.dart';
 
+/// SSH / Cursor / Anthropic keys + mic language.
+///
+/// Shown inside Settings (and optionally as a standalone scaffold).
 class ConnectScreen extends ConsumerStatefulWidget {
-  const ConnectScreen({super.key, this.embedded = false});
+  const ConnectScreen({
+    super.key,
+    this.embedded = false,
+    this.nestedInParentScroll = false,
+  });
 
   final bool embedded;
+
+  /// When true, use a non-scrolling shrink-wrapped list for embedding in
+  /// another [ListView] (Settings).
+  final bool nestedInParentScroll;
 
   @override
   ConsumerState<ConnectScreen> createState() => _ConnectScreenState();
@@ -167,8 +178,13 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final nested = widget.nestedInParentScroll;
     final body = ListView(
-      padding: EdgeInsets.all(widget.embedded ? 12 : 16),
+      shrinkWrap: nested,
+      physics: nested ? const NeverScrollableScrollPhysics() : null,
+      padding: EdgeInsets.all(
+        nested ? 0 : (widget.embedded ? 12 : 16),
+      ),
       children: [
           Text(
             'Secrets stay on this device in the platform keystore. '
@@ -261,7 +277,7 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
                   : 'Anthropic API key (optional)',
             ),
             subtitle: const Text(
-              'Optional if you signed in with Claude on the remote (Connect → '
+              'Optional if you signed in with Claude on the remote (Settings → '
               'Sign in to Claude). If set, the key is injected only into that '
               'agent process environment.',
             ),
@@ -310,10 +326,10 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
         ],
       );
 
-    if (widget.embedded) return body;
+    if (widget.embedded || widget.nestedInParentScroll) return body;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Connect')),
+      appBar: AppBar(title: const Text('Keys & credentials')),
       body: body,
     );
   }

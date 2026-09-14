@@ -612,7 +612,7 @@ exit 0
     if (!usePassword) {
       var pem = await _secureStore.readSshPrivateKey();
       // Local this-computer host: fall back to ~/.ssh/id_* so coding on the
-      // same Mac/PC works without pasting a key into Connect first.
+      // same Mac/PC works without pasting a key into Settings first.
       if ((pem == null || pem.trim().isEmpty) && isLocalThisComputerHost(host)) {
         pem = await readDefaultSshPrivateKeyPem();
       }
@@ -620,11 +620,11 @@ exit 0
         throw StateError(
           isLocalThisComputerHost(host)
               ? 'No SSH key for this computer. Enable Remote Login (Mac) or '
-                  'OpenSSH Server (Windows), then add your key in Connect, '
+                  'OpenSSH Server (Windows), then add your key in Settings, '
                   'or set a password on this host. Default ~/.ssh/id_ed25519 '
                   'or id_rsa is also tried automatically.'
-              : 'No SSH private key in Connect, and no password on this host. '
-                  'Add a key in Connect or set a password when editing the host.',
+              : 'No SSH private key in Settings, and no password on this host. '
+                  'Add a key in Settings or set a password when editing the host.',
         );
       }
       final passphrase = await _secureStore.readSshPassphrase();
@@ -1344,7 +1344,18 @@ test -x "$HOME/.local/bin/claude-code-acp"
     final local = _preferLocalFs(host);
     SSHClient? client;
     if (!local) {
-      client = await connect(host);
+      onProgress?.call('Opening SSH for ADSM…');
+      try {
+        client = await connect(host).timeout(
+          const Duration(seconds: 45),
+          onTimeout: () => throw TimeoutException(
+            'Timed out opening SSH to ${host.displayLabel} '
+            '(check network / ProxyJump).',
+          ),
+        );
+      } on TimeoutException {
+        rethrow;
+      }
     }
     var lastProbe = '';
 
@@ -1352,8 +1363,14 @@ test -x "$HOME/.local/bin/claude-code-acp"
       if (local) {
         throw StateError('Local This Mac/PC has no SSH client to refresh');
       }
+      onProgress?.call('Reconnecting SSH for ADSM…');
       invalidate(host.id);
-      client = await connect(host);
+      client = await connect(host).timeout(
+        const Duration(seconds: 45),
+        onTimeout: () => throw TimeoutException(
+          'Timed out reconnecting SSH to ${host.displayLabel}.',
+        ),
+      );
       return client!;
     }
 

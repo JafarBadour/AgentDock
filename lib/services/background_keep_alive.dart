@@ -39,6 +39,7 @@ class BackgroundKeepAlive {
   bool _initialized = false;
   bool _holding = false;
   int _sessionCount = 0;
+  String? _vpnLabel;
 
   /// True when lifecycle pause should leave SSH/ACP bridges alone.
   bool get canSurviveBackground {
@@ -66,9 +67,27 @@ class BackgroundKeepAlive {
     await prefs.setBool(prefKey, enabled);
     if (enabled) {
       await ensureRunning();
-    } else {
+    } else if (_vpnLabel == null) {
       await release();
+    } else {
+      // VPN tunnel still needs the foreground service.
+      await hold(sessionCount: _sessionCount);
     }
+  }
+
+  /// Keep the process alive while a local SSH proxy is listening.
+  Future<bool> setVpnActive(String? endpointLabel) async {
+    _vpnLabel = endpointLabel;
+    if (endpointLabel != null) {
+      // Force hold even if the user turned "Run in background" off — otherwise
+      // Android kills the SOCKS/HTTP listener as soon as they switch to Firefox.
+      return hold(sessionCount: _sessionCount, force: true);
+    }
+    if (!await isEnabled() && _sessionCount <= 0) {
+      await release();
+      return false;
+    }
+    return hold(sessionCount: _sessionCount);
   }
 
   Future<void> init() async {
@@ -104,6 +123,9 @@ class BackgroundKeepAlive {
 
   /// Start on launch when the setting is on (does not wait for an agent).
   Future<bool> ensureRunning() async {
+    if (_vpnLabel != null) {
+      return hold(sessionCount: _sessionCount, force: true);
+    }
     if (!await isEnabled()) return false;
     return hold(sessionCount: _sessionCount);
   }
@@ -111,6 +133,9 @@ class BackgroundKeepAlive {
   /// Refresh the notification for the current agent count; keep running even at 0.
   Future<bool> sync({required int sessionCount}) async {
     _sessionCount = sessionCount;
+    if (_vpnLabel != null) {
+      return hold(sessionCount: sessionCount, force: true);
+    }
     if (!await isEnabled()) {
       await release();
       return false;
@@ -118,7 +143,7 @@ class BackgroundKeepAlive {
     return hold(sessionCount: sessionCount);
   }
 
-  Future<bool> hold({required int sessionCount}) async {
+  Future<bool> hold({required int sessionCount, bool force = false}) async {
     _sessionCount = sessionCount;
     if (kIsWeb) return false;
     if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
@@ -126,6 +151,9 @@ class BackgroundKeepAlive {
       return true;
     }
     if (!isMobile) return false;
+    if (!force && !await isEnabled() && _vpnLabel == null) {
+      return false;
+    }
 
     await init();
     await _requestPermissions();
@@ -163,6 +191,12 @@ class BackgroundKeepAlive {
   }
 
   (String, String) _copyFor(int sessionCount) {
+    if (_vpnLabel != null) {
+      return (
+        'Agent Dock · VPN proxy',
+        _vpnLabel!,
+      );
+    }
     if (sessionCount <= 0) {
       return (
         'Agent Dock is running',

@@ -8,11 +8,11 @@ import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
-import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/mcp_server.dart';
 import '../../data/secure/safe_log.dart';
 import '../agents/agents_screen.dart';
+import '../connect/connect_screen.dart';
 import '../hosts/hosts_screen.dart';
 
 final mcpListProvider = FutureProvider.autoDispose<List<McpServer>>((ref) {
@@ -182,6 +182,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final body = ListView(
         padding: EdgeInsets.fromLTRB(16, 12, 16, widget.embedded ? 16 : 88),
         children: [
+          Text(
+            'Keys & credentials',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          const ConnectScreen(embedded: true, nestedInParentScroll: true),
+          const SizedBox(height: 28),
           if (!kIsWeb &&
               (defaultTargetPlatform == TargetPlatform.android ||
                   defaultTargetPlatform == TargetPlatform.iOS)) ...[
@@ -282,14 +289,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             },
             loading: () => const Center(child: CircularProgressIndicator()),
             error: (e, _) => Text('Error: $e'),
-          ),
-          const SizedBox(height: 24),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.vpn_key_outlined),
-            title: const Text('SSH & Cursor keys'),
-            subtitle: const Text('Managed in the Connect tab'),
-            onTap: () => openAppPanel(context, ref, DesktopRightPanel.connect),
           ),
         ],
       );

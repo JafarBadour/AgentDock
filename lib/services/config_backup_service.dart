@@ -162,5 +162,5 @@ class ConfigImportResult {
 
   String get summary =>
       'Imported $hosts host(s), $repos repo(s), $mcpServers MCP(s), $mcpHostLinks link(s). '
-      'SSH keys are not included — add them in Connect.';
+      'SSH keys are not included — add them in Settings.';
 }

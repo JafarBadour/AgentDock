@@ -45,9 +45,9 @@ class ShellScaffold extends StatelessWidget {
                 label: 'Hosts',
               ),
               NavigationDestination(
-                icon: Icon(Icons.vpn_key_outlined),
-                selectedIcon: Icon(Icons.vpn_key),
-                label: 'Connect',
+                icon: Icon(Icons.vpn_lock_outlined),
+                selectedIcon: Icon(Icons.vpn_lock),
+                label: 'VPN',
               ),
               NavigationDestination(
                 icon: Icon(Icons.settings_outlined),

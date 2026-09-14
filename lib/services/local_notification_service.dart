@@ -46,6 +46,14 @@ class LocalNotificationService {
             importance: Importance.defaultImportance,
           ),
         );
+        await androidPlugin?.createNotificationChannel(
+          const AndroidNotificationChannel(
+            'vpn_proxy',
+            'VPN proxy',
+            description: 'When the SSH SOCKS/HTTP proxy drops or restores',
+            importance: Importance.high,
+          ),
+        );
       }
       if (Platform.isIOS) {
         await _plugin
@@ -110,6 +118,40 @@ class LocalNotificationService {
       );
     } catch (e) {
       SafeLog.d('show notification failed', e);
+    }
+  }
+
+  /// VPN / SOCKS / HTTP proxy status (drop, restore).
+  Future<void> notifyVpnStatus({
+    required String title,
+    required String body,
+  }) async {
+    await init();
+    if (!_ready) return;
+    final text = body.trim();
+    if (text.isEmpty) return;
+    final clipped = text.length > 180 ? '${text.substring(0, 180)}…' : text;
+    try {
+      await _plugin.show(
+        id: 2602,
+        title: title,
+        body: clipped,
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'vpn_proxy',
+            'VPN proxy',
+            channelDescription:
+                'When the SSH SOCKS/HTTP proxy drops or restores',
+            importance: Importance.high,
+            priority: Priority.high,
+          ),
+          iOS: DarwinNotificationDetails(),
+          macOS: DarwinNotificationDetails(),
+        ),
+        payload: 'vpn',
+      );
+    } catch (e) {
+      SafeLog.d('VPN notification failed', e);
     }
   }
 }

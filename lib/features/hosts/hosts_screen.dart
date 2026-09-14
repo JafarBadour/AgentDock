@@ -52,7 +52,7 @@ class HostsScreen extends ConsumerWidget {
                         children: [
                           Expanded(
                             child: Text(
-                              'Add an SSH private key in Connect before testing hosts.',
+                              'Add an SSH private key in Settings before testing hosts.',
                               style: Theme.of(context).textTheme.bodySmall,
                             ),
                           ),
@@ -60,9 +60,9 @@ class HostsScreen extends ConsumerWidget {
                             onPressed: () => openAppPanel(
                               context,
                               ref,
-                              DesktopRightPanel.connect,
+                              DesktopRightPanel.settings,
                             ),
-                            child: const Text('Connect'),
+                            child: const Text('Settings'),
                           ),
                         ],
                       ),

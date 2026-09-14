@@ -244,7 +244,7 @@ class _ClaudeLoginSheetState extends ConsumerState<ClaudeLoginSheet> {
       };
 }
 
-/// Host picker + launch for Connect tab.
+/// Host picker + launch for Settings → Claude sign-in.
 class ClaudeHostLoginPanel extends ConsumerStatefulWidget {
   const ClaudeHostLoginPanel({super.key});
 

@@ -7,7 +7,8 @@ void main() {
     test('panel roots open the right rail panel only', () {
       expect(isDesktopPanelRoot('/hosts'), isTrue);
       expect(isDesktopPanelRoot('/automate'), isTrue);
-      expect(isDesktopPanelRoot('/connect'), isTrue);
+      expect(isDesktopPanelRoot('/vpn'), isTrue);
+      expect(isDesktopPanelRoot('/connect'), isFalse);
       expect(isDesktopPanelRoot('/settings'), isTrue);
       expect(isDesktopPanelRoot('/hosts/new'), isFalse);
       expect(isDesktopDetailRoute('/hosts'), isFalse);
@@ -35,6 +36,8 @@ void main() {
     test('panel-for-path still maps sections', () {
       expect(desktopPanelForPath('/hosts/new'), DesktopRightPanel.hosts);
       expect(desktopPanelForPath('/automate/edit/1'), DesktopRightPanel.automate);
+      expect(desktopPanelForPath('/vpn'), DesktopRightPanel.vpn);
+      expect(desktopPanelForPath('/connect'), DesktopRightPanel.settings);
       expect(desktopPanelForPath('/agents/chat/1'), isNull);
     });
   });

@@ -6,12 +6,12 @@ import '../features/agents/agents_screen.dart';
 import '../features/agents/chat_screen.dart';
 import '../features/automations/automations_screen.dart';
 import '../features/automations/schedule_edit_screen.dart';
-import '../features/connect/connect_screen.dart';
 import '../features/hosts/host_edit_screen.dart';
 import '../features/hosts/hosts_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
+import '../features/vpn/vpn_screen.dart';
 import 'desktop_shell_scaffold.dart';
 import 'platform_layout.dart';
 import 'shell_scaffold.dart';
@@ -105,8 +105,8 @@ final goRouterProvider = Provider<GoRouter>((ref) {
           StatefulShellBranch(
             routes: [
               GoRoute(
-                path: '/connect',
-                builder: (context, state) => const ConnectScreen(),
+                path: '/vpn',
+                builder: (context, state) => const VpnScreen(),
               ),
             ],
           ),
@@ -130,6 +130,11 @@ final goRouterProvider = Provider<GoRouter>((ref) {
             ],
           ),
         ],
+      ),
+      // Legacy: Connect tab became Settings (keys) + VPN (SOCKS).
+      GoRoute(
+        path: '/connect',
+        redirect: (context, state) => '/settings',
       ),
       // Legacy deep link from older builds.
       GoRoute(

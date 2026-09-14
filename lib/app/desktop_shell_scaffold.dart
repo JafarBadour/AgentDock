@@ -9,10 +9,10 @@ import '../features/agents/chat_screen.dart';
 import '../features/agents/new_agent_flow.dart';
 import '../features/agents/project_files_screen.dart';
 import '../features/automations/automations_screen.dart';
-import '../features/connect/connect_screen.dart';
 import '../features/hosts/hosts_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
+import '../features/vpn/vpn_screen.dart';
 import 'app_theme.dart';
 import 'platform_layout.dart';
 import 'providers.dart';
@@ -397,10 +397,10 @@ class _DesktopNavRail extends StatelessWidget {
               onTap: () => onSelectPanel(DesktopRightPanel.hosts),
             ),
             _RailIcon(
-              tooltip: 'Connect',
-              icon: Icons.vpn_key_outlined,
-              selected: activePanel == DesktopRightPanel.connect,
-              onTap: () => onSelectPanel(DesktopRightPanel.connect),
+              tooltip: 'VPN',
+              icon: Icons.vpn_lock_outlined,
+              selected: activePanel == DesktopRightPanel.vpn,
+              onTap: () => onSelectPanel(DesktopRightPanel.vpn),
             ),
             _RailIcon(
               tooltip: 'Settings',
@@ -501,7 +501,7 @@ class _DesktopRightPanel extends ConsumerWidget {
     final title = switch (panel) {
       DesktopRightPanel.automate => 'Automate',
       DesktopRightPanel.hosts => 'Hosts',
-      DesktopRightPanel.connect => 'Connect',
+      DesktopRightPanel.vpn => 'VPN',
       DesktopRightPanel.settings => 'Settings',
       DesktopRightPanel.files => filesArgs?.title ?? 'Project files',
       DesktopRightPanel.none => '',
@@ -511,7 +511,7 @@ class _DesktopRightPanel extends ConsumerWidget {
       DesktopRightPanel.automate =>
         const AutomationsScreen(embedded: true),
       DesktopRightPanel.hosts => const HostsScreen(embedded: true),
-      DesktopRightPanel.connect => const ConnectScreen(embedded: true),
+      DesktopRightPanel.vpn => const VpnScreen(embedded: true),
       DesktopRightPanel.settings => const SettingsScreen(embedded: true),
       DesktopRightPanel.files => filesArgs == null
           ? const Center(child: Text('No project selected'))

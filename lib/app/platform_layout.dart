@@ -20,8 +20,9 @@ bool useDesktopShell([BuildContext? context]) {
 DesktopRightPanel? desktopPanelForPath(String path) {
   if (path.startsWith('/automate')) return DesktopRightPanel.automate;
   if (path.startsWith('/hosts')) return DesktopRightPanel.hosts;
-  if (path.startsWith('/connect')) return DesktopRightPanel.connect;
+  if (path.startsWith('/vpn')) return DesktopRightPanel.vpn;
   if (path.startsWith('/settings')) return DesktopRightPanel.settings;
+  if (path.startsWith('/connect')) return DesktopRightPanel.settings;
   return null;
 }
 
@@ -29,7 +30,7 @@ DesktopRightPanel? desktopPanelForPath(String path) {
 bool isDesktopPanelRoot(String path) {
   return path == '/automate' ||
       path == '/hosts' ||
-      path == '/connect' ||
+      path == '/vpn' ||
       path == '/settings';
 }
 
@@ -41,7 +42,7 @@ bool isDesktopDetailRoute(String path) {
   return path.startsWith('/hosts') ||
       path.startsWith('/automate') ||
       path.startsWith('/settings') ||
-      path.startsWith('/connect');
+      path.startsWith('/vpn');
 }
 
 /// Host id for `/hosts/terminal/:hostId`, if [path] is a terminal session.
@@ -79,8 +80,8 @@ void openAppPanel(
       context.go('/automate');
     case DesktopRightPanel.hosts:
       context.go('/hosts');
-    case DesktopRightPanel.connect:
-      context.go('/connect');
+    case DesktopRightPanel.vpn:
+      context.go('/vpn');
     case DesktopRightPanel.settings:
       context.go('/settings');
     case DesktopRightPanel.files:

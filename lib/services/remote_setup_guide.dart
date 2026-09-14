@@ -11,7 +11,7 @@ curl -fsSL $kAgentDockScriptsBase/cursor-acp.sh | bash
 
 # Then authenticate:
 agent login
-# or save CURSOR_API_KEY in the Agent Dock Connect tab
+# or save CURSOR_API_KEY in Agent Dock Settings
 
 # Smoke:
 cursor-agent --version || agent --version
@@ -25,7 +25,7 @@ curl -fsSL $kAgentDockScriptsBase/claude-acp.sh | bash
 
 # Then authenticate (pick one):
 claude login
-# or save ANTHROPIC_API_KEY in the Agent Dock Connect tab
+# or save ANTHROPIC_API_KEY in Agent Dock Settings
 
 # Smoke:
 claude --version

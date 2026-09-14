@@ -154,9 +154,9 @@ cat <<'EOF'
 
 Next — pick ONE auth method:
   A) On this host:   claude login
-  B) In Agent Dock:  Connect tab → save Anthropic API key
+  B) In Agent Dock:  Settings → save Anthropic API key
 
-Then in Agent Dock create a Claude agent and tap Connect.
+Then in Agent Dock create a Claude agent and connect.
 
 Smoke:
   claude --version

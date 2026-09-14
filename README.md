@@ -52,7 +52,7 @@ Details: [`scripts/README.md`](scripts/README.md).
 ## Remote prerequisites
 
 SSH access; host can reach GitHub raw URLs for install scripts. Auth: `agent login`
-or `claude login` (or API keys in Connect).
+or `claude login` (or API keys in Settings).
 
 ## Run (Android)
 

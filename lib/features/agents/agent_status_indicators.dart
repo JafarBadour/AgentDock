@@ -612,7 +612,7 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
         title: const Text('Re-authenticate Cursor'),
         content: const Text(
           'Cursor ACP uses `agent login` on the host (or a Cursor API key in '
-          'Connect).\n\nOpen Connect to save a key, or run `agent login` from '
+          'Settings).\n\nOpen Settings to save a key, or run `agent login` from '
           'Hosts → Terminal on this machine.',
         ),
         actions: [
@@ -622,7 +622,7 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Open Connect'),
+            child: const Text('Open Settings'),
           ),
         ],
       ),
@@ -630,7 +630,7 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
     if (!mounted) return;
     if (goConnect == true) {
       Navigator.pop(context);
-      context.go('/connect');
+      context.go('/settings');
     }
   }
 

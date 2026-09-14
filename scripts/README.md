@@ -17,7 +17,7 @@ Then: `agent login` (or set `CURSOR_API_KEY` in the app).
 curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/claude-acp.sh | bash
 ```
 
-Then: `claude login` **or** save an Anthropic API key in Agent Dock → Connect.
+Then: `claude login` **or** save an Anthropic API key in Agent Dock → Settings.
 
 Both scripts are idempotent and install `tmux` when missing, then install/start **ADSM**.
 

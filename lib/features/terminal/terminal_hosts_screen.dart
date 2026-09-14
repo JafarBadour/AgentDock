@@ -22,11 +22,11 @@ class TerminalHostsScreen extends ConsumerWidget {
             data: (ok) => ok
                 ? const SizedBox.shrink()
                 : MaterialBanner(
-                    content: const Text('Add an SSH private key in Connect first.'),
+                    content: const Text('Add an SSH private key in Settings first.'),
                     actions: [
                       TextButton(
-                        onPressed: () => context.go('/connect'),
-                        child: const Text('Connect'),
+                        onPressed: () => context.go('/settings'),
+                        child: const Text('Settings'),
                       ),
                     ],
                   ),

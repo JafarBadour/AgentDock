@@ -105,8 +105,8 @@ cat <<'EOF'
 
 Next:
   1. Log in on this host:  agent login
-     (or set CURSOR_API_KEY in the Agent Dock Connect tab)
+     (or set CURSOR_API_KEY in Agent Dock Settings)
   2. Smoke test:           cursor-agent --version && agentdock-adsm status
-  3. In Agent Dock: create a Cursor agent and Connect
+  3. In Agent Dock: create a Cursor agent and connect
 
 EOF
