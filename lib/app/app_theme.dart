@@ -17,6 +17,11 @@ abstract final class AppColors {
   static const agentSelected = Color(0xFF2A2440);
   static const agentSelectedBorder = Color(0xFF4A3F6B);
 
+  /// Live ACP bridge on this device (warmer tint).
+  static const agentLive = Color(0xFF1E2A24);
+  /// No live bridge — cooler / dimmer so offline agents read as idle.
+  static const agentIdle = Color(0xFF18181B);
+
   /// Diff / churn colors (Cursor green / red).
   static const diffAdd = Color(0xFF3FB950);
   static const diffRemove = Color(0xFFF85149);

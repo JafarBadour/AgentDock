@@ -805,12 +805,22 @@ class _NestedAgentRow extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final working = runtime?.isWorking ?? false;
+    final live = runtime != null && !runtime!.closed && !runtime!.reconnecting;
+    final reconnecting = runtime?.reconnecting ?? false;
+    final Color rowColor;
+    if (selected) {
+      rowColor = AppColors.agentSelected;
+    } else if (live || working) {
+      rowColor = AppColors.agentLive.withValues(alpha: 0.92);
+    } else if (reconnecting) {
+      rowColor = AppColors.agentLive.withValues(alpha: 0.45);
+    } else {
+      rowColor = AppColors.agentIdle.withValues(alpha: 0.85);
+    }
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
       child: Material(
-        color: selected
-            ? AppColors.agentSelected
-            : scheme.surface.withValues(alpha: 0.55),
+        color: rowColor,
         borderRadius: BorderRadius.circular(10),
         child: InkWell(
           borderRadius: BorderRadius.circular(10),
@@ -831,9 +841,9 @@ class _NestedAgentRow extends StatelessWidget {
                             ? Icons.auto_awesome
                             : Icons.psychology_alt_outlined,
                         size: 15,
-                        color: selected
+                        color: selected || live
                             ? AppColors.accent
-                            : scheme.onSurfaceVariant,
+                            : scheme.onSurfaceVariant.withValues(alpha: 0.55),
                       ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -847,6 +857,9 @@ class _NestedAgentRow extends StatelessWidget {
                         style: theme.textTheme.bodyMedium?.copyWith(
                           fontWeight:
                               selected ? FontWeight.w600 : FontWeight.w500,
+                          color: live || selected
+                              ? null
+                              : scheme.onSurface.withValues(alpha: 0.72),
                         ),
                       ),
                       if (tag != null) ...[
@@ -1059,13 +1072,23 @@ class _PhoneChatCard extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final working = runtime?.isWorking ?? false;
+    final live = runtime != null && !runtime!.closed && !runtime!.reconnecting;
+    final reconnecting = runtime?.reconnecting ?? false;
+    final Color rowColor;
+    if (selected) {
+      rowColor = AppColors.agentSelected;
+    } else if (live || working) {
+      rowColor = AppColors.agentLive.withValues(alpha: 0.95);
+    } else if (reconnecting) {
+      rowColor = AppColors.agentLive.withValues(alpha: 0.45);
+    } else {
+      rowColor = AppColors.agentIdle.withValues(alpha: 0.9);
+    }
 
     return Padding(
       padding: EdgeInsets.only(bottom: compact ? 6 : 8),
       child: Material(
-        color: selected
-            ? AppColors.agentSelected
-            : scheme.surfaceContainerHigh.withValues(alpha: 0.72),
+        color: rowColor,
         borderRadius: BorderRadius.circular(compact ? 12 : 14),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
@@ -1098,9 +1121,9 @@ class _PhoneChatCard extends StatelessWidget {
                                 ? Icons.auto_awesome
                                 : Icons.psychology_alt_outlined,
                             size: 18,
-                            color: selected
+                            color: selected || live
                                 ? AppColors.accent
-                                : scheme.onSurfaceVariant,
+                                : scheme.onSurfaceVariant.withValues(alpha: 0.55),
                           ),
                     const SizedBox(width: 10),
                     Expanded(
@@ -1111,6 +1134,9 @@ class _PhoneChatCard extends StatelessWidget {
                         style: theme.textTheme.titleSmall?.copyWith(
                           fontWeight:
                               selected ? FontWeight.w700 : FontWeight.w600,
+                          color: live || selected
+                              ? null
+                              : scheme.onSurface.withValues(alpha: 0.72),
                         ),
                       ),
                     ),

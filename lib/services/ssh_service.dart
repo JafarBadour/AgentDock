@@ -1349,8 +1349,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
         client = await connect(host).timeout(
           const Duration(seconds: 45),
           onTimeout: () => throw TimeoutException(
-            'Timed out opening SSH to ${host.displayLabel} '
-            '(check network / ProxyJump).',
+            'Timed out opening SSH to ${host.displayLabel}',
           ),
         );
       } on TimeoutException {
@@ -1368,7 +1367,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
       client = await connect(host).timeout(
         const Duration(seconds: 45),
         onTimeout: () => throw TimeoutException(
-          'Timed out reconnecting SSH to ${host.displayLabel}.',
+          'Timed out reconnecting SSH to ${host.displayLabel}',
         ),
       );
       return client!;
@@ -1391,6 +1390,68 @@ test -x "$HOME/.local/bin/claude-code-acp"
           t.contains('connection reset') ||
           t.contains('broken pipe') ||
           t.contains('socket has been shut down');
+    }
+
+    Future<({bool ok, bool hasBin, String? version, String raw})> quickPing() async {
+      try {
+        final out = await runCmd(
+          r'''
+set +e
+python3 - <<'PY' 2>/dev/null
+import json, os, socket, sys
+p = os.path.expanduser("~/.agentdock/adsm.sock")
+if not os.path.exists(p):
+    print("ADSM_PROBE=missing_sock")
+    sys.exit(0)
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3)
+try:
+    s.connect(p)
+    s.sendall(b'{"id":1,"method":"ping","params":{}}\n')
+    data = s.recv(8192).decode("utf-8", "replace")
+    print(data.strip())
+    ver = ""
+    try:
+        msg = json.loads(data.strip().splitlines()[0])
+        ver = str((msg.get("result") or {}).get("version") or "")
+    except Exception:
+        pass
+    if ver:
+        print(f"ADSM_VERSION={ver}")
+    if '"ok"' in data or "version" in data:
+        print("ADSM_PROBE=ok")
+        sys.exit(0)
+except Exception as e:
+    print(f"ADSM_SOCK_ERR={e}")
+finally:
+    try:
+        s.close()
+    except Exception:
+        pass
+sys.exit(0)
+PY
+''',
+          timeout: const Duration(seconds: 15),
+        );
+        lastProbe = out.trim();
+        String? version;
+        for (final line in out.split('\n')) {
+          final t = line.trim();
+          if (t.startsWith('ADSM_VERSION=')) {
+            version = t.substring('ADSM_VERSION='.length).trim();
+            if (version.isEmpty) version = null;
+          }
+        }
+        return (
+          ok: out.contains('ADSM_PROBE=ok'),
+          hasBin: true,
+          version: version,
+          raw: lastProbe,
+        );
+      } catch (e) {
+        SafeLog.d('ADSM quick ping failed', e);
+        return (ok: false, hasBin: true, version: null, raw: '$e');
+      }
     }
 
     Future<({bool ok, bool hasBin, String? version, String raw})> probe() async {
@@ -1587,6 +1648,23 @@ exit 0
     }
 
     onProgress?.call('Checking ADSM…');
+    // Soft reconnect / already-ready: prefer a cheap unix-socket ping so a
+    // hung `ensure-running` (common behind ProxyJump) does not burn the
+    // whole connect budget. Full probe is the fallback.
+    if (!allowUpgrade || isAdsmReady(host.id)) {
+      final quick = await quickPing();
+      if (quick.ok) {
+        if (adsmVersionMeets(quick.version, kRequiredAdsmVersion)) {
+          _markAdsmReady(host.id, quick.version!);
+        }
+        onProgress?.call(
+          quick.version != null
+              ? 'ADSM ready (v${quick.version})'
+              : 'ADSM ready',
+        );
+        return;
+      }
+    }
     var state = await probe();
 
     // Healthy + new enough → done.

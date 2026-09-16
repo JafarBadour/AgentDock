@@ -84,6 +84,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   ChatSessionRuntime? _runtime;
   VoidCallback? _runtimeListener;
   Future<void>? _ensureAcpInFlight;
+  int _connectEpoch = 0;
   Timer? _markReadTimer;
   Timer? _runtimeUiCoalesce;
   bool _runtimeUiDirty = false;
@@ -702,11 +703,217 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     return 'Could not switch model: $compact';
   }
 
+  /// One-line connect failure for the compact banner (full text on tap).
+  static String _compactConnectError(Object error, {required bool isClaude}) {
+    var msg = error.toString().trim();
+    const prefixes = [
+      'TimeoutException: ',
+      'Exception: ',
+      'StateError: ',
+    ];
+    for (final p in prefixes) {
+      if (msg.startsWith(p)) msg = msg.substring(p.length).trim();
+    }
+    // Unwrap "Could not start … ACP: …" if we re-enter.
+    final acp = RegExp(
+      r'^Could not start (?:Claude|Cursor)(?: ACP)?:\s*',
+      caseSensitive: false,
+    ).firstMatch(msg);
+    if (acp != null) msg = msg.substring(acp.end).trim();
+    for (final p in prefixes) {
+      if (msg.startsWith(p)) msg = msg.substring(p.length).trim();
+    }
+
+    final lower = msg.toLowerCase();
+    if (lower.contains('can\'t reach') ||
+        lower.contains('timed out reaching') ||
+        lower.contains('timed out opening ssh') ||
+        lower.contains('socketexception') ||
+        lower.contains('connection refused') ||
+        lower.contains('network is unreachable') ||
+        lower.contains('no route to host')) {
+      return 'Can\'t reach host — check VPN/network';
+    }
+    if (lower.contains('timed out connecting to adsm')) {
+      final host = RegExp(
+        r'on ([^\s.]+)',
+        caseSensitive: false,
+      ).firstMatch(msg)?.group(1);
+      return host != null ? 'ADSM timed out on $host' : 'ADSM connect timed out';
+    }
+    if (lower.contains('timed out installing/starting adsm')) {
+      return 'ADSM install timed out';
+    }
+    if (lower.contains('timed out opening ssh')) {
+      return 'SSH timed out';
+    }
+    if (lower.contains('connect timed out')) {
+      return isClaude ? 'Claude connect timed out' : 'Cursor connect timed out';
+    }
+    if (msg.length > 72) return '${msg.substring(0, 69)}…';
+    return msg;
+  }
+
+  Future<void> _showFullConnectError(String full) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Connection error'),
+        content: SingleChildScrollView(
+          child: SelectableText(full),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _ensureAcp() {
     _ensureAcpInFlight ??= _ensureAcpBody().whenComplete(() {
       _ensureAcpInFlight = null;
     });
     return _ensureAcpInFlight!;
+  }
+
+  void _cancelConnect() {
+    _connectEpoch++;
+    if (!mounted) return;
+    setState(() {
+      _connecting = false;
+      _connectStatus = null;
+    });
+  }
+
+  bool _connectStillCurrent(int epoch) =>
+      mounted && epoch == _connectEpoch;
+
+  Future<void> _showConnectionControls({
+    required bool connecting,
+    required bool connected,
+  }) async {
+    final host = _host;
+    final chat = _chat;
+    if (host == null || chat == null || !mounted) return;
+
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final status = _connectStatus;
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                title: Text(
+                  connecting
+                      ? (status ?? 'Connecting…')
+                      : connected
+                          ? 'Agent connected'
+                          : 'Agent disconnected',
+                ),
+                subtitle: Text(host.displayLabel),
+              ),
+              if (connecting)
+                ListTile(
+                  leading: Icon(
+                    Icons.stop_circle_outlined,
+                    color: Theme.of(ctx).colorScheme.error,
+                  ),
+                  title: const Text('Cancel connecting'),
+                  onTap: () => Navigator.pop(ctx, 'cancel'),
+                ),
+              if (!connected && !connecting)
+                ListTile(
+                  leading: const Icon(Icons.link),
+                  title: const Text('Connect'),
+                  onTap: () => Navigator.pop(ctx, 'connect'),
+                ),
+              if (connected)
+                ListTile(
+                  leading: const Icon(Icons.link_off),
+                  title: const Text('Disconnect this chat'),
+                  onTap: () => Navigator.pop(ctx, 'disconnect'),
+                ),
+              ListTile(
+                leading: Icon(
+                  Icons.power_settings_new,
+                  color: Theme.of(ctx).colorScheme.error,
+                ),
+                title: const Text('Turn off ADSM'),
+                subtitle: const Text('Stops the daemon on this host'),
+                onTap: () => Navigator.pop(ctx, 'stop_adsm'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    if (!mounted || action == null) return;
+
+    switch (action) {
+      case 'cancel':
+        _cancelConnect();
+      case 'connect':
+        unawaited(_ensureAcp());
+      case 'disconnect':
+        _cancelConnect();
+        await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+        if (mounted) {
+          setState(() {
+            _runtime = null;
+            _error = null;
+          });
+        }
+      case 'stop_adsm':
+        final ok = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Turn off ADSM?'),
+            content: Text(
+              'Stops the ADSM daemon on ${host.displayLabel}. '
+              'Open chats disconnect until you reconnect.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Turn off'),
+              ),
+            ],
+          ),
+        );
+        if (ok != true || !mounted) return;
+        _cancelConnect();
+        try {
+          await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+          await ref.read(sshServiceProvider).stopAdsm(host);
+          if (mounted) {
+            setState(() {
+              _runtime = null;
+              _error = null;
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('ADSM turned off')),
+            );
+          }
+        } catch (e) {
+          SafeLog.d('stop ADSM from connecting sheet failed', e);
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Could not stop ADSM: $e')),
+            );
+          }
+        }
+    }
   }
 
   void _scheduleAuthReauthPrompt(String errorText) {
@@ -813,8 +1020,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
       status(
         provider == AgentProvider.claude
-            ? 'Checking Claude on the remote…'
-            : 'Checking Cursor CLI on the remote…',
+            ? 'Checking Claude…'
+            : 'Checking Cursor…',
       );
 
       final adsmReady = ssh.isAdsmReady(host.id);
@@ -843,7 +1050,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         status(
           provider == AgentProvider.claude
               ? 'Claude ACP found…'
-              : 'Cursor CLI found…',
+              : 'Cursor found…',
         );
       } else {
         binary = switch (provider) {
@@ -868,26 +1075,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
 
       status(adsmReady ? 'Connecting to ADSM…' : 'Starting ADSM…');
-      await ssh.ensureAdsm(
-        host,
-        onProgress: status,
-        allowUpgrade: !adsmReady,
-      ).timeout(
-        adsmReady
-            ? const Duration(seconds: 75)
-            : const Duration(minutes: 3),
-        onTimeout: () => throw TimeoutException(
+      try {
+        await ssh.ensureAdsm(
+          host,
+          onProgress: status,
+          allowUpgrade: !adsmReady,
+        ).timeout(
           adsmReady
-              ? 'Timed out connecting to ADSM on ${host.displayLabel}. '
-                  'Check SSH / ProxyJump, then retry.'
-              : 'Timed out installing/starting ADSM on the remote.',
-        ),
-      );
+              ? const Duration(seconds: 75)
+              : const Duration(minutes: 3),
+          onTimeout: () => throw TimeoutException(
+            adsmReady
+                ? 'Timed out connecting to ADSM on ${host.displayLabel}'
+                : 'Timed out installing/starting ADSM',
+          ),
+        );
+      } on TimeoutException {
+        ssh.clearAdsmReady(host.id);
+        rethrow;
+      }
 
       final mcps = await db.listEnabledMcpsForHost(host.id);
       final latest = await db.getChat(chatId);
 
-      status('Starting agent via ADSM…');
+      status('Starting agent…');
 
       return AdsmSession.start(
         ssh: ssh,
@@ -907,10 +1118,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         const Duration(seconds: 90),
         onTimeout: () => throw TimeoutException(
           provider == AgentProvider.claude
-              ? 'Connect timed out. Set ANTHROPIC_API_KEY in Settings or run '
-                  '`claude login` on the remote, then try again.'
-              : 'Connect timed out. Try `agent login` on the remote from Hosts → terminal, '
-                  'then try again.',
+              ? 'Claude connect timed out'
+              : 'Cursor connect timed out',
         ),
       );
     };
@@ -969,36 +1178,54 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     setState(() {
       _connecting = true;
-      _connectStatus = chat.provider == AgentProvider.claude
-          ? 'Preparing Claude on the remote…'
-          : 'Preparing Cursor on the remote…';
+      // Never say "Preparing Claude" before we can reach the host — that
+      // hid offline/VPN failures behind a misleading agent label.
+      _connectStatus = 'Reaching ${host.displayLabel}…';
       _error = null;
       _showSdkInstallGuide = false;
     });
-
-    if (chat.provider == AgentProvider.claude) {
-      final apiKey =
-          await ref.read(secureStoreProvider).readAnthropicApiKey();
-      if ((apiKey == null || apiKey.isEmpty) && mounted) {
-        setState(() {
-          _connectStatus =
-              'Preparing Claude… (save ANTHROPIC_API_KEY in Settings, or run '
-              '`claude login` on the host)';
-        });
-      }
-    }
+    final epoch = ++_connectEpoch;
 
     try {
+      try {
+        await ref.read(sshServiceProvider).connect(host).timeout(
+          const Duration(seconds: 20),
+          onTimeout: () => throw TimeoutException(
+            'Timed out reaching ${host.displayLabel}',
+          ),
+        );
+      } catch (e) {
+        if (!_connectStillCurrent(epoch)) return;
+        SafeLog.d('host unreachable before ACP connect', e);
+        setState(() {
+          _connecting = false;
+          _connectStatus = null;
+          _error =
+              'Can\'t reach ${host.displayLabel} — check VPN or network, then Retry.';
+          _showSdkInstallGuide = false;
+        });
+        return;
+      }
+      if (!_connectStillCurrent(epoch)) return;
+
       // Pull the live session id Mac wrote before we attach — without it the
       // agent starts over and only sees messages sent on this device.
       try {
-        final changed = await ref.read(agentDockServiceProvider).syncChatRecord(
+        if (mounted) {
+          setState(() => _connectStatus = 'Syncing chat…');
+        }
+        final changed = await ref
+            .read(agentDockServiceProvider)
+            .syncChatRecord(
               host: host,
               chatId: chat.id,
-            );
+            )
+            .timeout(const Duration(seconds: 12));
+        if (!_connectStillCurrent(epoch)) return;
         if (changed) {
           final refreshed =
               await ref.read(appDatabaseProvider).getChat(chat.id);
+          if (!_connectStillCurrent(epoch)) return;
           if (refreshed != null) {
             chat = refreshed;
             if (mounted) setState(() => _chat = refreshed);
@@ -1011,38 +1238,60 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (chat.provider == AgentProvider.claude) {
         final apiKey =
             await ref.read(secureStoreProvider).readAnthropicApiKey();
+        if (!_connectStillCurrent(epoch)) return;
         if (apiKey == null || apiKey.isEmpty) {
+          if (mounted) {
+            setState(() => _connectStatus = 'Checking Claude login…');
+          }
           final auth = ClaudeRemoteAuth(ref.read(sshServiceProvider));
-          if (!await auth.isLoggedIn(host)) {
-            if (!mounted) return;
-            setState(() => _connectStatus = 'Claude sign-in required…');
+          if (!await auth.isLoggedIn(host).timeout(
+                const Duration(seconds: 25),
+                onTimeout: () => false,
+              )) {
+            if (!_connectStillCurrent(epoch)) return;
+            setState(() => _connectStatus = 'Sign in required…');
             final signedIn =
                 await ClaudeLoginSheet.show(context, host: host);
+            if (!_connectStillCurrent(epoch)) return;
             if (signedIn != true) {
-              if (mounted) {
-                setState(() {
-                  _connecting = false;
-                  _connectStatus = null;
-                  _error =
-                      'Claude sign-in required. Open Settings → Sign in to Claude, '
-                      'or save ANTHROPIC_API_KEY.';
-                });
-              }
+              setState(() {
+                _connecting = false;
+                _connectStatus = null;
+                _error = 'Claude sign-in required. Open Settings to continue.';
+              });
               return;
             }
           }
         }
       }
 
+      if (!_connectStillCurrent(epoch)) return;
+      if (mounted) {
+        setState(
+          () => _connectStatus = chat.provider == AgentProvider.claude
+              ? 'Starting Claude…'
+              : 'Starting Cursor…',
+        );
+      }
       final factory = _buildSessionFactory(chatId: chat.id, cwd: repo.remotePath);
 
       final session = await factory();
+      if (!_connectStillCurrent(epoch)) {
+        try {
+          await session.close();
+        } catch (_) {}
+        return;
+      }
 
       final runtime = await ref.read(activeAcpSessionsProvider.notifier).attach(
             chatId: chat.id,
             session: session,
             sessionFactory: factory,
           );
+      if (!_connectStillCurrent(epoch)) {
+        await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+        return;
+      }
       runtime.chatMeta = chat;
       _bindRuntime(runtime);
 
@@ -1077,6 +1326,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         unawaited(_prefetchModelCatalogIfNeeded(runtime));
       }
     } on MissingToolException catch (e) {
+      if (!_connectStillCurrent(epoch)) return;
       if (mounted) {
         final isClaude = chat.provider == AgentProvider.claude;
         final isAdsm = e.tool.toUpperCase().contains('ADSM');
@@ -1106,6 +1356,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         });
       }
     } catch (e) {
+      if (!_connectStillCurrent(epoch)) return;
       SafeLog.d('ACP connect failed', e);
       final lower = e.toString().toLowerCase();
       final isClaude = chat.provider == AgentProvider.claude;
@@ -1123,7 +1374,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ? (isClaude
                   ? 'Could not start Claude — install may have failed on the remote.\n$e'
                   : 'Could not start Cursor — install may have failed on the remote.\n$e')
-              : 'Could not start ${isClaude ? 'Claude' : 'Cursor'} ACP: $e';
+              : _compactConnectError(e, isClaude: isClaude);
         });
       }
       final updated = chat.copyWith(status: ChatStatus.error, updatedAt: DateTime.now());
@@ -1131,7 +1382,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
       if (mounted) setState(() => _chat = updated);
     } finally {
-      if (mounted) {
+      if (_connectStillCurrent(epoch)) {
         setState(() {
           _connecting = false;
           _connectStatus = null;
@@ -2381,6 +2632,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final isPolling = pollingTools.isNotEmpty;
     final activityLabel = runtime?.activityLabel;
     final statusLabel = switch (true) {
+      _ when _connecting =>
+        ' · ${_connectStatus ?? 'Connecting…'}',
       _ when reconnecting => ' · reconnecting…',
       _ when remoteRunning && !connected => ' · running on host',
       _ when sending =>
@@ -2504,71 +2757,72 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ),
           if (_connecting || reconnecting)
             Padding(
-              padding: const EdgeInsets.only(right: 12),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (_connectStatus != null || reconnecting)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 10),
-                      child: Text(
-                        _connectStatus ??
-                            'Reconnecting (${runtime?.reconnectAttempts ?? 0})…',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                    ),
-                  const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ],
+              padding: const EdgeInsets.only(right: 4),
+              child: Tooltip(
+                message: _connectStatus ??
+                    'Reconnecting (${runtime?.reconnectAttempts ?? 0})…',
+                child: const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
               ),
-            )
-          else
-            IconButton(
-              tooltip: adsmSession != null
-                  ? 'ADSM host status'
-                  : connected
-                      ? 'Agent live — keeps running on the host if you disconnect'
-                      : 'Reconnect ACP',
-              onPressed: _connecting
-                  ? null
-                  : () {
-                      if (adsmSession != null) {
-                        unawaited(
-                          AdsmHealthSheet.show(
-                            context,
-                            session: adsmSession,
-                            bridgeOpen: connected,
-                            provider: _chat?.provider,
-                            onReconnect: connected ? null : _ensureAcp,
-                            onReauthed: () {
-                              unawaited(_reconnectAfterReauth());
-                            },
-                            onStopped: () {
-                              unawaited(() async {
-                                final chat = _chat;
-                                if (chat == null) return;
-                                await ref
-                                    .read(activeAcpSessionsProvider.notifier)
-                                    .close(chat.id);
-                                if (mounted) {
-                                  setState(() {
-                                    _runtime = null;
-                                    _error = null;
-                                  });
-                                }
-                              }());
-                            },
-                          ),
-                        );
-                      } else {
-                        unawaited(_ensureAcp());
-                      }
-                    },
-              icon: Icon(connected ? Icons.sensors : Icons.link),
             ),
+          IconButton(
+            tooltip: _connecting
+                ? (_connectStatus ?? 'Connecting — tap for controls')
+                : reconnecting
+                    ? 'Reconnecting — tap for controls'
+                    : adsmSession != null
+                        ? 'ADSM host status'
+                        : connected
+                            ? 'Agent live — keeps running on the host if you disconnect'
+                            : 'Reconnect ACP',
+            onPressed: () {
+              if (adsmSession != null) {
+                unawaited(
+                  AdsmHealthSheet.show(
+                    context,
+                    session: adsmSession,
+                    bridgeOpen: connected,
+                    provider: _chat?.provider,
+                    onReconnect: connected || _connecting ? null : _ensureAcp,
+                    onReauthed: () {
+                      unawaited(_reconnectAfterReauth());
+                    },
+                    onStopped: () {
+                      unawaited(() async {
+                        _cancelConnect();
+                        final chat = _chat;
+                        if (chat == null) return;
+                        await ref
+                            .read(activeAcpSessionsProvider.notifier)
+                            .close(chat.id);
+                        if (mounted) {
+                          setState(() {
+                            _runtime = null;
+                            _error = null;
+                          });
+                        }
+                      }());
+                    },
+                  ),
+                );
+                return;
+              }
+              unawaited(_showConnectionControls(
+                connecting: _connecting || reconnecting,
+                connected: connected,
+              ));
+            },
+            icon: Icon(
+              _connecting || reconnecting
+                  ? Icons.power_settings_new
+                  : connected
+                      ? Icons.sensors
+                      : Icons.link,
+            ),
+          ),
         ],
       ),
       body: Column(
@@ -2621,6 +2875,61 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ),
             ),
           ),
+          if (_connecting || reconnecting)
+            Material(
+              color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: theme.colorScheme.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        _connectStatus ??
+                            (reconnecting
+                                ? 'Reconnecting (${runtime?.reconnectAttempts ?? 0})…'
+                                : 'Connecting…'),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          color: theme.colorScheme.onPrimaryContainer,
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                      onPressed: () {
+                        _cancelConnect();
+                        if (reconnecting && runtime != null) {
+                          unawaited(
+                            ref
+                                .read(activeAcpSessionsProvider.notifier)
+                                .close(widget.chatId),
+                          );
+                          setState(() {
+                            _runtime = null;
+                            _error = null;
+                          });
+                        }
+                      },
+                      child: const Text('Cancel'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           if (displayError != null &&
               (_showSdkInstallGuide ||
                   displayError.toLowerCase().contains('tmux') ||
@@ -2642,27 +2951,42 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             )
           else if (displayError != null)
             Material(
-              color: theme.colorScheme.errorContainer,
+              color: theme.colorScheme.errorContainer.withValues(alpha: 0.9),
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                padding: const EdgeInsets.fromLTRB(8, 2, 0, 2),
                 child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    Icon(
+                      Icons.error_outline,
+                      size: 18,
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                    const SizedBox(width: 8),
                     Expanded(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 120),
-                        child: SingleChildScrollView(
-                          child: SelectableText(
+                      child: InkWell(
+                        onTap: () => unawaited(
+                          _showFullConnectError(displayError),
+                        ),
+                        child: Text(
+                          _compactConnectError(
                             displayError,
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: theme.colorScheme.onErrorContainer,
-                            ),
+                            isClaude: _chat?.provider == AgentProvider.claude,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onErrorContainer,
+                            fontWeight: FontWeight.w500,
                           ),
                         ),
                       ),
                     ),
                     if (!connected)
                       TextButton(
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                        ),
                         onPressed: _connecting
                             ? null
                             : () {
@@ -2674,10 +2998,63 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 runtime?.deliveryError = null;
                                 unawaited(_ensureAcp());
                               },
-                        child: const Text('Reconnect'),
+                        child: const Text('Retry'),
                       ),
+                    IconButton(
+                      tooltip: 'Connection controls',
+                      visualDensity: VisualDensity.compact,
+                      icon: Icon(
+                        Icons.power_settings_new,
+                        size: 20,
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                      onPressed: () {
+                        if (adsmSession != null) {
+                          unawaited(
+                            AdsmHealthSheet.show(
+                              context,
+                              session: adsmSession,
+                              bridgeOpen: connected,
+                              provider: _chat?.provider,
+                              onReconnect:
+                                  connected || _connecting ? null : _ensureAcp,
+                              onReauthed: () {
+                                unawaited(_reconnectAfterReauth());
+                              },
+                              onStopped: () {
+                                unawaited(() async {
+                                  _cancelConnect();
+                                  final chat = _chat;
+                                  if (chat == null) return;
+                                  await ref
+                                      .read(activeAcpSessionsProvider.notifier)
+                                      .close(chat.id);
+                                  if (mounted) {
+                                    setState(() {
+                                      _runtime = null;
+                                      _error = null;
+                                    });
+                                  }
+                                }());
+                              },
+                            ),
+                          );
+                        } else {
+                          unawaited(
+                            _showConnectionControls(
+                              connecting: _connecting || reconnecting,
+                              connected: connected,
+                            ),
+                          );
+                        }
+                      },
+                    ),
                     if (isAgentAuthFailureText(displayError))
                       TextButton(
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                        ),
                         onPressed: (_connecting || _authReauthInFlight)
                             ? null
                             : () => unawaited(
@@ -2687,8 +3064,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       ),
                     IconButton(
                       tooltip: 'Dismiss',
+                      visualDensity: VisualDensity.compact,
                       icon: Icon(
                         Icons.close,
+                        size: 18,
                         color: theme.colorScheme.onErrorContainer,
                       ),
                       onPressed: () {
