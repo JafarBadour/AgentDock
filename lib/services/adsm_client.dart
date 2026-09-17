@@ -572,8 +572,10 @@ class AdsmSession implements AgentSession {
       return applyAgentsList(list, forceEmit: forceEmit);
     } catch (e) {
       SafeLog.d('ADSM status poll failed chat=$chatId', e);
+      // Do not return a stale "running" — that freezes the UI as working
+      // forever when the bridge/VPN drops.
+      return null;
     }
-    return _daemonStatus;
   }
 
   /// Apply a shared `agents.list` result to this session (no extra RPC).
@@ -616,6 +618,19 @@ class AdsmSession implements AgentSession {
         }
       }
       return st;
+    }
+    // List succeeded but this chat is gone — worker finished / was reaped.
+    final prev = _daemonStatus;
+    if (prev == 'running' ||
+        prev == 'starting' ||
+        prev == 'waiting_permission' ||
+        forceEmit) {
+      _daemonStatus = 'idle';
+      if (!_updates.isClosed) {
+        _updates.add(const AcpUpdate.daemonStatus('idle'));
+        _updates.add(const AcpUpdate.activity(''));
+      }
+      return 'idle';
     }
     return _daemonStatus;
   }

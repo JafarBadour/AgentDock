@@ -1159,6 +1159,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         cwd: repo.remotePath,
       );
       _bindRuntime(existing);
+      // Re-open of an already-attached chat: clear sticky "working" from a
+      // previous dead turn, then ask ADSM whether anything is still live.
+      unawaited(existing.resyncBusyFromHost());
       if (existing.permissionPolicy != _permission) {
         try {
           await existing.applyPermissionPolicy(_permission);
@@ -2996,7 +2999,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 });
                                 runtime?.lastError = null;
                                 runtime?.deliveryError = null;
-                                unawaited(_ensureAcp());
+                                unawaited(() async {
+                                  await runtime?.resyncBusyFromHost();
+                                  await _ensureAcp();
+                                }());
                               },
                         child: const Text('Retry'),
                       ),

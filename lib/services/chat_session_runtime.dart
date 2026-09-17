@@ -151,7 +151,8 @@ class ChatSessionRuntime extends ChangeNotifier {
       entries.any((e) => e.tool?.isActive ?? false);
 
   bool get isWorking =>
-      sendingToHost || promptInFlight || remoteTurnActive || hasActiveTools;
+      !reconnecting &&
+      (sendingToHost || promptInFlight || remoteTurnActive || hasActiveTools);
 
   /// Live code churn from edit/write tools since local midnight.
   CodeChangeStats get codeDelta =>
@@ -489,6 +490,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     _sub?.cancel();
     _retryTimer?.cancel();
     _retryTimer = null;
+    _clearHostBusyWatchdog();
     final old = _session;
     _session = session;
     if (old != session) {
@@ -503,13 +505,22 @@ class ChatSessionRuntime extends ChangeNotifier {
     reconnectAttempts = 0;
     // A reconnect must not inherit a hung prompt chain from the dead socket.
     _breakPromptChain();
-    // Prefer host snapshot (async refresh) so sticky tools clear after reconnect.
+    // Drop sticky "working / Exploring" from the dead bridge immediately.
+    // Host status below can re-assert running if the turn is truly still live.
+    remoteTurnActive = false;
+    promptInFlight = false;
+    sendingToHost = false;
+    activityLabel = null;
+    if (hasActiveTools) {
+      unawaited(_finalizeStaleTools(reason: 'reconnect'));
+    }
+    // Prefer host snapshot (async refresh) so a live turn re-lights busy chrome.
     if (session is AdsmSession) {
       unawaited(
         session.refreshDaemonStatus(forceEmit: true).then((hostStatus) {
           if (_disposed) return;
           final st = (hostStatus ?? '').toLowerCase();
-          if (st == 'idle' || st == 'dead' || st == 'error') {
+          if (st == 'idle' || st == 'dead' || st == 'error' || st.isEmpty) {
             remoteTurnActive = false;
             promptInFlight = false;
             sendingToHost = false;
@@ -527,15 +538,14 @@ class ChatSessionRuntime extends ChangeNotifier {
               st == 'starting') {
             remoteTurnActive = true;
             promptInFlight = true;
+            activityLabel = st == 'waiting_permission'
+                ? 'Waiting for permission'
+                : 'Working on host…';
             _armHostBusyWatchdog();
             notifyListeners();
           }
         }),
       );
-    } else if (remoteTurnActive) {
-      // Non-ADSM: a turn handed off may still be running.
-      promptInFlight = true;
-      _armHostBusyWatchdog();
     }
     startListening();
     unawaited(rememberSessionId());
@@ -546,6 +556,40 @@ class ChatSessionRuntime extends ChangeNotifier {
     if (!remoteTurnActive && !promptInFlight) {
       resumeOutboundQueue();
       unawaited(recoverTrailingUserPromptIfStuck());
+    }
+  }
+
+  /// Force-clear sticky busy chrome, then re-check ADSM if available.
+  ///
+  /// Used when the user taps Retry / reconnect while the UI still says
+  /// "working" after a dead turn.
+  Future<void> resyncBusyFromHost() async {
+    if (_disposed) return;
+    remoteTurnActive = false;
+    promptInFlight = false;
+    sendingToHost = false;
+    activityLabel = null;
+    if (hasActiveTools) {
+      await _finalizeStaleTools(reason: 'user-resync');
+    } else {
+      notifyListeners();
+    }
+    if (_session is! AdsmSession || closed) return;
+    final st =
+        ((await (_session as AdsmSession).refreshDaemonStatus(forceEmit: true)) ??
+                '')
+            .toLowerCase();
+    if (_disposed) return;
+    if (st == 'running' ||
+        st == 'waiting_permission' ||
+        st == 'starting') {
+      remoteTurnActive = true;
+      promptInFlight = true;
+      activityLabel = st == 'waiting_permission'
+          ? 'Waiting for permission'
+          : 'Working on host…';
+      _armHostBusyWatchdog();
+      notifyListeners();
     }
   }
 
@@ -730,6 +774,14 @@ class ChatSessionRuntime extends ChangeNotifier {
     final delay = immediate ? Duration.zero : _backoffFor(reconnectAttempts);
     reconnectAttempts++;
     reconnecting = true;
+    // Don't keep advertising Exploring/tools while the bridge is being rebuilt.
+    remoteTurnActive = false;
+    promptInFlight = false;
+    sendingToHost = false;
+    activityLabel = null;
+    if (hasActiveTools) {
+      unawaited(_finalizeStaleTools(reason: 'reconnect-start'));
+    }
     // Drop sticky transport nags — reconnect is already underway.
     if (lastError != null && isTransientBridgeErrorText(lastError!)) {
       lastError = null;
@@ -1405,13 +1457,27 @@ class ChatSessionRuntime extends ChangeNotifier {
             ? const Duration(seconds: 40)
             : const Duration(seconds: 90));
 
-    // Durable: host status is authoritative. Never unlock the composer while
-    // the daemon still says running — that left "Thinking" folds + follow-ups
-    // that looked sent but hit "already running" and never ran.
+    // Durable: host status is authoritative when we can reach ADSM. A failed
+    // poll must not keep recycling a stale "running" forever (VPN off, etc.).
     if (durable && _session is AdsmSession) {
-      final st = await (_session as AdsmSession).refreshDaemonStatus(
-        forceEmit: true,
-      );
+      final adsm = _session as AdsmSession;
+      if (!adsm.bridgeClient.isOpen) {
+        if (silentFor >= const Duration(seconds: 35)) {
+          SafeLog.d(
+            'watchdog: ADSM bridge closed after ${silentFor.inSeconds}s '
+            'silence — clear sticky busy chat=$chatId',
+          );
+          await _clearStickyBusyAfterLostHost(
+            reason: 'bridge-closed',
+            notifyLost: true,
+          );
+          return;
+        }
+        _armHostBusyWatchdog();
+        return;
+      }
+
+      final st = await adsm.refreshDaemonStatus(forceEmit: true);
       if (_disposed) return;
       final host = (st ?? '').toLowerCase();
       if (_suppressHostRunning &&
@@ -1445,10 +1511,37 @@ class ChatSessionRuntime extends ChangeNotifier {
         return;
       }
       if (host == 'idle' || host == 'dead' || host == 'error') {
-        // refreshDaemonStatus already emitted status — nothing more here.
+        // daemonStatus handler usually clears tools; if rows are still sticky,
+        // finish them here so "working · N tools" cannot linger.
+        if (hasActiveTools) {
+          await _finalizeStaleTools(reason: 'watchdog-daemon-$host');
+        } else if (isWorking) {
+          remoteTurnActive = false;
+          promptInFlight = false;
+          sendingToHost = false;
+          activityLabel = null;
+          notifyListeners();
+          if (!closed) _drainOutboundQueue();
+        }
         return;
       }
-      // Poll failed / unknown — keep waiting; do not fake-idle the UI.
+
+      // Poll failed / unknown (null). After silence, unlock — do not keep
+      // advertising Exploring/tools while we cannot reach the host.
+      final lostAfter = answered
+          ? const Duration(seconds: 45)
+          : const Duration(seconds: 75);
+      if (silentFor >= lostAfter) {
+        SafeLog.d(
+          'watchdog: lost ADSM contact after ${silentFor.inSeconds}s '
+          'silence chat=$chatId',
+        );
+        await _clearStickyBusyAfterLostHost(
+          reason: 'poll-failed',
+          notifyLost: true,
+        );
+        return;
+      }
       if (sendingToHost && silentFor >= const Duration(seconds: 45)) {
         SafeLog.d(
           'watchdog: delivery stall ${silentFor.inSeconds}s '
@@ -1459,9 +1552,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
       activityLabel = activityLabel?.isNotEmpty == true
           ? activityLabel
-          : 'Working on host…';
-      remoteTurnActive = true;
-      promptInFlight = true;
+          : 'Checking host…';
       notifyListeners();
       _armHostBusyWatchdog();
       return;
@@ -1555,6 +1646,26 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
     }
     return false;
+  }
+
+  Future<void> _clearStickyBusyAfterLostHost({
+    required String reason,
+    required bool notifyLost,
+  }) async {
+    _clearHostBusyWatchdog();
+    if (hasActiveTools) {
+      await _finalizeStaleTools(reason: reason);
+    }
+    promptInFlight = false;
+    remoteTurnActive = false;
+    sendingToHost = false;
+    activityLabel = null;
+    if (notifyLost) {
+      deliveryError =
+          'Lost contact with the host — status may be stale. Tap Retry or check VPN.';
+    }
+    notifyListeners();
+    if (!closed) _drainOutboundQueue();
   }
 
   Future<void> _watchdogUnstickPrompt() async {
