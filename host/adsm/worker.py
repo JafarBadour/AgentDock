@@ -591,7 +591,10 @@ class Worker:
             # Re-ensure must not clobber a live turn back to idle (that used to
             # desync the phone busy chrome from the host).
             if not self._turn_in_flight():
-                await self._set_status(self.chat_id, protocol.STATUS_IDLE, None)
+                # Successful reconnect clears sticky MCP/open_session errors so
+                # the health sheet stops looking broken after recovery.
+                self.last_error = None
+                await self._set_status(self.chat_id, protocol.STATUS_IDLE, "")
             await self._emit_event(
                 "session",
                 acpSessionId=self.acp_session_id,

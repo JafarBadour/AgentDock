@@ -176,7 +176,8 @@ class Daemon:
         if w:
             w.status = status
             if error is not None:
-                w.last_error = error
+                # Empty string clears a sticky lastError after recovery.
+                w.last_error = error or None
         await self._patch_agent_record(chat_id, status=status, error=error)
 
     async def _patch_agent_record(
@@ -213,7 +214,10 @@ class Daemon:
         if provider:
             data["provider"] = provider
         if error is not None:
-            data["last_error"] = error
+            if error:
+                data["last_error"] = error
+            else:
+                data.pop("last_error", None)
         from datetime import datetime, timezone
 
         data["updated_at"] = datetime.now(timezone.utc).isoformat()

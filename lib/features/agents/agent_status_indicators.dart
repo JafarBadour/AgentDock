@@ -816,10 +816,12 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
                   ok: true,
                   monospace: true,
                 ),
-              if (h.agentLastError != null && h.agentLastError!.isNotEmpty)
+              if (!h.agentHealthy &&
+                  h.agentLastError != null &&
+                  h.agentLastError!.isNotEmpty)
                 _HealthRow(
                   label: 'Last error',
-                  value: h.agentLastError!,
+                  value: _humanizeAgentError(h.agentLastError!),
                   ok: false,
                 ),
               if (h.fetchError != null)
@@ -935,6 +937,27 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
       ),
     );
   }
+}
+
+/// Turn Zod/ACP schema dumps into a short actionable line for the health sheet.
+String _humanizeAgentError(String raw) {
+  final text = raw.trim();
+  final lower = text.toLowerCase();
+  if (lower.contains('mcpservers') &&
+      (lower.contains('expected array, received object') ||
+          lower.contains('headers'))) {
+    return 'MCP config rejected by the agent (headers/env must be '
+        'name/value arrays). Start a new session after updating Agent Dock.';
+  }
+  if (lower.contains('mcpservers') && lower.contains('invalid params')) {
+    return 'MCP servers failed validation on session/new. '
+        'Try Start a new session, or check MCP URLs in Settings.';
+  }
+  if (lower.contains('tmux session ended')) {
+    return 'Agent process ended — reconnect or start a new session.';
+  }
+  if (text.length <= 280) return text;
+  return '${text.substring(0, 277)}…';
 }
 
 class _HealthRow extends StatelessWidget {
