@@ -73,6 +73,72 @@ def list_messages(chat_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def _message_bytes(row: dict[str, Any]) -> int:
+    """UTF-8 content size + small fixed overhead (matches Dart budget helper)."""
+    content = str(row.get("content") or "")
+    return len(content.encode("utf-8")) + 64
+
+
+def pull_messages(
+    chat_id: str,
+    *,
+    limit: int = 900,
+    max_bytes: int = 0,
+    before_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return a chronological slice for the UI working set.
+
+    - Default: last [limit] messages (legacy count mode).
+    - [max_bytes] > 0: last ~N UTF-8 bytes of content (at least one message).
+    - [before_id]: only messages strictly older than that id, then apply the
+      same limit/byte budget (for "load another MB" pagination).
+    """
+    messages = list_messages(chat_id)
+    if before_id:
+        pivot = next(
+            (i for i, m in enumerate(messages) if m.get("id") == before_id),
+            -1,
+        )
+        messages = messages[:pivot] if pivot > 0 else []
+
+    if max_bytes > 0:
+        selected: list[dict[str, Any]] = []
+        used = 0
+        for row in reversed(messages):
+            size = _message_bytes(row)
+            if selected and used + size > max_bytes:
+                break
+            selected.append(row)
+            used += size
+        selected.reverse()
+        older_remaining = 0
+        if selected:
+            first_id = selected[0].get("id")
+            for row in messages:
+                if row.get("id") == first_id:
+                    break
+                older_remaining += 1
+        else:
+            older_remaining = len(messages)
+        return {
+            "messages": selected,
+            "hasMore": older_remaining > 0,
+            "bytes": used,
+            "oldestId": selected[0]["id"] if selected else None,
+            "newestId": selected[-1]["id"] if selected else None,
+        }
+
+    limit = max(1, min(int(limit), 5000))
+    sliced = messages[-limit:]
+    return {
+        "messages": sliced,
+        "hasMore": len(messages) > len(sliced),
+        "bytes": sum(_message_bytes(m) for m in sliced),
+        "oldestId": sliced[0]["id"] if sliced else None,
+        "newestId": sliced[-1]["id"] if sliced else None,
+    }
+
+
 def append_message(
     chat_id: str,
     *,

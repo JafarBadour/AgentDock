@@ -19,6 +19,7 @@ import 'adsm_version.dart';
 import 'cursor_acp_service.dart';
 import 'local_host_bootstrap.dart';
 import 'ssh_service.dart';
+import 'transcript_budget.dart';
 
 export 'adsm_version.dart';
 
@@ -819,7 +820,9 @@ class AdsmSession implements AgentSession {
       }
       // Pull durable host transcript ASAP — before UI settles on SQLite-only.
       try {
-        session.hostTranscript = await session.pullTranscript(limit: 300);
+        session.hostTranscript = await session.pullTranscript(
+          maxBytes: kTranscriptChunkBytes,
+        );
       } catch (e) {
         SafeLog.d('ADSM transcript.pull failed', e);
       }
@@ -841,22 +844,54 @@ class AdsmSession implements AgentSession {
   /// Messages pulled from host `~/.agentdock/messages/<chatId>.jsonl`.
   List<ChatMessage> hostTranscript = const [];
 
-  Future<List<ChatMessage>> pullTranscript({int limit = 300}) async {
-    final result = await _client.request('transcript.pull', {
+  /// Whether the host archive has messages older than [hostTranscript].
+  bool hostTranscriptHasMore = false;
+
+  Future<List<ChatMessage>> pullTranscript({
+    int limit = 300,
+    int? maxBytes,
+    String? beforeId,
+  }) async {
+    final result = await pullTranscriptPage(
+      limit: limit,
+      maxBytes: maxBytes,
+      beforeId: beforeId,
+    );
+    return result.messages;
+  }
+
+  Future<({List<ChatMessage> messages, bool hasMore, int bytes})>
+  pullTranscriptPage({
+    int limit = 300,
+    int? maxBytes,
+    String? beforeId,
+  }) async {
+    final params = <String, dynamic>{
       'chatId': chatId,
       'limit': limit,
-    });
+      if (maxBytes != null && maxBytes > 0) 'maxBytes': maxBytes,
+      if (beforeId != null && beforeId.isNotEmpty) 'beforeId': beforeId,
+    };
+    final result = await _client.request('transcript.pull', params);
     final raw = result['messages'];
-    if (raw is! List) return const [];
     final out = <ChatMessage>[];
-    for (final item in raw) {
-      if (item is! Map) continue;
-      try {
-        out.add(ChatMessage.fromMap(Map<String, Object?>.from(item)));
-      } catch (_) {}
+    if (raw is List) {
+      for (final item in raw) {
+        if (item is! Map) continue;
+        try {
+          out.add(ChatMessage.fromMap(Map<String, Object?>.from(item)));
+        } catch (_) {}
+      }
     }
-    hostTranscript = out;
-    return out;
+    final hasMore = result['hasMore'] == true;
+    final bytes = (result['bytes'] is int)
+        ? result['bytes'] as int
+        : out.fold<int>(0, (sum, m) => sum + chatMessageBytes(m));
+    if (beforeId == null) {
+      hostTranscript = out;
+      hostTranscriptHasMore = hasMore;
+    }
+    return (messages: out, hasMore: hasMore, bytes: bytes);
   }
 
   /// Push local messages into the host store (merge by id).

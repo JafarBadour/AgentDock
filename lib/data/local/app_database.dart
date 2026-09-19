@@ -13,6 +13,7 @@ import '../models/host.dart';
 import '../models/mcp_server.dart';
 import '../models/repo.dart';
 import '../models/scheduled_job.dart';
+import '../../services/transcript_budget.dart';
 
 /// Local metadata only — never stores secrets.
 class AppDatabase {
@@ -697,6 +698,49 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
       limit: limit,
     );
     return rows.reversed.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Chronological messages for a chat (full local archive). Prefer
+  /// [listRecentMessagesByBytes] for UI opens.
+  Future<List<ChatMessage>> listMessagesChronological(String chatId) async {
+    final db = await database;
+    final rows = await db.query(
+      'messages',
+      where: 'chat_id = ?',
+      whereArgs: [chatId],
+      orderBy: 'created_at ASC, rowid ASC',
+    );
+    return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Last ~[maxBytes] of local message content (UTF-8), chronological.
+  Future<({List<ChatMessage> messages, bool hasMore})> listRecentMessagesByBytes(
+    String chatId, {
+    required int maxBytes,
+  }) async {
+    final all = await listMessagesChronological(chatId);
+    final slice = takeRecentMessagesByBytes(all, maxBytes: maxBytes);
+    return (messages: slice, hasMore: slice.length < all.length);
+  }
+
+  /// Next older ~[maxBytes] before [beforeId], chronological.
+  Future<({List<ChatMessage> messages, bool hasMore})> listOlderMessagesByBytes(
+    String chatId, {
+    required String beforeId,
+    required int maxBytes,
+  }) async {
+    final all = await listMessagesChronological(chatId);
+    final slice = takeOlderMessagesByBytes(
+      all,
+      beforeId: beforeId,
+      maxBytes: maxBytes,
+    );
+    final pivot = all.indexWhere((m) => m.id == beforeId);
+    final olderCount = pivot < 0 ? 0 : pivot;
+    return (
+      messages: slice,
+      hasMore: slice.isNotEmpty && slice.length < olderCount,
+    );
   }
 
   /// Stable chronological page without materializing the whole transcript.

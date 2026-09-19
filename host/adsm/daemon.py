@@ -556,15 +556,22 @@ class Daemon:
         chat_id = str(params.get("chatId") or "")
         if not chat_id:
             raise ValueError("chatId required")
-        messages = transcript_store.list_messages(chat_id)
         try:
-            limit = max(1, min(int(params.get("limit") or 900), 2000))
+            limit = max(1, min(int(params.get("limit") or 900), 5000))
         except (TypeError, ValueError):
             limit = 900
-        return {
-            "messages": messages[-limit:],
-            "hasMore": len(messages) > limit,
-        }
+        try:
+            max_bytes = max(0, int(params.get("maxBytes") or 0))
+        except (TypeError, ValueError):
+            max_bytes = 0
+        before_id = params.get("beforeId")
+        before_id_s = str(before_id).strip() if before_id else None
+        return transcript_store.pull_messages(
+            chat_id,
+            limit=limit,
+            max_bytes=max_bytes,
+            before_id=before_id_s or None,
+        )
 
     async def _transcript_sync(self, params: dict[str, Any]) -> dict[str, Any]:
         chat_id = str(params.get("chatId") or "")

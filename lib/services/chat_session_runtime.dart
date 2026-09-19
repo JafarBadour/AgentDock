@@ -22,6 +22,7 @@ import 'adsm_client.dart';
 import 'agent_session.dart';
 import 'cursor_acp_service.dart';
 import 'ssh_service.dart';
+import 'transcript_budget.dart';
 
 /// One transcript row — message and/or live tool.
 class TranscriptEntry {
@@ -81,7 +82,10 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   /// Runtime/UI memory is a live tail, not the transcript archive. SQLite and
   /// the host remain authoritative for older history.
+  ///
+  /// Soft cap is ~1 MiB of content; users can expand with explicit "load more".
   static const residentTranscriptLimit = 900;
+  static const residentTranscriptBytes = kTranscriptChunkBytes;
   static const transcriptPushTail = 64;
 
   final String chatId;
@@ -109,6 +113,13 @@ class ChatSessionRuntime extends ChangeNotifier {
   final Map<String, String> _toolMessageIds = {};
   final Map<String, int> _toolEntryIndexes = {};
   final _random = Random();
+
+  /// How many bytes of archive the UI is allowed to keep mounted.
+  /// Starts at one chunk; each "load earlier" adds another chunk.
+  int displayBudgetBytes = kTranscriptChunkBytes;
+
+  /// Host/SQLite still has messages older than the current [entries] head.
+  bool hasMoreOlder = false;
 
   /// Serializes tool upserts so parallel tool_call / tool_call_update events
   /// cannot insert two SQLite rows for the same toolCallId.
@@ -438,7 +449,6 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   void _trimResidentTranscript() {
-    if (entries.length <= residentTranscriptLimit) return;
     final originalOrder = <TranscriptEntry, int>{
       for (var i = 0; i < entries.length; i++) entries[i]: i,
     };
@@ -454,7 +464,31 @@ class ChatSessionRuntime extends ChangeNotifier {
       if (byTime != 0) return byTime;
       return originalOrder[a]!.compareTo(originalOrder[b]!);
     });
-    entries.removeRange(0, entries.length - residentTranscriptLimit);
+
+    var used = 0;
+    for (final entry in entries) {
+      used += _entryBytes(entry);
+    }
+    final budget = displayBudgetBytes > 0
+        ? displayBudgetBytes
+        : residentTranscriptBytes;
+    var removed = 0;
+    while (entries.length > 1 && used > budget) {
+      used -= _entryBytes(entries.first);
+      entries.removeAt(0);
+      removed++;
+      hasMoreOlder = true;
+    }
+    // Hard safety net against pathological tiny-message floods.
+    if (entries.length > residentTranscriptLimit) {
+      removed += entries.length - residentTranscriptLimit;
+      entries.removeRange(0, entries.length - residentTranscriptLimit);
+      hasMoreOlder = true;
+    }
+    if (removed == 0) {
+      _rebuildToolEntryIndexes();
+      return;
+    }
     final retainedTools = <String, String>{};
     _toolEntryIndexes.clear();
     for (var i = 0; i < entries.length; i++) {
@@ -471,6 +505,86 @@ class ChatSessionRuntime extends ChangeNotifier {
       ..addAll(retainedTools);
   }
 
+  int _entryBytes(TranscriptEntry entry) {
+    final message = entry.message;
+    if (message != null) return chatMessageBytes(message);
+    final tool = entry.tool;
+    if (tool != null) return toolCallBytes(tool);
+    return kTranscriptRowOverheadBytes;
+  }
+
+  /// Reset to a single live chunk (e.g. jump-to-latest) and drop older rows.
+  void pinDisplayToLiveChunk() {
+    displayBudgetBytes = kTranscriptChunkBytes;
+    _trimResidentTranscript();
+    _notifyUi(immediate: true);
+  }
+
+  /// Pull another ~1 MiB of older messages from SQLite / host and prepend.
+  ///
+  /// Returns how many messages were added.
+  Future<int> loadOlderTranscriptChunk() async {
+    if (closed) return 0;
+    String? beforeId;
+    for (final entry in entries) {
+      final id = entry.messageId;
+      if (id != null && id.isNotEmpty) {
+        beforeId = id;
+        break;
+      }
+    }
+    if (beforeId == null) {
+      hasMoreOlder = false;
+      _notifyUi(immediate: true);
+      return 0;
+    }
+
+    final local = await _db.listOlderMessagesByBytes(
+      chatId,
+      beforeId: beforeId,
+      maxBytes: kTranscriptChunkBytes,
+    );
+    var older = List<ChatMessage>.from(local.messages);
+    var hasMore = local.hasMore;
+
+    final session = _session;
+    if (session is AdsmSession) {
+      try {
+        final remote = await session.pullTranscriptPage(
+          maxBytes: kTranscriptChunkBytes,
+          beforeId: beforeId,
+        );
+        if (remote.messages.isNotEmpty) {
+          await _db.mergeMessages(chatId, remote.messages);
+          // Prefer the merged chronological view from DB for this window.
+          final refreshed = await _db.listOlderMessagesByBytes(
+            chatId,
+            beforeId: beforeId,
+            maxBytes: kTranscriptChunkBytes,
+          );
+          older = List<ChatMessage>.from(refreshed.messages);
+          hasMore = refreshed.hasMore || remote.hasMore;
+        } else {
+          hasMore = hasMore || remote.hasMore;
+        }
+      } catch (e) {
+        SafeLog.d('load older transcript from host failed', e);
+      }
+    }
+
+    if (older.isEmpty) {
+      hasMoreOlder = hasMore;
+      _notifyUi(immediate: true);
+      return 0;
+    }
+
+    displayBudgetBytes += kTranscriptChunkBytes;
+    absorbMessages(older);
+    hasMoreOlder = hasMore;
+    _notifyUi(immediate: true);
+    return older.length;
+  }
+
   void _rebuildToolEntryIndexes() {
     _toolEntryIndexes.clear();
     for (var i = 0; i < entries.length; i++) {
@@ -482,9 +596,12 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// Pull the recent on-disk tail (and queue) into memory after remote sync.
   Future<void> syncTranscriptFromDb() async {
     await restoreOutboundQueue();
-    absorbMessages(
-      await _db.listRecentMessages(chatId, limit: residentTranscriptLimit),
+    final page = await _db.listRecentMessagesByBytes(
+      chatId,
+      maxBytes: displayBudgetBytes,
     );
+    absorbMessages(page.messages);
+    hasMoreOlder = page.hasMore || hasMoreOlder;
   }
 
   /// Push local SQLite messages into the host ADSM store.

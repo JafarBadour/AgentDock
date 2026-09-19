@@ -43,6 +43,7 @@ import 'project_files_screen.dart';
 import 'tool_call_card.dart';
 import 'transcript_blocks.dart';
 import 'transcript_window.dart';
+import '../../services/transcript_budget.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   const ChatScreen({super.key, required this.chatId});
@@ -233,6 +234,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
+  /// When true, SQLite still has messages older than [_dbEntries] (offline).
+  bool _localHasMoreOlder = false;
+
   void _setFollowOutput(bool follow) {
     if (follow == _followOutput) {
       _transcriptWindow.pinnedToEnd = follow;
@@ -245,8 +249,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _followOutput = follow;
     _transcriptWindow.pinnedToEnd = follow;
     if (follow) {
-      // Resume live document — drop the PDF snapshot and paint fresh tail.
+      // Resume live document — drop the PDF snapshot and keep only ~1 MiB.
       _frozenTranscript = null;
+      _freezeCapturePending = false;
+      _runtime?.pinDisplayToLiveChunk();
       _runtimeUiDirty = true;
       _scheduleRuntimeUi(immediate: true);
     } else {
@@ -294,12 +300,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _freezeCapturePending = false;
 
   void _syncWindowToBlocks(int total) {
-    // Frozen document: window geometry is owned by the snapshot.
+    // Resident entries are already byte-capped; mount the full working set.
     if (_frozenTranscript != null && !_followOutput) {
       _blocksLength = _frozenTranscript!.allBlocks.length;
       return;
     }
     _blocksLength = total;
+    _transcriptWindow.visibleCount = total <= 0 ? _transcriptWindow.pageSize : total;
     _transcriptWindow.sync(total, followOutput: _followOutput);
   }
 
@@ -320,129 +327,125 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _blocksLength = allBlocks.length;
   }
 
-  /// Grow the mounted transcript toward older history (top edge or tap).
-  void _maybeLoadOlderHistory({bool fromUserTap = false}) {
-    if (!mounted) return;
-    if (_loadingOlderHistory || _programmaticScroll) return;
+  bool get _hasMoreOlderArchive =>
+      _runtime?.hasMoreOlder ?? _localHasMoreOlder;
+
+  /// Explicit "load earlier" — pulls another ~1 MiB from SQLite / host.
+  Future<void> _loadOlderHistoryChunk() async {
+    if (!mounted || _loadingOlderHistory || _programmaticScroll) return;
 
     final hasScroll = _scroll.hasClients;
     final before = hasScroll ? _scroll.position.pixels : 0.0;
     final beforeMax = hasScroll ? _scroll.position.maxScrollExtent : 0.0;
 
-    final frozen = _frozenTranscript;
-    final int added;
-    if (frozen != null && !_followOutput) {
-      // Expand inside the frozen PDF snapshot only — never pull live tail.
-      final room = frozen.allBlocks.length - frozen.visibleCount;
-      if (room <= 0) return;
-      if (!fromUserTap) {
-        if (!hasScroll || before > _transcriptWindow.edgePx) return;
-      }
-      added = room < _transcriptWindow.pageSize
-          ? room
-          : _transcriptWindow.pageSize;
-      frozen.visibleCount += added;
-    } else if (fromUserTap) {
-      added = _transcriptWindow.loadOlder(
-        _blocksLength,
-        now: DateTime.now(),
-        force: true,
-      );
-    } else {
-      if (!hasScroll) return;
-      final startBefore = _transcriptWindow.start;
-      final ok = _transcriptWindow.tryLoadOlderAtTop(
-        total: _blocksLength,
-        pixels: before,
-        maxScrollExtent: beforeMax,
-        now: DateTime.now(),
-        busy: false,
-      );
-      if (!ok) return;
-      added = startBefore - _transcriptWindow.start;
-    }
-    if (added <= 0) return;
-
     _loadingOlderHistory = true;
     _programmaticScroll = true;
     if (_followOutput) _setFollowOutput(false);
-    // Prefer epoch bump over setState so chrome/banners don't relayout.
     _transcriptUiEpoch.value++;
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      try {
-        if (_scroll.hasClients) {
-          final target = _transcriptWindow.preserveScrollAfterPrepend(
-            beforePixels: before,
-            beforeMax: beforeMax,
-            afterMax: _scroll.position.maxScrollExtent,
-          );
-          _scroll.jumpTo(target);
+    try {
+      final runtime = _runtime;
+      final int added;
+      if (runtime != null && !runtime.closed) {
+        added = await runtime.loadOlderTranscriptChunk();
+        _localHasMoreOlder = runtime.hasMoreOlder;
+      } else {
+        added = await _loadOlderChunkOffline();
+      }
+      if (!mounted) return;
+
+      // Rebuild from the expanded resident set (clear PDF freeze).
+      _frozenTranscript = null;
+      _freezeCapturePending = true;
+      _transcriptUiEpoch.value++;
+
+      await Future<void>.delayed(Duration.zero);
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        try {
+          if (_scroll.hasClients) {
+            final target = _transcriptWindow.preserveScrollAfterPrepend(
+              beforePixels: before,
+              beforeMax: beforeMax,
+              afterMax: _scroll.position.maxScrollExtent,
+            );
+            _scroll.jumpTo(target);
+          }
+          if (added > 0) {
+            final label = added == 1
+                ? 'Loaded 1 earlier message'
+                : 'Loaded $added earlier messages';
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(label),
+                duration: const Duration(seconds: 2),
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          } else if (!_hasMoreOlderArchive) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('No earlier messages'),
+                duration: Duration(seconds: 2),
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
+        } finally {
+          _programmaticScroll = false;
+          _loadingOlderHistory = false;
         }
-        if (!mounted || !fromUserTap) return;
-        final label = added == 1
-            ? 'Loaded 1 earlier message'
-            : 'Loaded $added earlier messages';
+      });
+    } catch (e) {
+      _programmaticScroll = false;
+      _loadingOlderHistory = false;
+      SafeLog.d('load older transcript chunk failed', e);
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(label),
-            duration: const Duration(seconds: 2),
+            content: Text('Could not load earlier messages: $e'),
             behavior: SnackBarBehavior.floating,
           ),
         );
-      } finally {
-        _programmaticScroll = false;
-        _loadingOlderHistory = false;
       }
-    });
+    }
   }
 
-  /// Drop older pages when scrolling back to the live end (past [softMax]).
-  void _maybeTrimOlderHistory() {
-    if (!mounted) return;
-    // Never trim while reading a frozen history snapshot — that is PDF mode.
-    if (!_followOutput || _frozenTranscript != null) return;
-    if (_loadingOlderHistory || _programmaticScroll) return;
-    if (!_scroll.hasClients) return;
-
-    final before = _scroll.position.pixels;
-    final beforeMax = _scroll.position.maxScrollExtent;
-    final startBefore = _transcriptWindow.start;
-    final ok = _transcriptWindow.tryTrimOlderNearBottom(
-      total: _blocksLength,
-      pixels: before,
-      maxScrollExtent: beforeMax,
-      now: DateTime.now(),
-      busy: false,
-    );
-    if (!ok) return;
-    final dropped = _transcriptWindow.start - startBefore;
-    if (dropped <= 0) return;
-
-    _loadingOlderHistory = true;
-    _programmaticScroll = true;
-    _transcriptUiEpoch.value++;
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      try {
-        if (_scroll.hasClients) {
-          final target = _transcriptWindow.preserveScrollAfterTrim(
-            beforePixels: before,
-            beforeMax: beforeMax,
-            afterMax: _scroll.position.maxScrollExtent,
-          );
-          _scroll.jumpTo(target);
-        }
-      } finally {
-        _programmaticScroll = false;
-        _loadingOlderHistory = false;
+  Future<int> _loadOlderChunkOffline() async {
+    final db = ref.read(appDatabaseProvider);
+    String? beforeId;
+    for (final entry in _dbEntries) {
+      final id = entry.messageId;
+      if (id != null && id.isNotEmpty) {
+        beforeId = id;
+        break;
       }
-    });
+    }
+    if (beforeId == null) {
+      _localHasMoreOlder = false;
+      return 0;
+    }
+    final page = await db.listOlderMessagesByBytes(
+      widget.chatId,
+      beforeId: beforeId,
+      maxBytes: kTranscriptChunkBytes,
+    );
+    if (page.messages.isEmpty) {
+      _localHasMoreOlder = page.hasMore;
+      return 0;
+    }
+    final olderEntries = _entriesFromMessages(page.messages);
+    _dbEntries.insertAll(0, olderEntries);
+    _localHasMoreOlder = page.hasMore;
+    _messageCount = _dbEntries.length;
+    return page.messages.length;
   }
 
   void _pinWindowToLatest() {
     _frozenTranscript = null;
     _freezeCapturePending = false;
+    _runtime?.pinDisplayToLiveChunk();
     _transcriptWindow.pinToLatest(_blocksLength);
     _setFollowOutput(true);
   }
@@ -461,11 +464,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     final repo = await db.getRepo(chat.repoId);
     final host = repo == null ? null : await db.getHost(repo.hostId);
-    final messages = await db.listRecentMessages(chat.id, limit: 250);
+    final page = await db.listRecentMessagesByBytes(
+      chat.id,
+      maxBytes: kTranscriptChunkBytes,
+    );
+    final messages = page.messages;
 
     _dbEntries
       ..clear()
       ..addAll(_entriesFromMessages(messages));
+    _localHasMoreOlder = page.hasMore;
 
     setState(() {
       _chat = chat;
@@ -479,6 +487,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (existing != null) {
       _bindRuntime(existing);
+      _localHasMoreOlder = existing.hasMoreOlder || _localHasMoreOlder;
       // A live runtime already owns the current tail. Re-reading and merging
       // hundreds of DB rows on every tab switch made chat selection stutter.
       if (existing.entries.isEmpty) {
@@ -2919,8 +2928,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
         late final List<ChatBlock> visibleBlocks;
         late final List<Widget> extra;
-        late final int hiddenOlder;
         late final int windowStart;
+        final showLoadEarlier = _hasMoreOlderArchive;
 
         final existingFreeze = _frozenTranscript;
         if (!_followOutput &&
@@ -2929,7 +2938,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           // PDF mode: immutable document — ignore live tools/thinking/tail.
           visibleBlocks = existingFreeze.visibleBlocks;
           extra = existingFreeze.extras;
-          hiddenOlder = existingFreeze.hiddenOlder;
           windowStart = existingFreeze.start;
           _blocksLength = existingFreeze.allBlocks.length;
         } else {
@@ -2980,22 +2988,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             _captureFrozenTranscript(
               allBlocks: blocks,
               extras: liveExtra,
-              visibleCount: _transcriptWindow.visibleCount > blocks.length
-                  ? blocks.length
-                  : _transcriptWindow.visibleCount,
+              visibleCount: blocks.length,
             );
             final frozen = _frozenTranscript!;
             visibleBlocks = frozen.visibleBlocks;
             extra = frozen.extras;
-            hiddenOlder = frozen.hiddenOlder;
             windowStart = frozen.start;
           } else {
             _frozenTranscript = null;
             _freezeCapturePending = false;
-            visibleBlocks = _transcriptWindow.visibleSlice(blocks);
+            visibleBlocks = blocks;
             extra = liveExtra;
-            hiddenOlder = _transcriptWindow.hiddenOlder();
-            windowStart = _transcriptWindow.start;
+            windowStart = 0;
           }
         }
 
@@ -3478,20 +3482,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           return false;
                         }
                         // Trackpad / wheel / touch: UserScrollNotification.
+                        // Never auto-fetch history — only the top button does.
                         if (notification is UserScrollNotification) {
                           if (notification.direction != ScrollDirection.idle) {
                             _onUserScrollIntent(
                               notification.direction,
                               notification.metrics,
                             );
-                          }
-                          if (notification.direction ==
-                              ScrollDirection.reverse) {
-                            _maybeLoadOlderHistory();
-                          } else if (notification.direction ==
-                              ScrollDirection.forward) {
-                            // Past softMax (~370): ditch oldest page near live end.
-                            _maybeTrimOlderHistory();
                           }
                           return false;
                         }
@@ -3507,11 +3504,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             direction,
                             notification.metrics,
                           );
-                          if (direction == ScrollDirection.reverse) {
-                            _maybeLoadOlderHistory();
-                          } else {
-                            _maybeTrimOlderHistory();
-                          }
                         }
                         return false;
                       },
@@ -3531,12 +3523,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           physics: const AlwaysScrollableScrollPhysics(),
                           cacheExtent: 280,
                           itemCount:
-                              (hiddenOlder > 0 ? 1 : 0) +
+                              (showLoadEarlier ? 1 : 0) +
                               visibleBlocks.length +
                               extra.length,
                           itemBuilder: (context, index) {
                             var cursor = index;
-                            if (hiddenOlder > 0) {
+                            if (showLoadEarlier) {
                               if (cursor == 0) {
                                 return Padding(
                                   padding: const EdgeInsets.only(bottom: 8),
@@ -3544,13 +3536,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     child: TextButton(
                                       onPressed: _loadingOlderHistory
                                           ? null
-                                          : () => _maybeLoadOlderHistory(
-                                              fromUserTap: true,
+                                          : () => unawaited(
+                                              _loadOlderHistoryChunk(),
                                             ),
                                       child: Text(
                                         _loadingOlderHistory
                                             ? 'Loading earlier…'
-                                            : '↑ $hiddenOlder earlier · tap to load',
+                                            : '↑ Load earlier messages (~1 MB)',
                                         style: theme.textTheme.labelSmall
                                             ?.copyWith(
                                               color: theme.colorScheme.primary,

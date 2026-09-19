@@ -256,6 +256,41 @@ class TranscriptRpcTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["id"] for m in tail["messages"]], ["a1"])
         self.assertTrue(tail["hasMore"])
 
+        # Byte-budget pull + pagination cursor.
+        big = "x" * 2000
+        await self.daemon._transcript_sync(
+            {
+                "chatId": chat_id,
+                "messages": [
+                    {
+                        "id": "u0",
+                        "role": "user",
+                        "content": big,
+                        "created_at": "2026-01-01T09:00:00+00:00",
+                    },
+                    {
+                        "id": "a0",
+                        "role": "assistant",
+                        "content": big,
+                        "created_at": "2026-01-01T09:00:01+00:00",
+                    },
+                ],
+            }
+        )
+        by_bytes = await self.daemon._transcript_pull(
+            {"chatId": chat_id, "maxBytes": 2500}
+        )
+        self.assertGreaterEqual(len(by_bytes["messages"]), 1)
+        self.assertLessEqual(by_bytes["bytes"], 2500 + 64)
+        self.assertTrue(by_bytes["hasMore"])
+        oldest = by_bytes["messages"][0]["id"]
+        older = await self.daemon._transcript_pull(
+            {"chatId": chat_id, "maxBytes": 2500, "beforeId": oldest}
+        )
+        self.assertTrue(all(m["id"] != oldest for m in older["messages"]))
+        for m in older["messages"]:
+            self.assertNotEqual(m["id"], by_bytes["messages"][-1]["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

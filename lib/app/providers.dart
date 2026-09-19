@@ -20,6 +20,7 @@ import '../services/schedule_runner.dart';
 import '../services/schedule_sync_service.dart';
 import '../services/ssh_service.dart';
 import '../services/ssh_socks_service.dart';
+import '../services/transcript_budget.dart';
 
 final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
 
@@ -376,11 +377,14 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       },
     );
     await runtime.restoreOutboundQueue();
-    final messages = await _db.listRecentMessages(
+    final page = await _db.listRecentMessagesByBytes(
       chatId,
-      limit: ChatSessionRuntime.residentTranscriptLimit,
+      maxBytes: kTranscriptChunkBytes,
     );
-    runtime.hydrateFromMessages(messages);
+    runtime.hydrateFromMessages(page.messages);
+    runtime.hasMoreOlder =
+        page.hasMore ||
+        (session is AdsmSession && session.hostTranscriptHasMore);
     runtime.startListening();
     await runtime.rememberSessionId();
     state = {...state, chatId: runtime};
