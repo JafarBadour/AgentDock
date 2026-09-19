@@ -102,26 +102,30 @@ class McpServer {
     );
   }
 
-  /// Shape expected by ACP `session/new` mcpServers + ~/.cursor/mcp.json entry.
+  /// Shape expected by ACP `session/new` / `session/load` mcpServers.
   ///
-  /// For HTTP MCPs, [env] is treated as request headers (e.g. Authorization).
+  /// ACP v1 uses `{name,value}` arrays for headers/env (not JSON objects), and
+  /// stdio entries omit `type`. Cursor/Claude config files still use maps —
+  /// see [toMcpJsonEntry] / [toClaudeMcpJsonEntry].
   Map<String, dynamic> toAcpConfig() {
     if (transport == McpTransport.http) {
       return {
         'type': 'http',
         'name': name,
         'url': url ?? '',
-        if (env.isNotEmpty) 'headers': env,
+        'headers': _nameValuePairs(env),
       };
     }
     return {
-      'type': 'stdio',
       'name': name,
       'command': command ?? '',
       'args': args,
-      if (env.isNotEmpty) 'env': env,
+      'env': _nameValuePairs(env),
     };
   }
+
+  static List<Map<String, String>> _nameValuePairs(Map<String, String> map) =>
+      [for (final e in map.entries) {'name': e.key, 'value': e.value}];
 
   /// Entry under mcpServers[name] for ~/.cursor/mcp.json.
   Map<String, dynamic> toMcpJsonEntry() {
