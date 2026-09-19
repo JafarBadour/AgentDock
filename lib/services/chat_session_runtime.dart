@@ -294,7 +294,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
     _uiNotifyDirty = true;
     if (_uiNotifyCoalesce?.isActive ?? false) return;
-    _uiNotifyCoalesce = Timer(const Duration(milliseconds: 100), () {
+    _uiNotifyCoalesce = Timer(const Duration(milliseconds: 150), () {
       _uiNotifyCoalesce = null;
       if (_disposed || !_uiNotifyDirty) return;
       _uiNotifyDirty = false;

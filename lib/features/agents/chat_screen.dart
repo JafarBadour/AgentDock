@@ -104,9 +104,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Timer? _runtimeUiCoalesce;
   bool _runtimeUiDirty = false;
 
-  /// Streaming invalidates only the transcript/chrome builder, never the
-  /// composer subtree.
-  final ValueNotifier<int> _runtimeUiEpoch = ValueNotifier(0);
+  /// Streaming invalidates chrome (status) and transcript separately so an
+  /// activity-label tick never rebuilds the ListView (that made scrolling choke).
+  final ValueNotifier<int> _chromeUiEpoch = ValueNotifier(0);
+  final ValueNotifier<int> _transcriptUiEpoch = ValueNotifier(0);
   final ValueNotifier<int> _composerUiEpoch = ValueNotifier(0);
   final ValueNotifier<({bool streaming, bool connected, int queuedCount})>
   _composerRuntimeN = ValueNotifier((
@@ -148,6 +149,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   String? _blocksCacheKey;
   DateTime? _lastScrollToEndAt;
   double _lastScrollMaxExtent = 0;
+
+  /// Fingerprint of transcript content; activity-only changes skip list rebuild.
+  String _lastTranscriptFp = '';
+  int _emptyLandIdleFrames = 0;
 
   /// Telegram-style: recording continues after finger-up until stop.
   bool _voiceLocked = false;
@@ -519,8 +524,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     runtime.addListener(_runtimeListener!);
     _lastOutboundQueueLen = runtime.outboundQueue.length;
     _syncComposerRuntime(runtime);
-    setState(() {});
-    _scrollToEnd();
+    _lastTranscriptFp = '';
+    _chromeUiEpoch.value++;
+    _transcriptUiEpoch.value++;
+    _scrollToEnd(force: true);
     // Coming back to a chat whose turn already finished should drain the queue.
     runtime.resumeOutboundQueue();
     unawaited(runtime.recoverTrailingUserPromptIfStuck());
@@ -540,19 +547,91 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
     if (_runtimeUiCoalesce?.isActive ?? false) return;
-    // Five visual updates/sec is enough for streaming text and leaves ample
-    // frame budget for typing/scrolling on long markdown transcripts.
-    _runtimeUiCoalesce = Timer(const Duration(milliseconds: 200), () {
+    // While following live output, refresh chrome a bit more often than the
+    // transcript so scroll stays usable.
+    final ms = _followOutput ? 320 : 200;
+    _runtimeUiCoalesce = Timer(Duration(milliseconds: ms), () {
       _runtimeUiCoalesce = null;
       _flushRuntimeUi();
     });
   }
 
+  String _chromeStatusLabel(ChatSessionRuntime? runtime) {
+    final streaming = runtime?.isWorking ?? false;
+    final connected = runtime != null && !runtime.closed;
+    final reconnecting = runtime?.reconnecting ?? false;
+    final remoteRunning = runtime?.remoteTurnActive == true;
+    final sending = runtime?.sendingToHost == true;
+    final activeToolEntries = runtime == null
+        ? const <ToolCallState>[]
+        : [
+            for (final e in runtime.entries)
+              if (e.tool?.isActive ?? false) e.tool!,
+          ];
+    final activeTools = activeToolEntries.length;
+    final pollingTools = [
+      for (final t in activeToolEntries)
+        if (t.isPollingWait) t,
+    ];
+    final isPolling = pollingTools.isNotEmpty;
+    final activityLabel = runtime?.activityLabel;
+    return switch (true) {
+      _ when reconnecting => ' · reconnecting…',
+      _ when remoteRunning && !connected => ' · running on host',
+      _ when sending =>
+        ' · ${activityLabel?.isNotEmpty == true ? activityLabel! : 'Sending to host…'}',
+      _ when streaming && isPolling =>
+        ' · Polling · ${pollingTools.first.displayTitle}',
+      _ when streaming && activityLabel != null && activityLabel.isNotEmpty =>
+        ' · $activityLabel',
+      _ when streaming && activeTools == 1 =>
+        ' · working · ${activeToolEntries.first.displayTitle}',
+      _ when streaming && activeTools > 1 =>
+        ' · working · $activeTools tools',
+      _ when streaming => ' · Thinking',
+      _ when connected && _resumedInPlace => ' · live · resumed',
+      _ when connected => ' · live',
+      _ => '',
+    };
+  }
+
+  String _transcriptContentFingerprint(ChatSessionRuntime? runtime) {
+    if (runtime == null) {
+      return 'db:${_dbEntries.length}';
+    }
+    final tools = <String>[];
+    for (final e in runtime.entries) {
+      final t = e.tool;
+      if (t == null || !t.isActive) continue;
+      // Bucket output length so stdout growth does not thrash the list.
+      final outBucket = (t.rawOutput?.length ?? 0) >> 12; // 4 KiB buckets
+      tools.add('${t.toolCallId}:${t.status}:$outBucket');
+      if (tools.length >= 8) break;
+    }
+    return [
+      runtime.entries.length,
+      runtime.outboundQueue.length,
+      runtime.liveAssistantMessageId ?? '',
+      runtime.assistantBuffer.length >> 5, // 32-char buckets
+      runtime.thoughtBuffer.length >> 5,
+      runtime.isWorking ? 1 : 0,
+      runtime.pendingPermission?.requestId ?? '',
+      tools.join(','),
+    ].join('|');
+  }
+
   void _flushRuntimeUi() {
     if (!mounted || !_runtimeUiDirty) return;
     _runtimeUiDirty = false;
-    _runtimeUiEpoch.value++;
-    _scrollToEnd();
+    final fp = _transcriptContentFingerprint(_runtime);
+    final contentChanged = fp != _lastTranscriptFp;
+    if (contentChanged) {
+      _lastTranscriptFp = fp;
+      _transcriptUiEpoch.value++;
+      _scrollToEnd();
+    }
+    // Status / activity / error chrome — never forces ListView rebuild.
+    _chromeUiEpoch.value++;
     _scheduleMarkRead();
   }
 
@@ -1891,17 +1970,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// The list is lazy, so its scroll extent keeps growing for several frames as
   /// rows are built and markdown lays out. Animating would chase a target that
   /// is still moving and stop short, so pin to the end until it settles.
-  void _landAtBottom({int framesLeft = 10}) {
+  void _landAtBottom({int framesLeft = 3}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (_scroll.hasClients) {
         final max = _scroll.position.maxScrollExtent;
-        if ((_scroll.position.pixels - max).abs() > 1) {
-          _programmaticScroll = true;
-          _scroll.jumpTo(max);
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            _programmaticScroll = false;
-          });
+        // Empty / near-empty transcripts: don't burn frames jumping to 0.
+        if (max < 1) {
+          _emptyLandIdleFrames++;
+          if (_emptyLandIdleFrames >= 2 || framesLeft <= 1) {
+            _landedAtBottom = true;
+            _setFollowOutput(true);
+            return;
+          }
+        } else {
+          _emptyLandIdleFrames = 0;
+          if ((_scroll.position.pixels - max).abs() > 1) {
+            _programmaticScroll = true;
+            _scroll.jumpTo(max);
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _programmaticScroll = false;
+            });
+          }
         }
       }
       if (framesLeft > 1) {
@@ -1934,17 +2024,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       // Re-check: user may have scrolled away since this was scheduled.
       if (!force && !_followOutput) return;
       final max = _scroll.position.maxScrollExtent;
+      if (max < 1) {
+        _lastScrollMaxExtent = max;
+        return;
+      }
       final now = DateTime.now();
       final lastAt = _lastScrollToEndAt;
       final grew = max - _lastScrollMaxExtent;
-      // Streaming markdown grows the extent constantly — jumping every flush
-      // fights the trackpad. Only follow when we moved enough or enough time
-      // passed (or the user forced jump-to-latest).
+      // Streaming grows the extent constantly — jumping every flush fights the
+      // trackpad. Only follow when we moved enough or enough time passed.
       if (!force &&
-          grew < 28 &&
+          grew < 48 &&
           lastAt != null &&
-          now.difference(lastAt) < const Duration(milliseconds: 140) &&
-          (_scroll.position.pixels - max).abs() < 48) {
+          now.difference(lastAt) < const Duration(milliseconds: 280) &&
+          (_scroll.position.pixels - max).abs() < 64) {
         return;
       }
       if ((_scroll.position.pixels - max).abs() < 1) {
@@ -2016,7 +2109,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     _markReadTimer?.cancel();
     _runtimeUiCoalesce?.cancel();
-    _runtimeUiEpoch.dispose();
+    _chromeUiEpoch.dispose();
+    _transcriptUiEpoch.dispose();
     _composerUiEpoch.dispose();
     _composerRuntimeN.dispose();
     _connectingN.dispose();
@@ -2691,8 +2785,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       );
     }
 
+    // Transcript list only rebuilds on [_transcriptUiEpoch]. Activity/status
+    // chrome uses [_chromeUiEpoch] in small nested builders so scrolling while
+    // the agent runs is not fighting a full ListView rebuild every tick.
     return ListenableBuilder(
-      listenable: _runtimeUiEpoch,
+      listenable: _transcriptUiEpoch,
       child: _buildIsolatedComposer(),
       builder: (context, composerChild) {
         final theme = Theme.of(context);
@@ -2744,7 +2841,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }();
         final connected = runtime != null && !runtime.closed;
         final reconnecting = runtime?.reconnecting ?? false;
-        final remoteRunning = runtime?.remoteTurnActive == true;
         final sending = runtime?.sendingToHost == true;
         final activeToolEntries = runtime == null
             ? const <ToolCallState>[]
@@ -2759,29 +2855,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         ];
         final isPolling = pollingTools.isNotEmpty;
         final activityLabel = runtime?.activityLabel;
-        final statusLabel = switch (true) {
-          // Connecting status lives on the toolbar spinner (ValueNotifier) —
-          // do not bake it into this label or every SSH step rebuilds the chat.
-          _ when reconnecting => ' · reconnecting…',
-          _ when remoteRunning && !connected => ' · running on host',
-          _ when sending =>
-            ' · ${activityLabel?.isNotEmpty == true ? activityLabel! : 'Sending to host…'}',
-          _ when streaming && isPolling =>
-            ' · Polling · ${pollingTools.first.displayTitle}',
-          _
-              when streaming &&
-                  activityLabel != null &&
-                  activityLabel.isNotEmpty =>
-            ' · $activityLabel',
-          _ when streaming && activeTools == 1 =>
-            ' · working · ${activeToolEntries.first.displayTitle}',
-          _ when streaming && activeTools > 1 =>
-            ' · working · $activeTools tools',
-          _ when streaming => ' · Thinking',
-          _ when connected && _resumedInPlace => ' · live · resumed',
-          _ when connected => ' · live',
-          _ => '',
-        };
 
         final extra = <Widget>[];
         // Keep live text visible even if isWorking cleared a tick before flush —
@@ -2848,9 +2921,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         ),
                       ],
                     ),
-                    Text(
-                      '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
-                      style: theme.textTheme.bodySmall,
+                    ListenableBuilder(
+                      listenable: _chromeUiEpoch,
+                      builder: (context, _) {
+                        final statusLabel = _chromeStatusLabel(_runtime);
+                        return Text(
+                          '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
+                          style: theme.textTheme.bodySmall,
+                        );
+                      },
                     ),
                   ],
                 ),

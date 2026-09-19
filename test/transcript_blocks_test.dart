@@ -39,7 +39,11 @@ TranscriptEntry _stats(String id, {int added = 1, int removed = 0}) =>
       ),
     );
 
-TranscriptEntry _tool(String id, {String status = 'completed'}) =>
+TranscriptEntry _tool(
+  String id, {
+  String status = 'completed',
+  String? output,
+}) =>
     TranscriptEntry.tool(
       ToolCallState(
         toolCallId: id,
@@ -47,7 +51,8 @@ TranscriptEntry _tool(String id, {String status = 'completed'}) =>
         kind: 'edit',
         status: status,
         locations: ['a.dart'],
-        rawOutput: '''
+        rawOutput: output ??
+            '''
 --- a/a.dart
 +++ b/a.dart
 @@ -1 +1,2 @@
@@ -115,7 +120,9 @@ void main() {
       final k2 = transcriptBlocksCacheKey(a, openTurnActive: true);
       expect(k1, isNot(k2));
 
-      final b = [_user('u1'), _assistant('a1', 'hello!')];
+      // Message length is bucketed (~32 chars) so tiny edits do not thrash
+      // the cache; crossing a bucket must still invalidate.
+      final b = [_user('u1'), _assistant('a1', 'h' * 40)];
       expect(
         transcriptBlocksCacheKey(a, openTurnActive: false),
         isNot(transcriptBlocksCacheKey(b, openTurnActive: false)),
@@ -125,12 +132,23 @@ void main() {
       expect(empty, startsWith('0|'));
     });
 
-    test('tool status / output length affect key', () {
+    test('tool status changes the key; tiny stdout growth does not', () {
       final pending = [_tool('t1', status: 'pending')];
       final done = [_tool('t1', status: 'completed')];
       expect(
         transcriptBlocksCacheKey(pending, openTurnActive: true),
         isNot(transcriptBlocksCacheKey(done, openTurnActive: true)),
+      );
+
+      final small = [
+        _tool('t1', status: 'pending', output: 'x' * 100),
+      ];
+      final stillSameBucket = [
+        _tool('t1', status: 'pending', output: 'x' * 200),
+      ];
+      expect(
+        transcriptBlocksCacheKey(small, openTurnActive: true),
+        transcriptBlocksCacheKey(stillSameBucket, openTurnActive: true),
       );
     });
   });

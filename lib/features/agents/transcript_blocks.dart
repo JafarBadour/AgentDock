@@ -82,11 +82,14 @@ String transcriptBlocksCacheKey(
   required bool openTurnActive,
 }) {
   final last = entries.isEmpty ? null : entries.last;
+  final tool = last?.tool;
+  // Bucket tool stdout so live output growth does not rebuild every block.
+  final outBucket = tool == null ? 0 : (tool.rawOutput?.length ?? 0) >> 12;
+  final contentBucket = tool == null ? 0 : (tool.content?.length ?? 0) >> 12;
+  final msgLen = last?.message?.content.length ?? 0;
   return '${entries.length}|$openTurnActive|'
-      '${last?.messageId ?? ''}|${last?.tool?.toolCallId ?? ''}|'
-      '${last?.tool?.status ?? ''}|${last?.message?.content.length ?? 0}|'
-      '${last?.tool?.rawOutput?.length ?? 0}|'
-      '${last?.tool?.content?.length ?? 0}';
+      '${last?.messageId ?? ''}|${tool?.toolCallId ?? ''}|'
+      '${tool?.status ?? ''}|${msgLen >> 5}|$outBucket|$contentBucket';
 }
 
 /// Collapse tool spam between user messages into one expandable row.
