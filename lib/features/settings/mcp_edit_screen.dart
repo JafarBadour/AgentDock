@@ -104,6 +104,20 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
       return null;
     }
 
+    final existingByName = _existing == null
+        ? await ref.read(appDatabaseProvider).findMcpServerByName(name)
+        : null;
+    if (_existing == null && existingByName != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'An MCP named "$name" already exists — open it instead of creating a duplicate.',
+          ),
+        ),
+      );
+      return null;
+    }
+
     final server = McpServer(
       id: _existing?.id ?? const Uuid().v4(),
       name: name,

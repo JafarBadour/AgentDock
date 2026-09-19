@@ -345,7 +345,35 @@ PY
   }
 
   /// Read Cursor / Claude / Codex MCP names on [host] and refresh local links.
+  Future<void>? _syncRemoteInFlight;
+
   Future<void> syncRemoteMcpState(Host host) async {
+    // Serialize probes — concurrent host refreshes used to mint duplicate stubs.
+    while (_syncRemoteInFlight != null) {
+      try {
+        await _syncRemoteInFlight;
+      } catch (_) {}
+    }
+    final done = Completer<void>();
+    _syncRemoteInFlight = done.future;
+    try {
+      await _syncRemoteMcpStateUnlocked(host);
+      done.complete();
+    } catch (e, st) {
+      done.completeError(e, st);
+      rethrow;
+    } finally {
+      if (identical(_syncRemoteInFlight, done.future)) {
+        _syncRemoteInFlight = null;
+      }
+    }
+  }
+
+  Future<void> _syncRemoteMcpStateUnlocked(Host host) async {
+    try {
+      await _db.ensureMcpServersDeduped();
+    } catch (_) {}
+
     final client = await _ssh.connect(host);
     final raw = await _run(
       client,
@@ -411,29 +439,44 @@ PY
 
     final locals = await _db.listMcpServers();
     final byName = <String, McpServer>{
-      for (final m in locals) m.name: m,
+      for (final m in locals) m.name.trim().toLowerCase(): m,
     };
+
+    String norm(String n) => n.trim().toLowerCase();
 
     // Create local stubs for remotes we have never seen.
     for (final name in allNames) {
-      if (byName.containsKey(name)) continue;
+      final key = norm(name);
+      if (byName.containsKey(key)) continue;
       final stub = McpServer(
         id: const Uuid().v4(),
-        name: name,
+        name: name.trim(),
         transport: McpTransport.http,
         url: null,
         createdAt: DateTime.now(),
       );
-      await _db.upsertMcpServer(stub);
-      byName[name] = stub;
+      try {
+        await _db.upsertMcpServer(stub);
+        byName[key] = stub;
+      } catch (e) {
+        // Unique name index: another probe won the race — reuse that row.
+        SafeLog.d('mcp stub insert raced for $name', e);
+        final existing = await _db.findMcpServerByName(name);
+        if (existing != null) byName[key] = existing;
+      }
     }
+
+    final cursorKeys = {for (final n in cursor) norm(n)};
+    final claudeKeys = {for (final n in claude) norm(n)};
+    final codexKeys = {for (final n in codex) norm(n)};
 
     final localsAfter = byName.values.toList();
     for (final mcp in localsAfter) {
+      final key = norm(mcp.name);
       final targets = <McpClientTarget>[
-        if (cursor.contains(mcp.name)) McpClientTarget.cursor,
-        if (claude.contains(mcp.name)) McpClientTarget.claude,
-        if (codex.contains(mcp.name)) McpClientTarget.codex,
+        if (cursorKeys.contains(key)) McpClientTarget.cursor,
+        if (claudeKeys.contains(key)) McpClientTarget.claude,
+        if (codexKeys.contains(key)) McpClientTarget.codex,
       ];
       final links = await _db.listMcpHostLinks(
         mcpId: mcp.id,

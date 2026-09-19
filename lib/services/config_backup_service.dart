@@ -122,7 +122,42 @@ class ConfigBackupService {
       for (final item in mcpsRaw) {
         if (item is! Map) continue;
         final mcp = McpServer.fromMap(Map<String, Object?>.from(item));
-        await _db.upsertMcpServer(mcp);
+        final existing = await _db.findMcpServerByName(mcp.name);
+        if (existing != null && existing.id != mcp.id) {
+          // Keep the richer definition under the stable local id.
+          final preferIncoming =
+              ((mcp.url ?? '').trim().isNotEmpty ||
+                  (mcp.command ?? '').trim().isNotEmpty) &&
+              ((existing.url ?? '').trim().isEmpty &&
+                  (existing.command ?? '').trim().isEmpty);
+          await _db.upsertMcpServer(
+            preferIncoming
+                ? McpServer(
+                    id: existing.id,
+                    name: mcp.name.trim(),
+                    transport: mcp.transport,
+                    command: mcp.command,
+                    args: mcp.args,
+                    url: mcp.url,
+                    env: mcp.env,
+                    createdAt: existing.createdAt,
+                  )
+                : existing,
+          );
+        } else {
+          await _db.upsertMcpServer(
+            McpServer(
+              id: mcp.id,
+              name: mcp.name.trim(),
+              transport: mcp.transport,
+              command: mcp.command,
+              args: mcp.args,
+              url: mcp.url,
+              env: mcp.env,
+              createdAt: mcp.createdAt,
+            ),
+          );
+        }
         mcpsN++;
       }
     }

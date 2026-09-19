@@ -53,7 +53,7 @@ class AppDatabase {
         );
     return openDatabase(
       path,
-      version: 17,
+      version: 18,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -126,6 +126,10 @@ CREATE TABLE messages (
         );
         await _createMcpTables(db);
         await _createScheduledJobsTable(db);
+        await db.execute(
+          'CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name_unique '
+          'ON mcp_servers(name COLLATE NOCASE)',
+        );
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -237,8 +241,192 @@ AND (
             'ON messages(role, chat_id, created_at)',
           );
         }
+        if (oldVersion < 18) {
+          // Duplicate mcp_servers rows (same name, different ids) are cleaned
+          // in [dedupeMcpServersByName] on first open after this migrate.
+          await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_mcp_servers_name '
+            'ON mcp_servers(name COLLATE NOCASE)',
+          );
+        }
       },
     );
+  }
+
+  bool _mcpDeduped = false;
+
+  /// Collapse duplicate MCP definitions that share a name (case-insensitive).
+  ///
+  /// Remote sync used to mint a new UUID stub whenever it raced or when a
+  /// configured row and a probe stub both existed — the settings list then
+  /// showed the same server many times.
+  Future<int> dedupeMcpServersByName() async {
+    final db = await database;
+    final rows = await db.query('mcp_servers', orderBy: 'name COLLATE NOCASE');
+    final all = rows.map(McpServer.fromMap).toList();
+    if (all.length < 2) return 0;
+
+    final groups = <String, List<McpServer>>{};
+    for (final mcp in all) {
+      final key = mcp.name.trim().toLowerCase();
+      if (key.isEmpty) continue;
+      (groups[key] ??= <McpServer>[]).add(mcp);
+    }
+
+    var removed = 0;
+    for (final group in groups.values) {
+      if (group.length < 2) continue;
+      group.sort(_mcpDedupeRank);
+      final winner = group.first;
+      for (final loser in group.skip(1)) {
+        await _reassignMcpLinks(fromId: loser.id, toId: winner.id);
+        await db.delete('mcp_servers', where: 'id = ?', whereArgs: [loser.id]);
+        removed++;
+      }
+      // Normalize stored name to trimmed form.
+      if (winner.name != winner.name.trim()) {
+        await upsertMcpServer(
+          McpServer(
+            id: winner.id,
+            name: winner.name.trim(),
+            transport: winner.transport,
+            command: winner.command,
+            args: winner.args,
+            url: winner.url,
+            env: winner.env,
+            createdAt: winner.createdAt,
+          ),
+        );
+      }
+    }
+    return removed;
+  }
+
+  static int _mcpDedupeRank(McpServer a, McpServer b) {
+    int score(McpServer m) {
+      var s = 0;
+      if ((m.url ?? '').trim().isNotEmpty) s += 4;
+      if ((m.command ?? '').trim().isNotEmpty) s += 4;
+      if (m.env.isNotEmpty) s += 2;
+      if (m.args.isNotEmpty) s += 1;
+      return s;
+    }
+
+    final byScore = score(b).compareTo(score(a));
+    if (byScore != 0) return byScore;
+    return a.createdAt.compareTo(b.createdAt);
+  }
+
+  Future<void> _reassignMcpLinks({
+    required String fromId,
+    required String toId,
+  }) async {
+    if (fromId == toId) return;
+    final losers = await listMcpHostLinks(mcpId: fromId);
+    for (final link in losers) {
+      final existing = await listMcpHostLinks(mcpId: toId, hostId: link.hostId);
+      if (existing.isEmpty) {
+        await upsertMcpHostLink(
+          McpHostLink(
+            mcpId: toId,
+            hostId: link.hostId,
+            enabled: link.enabled,
+            installStatus: link.installStatus,
+            installDetail: link.installDetail,
+            targets: link.targets,
+          ),
+        );
+      } else {
+        final keep = existing.first;
+        final mergedTargets = <McpClientTarget>{
+          ...keep.targets,
+          ...link.targets,
+        }.toList();
+        final preferLoser =
+            link.installStatus == McpHostInstallStatus.installed &&
+            keep.installStatus != McpHostInstallStatus.installed;
+        await upsertMcpHostLink(
+          keep.copyWith(
+            enabled: keep.enabled || link.enabled,
+            installStatus: preferLoser ? link.installStatus : keep.installStatus,
+            installDetail: preferLoser
+                ? link.installDetail
+                : (keep.installDetail ?? link.installDetail),
+            targets: mergedTargets,
+          ),
+        );
+      }
+      await deleteMcpHostLink(fromId, link.hostId);
+    }
+  }
+
+  Future<McpServer?> findMcpServerByName(String name) async {
+    final key = name.trim().toLowerCase();
+    if (key.isEmpty) return null;
+    final db = await database;
+    final rows = await db.query('mcp_servers', orderBy: 'name COLLATE NOCASE');
+    for (final row in rows) {
+      final mcp = McpServer.fromMap(row);
+      if (mcp.name.trim().toLowerCase() == key) return mcp;
+    }
+    return null;
+  }
+
+  /// Ensure duplicates are collapsed once per process (and after v18 migrate).
+  Future<void> ensureMcpServersDeduped() async {
+    if (_mcpDeduped) return;
+    // Mark early so nested listMcpServers/dedupe calls don't re-enter.
+    _mcpDeduped = true;
+    try {
+      // Use the open DB without going through listMcpServers (avoids recursion).
+      final db = await database;
+      final rows = await db.query('mcp_servers', orderBy: 'name COLLATE NOCASE');
+      final all = rows.map(McpServer.fromMap).toList();
+      if (all.length >= 2) {
+        final groups = <String, List<McpServer>>{};
+        for (final mcp in all) {
+          final key = mcp.name.trim().toLowerCase();
+          if (key.isEmpty) continue;
+          (groups[key] ??= <McpServer>[]).add(mcp);
+        }
+        for (final group in groups.values) {
+          if (group.length < 2) continue;
+          group.sort(_mcpDedupeRank);
+          final winner = group.first;
+          for (final loser in group.skip(1)) {
+            await _reassignMcpLinks(fromId: loser.id, toId: winner.id);
+            await db.delete(
+              'mcp_servers',
+              where: 'id = ?',
+              whereArgs: [loser.id],
+            );
+          }
+          if (winner.name != winner.name.trim()) {
+            await db.insert(
+              'mcp_servers',
+              McpServer(
+                id: winner.id,
+                name: winner.name.trim(),
+                transport: winner.transport,
+                command: winner.command,
+                args: winner.args,
+                url: winner.url,
+                env: winner.env,
+                createdAt: winner.createdAt,
+              ).toMap(),
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
+          }
+        }
+      }
+      await db.execute(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name_unique '
+        'ON mcp_servers(name COLLATE NOCASE)',
+      );
+    } catch (_) {
+      _mcpDeduped = false;
+      rethrow;
+    }
   }
 
   static Future<void> _createScheduledJobsTable(Database db) async {
@@ -987,6 +1175,9 @@ GROUP BY m.chat_id
   // --- MCP ---
 
   Future<List<McpServer>> listMcpServers() async {
+    try {
+      await ensureMcpServersDeduped();
+    } catch (_) {}
     final db = await database;
     final rows = await db.query('mcp_servers', orderBy: 'name COLLATE NOCASE');
     return rows.map(McpServer.fromMap).toList();
