@@ -147,6 +147,34 @@ void main() {
       );
     });
 
+    test('Task/subagent description becomes the title', () {
+      expect(
+        _tool(
+          title: 'Tool',
+          kind: 'think',
+          input:
+              '{"description":"Find SET/RigL pruning logic","prompt":"long…"}',
+        ).displayTitle,
+        'Find SET/RigL pruning logic',
+      );
+      expect(
+        _tool(title: 'Tool', kind: 'task').displayTitle,
+        'Running subagent',
+      );
+    });
+
+    test('shell-dump titles collapse to Ran a command', () {
+      expect(
+        _tool(
+          title:
+              'echo "=== total memory ==="; free -h | head -2; echo; sudo -n dmidecode',
+          kind: 'execute',
+          input: '{"command":"free -h"}',
+        ).displayTitle,
+        'Ran a command',
+      );
+    });
+
     test('does not scan an entire 100KB rawInput for classification', () {
       final huge = 'x' * 100000;
       final sw = Stopwatch()..start();

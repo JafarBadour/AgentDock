@@ -26,11 +26,28 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   int get _hardFailCount => widget.tools.where((t) => t.isHardFail).length;
   int get _softFailCount => widget.tools.where((t) => t.isSoftFail).length;
 
+  String get _groupLabel {
+    final count = widget.tools.length;
+    final titles = <String>[];
+    final seen = <String>{};
+    for (final t in widget.tools) {
+      final label = t.displayTitle.trim();
+      if (label.isEmpty || !seen.add(label)) continue;
+      titles.add(label);
+      if (titles.length >= 3) break;
+    }
+    if (titles.isEmpty) {
+      return count == 1 ? '1 tool call' : '$count tool calls';
+    }
+    final joined = titles.join(' · ');
+    final extra = count > titles.length ? ' · +${count - titles.length}' : '';
+    return '$count tools · $joined$extra';
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final count = widget.tools.length;
     final hard = _hardFails;
     final softOnly = !hard && _softFailCount > 0;
     final labelColor = hard
@@ -67,12 +84,14 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                       child: Shimmer(
                         enabled: false,
                         child: Text(
-                          '$count tool calls',
+                          _groupLabel,
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: labelColor,
                             fontWeight: FontWeight.w500,
                             height: 1.3,
                           ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ),
@@ -143,6 +162,12 @@ class _ToolCallCardState extends State<ToolCallCard> {
     final k = (widget.tool.kind ?? '').toLowerCase();
     final title = widget.tool.title.toLowerCase();
     final blob = '$k $title';
+    if (k.contains('think') ||
+        k.contains('task') ||
+        k.contains('agent') ||
+        blob.contains('subagent')) {
+      return Icons.hub_outlined;
+    }
     if (blob.contains('web') ||
         blob.contains('browser') ||
         k.contains('fetch') ||
@@ -158,6 +183,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
       return Icons.search_rounded;
     }
     if (k.contains('delete')) return Icons.delete_outline;
+    if (k.contains('mcp')) return Icons.extension_outlined;
     return Icons.auto_awesome_outlined;
   }
 

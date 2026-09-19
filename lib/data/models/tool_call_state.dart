@@ -102,21 +102,39 @@ class ToolCallState {
       return isActive ? 'Waiting on remote job' : 'Waited on remote job';
     }
     final given = title.trim();
-    // Agents sometimes dump a JSON fragment as the title; treat that as missing.
-    if (given.isNotEmpty &&
+    final titleUsable = given.isNotEmpty &&
         given.toLowerCase() != 'tool' &&
         !given.startsWith('{') &&
         !given.startsWith('[') &&
-        // Shell dumps the whole `until …` script as the title — collapse those.
+        // Shell dumps the whole `until …` / multi-line script as the title.
         !given.toLowerCase().startsWith('until ') &&
-        !given.toLowerCase().startsWith('while ')) {
-      return given;
+        !given.toLowerCase().startsWith('while ') &&
+        !_looksLikeShellDump(given);
+
+    if (titleUsable) return given;
+
+    // Task / subagent prompts usually put the useful name in `description`.
+    final desc = _descriptionFromInput();
+    if (desc != null && desc.isNotEmpty) {
+      return desc.length > 72 ? '${desc.substring(0, 71)}…' : desc;
     }
+
     final k = (kind ?? '').toLowerCase();
     // Never scan full rawInput — Claude tool payloads can be 100KB+ JSON and
     // displayTitle is hit on every list rebuild.
     final inputHead = _inputHead;
     final blob = '$k ${title.toLowerCase()} ${inputHead.toLowerCase()}';
+    if (k.contains('think') ||
+        k.contains('task') ||
+        k.contains('agent') ||
+        k.contains('subagent') ||
+        blob.contains('"subagent') ||
+        blob.contains('task tool')) {
+      return isActive ? 'Running subagent' : 'Subagent';
+    }
+    if (k.contains('mcp') || blob.contains('mcp__') || blob.contains('saisher')) {
+      return 'MCP tool';
+    }
     if (blob.contains('websearch') ||
         blob.contains('web_search') ||
         blob.contains('web search') ||
@@ -131,7 +149,10 @@ class ToolCallState {
         k.contains('url')) {
       return 'Fetched a URL';
     }
-    if (k.contains('exec') || k.contains('shell') || k.contains('terminal')) {
+    if (k.contains('exec') ||
+        k.contains('shell') ||
+        k.contains('terminal') ||
+        k.contains('bash')) {
       return 'Ran a command';
     }
     if (k.contains('read')) return 'Read a file';
@@ -142,7 +163,37 @@ class ToolCallState {
       return 'Searched the code';
     }
     if (k.contains('delete')) return 'Deleted a file';
+    // Last resort: first line of a shell-ish input, clipped.
+    final cmd = _commandFromInput();
+    if (cmd != null) return cmd;
     return 'Tool call';
+  }
+
+  /// True when the agent stuffed a whole shell script into `title`.
+  static bool _looksLikeShellDump(String title) {
+    if (title.length < 48) return false;
+    final low = title.toLowerCase();
+    if (title.contains('\n')) return true;
+    return low.startsWith('echo ') ||
+        low.startsWith('ls ') ||
+        low.startsWith('cd ') ||
+        low.startsWith('cat ') ||
+        low.startsWith('python') ||
+        low.startsWith('sudo ') ||
+        low.contains(' && ') ||
+        low.contains('; echo');
+  }
+
+  String? _commandFromInput() {
+    final input = rawInput?.trim();
+    if (input == null || input.isEmpty) return null;
+    final fromJson = _previewFromJson(
+      input.length > 8000 ? input.substring(0, 8000) : input,
+    );
+    if (fromJson != null && fromJson.isNotEmpty) {
+      return fromJson.length > 72 ? '${fromJson.substring(0, 71)}…' : fromJson;
+    }
+    return null;
   }
 
   String? _descriptionFromInput() {

@@ -1696,6 +1696,12 @@ class Worker:
                     if typ in ("tool_call", "toolCall")
                     else "tool_update"
                 )
+                label = str(tool.get("title") or "Tool")
+                if len(label) > 48:
+                    label = label[:47] + "…"
+                status = str(tool.get("status") or "").lower()
+                if status in ("", "pending", "in_progress", "running"):
+                    await self._emit_event("activity", label=label)
                 await self._emit_event(kind, tool=tool)
             return
 
@@ -1859,7 +1865,43 @@ def _parse_tool(update: dict[str, Any]) -> Optional[dict[str, Any]]:
         or update.get("title")
         or "Tool"
     )
-    if not tid and title == "Tool":
+    # Prefer MCP / Task descriptions when Claude only sends title=Tool.
+    if title == "Tool" or title.lower() == "tool":
+        raw_in = nested.get("rawInput") or update.get("rawInput")
+        if isinstance(raw_in, str) and raw_in:
+            head = raw_in[:4000]
+            for key in ("description", "prompt", "command", "cmd", "path", "query"):
+                marker = f'"{key}"'
+                i = head.find(marker)
+                if i < 0:
+                    continue
+                colon = head.find(":", i + len(marker))
+                if colon < 0:
+                    continue
+                rest = head[colon + 1 :].lstrip()
+                if rest.startswith('"'):
+                    end = 1
+                    while end < len(rest):
+                        if rest[end] == '"' and rest[end - 1] != "\\":
+                            break
+                        end += 1
+                    val = rest[1:end].replace("\\n", " ").replace('\\"', '"')
+                    val = " ".join(val.split())
+                    if val:
+                        title = val[:80] + ("…" if len(val) > 80 else "")
+                        break
+        kind_l = str(nested.get("kind") or update.get("kind") or "").lower()
+        if title in ("Tool", "tool"):
+            if "think" in kind_l or "task" in kind_l or "agent" in kind_l:
+                title = "Subagent"
+            elif "read" in kind_l:
+                title = "Read"
+            elif "exec" in kind_l or "shell" in kind_l or "terminal" in kind_l:
+                title = "Terminal"
+            elif "mcp" in kind_l:
+                title = "MCP"
+
+    if not tid and title in ("Tool", "tool"):
         return None
     locations: list[str] = []
     raw_locs = nested.get("locations") or update.get("locations")
