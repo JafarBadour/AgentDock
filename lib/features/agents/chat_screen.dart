@@ -234,8 +234,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   void _setFollowOutput(bool follow) {
+    if (follow == _followOutput) {
+      _transcriptWindow.pinnedToEnd = follow;
+      final showJump = !follow;
+      if (_showJumpToLatest.value != showJump) {
+        _showJumpToLatest.value = showJump;
+      }
+      return;
+    }
     _followOutput = follow;
     _transcriptWindow.pinnedToEnd = follow;
+    if (follow) {
+      // Resume live document — drop the PDF snapshot and paint fresh tail.
+      _frozenTranscript = null;
+      _runtimeUiDirty = true;
+      _scheduleRuntimeUi(immediate: true);
+    } else {
+      // Snapshot on the next transcript build; until then keep scrolling on the
+      // last painted rows so we don't rebuild mid-gesture.
+      _freezeCapturePending = true;
+      _transcriptUiEpoch.value++;
+    }
     final showJump = !follow;
     if (_showJumpToLatest.value != showJump) {
       _showJumpToLatest.value = showJump;
@@ -270,9 +289,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _loadingOlderHistory = false;
   int _blocksLength = 0;
 
+  /// PDF-mode snapshot of the transcript while the user reads history.
+  _FrozenTranscript? _frozenTranscript;
+  bool _freezeCapturePending = false;
+
   void _syncWindowToBlocks(int total) {
+    // Frozen document: window geometry is owned by the snapshot.
+    if (_frozenTranscript != null && !_followOutput) {
+      _blocksLength = _frozenTranscript!.allBlocks.length;
+      return;
+    }
     _blocksLength = total;
     _transcriptWindow.sync(total, followOutput: _followOutput);
+  }
+
+  void _captureFrozenTranscript({
+    required List<ChatBlock> allBlocks,
+    required List<Widget> extras,
+    required int visibleCount,
+  }) {
+    final count = visibleCount.clamp(0, allBlocks.length);
+    _frozenTranscript = _FrozenTranscript(
+      allBlocks: List<ChatBlock>.from(allBlocks),
+      extras: List<Widget>.from(extras),
+      visibleCount: count == 0 && allBlocks.isNotEmpty
+          ? allBlocks.length
+          : count,
+    );
+    _freezeCapturePending = false;
+    _blocksLength = allBlocks.length;
   }
 
   /// Grow the mounted transcript toward older history (top edge or tap).
@@ -284,8 +329,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final before = hasScroll ? _scroll.position.pixels : 0.0;
     final beforeMax = hasScroll ? _scroll.position.maxScrollExtent : 0.0;
 
+    final frozen = _frozenTranscript;
     final int added;
-    if (fromUserTap) {
+    if (frozen != null && !_followOutput) {
+      // Expand inside the frozen PDF snapshot only — never pull live tail.
+      final room = frozen.allBlocks.length - frozen.visibleCount;
+      if (room <= 0) return;
+      if (!fromUserTap) {
+        if (!hasScroll || before > _transcriptWindow.edgePx) return;
+      }
+      added = room < _transcriptWindow.pageSize
+          ? room
+          : _transcriptWindow.pageSize;
+      frozen.visibleCount += added;
+    } else if (fromUserTap) {
       added = _transcriptWindow.loadOlder(
         _blocksLength,
         now: DateTime.now(),
@@ -308,8 +365,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     _loadingOlderHistory = true;
     _programmaticScroll = true;
-    _setFollowOutput(false);
-    setState(() {}); // mount the newly prepended history slice
+    if (_followOutput) _setFollowOutput(false);
+    // Prefer epoch bump over setState so chrome/banners don't relayout.
+    _transcriptUiEpoch.value++;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
@@ -342,6 +400,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// Drop older pages when scrolling back to the live end (past [softMax]).
   void _maybeTrimOlderHistory() {
     if (!mounted) return;
+    // Never trim while reading a frozen history snapshot — that is PDF mode.
+    if (!_followOutput || _frozenTranscript != null) return;
     if (_loadingOlderHistory || _programmaticScroll) return;
     if (!_scroll.hasClients) return;
 
@@ -361,7 +421,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     _loadingOlderHistory = true;
     _programmaticScroll = true;
-    setState(() {});
+    _transcriptUiEpoch.value++;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       try {
@@ -381,6 +441,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   void _pinWindowToLatest() {
+    _frozenTranscript = null;
+    _freezeCapturePending = false;
     _transcriptWindow.pinToLatest(_blocksLength);
     _setFollowOutput(true);
   }
@@ -542,12 +604,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               !isTransientBridgeErrorText(runtime.lastError!)) ||
           runtime.deliveryError != null;
 
-      // User scrolled up to read history — don't rebuild/re-layout the whole
-      // transcript (and GptMarkdown) on every Claude token; that is what makes
-      // scrolling feel stuck. Keep a dirty flag and refresh when they jump back.
-      if (!needsImmediate && !_followOutput && working) {
+      // PDF mode: user scrolled up — never mutate the transcript document.
+      // Chrome (status / activity overlay) may still tick.
+      if (!_followOutput) {
         _runtimeUiDirty = true;
-        _setFollowOutput(false);
+        _chromeUiEpoch.value++;
         _scheduleMarkRead();
         return;
       }
@@ -656,6 +717,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void _flushRuntimeUi() {
     if (!mounted || !_runtimeUiDirty) return;
     _runtimeUiDirty = false;
+    // Still reading history — keep the frozen document; only refresh chrome.
+    if (!_followOutput) {
+      _chromeUiEpoch.value++;
+      _scheduleMarkRead();
+      return;
+    }
     final fp = _transcriptContentFingerprint(_runtime);
     final contentChanged = fp != _lastTranscriptFp;
     if (contentChanged) {
@@ -2849,10 +2916,89 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         // Composer no longer locks for the whole turn — only the live buffer
         // counts as "working" for the agent bubble.
         final streaming = runtime?.isWorking ?? false;
-        final blocks = _blocksForMemoized(entries, openTurnActive: streaming);
-        _syncWindowToBlocks(blocks.length);
-        final visibleBlocks = _transcriptWindow.visibleSlice(blocks);
-        final hiddenOlder = _transcriptWindow.hiddenOlder();
+
+        late final List<ChatBlock> visibleBlocks;
+        late final List<Widget> extra;
+        late final int hiddenOlder;
+        late final int windowStart;
+
+        final existingFreeze = _frozenTranscript;
+        if (!_followOutput &&
+            existingFreeze != null &&
+            !_freezeCapturePending) {
+          // PDF mode: immutable document — ignore live tools/thinking/tail.
+          visibleBlocks = existingFreeze.visibleBlocks;
+          extra = existingFreeze.extras;
+          hiddenOlder = existingFreeze.hiddenOlder;
+          windowStart = existingFreeze.start;
+          _blocksLength = existingFreeze.allBlocks.length;
+        } else {
+          final blocks = _blocksForMemoized(
+            entries,
+            openTurnActive: streaming,
+          );
+          _syncWindowToBlocks(blocks.length);
+          final liveExtra = <Widget>[];
+          // Keep live text visible even if isWorking cleared a tick before flush —
+          // that race used to make the answer vanish until reopen.
+          if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
+            if (thoughtBuffer.isNotEmpty) {
+              liveExtra.add(
+                _ThinkingFold(
+                  text: thoughtBuffer,
+                  // Freeze as static text so the fold cannot keep resizing.
+                  streaming: _followOutput && streaming,
+                  initiallyExpanded: streaming,
+                ),
+              );
+            }
+            // Live answer stays above queued user bubbles so the current turn can
+            // finish without burying what the user just scheduled.
+            if (assistantBuffer.isNotEmpty) {
+              liveExtra.add(
+                _Bubble(
+                  role: MessageRole.assistant,
+                  text: assistantBuffer,
+                  streaming: _followOutput && streaming,
+                ),
+              );
+            }
+          }
+          if (_followOutput) {
+            for (final m in queue) {
+              liveExtra.add(
+                _Bubble(
+                  role: MessageRole.user,
+                  text: m.content,
+                  at: m.createdAt,
+                  queued: true,
+                ),
+              );
+            }
+          }
+          if (!_followOutput) {
+            _captureFrozenTranscript(
+              allBlocks: blocks,
+              extras: liveExtra,
+              visibleCount: _transcriptWindow.visibleCount > blocks.length
+                  ? blocks.length
+                  : _transcriptWindow.visibleCount,
+            );
+            final frozen = _frozenTranscript!;
+            visibleBlocks = frozen.visibleBlocks;
+            extra = frozen.extras;
+            hiddenOlder = frozen.hiddenOlder;
+            windowStart = frozen.start;
+          } else {
+            _frozenTranscript = null;
+            _freezeCapturePending = false;
+            visibleBlocks = _transcriptWindow.visibleSlice(blocks);
+            extra = liveExtra;
+            hiddenOlder = _transcriptWindow.hiddenOlder();
+            windowStart = _transcriptWindow.start;
+          }
+        }
+
         final liveError = runtime?.lastError;
         final deliveryError = runtime?.deliveryError;
         final rawError = _error ?? liveError ?? deliveryError;
@@ -2872,42 +3018,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }();
         final connected = runtime != null && !runtime.closed;
         final reconnecting = runtime?.reconnecting ?? false;
-
-        final extra = <Widget>[];
-        // Keep live text visible even if isWorking cleared a tick before flush —
-        // that race used to make the answer vanish until reopen.
-        if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
-          if (thoughtBuffer.isNotEmpty) {
-            extra.add(
-              _ThinkingFold(
-                text: thoughtBuffer,
-                streaming: streaming,
-                initiallyExpanded: streaming,
-              ),
-            );
-          }
-          // Live answer stays above queued user bubbles so the current turn can
-          // finish without burying what the user just scheduled.
-          if (assistantBuffer.isNotEmpty) {
-            extra.add(
-              _Bubble(
-                role: MessageRole.assistant,
-                text: assistantBuffer,
-                streaming: true,
-              ),
-            );
-          }
-        }
-        for (final m in queue) {
-          extra.add(
-            _Bubble(
-              role: MessageRole.user,
-              text: m.content,
-              at: m.createdAt,
-              queued: true,
-            ),
-          );
-        }
 
         return Scaffold(
           appBar: AppBar(
@@ -3455,7 +3565,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             if (cursor < visibleBlocks.length) {
                               final historyIndex = cursor;
                               final absoluteIndex =
-                                  _transcriptWindow.start + historyIndex;
+                                  windowStart + historyIndex;
                               final block = visibleBlocks[historyIndex];
                               final prevAt = historyIndex > 0
                                   ? visibleBlocks[historyIndex - 1].createdAt
@@ -3577,10 +3687,46 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         );
                       },
                     ),
+                    // Activity strip overlays the list so turn status cannot
+                    // resize the scroll viewport (PDF-stable scrollbar).
+                    ListenableBuilder(
+                      listenable: _chromeUiEpoch,
+                      builder: (context, _) {
+                        final rt = _runtime;
+                        if (rt == null || !rt.isWorking) {
+                          return const SizedBox.shrink();
+                        }
+                        return Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: Material(
+                            color: theme.colorScheme.errorContainer.withValues(
+                              alpha: 0.35,
+                            ),
+                            child: SizedBox(
+                              height: 32,
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                ),
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: _buildStreamingActivityLabel(
+                                    theme,
+                                    rt,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
                   ],
                 ),
               ),
-              if (queue.isNotEmpty)
+              if (_followOutput && queue.isNotEmpty)
                 _OutboundQueueBar(
                   queue: queue,
                   busy: streaming,
@@ -3590,7 +3736,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     runtime?.removeFromQueue(id) ?? Future<void>.value(),
                   ),
                 ),
-              if (runtime?.pendingPermission != null)
+              if (_followOutput && runtime?.pendingPermission != null)
                 _PermissionPromptBar(
                   request: runtime!.pendingPermission!,
                   onSelect: (optionId) {
@@ -3600,99 +3746,73 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     );
                   },
                 ),
-              if (streaming)
-                // Fixed height so activity-label churn cannot resize the
-                // transcript viewport (that made the scrollbar jump).
-                SizedBox(
-                  height: 32,
-                  child: Material(
-                    color: theme.colorScheme.errorContainer.withValues(
-                      alpha: 0.35,
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 14),
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: ListenableBuilder(
-                          listenable: _chromeUiEpoch,
-                          builder: (context, _) {
-                            final rt = _runtime;
-                            final explore = rt?.turnExploreStats;
-                            final style = theme.textTheme.bodyMedium?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
-                              fontWeight: FontWeight.w500,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                            );
-                            final active = rt == null
-                                ? const <ToolCallState>[]
-                                : [
-                                    for (final e in rt.entries)
-                                      if (e.tool?.isActive ?? false) e.tool!,
-                                  ];
-                            final polling = [
-                              for (final t in active)
-                                if (t.isPollingWait) t,
-                            ];
-                            final act = rt?.activityLabel;
-                            if (polling.isNotEmpty) {
-                              final label =
-                                  '${polling.first.displayTitle} · Polling';
-                              final text =
-                                  label.endsWith('…') || label.endsWith('...')
-                                  ? label
-                                  : '$label…';
-                              return Text(
-                                text,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: style,
-                              );
-                            }
-                            if (explore != null && explore.isNotEmpty) {
-                              return ExploreStatsLabel(
-                                files: explore.fileCount,
-                                searches: explore.searchCount,
-                                style: style,
-                                showEllipsis: true,
-                              );
-                            }
-                            final String label;
-                            if (rt?.sendingToHost == true) {
-                              label = act?.isNotEmpty == true
-                                  ? act!
-                                  : 'Sending to host…';
-                            } else if (act != null && act.isNotEmpty) {
-                              label = act;
-                            } else if (active.length == 1) {
-                              label = active.first.displayTitle;
-                            } else if (active.length > 1) {
-                              label = 'Working · ${active.length} tools';
-                            } else {
-                              label = 'Thinking';
-                            }
-                            final text =
-                                label.endsWith('…') || label.endsWith('...')
-                                ? label
-                                : '$label…';
-                            return Text(
-                              text,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: style,
-                            );
-                          },
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
               composerChild!,
             ],
           ),
         );
       },
+    );
+  }
+
+  Widget _buildStreamingActivityLabel(
+    ThemeData theme,
+    ChatSessionRuntime rt,
+  ) {
+    final explore = rt.turnExploreStats;
+    final style = theme.textTheme.bodyMedium?.copyWith(
+      color: theme.colorScheme.onSurfaceVariant,
+      fontWeight: FontWeight.w500,
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+    final active = [
+      for (final e in rt.entries)
+        if (e.tool?.isActive ?? false) e.tool!,
+    ];
+    final polling = [
+      for (final t in active)
+        if (t.isPollingWait) t,
+    ];
+    final act = rt.activityLabel;
+    if (polling.isNotEmpty) {
+      final label = '${polling.first.displayTitle} · Polling';
+      final text = label.endsWith('…') || label.endsWith('...')
+          ? label
+          : '$label…';
+      return Text(
+        text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: style,
+      );
+    }
+    if (explore.isNotEmpty) {
+      return ExploreStatsLabel(
+        files: explore.fileCount,
+        searches: explore.searchCount,
+        style: style,
+        showEllipsis: true,
+      );
+    }
+    final String label;
+    if (rt.sendingToHost) {
+      label = act?.isNotEmpty == true ? act! : 'Sending to host…';
+    } else if (act != null && act.isNotEmpty) {
+      label = act;
+    } else if (active.length == 1) {
+      label = active.first.displayTitle;
+    } else if (active.length > 1) {
+      label = 'Working · ${active.length} tools';
+    } else {
+      label = 'Thinking';
+    }
+    final text = label.endsWith('…') || label.endsWith('...')
+        ? label
+        : '$label…';
+    return Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: style,
     );
   }
 
@@ -3878,6 +3998,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 }
 
 /// Collapsible agent reasoning — collapsed by default after the turn ends.
+/// Immutable transcript document used while the user scrolls history.
+///
+/// Live tool/thinking/token updates must not change these rows — that is what
+/// made the scrollbar thrash (extent changing under a fixed pixel offset).
+class _FrozenTranscript {
+  _FrozenTranscript({
+    required this.allBlocks,
+    required this.extras,
+    required this.visibleCount,
+  });
+
+  final List<ChatBlock> allBlocks;
+  final List<Widget> extras;
+  int visibleCount;
+
+  int get start {
+    if (allBlocks.isEmpty) return 0;
+    if (visibleCount >= allBlocks.length) return 0;
+    return allBlocks.length - visibleCount;
+  }
+
+  int get hiddenOlder => start;
+
+  List<ChatBlock> get visibleBlocks {
+    if (allBlocks.isEmpty) return allBlocks;
+    return allBlocks.sublist(start);
+  }
+}
+
 class _ThinkingFold extends StatefulWidget {
   const _ThinkingFold({
     required this.text,
