@@ -38,8 +38,6 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
         await keep.ensureRunning();
       }());
       unawaited(ref.read(localNotificationServiceProvider).init());
-      // Schedule runner polls due automated prompts while the app is alive.
-      ref.read(scheduleRunnerProvider).start();
       // Keep provider alive so remote deletes tear down ACP sessions.
       ref.read(remoteDeletedChatsPrunerProvider);
       // Mac / Windows: offer this machine as a host for local agents.
@@ -66,15 +64,16 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       case AppLifecycleState.resumed:
         ref.read(appInForegroundProvider.notifier).state = true;
         ref.read(sshServiceProvider).onAppResumed();
-        ref.read(activeAcpSessionsProvider.notifier).resumeAll();
-        unawaited(ref.read(agentDockServiceProvider).syncAllHostsCatalog());
+        // Host agents are durable. Do not reconnect every chat or sweep every
+        // host just because the window regained focus; either operation runs
+        // dartssh2 crypto on the UI isolate and stalls the first interactive
+        // frames. The focused chat reconnects on Send/Connect, and catalog
+        // refresh is an explicit user action.
         // Re-assert FGS in case the OEM killed the notification.
         unawaited(ref.read(backgroundKeepAliveProvider).ensureRunning());
-        unawaited(ref.read(scheduleRunnerProvider).tick());
       case AppLifecycleState.paused:
       case AppLifecycleState.hidden:
         ref.read(appInForegroundProvider.notifier).state = false;
-        unawaited(ref.read(agentDockServiceProvider).flushPendingPushes());
         unawaited(_suspendBridgesUnlessKeepAlive());
       case AppLifecycleState.detached:
         ref.read(appInForegroundProvider.notifier).state = false;
@@ -96,6 +95,12 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       // Notification permission / OEM deny may have left _holding false.
       if (await keep.ensureRunning()) return;
     }
+    if (!mounted) return;
+    // Only force an immediate remote flush when transports really are about to
+    // be suspended. Desktop window switching and a healthy foreground service
+    // keep the normal debounced push path; forcing a full encrypted write on
+    // every focus change was visible as UI jank after returning.
+    await ref.read(agentDockServiceProvider).flushPendingPushes();
     if (!mounted) return;
     ref.read(activeAcpSessionsProvider.notifier).suspendAll();
     ref.read(sshServiceProvider).onAppPaused();
@@ -120,10 +125,9 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
           final scaled = dense
               ? MediaQuery(
                   data: MediaQuery.of(context).copyWith(
-                    textScaler: MediaQuery.textScalerOf(context).clamp(
-                      minScaleFactor: 0.9,
-                      maxScaleFactor: 1.1,
-                    ),
+                    textScaler: MediaQuery.textScalerOf(
+                      context,
+                    ).clamp(minScaleFactor: 0.9, maxScaleFactor: 1.1),
                   ),
                   child: body,
                 )

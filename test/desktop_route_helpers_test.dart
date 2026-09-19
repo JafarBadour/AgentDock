@@ -14,14 +14,19 @@ void main() {
       expect(isDesktopDetailRoute('/hosts'), isFalse);
     });
 
-    test('nested host/automate/settings routes are desktop details', () {
+    test('nested host/automate routes are desktop details; settings stay in panel',
+        () {
       expect(isDesktopDetailRoute('/hosts/new'), isTrue);
       expect(isDesktopDetailRoute('/hosts/edit/abc'), isTrue);
       expect(isDesktopDetailRoute('/hosts/terminal/abc'), isTrue);
       expect(isDesktopDetailRoute('/automate/new'), isTrue);
       expect(isDesktopDetailRoute('/automate/edit/1'), isTrue);
-      expect(isDesktopDetailRoute('/settings/mcp/new'), isTrue);
-      expect(isDesktopDetailRoute('/settings/mcp/x'), isTrue);
+      expect(isDesktopDetailRoute('/settings/mcp/new'), isFalse);
+      expect(isDesktopDetailRoute('/settings/mcp/x'), isFalse);
+      expect(isDesktopDetailRoute('/settings/keys'), isFalse);
+      expect(isDesktopDetailRoute('/settings/keys/cursor'), isFalse);
+      expect(isDesktopSettingsSubroute('/settings/mcp/x'), isTrue);
+      expect(isDesktopSettingsSubroute('/settings/keys'), isTrue);
       expect(isDesktopDetailRoute('/agents'), isFalse);
       expect(isDesktopDetailRoute('/agents/chat/1'), isFalse);
     });

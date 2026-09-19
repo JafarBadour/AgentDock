@@ -10,6 +10,8 @@ import '../features/agents/new_agent_flow.dart';
 import '../features/agents/project_files_screen.dart';
 import '../features/automations/automations_screen.dart';
 import '../features/hosts/hosts_screen.dart';
+import '../features/settings/api_keys_screen.dart';
+import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
 import '../features/vpn/vpn_screen.dart';
@@ -74,13 +76,18 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
     // column — bounce back to Agents while keeping the right panel open.
     // Never do this for detail routes (/hosts/new, /automate/edit/…): those
     // must stay on their branch so navigationShell can render them.
-    if (isDesktopPanelRoot(path) &&
-        widget.navigationShell.currentIndex != 0) {
+    if (isDesktopPanelRoot(path) && widget.navigationShell.currentIndex != 0) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         widget.navigationShell.goBranch(0, initialLocation: false);
       });
     }
+  }
+
+  void _closeRightPanel() {
+    ref.read(desktopRightPanelProvider.notifier).state = DesktopRightPanel.none;
+    ref.read(desktopProjectFilesProvider.notifier).state = null;
+    ref.read(desktopSettingsOverlayProvider.notifier).state = null;
   }
 
   void _selectPanel(DesktopRightPanel panel) {
@@ -90,25 +97,27 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
     if (next != DesktopRightPanel.files) {
       ref.read(desktopProjectFilesProvider.notifier).state = null;
     }
-  }
-
-  void _closeRightPanel() {
-    ref.read(desktopRightPanelProvider.notifier).state = DesktopRightPanel.none;
-    ref.read(desktopProjectFilesProvider.notifier).state = null;
+    if (next != DesktopRightPanel.settings) {
+      ref.read(desktopSettingsOverlayProvider.notifier).state = null;
+    }
   }
 
   void _resizeLeft(double dx, double totalWidth, bool rightOpen) {
     final right = rightOpen ? _rightWidth : 0.0;
-    final maxLeft = (totalWidth - _railWidth - right - _minCenter)
-        .clamp(_minLeft, _maxLeft);
+    final maxLeft = (totalWidth - _railWidth - right - _minCenter).clamp(
+      _minLeft,
+      _maxLeft,
+    );
     setState(() {
       _leftWidth = (_leftWidth + dx).clamp(_minLeft, maxLeft);
     });
   }
 
   void _resizeRight(double dx, double totalWidth) {
-    final maxRight =
-        (totalWidth - _railWidth - _leftWidth - _minCenter).clamp(_minRight, _maxRight);
+    final maxRight = (totalWidth - _railWidth - _leftWidth - _minCenter).clamp(
+      _minRight,
+      _maxRight,
+    );
     // Handle is the left edge of the right panel: drag left → wider panel.
     setState(() {
       _rightWidth = (_rightWidth - dx).clamp(_minRight, maxRight);
@@ -189,9 +198,7 @@ class _DesktopShellScaffoldState extends ConsumerState<DesktopShellScaffold> {
           ),
           Expanded(child: _centerColumn(path, chatId)),
           if (rightOpen) ...[
-            _PanelResizeHandle(
-              onDrag: (dx) => _resizeRight(dx, totalWidth),
-            ),
+            _PanelResizeHandle(onDrag: (dx) => _resizeRight(dx, totalWidth)),
             SizedBox(
               width: _rightWidth,
               child: ColoredBox(
@@ -257,9 +264,9 @@ class _DesktopSidebarHeader extends ConsumerWidget {
                     AgentsSidebarMode.directories => 'Directories',
                     AgentsSidebarMode.hosts => 'Hosts',
                   },
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
                 ),
               ),
               IconButton(
@@ -274,8 +281,7 @@ class _DesktopSidebarHeader extends ConsumerWidget {
                 tooltip: 'Refresh / sync',
                 visualDensity: VisualDensity.compact,
                 onPressed: () {
-                  ref.invalidate(agentsTreeProvider);
-                  ref.invalidate(agentsSyncProvider);
+                  unawaited(ref.read(catalogSyncProvider.notifier).refresh());
                   ref.invalidate(unreadCountsProvider);
                 },
                 icon: const Icon(Icons.refresh, size: 18),
@@ -324,12 +330,11 @@ class _AgentsModeSwitcher extends ConsumerWidget {
                   Text(
                     label,
                     style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          fontWeight:
-                              selected ? FontWeight.w700 : FontWeight.w500,
-                          color: selected
-                              ? AppColors.accent
-                              : scheme.onSurfaceVariant,
-                        ),
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      color: selected
+                          ? AppColors.accent
+                          : scheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
@@ -343,11 +348,7 @@ class _AgentsModeSwitcher extends ConsumerWidget {
       children: [
         chip(AgentsSidebarMode.agents, 'Agents', Icons.forum_outlined),
         const SizedBox(width: 6),
-        chip(
-          AgentsSidebarMode.directories,
-          'Directory',
-          Icons.folder_outlined,
-        ),
+        chip(AgentsSidebarMode.directories, 'Directory', Icons.folder_outlined),
         const SizedBox(width: 6),
         chip(AgentsSidebarMode.hosts, 'Hosts', Icons.dns_outlined),
       ],
@@ -470,15 +471,15 @@ class _DesktopChatPlaceholder extends StatelessWidget {
           Text(
             'Select an agent',
             style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: AppColors.mist.withValues(alpha: 0.75),
-                ),
+              color: AppColors.mist.withValues(alpha: 0.75),
+            ),
           ),
           const SizedBox(height: 8),
           Text(
             'Pick a chat from the left, or create a new agent.',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppColors.chatMeta,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: AppColors.chatMeta),
           ),
         ],
       ),
@@ -487,10 +488,7 @@ class _DesktopChatPlaceholder extends StatelessWidget {
 }
 
 class _DesktopRightPanel extends ConsumerWidget {
-  const _DesktopRightPanel({
-    required this.panel,
-    required this.onClose,
-  });
+  const _DesktopRightPanel({required this.panel, required this.onClose});
 
   final DesktopRightPanel panel;
   final VoidCallback onClose;
@@ -498,59 +496,119 @@ class _DesktopRightPanel extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final filesArgs = ref.watch(desktopProjectFilesProvider);
+    final overlay = ref.watch(desktopSettingsOverlayProvider);
+    final settingsSub = panel == DesktopRightPanel.settings && overlay != null
+        ? _desktopSettingsBody(overlay)
+        : null;
     final title = switch (panel) {
       DesktopRightPanel.automate => 'Automate',
       DesktopRightPanel.hosts => 'Hosts',
       DesktopRightPanel.vpn => 'VPN',
-      DesktopRightPanel.settings => 'Settings',
+      DesktopRightPanel.settings => settingsSub?.title ?? 'Settings',
       DesktopRightPanel.files => filesArgs?.title ?? 'Project files',
       DesktopRightPanel.none => '',
     };
 
     final body = switch (panel) {
-      DesktopRightPanel.automate =>
-        const AutomationsScreen(embedded: true),
+      DesktopRightPanel.automate => const AutomationsScreen(embedded: true),
       DesktopRightPanel.hosts => const HostsScreen(embedded: true),
       DesktopRightPanel.vpn => const VpnScreen(embedded: true),
-      DesktopRightPanel.settings => const SettingsScreen(embedded: true),
-      DesktopRightPanel.files => filesArgs == null
-          ? const Center(child: Text('No project selected'))
-          : ProjectFilesScreen(
-              key: ValueKey(
-                '${filesArgs.host.id}:${filesArgs.rootPath}',
+      DesktopRightPanel.settings =>
+        settingsSub?.child ?? const SettingsScreen(embedded: true),
+      DesktopRightPanel.files =>
+        filesArgs == null
+            ? const Center(child: Text('No project selected'))
+            : ProjectFilesScreen(
+                key: ValueKey('${filesArgs.host.id}:${filesArgs.rootPath}'),
+                host: filesArgs.host,
+                rootPath: filesArgs.rootPath,
+                title: filesArgs.title,
+                embedded: true,
               ),
-              host: filesArgs.host,
-              rootPath: filesArgs.rootPath,
-              title: filesArgs.title,
-              embedded: true,
-            ),
       DesktopRightPanel.none => const SizedBox.shrink(),
     };
+
+    final hideChrome = settingsSub != null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(8, 8, 4, 0),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  title,
-                  style: Theme.of(context).textTheme.titleMedium,
+        if (!hideChrome)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 8, 4, 0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                 ),
-              ),
-              IconButton(
-                tooltip: 'Close panel',
-                icon: const Icon(Icons.close),
-                onPressed: onClose,
-              ),
-            ],
+                IconButton(
+                  tooltip: 'Close panel',
+                  icon: const Icon(Icons.close),
+                  onPressed: onClose,
+                ),
+              ],
+            ),
           ),
-        ),
-        const Divider(height: 1),
+        if (!hideChrome) const Divider(height: 1),
+        if (hideChrome)
+          Align(
+            alignment: Alignment.centerRight,
+            child: IconButton(
+              tooltip: 'Close panel',
+              icon: const Icon(Icons.close),
+              onPressed: onClose,
+            ),
+          ),
         Expanded(child: body),
       ],
     );
   }
+}
+
+class _SettingsPanelPage {
+  const _SettingsPanelPage({required this.title, required this.child});
+  final String title;
+  final Widget child;
+}
+
+_SettingsPanelPage? _desktopSettingsBody(String path) {
+  final segs = Uri.tryParse(path)?.pathSegments ?? const <String>[];
+  if (segs.length < 2 || segs[0] != 'settings') return null;
+  if (segs[1] == 'mcp') {
+    if (segs.length < 3) return null;
+    final id = segs[2];
+    if (id == 'new') {
+      return const _SettingsPanelPage(
+        title: 'Add MCP',
+        child: McpEditScreen(embedded: true),
+      );
+    }
+    return _SettingsPanelPage(
+      title: 'MCP',
+      child: McpEditScreen(mcpId: id, embedded: true),
+    );
+  }
+  if (segs[1] == 'keys') {
+    if (segs.length == 2) {
+      return const _SettingsPanelPage(
+        title: 'API keys',
+        child: ApiKeysScreen(embedded: true),
+      );
+    }
+    final kind = ApiKeyKind.tryParse(segs[2]);
+    if (kind == null) {
+      return const _SettingsPanelPage(
+        title: 'API keys',
+        child: ApiKeysScreen(embedded: true),
+      );
+    }
+    return _SettingsPanelPage(
+      title: kind.title,
+      child: ApiKeyEditScreen(kind: kind, embedded: true),
+    );
+  }
+  return null;
 }

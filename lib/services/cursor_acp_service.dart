@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -37,7 +38,9 @@ class AcpAgentCapabilities {
   /// can be resumed by id instead of started from scratch.
   final bool loadSession;
 
-  factory AcpAgentCapabilities.fromInitializeResult(Map<String, dynamic> result) {
+  factory AcpAgentCapabilities.fromInitializeResult(
+    Map<String, dynamic> result,
+  ) {
     final caps = result['agentCapabilities'] ?? result['agent_capabilities'];
     if (caps is Map) {
       final value = caps['loadSession'] ?? caps['load_session'];
@@ -113,12 +116,14 @@ class AcpSession implements AgentSession {
   final _pending = <String, Completer<Map<String, dynamic>>>{};
   final _updates = StreamController<AcpUpdate>.broadcast();
   final _buffer = StringBuffer();
+  final Queue<String> _lineQueue = Queue<String>();
+  bool _drainingLines = false;
 
   /// Request ids are prefixed per connection. When resuming a journal we can
   /// still encounter responses addressed to a previous connection's requests;
   /// the prefix stops those from completing an unrelated new request.
-  late final String _epoch =
-      DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+  late final String _epoch = DateTime.now().microsecondsSinceEpoch
+      .toRadixString(36);
   int _nextId = 1;
 
   int _consumed = 0;
@@ -378,16 +383,17 @@ class AcpSession implements AgentSession {
     }
 
     final agentArgs = switch (provider) {
-      AgentProvider.cursor => permissionPolicy.fullAccess
-          ? '--force --approve-mcps --trust acp'
-          : 'acp',
+      AgentProvider.cursor =>
+        permissionPolicy.fullAccess
+            ? '--force --approve-mcps --trust acp'
+            : 'acp',
       AgentProvider.claude => '',
     };
     final command = agentArgs.isEmpty
         ? '${envExports}cd ${SshService.shellQuote(cwd)} && '
-            'exec ${SshService.shellQuote(binary)}'
+              'exec ${SshService.shellQuote(binary)}'
         : '${envExports}cd ${SshService.shellQuote(cwd)} && '
-            'exec ${SshService.shellQuote(binary)} $agentArgs';
+              'exec ${SshService.shellQuote(binary)} $agentArgs';
 
     final session = await client.execute(command);
     final acp = AcpSession._(
@@ -426,11 +432,15 @@ class AcpSession implements AgentSession {
     );
     // Half-open SSH: stdout can stall while stdin is already dead. Without this
     // a send hangs on "Agent is working" forever.
-    unawaited(_session.stdin.done.then((_) {
-      _handleTransportDead(StateError('ACP stdin closed'));
-    }).catchError((Object e) {
-      _handleTransportDead(e);
-    }));
+    unawaited(
+      _session.stdin.done
+          .then((_) {
+            _handleTransportDead(StateError('ACP stdin closed'));
+          })
+          .catchError((Object e) {
+            _handleTransportDead(e);
+          }),
+    );
     _session.stderr.listen((data) {
       final text = utf8.decode(data, allowMalformed: true);
       if (text.trim().isNotEmpty) {
@@ -553,9 +563,7 @@ class AcpSession implements AgentSession {
       });
       _applyModels(result['models']);
       _applyModes(result['modes']);
-      _applyConfigOptions(
-        result['configOptions'] ?? result['config_options'],
-      );
+      _applyConfigOptions(result['configOptions'] ?? result['config_options']);
     } catch (e) {
       SafeLog.d('session/load for model catalog failed', e);
       rethrow;
@@ -604,26 +612,25 @@ class AcpSession implements AgentSession {
       _started = true;
       _applyModes(result['modes']);
       _applyModels(result['models']);
-      _applyConfigOptions(
-        result['configOptions'] ?? result['config_options'],
-      );
+      _applyConfigOptions(result['configOptions'] ?? result['config_options']);
     } finally {
       _replaying = false;
     }
   }
 
-  Future<void> _newSession({required List<Map<String, dynamic>> mcpServers}) async {
+  Future<void> _newSession({
+    required List<Map<String, dynamic>> mcpServers,
+  }) async {
     final result = await _request('session/new', {
       'cwd': cwd,
       'mcpServers': mcpServers,
     });
-    sessionId = result['sessionId'] as String? ?? result['session_id'] as String?;
+    sessionId =
+        result['sessionId'] as String? ?? result['session_id'] as String?;
     _started = true;
     _applyModes(result['modes']);
     _applyModels(result['models']);
-    _applyConfigOptions(
-      result['configOptions'] ?? result['config_options'],
-    );
+    _applyConfigOptions(result['configOptions'] ?? result['config_options']);
   }
 
   void _applyModels(Object? models) {
@@ -709,9 +716,7 @@ class AcpSession implements AgentSession {
         'type': 'id',
         'value': modelId,
       });
-      _applyConfigOptions(
-        result['configOptions'] ?? result['config_options'],
-      );
+      _applyConfigOptions(result['configOptions'] ?? result['config_options']);
       // Keep ACP's currentValue when the response carried one; otherwise the
       // id we asked for (so the chip never claims a switch that only wrote
       // the local preference).
@@ -833,9 +838,7 @@ class AcpSession implements AgentSession {
         .where((o) => o.optionId == optionId)
         .map((o) => o.name)
         .firstOrNull;
-    _updates.add(
-      AcpUpdate.permission(label ?? optionId, request: null),
-    );
+    _updates.add(AcpUpdate.permission(label ?? optionId, request: null));
   }
 
   /// Cancel every unanswered permission (disconnect / cancel turn).
@@ -857,7 +860,9 @@ class AcpSession implements AgentSession {
   }
 
   void _autoAnswerOpenPermissions() {
-    final pending = Map<Object, PendingPermissionRequest>.from(_openPermissions);
+    final pending = Map<Object, PendingPermissionRequest>.from(
+      _openPermissions,
+    );
     _openPermissions.clear();
     for (final entry in pending.entries) {
       _writePermissionSelected(entry.key, entry.value, preferAlways: true);
@@ -898,7 +903,10 @@ class AcpSession implements AgentSession {
     completer.complete({'stopReason': reason});
   }
 
-  Future<Map<String, dynamic>> _request(String method, Map<String, dynamic> params) async {
+  Future<Map<String, dynamic>> _request(
+    String method,
+    Map<String, dynamic> params,
+  ) async {
     final key = '$_epoch-${_nextId++}';
     final completer = Completer<Map<String, dynamic>>();
     _pending[key] = completer;
@@ -907,19 +915,13 @@ class AcpSession implements AgentSession {
       _promptSawOutput = false;
       _promptHadTools = false;
     }
-    _write({
-      'jsonrpc': '2.0',
-      'id': key,
-      'method': method,
-      'params': params,
-    });
+    _write({'jsonrpc': '2.0', 'id': key, 'method': method, 'params': params});
     final timeout = switch (method) {
       'initialize' || 'session/new' => const Duration(seconds: 25),
       'session/load' => const Duration(seconds: 60),
       'session/set_mode' ||
       'session/set_model' ||
-      'session/set_config_option' =>
-        const Duration(seconds: 15),
+      'session/set_config_option' => const Duration(seconds: 15),
       // Silence budget: agent may work for a long time, but once it goes quiet
       // after producing output we settle much sooner (see soft settle below).
       'session/prompt' => const Duration(minutes: 5),
@@ -970,9 +972,7 @@ class AcpSession implements AgentSession {
       final sinceStart = now.difference(promptStarted);
       final idleCap = _promptHadTools ? hardIdleAfterTools : hardIdle;
 
-      if (_promptSawOutput &&
-          !_promptHadTools &&
-          sinceActivity >= softSettle) {
+      if (_promptSawOutput && !_promptHadTools && sinceActivity >= softSettle) {
         _finishPromptEarly(reason: 'end_turn');
         try {
           return await future.timeout(Duration.zero);
@@ -996,12 +996,14 @@ class AcpSession implements AgentSession {
       final wait = _promptHadTools
           ? idleCap - sinceActivity
           : _promptSawOutput
-              ? softSettle - sinceActivity
-              : hardIdle - sinceStart;
+          ? softSettle - sinceActivity
+          : hardIdle - sinceStart;
       try {
-        return await future.timeout(wait < const Duration(milliseconds: 50)
-            ? const Duration(milliseconds: 50)
-            : wait);
+        return await future.timeout(
+          wait < const Duration(milliseconds: 50)
+              ? const Duration(milliseconds: 50)
+              : wait,
+        );
       } on TimeoutException {
         continue;
       }
@@ -1020,11 +1022,7 @@ class AcpSession implements AgentSession {
   }
 
   Future<void> _notify(String method, Map<String, dynamic> params) async {
-    _write({
-      'jsonrpc': '2.0',
-      'method': method,
-      'params': params,
-    });
+    _write({'jsonrpc': '2.0', 'method': method, 'params': params});
   }
 
   void _write(Map<String, dynamic> message) {
@@ -1052,19 +1050,42 @@ class AcpSession implements AgentSession {
       final line = content.substring(0, index).trim();
       content = content.substring(index + 1);
       if (line.isNotEmpty) {
-        _handleLine(line);
+        _lineQueue.addLast(line);
       }
       index = content.indexOf('\n');
     }
     _buffer
       ..clear()
       ..write(content);
+    unawaited(_drainLines());
+  }
+
+  Future<void> _drainLines() async {
+    if (_drainingLines) return;
+    _drainingLines = true;
+    try {
+      var batch = 0;
+      while (_lineQueue.isNotEmpty) {
+        _handleLine(_lineQueue.removeFirst());
+        batch++;
+        if (batch >= 24) {
+          batch = 0;
+          // Journal replay and tool bursts can contain thousands of JSON lines.
+          // Yield between batches so pointer/keyboard frames are serviced.
+          await Future<void>.delayed(Duration.zero);
+        }
+      }
+    } finally {
+      _drainingLines = false;
+      if (_lineQueue.isNotEmpty) unawaited(_drainLines());
+    }
   }
 
   void _handleLine(String line) {
     try {
       final msg = jsonDecode(line) as Map<String, dynamic>;
-      if (msg.containsKey('id') && (msg.containsKey('result') || msg.containsKey('error'))) {
+      if (msg.containsKey('id') &&
+          (msg.containsKey('result') || msg.containsKey('error'))) {
         final key = '${msg['id']}';
         if (_promptRequestKey == key) _promptRequestKey = null;
         final completer = _pending.remove(key);
@@ -1074,7 +1095,9 @@ class AcpSession implements AgentSession {
         } else {
           final result = msg['result'];
           completer.complete(
-            result is Map<String, dynamic> ? result : <String, dynamic>{'value': result},
+            result is Map<String, dynamic>
+                ? result
+                : <String, dynamic>{'value': result},
           );
         }
         return;
@@ -1154,7 +1177,9 @@ class AcpSession implements AgentSession {
         }
       }
     }
-    optionId ??= ids.isNotEmpty ? ids.first : (preferAlways ? 'allow-always' : 'allow-once');
+    optionId ??= ids.isNotEmpty
+        ? ids.first
+        : (preferAlways ? 'allow-always' : 'allow-once');
 
     _write({
       'jsonrpc': '2.0',
@@ -1254,10 +1279,7 @@ class AcpSession implements AgentSession {
         'jsonrpc': '2.0',
         'id': id,
         'result': {
-          'outcome': {
-            'outcome': 'answered',
-            'answers': answers,
-          },
+          'outcome': {'outcome': 'answered', 'answers': answers},
         },
       });
       return;
@@ -1267,10 +1289,7 @@ class AcpSession implements AgentSession {
       'jsonrpc': '2.0',
       'id': id,
       'result': {
-        'outcome': {
-          'outcome': 'skipped',
-          'reason': 'No options to select',
-        },
+        'outcome': {'outcome': 'skipped', 'reason': 'No options to select'},
       },
     });
   }
@@ -1355,9 +1374,7 @@ class PermissionOption {
   bool get isReject {
     final k = kind.toLowerCase();
     final id = optionId.toLowerCase();
-    return k.contains('reject') ||
-        id.contains('reject') ||
-        id.contains('deny');
+    return k.contains('reject') || id.contains('reject') || id.contains('deny');
   }
 }
 
@@ -1444,36 +1461,38 @@ class AcpUpdate {
   const AcpUpdate.delta(String text) : this._(AcpUpdateKind.delta, text);
   const AcpUpdate.thought(String text) : this._(AcpUpdateKind.thought, text);
   const AcpUpdate.permission(String text, {PendingPermissionRequest? request})
-      : this._(AcpUpdateKind.permission, text, permissionRequest: request);
+    : this._(AcpUpdateKind.permission, text, permissionRequest: request);
   const AcpUpdate.error(String text) : this._(AcpUpdateKind.error, text);
   const AcpUpdate.closed() : this._(AcpUpdateKind.closed, '');
   const AcpUpdate.ignored() : this._(AcpUpdateKind.ignored, '');
+
   /// Agent finished the current turn (idle / stopReason), even if the
   /// `session/prompt` JSON-RPC response has not arrived yet.
   const AcpUpdate.turnComplete([String reason = 'end_turn'])
-      : this._(AcpUpdateKind.turnComplete, reason);
+    : this._(AcpUpdateKind.turnComplete, reason);
   const AcpUpdate.status(String text, {String? title})
-      : this._(AcpUpdateKind.status, text, title: title);
+    : this._(AcpUpdateKind.status, text, title: title);
+
   /// Host/daemon activity label for the UI (Thinking, Connecting, tool name…).
   const AcpUpdate.activity(String label)
-      : this._(AcpUpdateKind.activity, label);
+    : this._(AcpUpdateKind.activity, label);
 
   /// ADSM accepted the user prompt (message is on the host; turn may still run).
   const AcpUpdate.promptAccepted([String userMessageId = ''])
-      : this._(AcpUpdateKind.promptAccepted, userMessageId);
+    : this._(AcpUpdateKind.promptAccepted, userMessageId);
 
   /// Host agent lifecycle (`idle` / `running` / …) from ADSM status events.
   const AcpUpdate.daemonStatus(String status)
-      : this._(AcpUpdateKind.daemonStatus, status);
+    : this._(AcpUpdateKind.daemonStatus, status);
 
   /// Context-window usage from ACP `usage_update`.
   const AcpUpdate.usage({required int used, required int size})
-      : this._(AcpUpdateKind.usage, '', tokensUsed: used, contextSize: size);
+    : this._(AcpUpdateKind.usage, '', tokensUsed: used, contextSize: size);
 
   AcpUpdate.toolCall(ToolCallState tool)
-      : this._(AcpUpdateKind.tool, tool.title, tool: tool);
+    : this._(AcpUpdateKind.tool, tool.title, tool: tool);
   AcpUpdate.mode(AgentSessionMode mode)
-      : this._(AcpUpdateKind.mode, mode.label, mode: mode);
+    : this._(AcpUpdateKind.mode, mode.label, mode: mode);
 
   factory AcpUpdate.fromParams(Map<String, dynamic> params) {
     final update = params['update'] as Map<String, dynamic>? ?? params;
@@ -1609,18 +1628,20 @@ class AcpUpdate {
     final nested = update['toolCall'] is Map
         ? Map<String, dynamic>.from(update['toolCall'] as Map)
         : update;
-    final id = (nested['toolCallId'] ??
-            nested['tool_call_id'] ??
-            nested['id'] ??
-            update['toolCallId'] ??
-            '')
-        .toString();
-    final title = (nested['title'] ??
-            nested['name'] ??
-            nested['toolName'] ??
-            update['title'] ??
-            'Tool')
-        .toString();
+    final id =
+        (nested['toolCallId'] ??
+                nested['tool_call_id'] ??
+                nested['id'] ??
+                update['toolCallId'] ??
+                '')
+            .toString();
+    final title =
+        (nested['title'] ??
+                nested['name'] ??
+                nested['toolName'] ??
+                update['title'] ??
+                'Tool')
+            .toString();
     if (id.isEmpty && title == 'Tool') return null;
 
     final locations = <String>[];
@@ -1643,9 +1664,15 @@ class AcpUpdate {
       kind: (nested['kind'] ?? update['kind'])?.toString(),
       status: (nested['status'] ?? update['status'] ?? 'pending').toString(),
       locations: locations,
-      rawInput: ToolCallState.formatOpaque(nested['rawInput'] ?? update['rawInput']),
-      rawOutput: ToolCallState.formatOpaque(nested['rawOutput'] ?? update['rawOutput']),
-      content: ToolCallState.formatOpaque(nested['content'] ?? update['content']),
+      rawInput: ToolCallState.formatOpaque(
+        nested['rawInput'] ?? update['rawInput'],
+      ),
+      rawOutput: ToolCallState.formatOpaque(
+        nested['rawOutput'] ?? update['rawOutput'],
+      ),
+      content: ToolCallState.formatOpaque(
+        nested['content'] ?? update['content'],
+      ),
     );
   }
 
@@ -1661,7 +1688,8 @@ class AcpUpdate {
     if (message is Map) {
       if (message['text'] != null) return message['text'].toString();
       final inner = message['content'];
-      if (inner is Map && inner['text'] != null) return inner['text'].toString();
+      if (inner is Map && inner['text'] != null)
+        return inner['text'].toString();
       if (inner is String) return inner;
     }
     if (message is String) return message;

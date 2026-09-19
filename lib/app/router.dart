@@ -8,6 +8,7 @@ import '../features/automations/automations_screen.dart';
 import '../features/automations/schedule_edit_screen.dart';
 import '../features/hosts/host_edit_screen.dart';
 import '../features/hosts/hosts_screen.dart';
+import '../features/settings/api_keys_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
@@ -116,6 +117,24 @@ final goRouterProvider = Provider<GoRouter>((ref) {
                 path: '/settings',
                 builder: (context, state) => const SettingsScreen(),
                 routes: [
+                  GoRoute(
+                    path: 'keys',
+                    builder: (context, state) => const ApiKeysScreen(),
+                    routes: [
+                      GoRoute(
+                        path: ':keyId',
+                        builder: (context, state) {
+                          final kind = ApiKeyKind.tryParse(
+                            state.pathParameters['keyId'],
+                          );
+                          if (kind == null) {
+                            return const ApiKeysScreen();
+                          }
+                          return ApiKeyEditScreen(kind: kind);
+                        },
+                      ),
+                    ],
+                  ),
                   GoRoute(
                     path: 'mcp/new',
                     builder: (context, state) => const McpEditScreen(),

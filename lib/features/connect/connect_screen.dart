@@ -1,15 +1,12 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/providers.dart';
 import '../../data/secure/safe_log.dart';
-import 'claude_login_sheet.dart';
 
-/// SSH / Cursor / Anthropic keys + mic language.
+/// SSH private key + chat mic language.
 ///
-/// Shown inside Settings (and optionally as a standalone scaffold).
+/// API keys live under Settings → API keys.
 class ConnectScreen extends ConsumerStatefulWidget {
   const ConnectScreen({
     super.key,
@@ -30,12 +27,8 @@ class ConnectScreen extends ConsumerStatefulWidget {
 class _ConnectScreenState extends ConsumerState<ConnectScreen> {
   final _keyController = TextEditingController();
   final _passphraseController = TextEditingController();
-  final _cursorKeyController = TextEditingController();
-  final _anthropicKeyController = TextEditingController();
   final _gcpLangController = TextEditingController(text: 'en-US');
   bool _hasKey = false;
-  bool _hasCursorKey = false;
-  bool _hasAnthropicKey = false;
   bool _saving = false;
   String? _status;
 
@@ -43,22 +36,15 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
   void initState() {
     super.initState();
     _load();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(ref.read(scheduleRunnerProvider).tick());
-    });
   }
 
   Future<void> _load() async {
     final store = ref.read(secureStoreProvider);
     final hasKey = await store.hasSshPrivateKey();
-    final hasCursor = await store.hasCursorApiKey();
-    final hasAnthropic = await store.hasAnthropicApiKey();
     final gcpLang = await store.readGcpSpeechLanguage();
     if (!mounted) return;
     setState(() {
       _hasKey = hasKey;
-      _hasCursorKey = hasCursor;
-      _hasAnthropicKey = hasAnthropic;
       if (_gcpLangController.text.trim().isEmpty ||
           _gcpLangController.text == 'en-US') {
         _gcpLangController.text = gcpLang;
@@ -104,47 +90,6 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     setState(() => _status = 'SSH key removed from keystore.');
   }
 
-  Future<void> _saveCursorKey() async {
-    setState(() {
-      _saving = true;
-      _status = null;
-    });
-    try {
-      await ref.read(secureStoreProvider).saveCursorApiKey(_cursorKeyController.text);
-      _cursorKeyController.clear();
-      await _load();
-      setState(() => _status = 'Cursor API key saved. Prefer agent login on the remote when possible.');
-    } catch (e) {
-      SafeLog.d('save cursor key failed', e);
-      setState(() => _status = 'Failed to save Cursor key: $e');
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  Future<void> _saveAnthropicKey() async {
-    setState(() {
-      _saving = true;
-      _status = null;
-    });
-    try {
-      await ref
-          .read(secureStoreProvider)
-          .saveAnthropicApiKey(_anthropicKeyController.text);
-      _anthropicKeyController.clear();
-      await _load();
-      setState(
-        () => _status =
-            'Anthropic API key saved. Prefer `claude login` on the remote when possible.',
-      );
-    } catch (e) {
-      SafeLog.d('save anthropic key failed', e);
-      setState(() => _status = 'Failed to save Anthropic key: $e');
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
   Future<void> _saveGcpKey() async {
     setState(() {
       _saving = true;
@@ -155,8 +100,8 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
       await store.saveGcpSpeechLanguage(_gcpLangController.text);
       await _load();
       setState(
-        () => _status =
-            'Speech language saved. Mic uses on-device recognition.',
+        () =>
+            _status = 'Speech language saved. Mic uses on-device recognition.',
       );
     } catch (e) {
       SafeLog.d('save speech language failed', e);
@@ -170,8 +115,6 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
   void dispose() {
     _keyController.dispose();
     _passphraseController.dispose();
-    _cursorKeyController.dispose();
-    _anthropicKeyController.dispose();
     _gcpLangController.dispose();
     super.dispose();
   }
@@ -182,149 +125,90 @@ class _ConnectScreenState extends ConsumerState<ConnectScreen> {
     final body = ListView(
       shrinkWrap: nested,
       physics: nested ? const NeverScrollableScrollPhysics() : null,
-      padding: EdgeInsets.all(
-        nested ? 0 : (widget.embedded ? 12 : 16),
-      ),
+      padding: EdgeInsets.all(nested ? 0 : (widget.embedded ? 12 : 16)),
       children: [
-          Text(
-            'Secrets stay on this device in the platform keystore. '
-            'Nothing is uploaded to our servers — this app has no analytics or cloud backend.',
-            style: Theme.of(context).textTheme.bodyMedium,
+        Text(
+          'Secrets stay on this device in the platform keystore. '
+          'Nothing is uploaded to our servers — this app has no analytics or cloud backend.',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+        const SizedBox(height: 16),
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(
+            _hasKey ? Icons.check_circle : Icons.warning_amber,
+            color: _hasKey ? Colors.green : Colors.orange,
           ),
-          const SizedBox(height: 16),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(
-              _hasKey ? Icons.check_circle : Icons.warning_amber,
-              color: _hasKey ? Colors.green : Colors.orange,
+          title: Text(
+            _hasKey ? 'SSH private key stored' : 'No SSH private key',
+          ),
+          subtitle: const Text('Used only to open SSH sessions you configure'),
+        ),
+        TextField(
+          controller: _keyController,
+          maxLines: 6,
+          obscureText: false,
+          decoration: const InputDecoration(
+            labelText: 'SSH private key (PEM)',
+            alignLabelWithHint: true,
+            border: OutlineInputBorder(),
+            hintText: '-----BEGIN OPENSSH PRIVATE KEY-----',
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _passphraseController,
+          obscureText: true,
+          decoration: const InputDecoration(
+            labelText: 'Key passphrase (optional)',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            FilledButton(
+              onPressed: _saving ? null : _saveKey,
+              child: const Text('Save key'),
             ),
-            title: Text(_hasKey ? 'SSH private key stored' : 'No SSH private key'),
-            subtitle: const Text('Used only to open SSH sessions you configure'),
-          ),
-          TextField(
-            controller: _keyController,
-            maxLines: 6,
-            obscureText: false,
-            decoration: const InputDecoration(
-              labelText: 'SSH private key (PEM)',
-              alignLabelWithHint: true,
-              border: OutlineInputBorder(),
-              hintText: '-----BEGIN OPENSSH PRIVATE KEY-----',
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _passphraseController,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'Key passphrase (optional)',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              FilledButton(
-                onPressed: _saving ? null : _saveKey,
-                child: const Text('Save key'),
+            const SizedBox(width: 12),
+            if (_hasKey)
+              OutlinedButton(
+                onPressed: _saving ? null : _clearKey,
+                child: const Text('Remove key'),
               ),
-              const SizedBox(width: 12),
-              if (_hasKey)
-                OutlinedButton(
-                  onPressed: _saving ? null : _clearKey,
-                  child: const Text('Remove key'),
-                ),
-            ],
-          ),
-          const Divider(height: 40),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(
-              _hasCursorKey ? Icons.check_circle : Icons.info_outline,
-              color: _hasCursorKey ? Colors.green : null,
-            ),
-            title: Text(_hasCursorKey ? 'Cursor API key stored' : 'Cursor API key (optional)'),
-            subtitle: const Text(
-              'Prefer logging in with the Cursor CLI on the remote host. '
-              'If set, the key is injected only into that agent process environment.',
-            ),
-          ),
-          TextField(
-            controller: _cursorKeyController,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'CURSOR_API_KEY',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          FilledButton.tonal(
-            onPressed: _saving ? null : _saveCursorKey,
-            child: const Text('Save Cursor key'),
-          ),
-          const Divider(height: 40),
-          const ClaudeHostLoginPanel(),
-          const Divider(height: 40),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(
-              _hasAnthropicKey ? Icons.check_circle : Icons.info_outline,
-              color: _hasAnthropicKey ? Colors.green : null,
-            ),
-            title: Text(
-              _hasAnthropicKey
-                  ? 'Anthropic API key stored'
-                  : 'Anthropic API key (optional)',
-            ),
-            subtitle: const Text(
-              'Optional if you signed in with Claude on the remote (Settings → '
-              'Sign in to Claude). If set, the key is injected only into that '
-              'agent process environment.',
-            ),
-          ),
-          TextField(
-            controller: _anthropicKeyController,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'ANTHROPIC_API_KEY',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          FilledButton.tonal(
-            onPressed: _saving ? null : _saveAnthropicKey,
-            child: const Text('Save Anthropic key'),
-          ),
-          const Divider(height: 40),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.mic),
-            title: const Text('Chat mic'),
-            subtitle: const Text(
-              'Uses on-device speech recognition (no Gemini upload). '
-              'Set a language hint below if needed.',
-            ),
-          ),
-          TextField(
-            controller: _gcpLangController,
-            decoration: const InputDecoration(
-              labelText: 'Language code',
-              hintText: 'en-US',
-              border: OutlineInputBorder(),
-              helperText: 'BCP-47 code, e.g. en-US, nl-NL, de-DE',
-            ),
-          ),
-          const SizedBox(height: 12),
-          FilledButton.tonal(
-            onPressed: _saving ? null : _saveGcpKey,
-            child: const Text('Save language'),
-          ),
-          if (_status != null) ...[
-            const SizedBox(height: 20),
-            Text(_status!, style: Theme.of(context).textTheme.bodySmall),
           ],
+        ),
+        const Divider(height: 40),
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.mic),
+          title: const Text('Chat mic'),
+          subtitle: const Text(
+            'Uses on-device speech recognition (no Gemini upload). '
+            'Set a language hint below if needed.',
+          ),
+        ),
+        TextField(
+          controller: _gcpLangController,
+          decoration: const InputDecoration(
+            labelText: 'Language code',
+            hintText: 'en-US',
+            border: OutlineInputBorder(),
+            helperText: 'BCP-47 code, e.g. en-US, nl-NL, de-DE',
+          ),
+        ),
+        const SizedBox(height: 12),
+        FilledButton.tonal(
+          onPressed: _saving ? null : _saveGcpKey,
+          child: const Text('Save language'),
+        ),
+        if (_status != null) ...[
+          const SizedBox(height: 20),
+          Text(_status!, style: Theme.of(context).textTheme.bodySmall),
         ],
-      );
+      ],
+    );
 
     if (widget.embedded || widget.nestedInParentScroll) return body;
 

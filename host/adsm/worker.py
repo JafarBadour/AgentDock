@@ -432,6 +432,7 @@ class Worker:
         mode: Optional[str] = None,
         model_id: Optional[str] = None,
         permission_ask: bool = False,
+        force_new_session: bool = False,
     ) -> dict[str, Any]:
         async with self._lock:
             self.cwd = cwd
@@ -442,6 +443,30 @@ class Worker:
             await self._set_status(
                 self.chat_id, protocol.STATUS_STARTING, None
             )
+
+            sid_path = self.dir / "acp_session_id"
+
+            # Drop the live ACP peer so session/new picks up current MCPs.
+            # Resume/load keeps the old tool set; only a fresh session binds
+            # newly deployed servers.
+            if force_new_session:
+                await self._detach_fifo()
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "tmux",
+                        "kill-session",
+                        "-t",
+                        paths.tmux_session_name(self.chat_id),
+                    ],
+                    capture_output=True,
+                )
+                try:
+                    sid_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.acp_session_id = None
+                resume_session_id = None
 
             state, _size = await asyncio.to_thread(
                 ensure_tmux_worker,
@@ -455,15 +480,18 @@ class Worker:
             )
 
             await self._attach_pipes()
-            freshly = state != "RUNNING"
+            freshly = force_new_session or state != "RUNNING"
 
-            sid_path = self.dir / "acp_session_id"
             stored = (
                 sid_path.read_text(encoding="utf-8").strip()
                 if sid_path.exists()
                 else ""
             )
-            effective = resume_session_id or (stored or None)
+            effective = (
+                None
+                if force_new_session
+                else (resume_session_id or (stored or None))
+            )
 
             # Process is up but we have no session id to address it — recycle
             # so initialize + session/new can mint one. Otherwise set_mode /

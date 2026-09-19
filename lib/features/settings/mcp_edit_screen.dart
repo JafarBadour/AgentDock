@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
 import '../../data/models/mcp_server.dart';
@@ -13,9 +14,12 @@ import '../../data/secure/safe_log.dart';
 import 'settings_screen.dart';
 
 class McpEditScreen extends ConsumerStatefulWidget {
-  const McpEditScreen({super.key, this.mcpId});
+  const McpEditScreen({super.key, this.mcpId, this.embedded = false});
 
   final String? mcpId;
+
+  /// When true (desktop Settings panel), show an in-panel back control.
+  final bool embedded;
 
   @override
   ConsumerState<McpEditScreen> createState() => _McpEditScreenState();
@@ -112,6 +116,7 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
     );
     await ref.read(appDatabaseProvider).upsertMcpServer(server);
     ref.invalidate(mcpListProvider);
+    ref.invalidate(mcpHostLinksProvider);
     setState(() => _existing = server);
     return server;
   }
@@ -125,7 +130,11 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
           const SnackBar(content: Text('MCP saved.')),
         );
         if (widget.mcpId == null) {
-          context.replace('/settings/mcp/${server.id}');
+          if (widget.embedded) {
+            openSettingsSubpage(context, ref, '/settings/mcp/${server.id}');
+          } else {
+            context.replace('/settings/mcp/${server.id}');
+          }
         }
       }
     } finally {
@@ -160,6 +169,8 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
         _links[host.id] = link;
         _busyHosts.remove(host.id);
       });
+      ref.invalidate(mcpListProvider);
+      ref.invalidate(mcpHostLinksProvider);
       final ok = link.installStatus == McpHostInstallStatus.installed ||
           link.installStatus == McpHostInstallStatus.removed;
       messenger.showSnackBar(
@@ -186,7 +197,13 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
     if (_existing == null) return;
     await ref.read(appDatabaseProvider).deleteMcpServer(_existing!.id);
     ref.invalidate(mcpListProvider);
-    if (mounted) context.pop();
+    ref.invalidate(mcpHostLinksProvider);
+    if (!mounted) return;
+    if (widget.embedded) {
+      closeSettingsSubpage(context, ref);
+    } else {
+      context.pop();
+    }
   }
 
   @override
@@ -199,15 +216,204 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
     super.dispose();
   }
 
+  void _backToSettings() {
+    if (widget.embedded) {
+      closeSettingsSubpage(context, ref);
+      return;
+    }
+    if (context.canPop()) {
+      context.pop();
+    } else {
+      context.go('/settings');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) {
+      if (widget.embedded) {
+        return const Center(child: CircularProgressIndicator());
+      }
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final title = _existing == null ? 'Add MCP' : _existing!.name;
+    final form = ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        TextField(
+          controller: _name,
+          decoration: const InputDecoration(
+            labelText: 'Name',
+            hintText: 'filesystem',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        SegmentedButton<McpTransport>(
+          segments: const [
+            ButtonSegment(
+              value: McpTransport.stdio,
+              label: Text('stdio'),
+              icon: Icon(Icons.terminal),
+            ),
+            ButtonSegment(
+              value: McpTransport.http,
+              label: Text('HTTP'),
+              icon: Icon(Icons.cloud_outlined),
+            ),
+          ],
+          selected: {_transport},
+          onSelectionChanged: (s) => setState(() => _transport = s.first),
+        ),
+        const SizedBox(height: 12),
+        if (_transport == McpTransport.stdio) ...[
+          TextField(
+            controller: _command,
+            decoration: const InputDecoration(
+              labelText: 'Command',
+              hintText: 'npx',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _args,
+            decoration: const InputDecoration(
+              labelText: 'Args',
+              hintText: '-y @modelcontextprotocol/server-filesystem /path',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ] else
+          TextField(
+            controller: _url,
+            decoration: const InputDecoration(
+              labelText: 'URL',
+              hintText: 'https://mcp.example.com/sse',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _env,
+          minLines: 2,
+          maxLines: 5,
+          decoration: InputDecoration(
+            labelText: _transport == McpTransport.http
+                ? 'Headers (Name=value per line)'
+                : 'Env (KEY=value per line)',
+            hintText: _transport == McpTransport.http
+                ? 'Authorization=Bearer …'
+                : null,
+            border: const OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 16),
+        FilledButton(
+          onPressed: _saving ? null : _saveOnly,
+          child: Text(_saving ? 'Saving…' : 'Save MCP'),
+        ),
+        const SizedBox(height: 28),
+        Text(
+          'Visible on hosts',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Toggle a host to install or remove this MCP over SSH (background).',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        if (_hosts.isEmpty)
+          const Text('Add a host first in the Hosts tab.')
+        else
+          ..._hosts.map((host) {
+            final link = _links[host.id];
+            final enabled = link?.enabled == true &&
+                link?.installStatus != McpHostInstallStatus.removed &&
+                link?.installStatus != McpHostInstallStatus.failed;
+            final busy = _busyHosts.contains(host.id) ||
+                link?.installStatus == McpHostInstallStatus.installing;
+            return SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(host.displayLabel),
+              subtitle: Text(
+                [
+                  host.endpointLabel,
+                  if (link?.targets.isNotEmpty == true) link!.targetsLabel,
+                  if (link?.installStatus != null) link!.installStatus.name,
+                  if (link?.installDetail != null &&
+                      link!.installDetail!.isNotEmpty)
+                    link.installDetail!,
+                ].join(' · '),
+                maxLines: 6,
+                overflow: TextOverflow.ellipsis,
+              ),
+              value: enabled || busy && link?.enabled == true,
+              onChanged: busy ? null : (v) => unawaited(_toggleHost(host, v)),
+              secondary: busy
+                  ? const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      link?.installStatus == McpHostInstallStatus.installed
+                          ? Icons.check_circle_outline
+                          : Icons.dns_outlined,
+                    ),
+            );
+          }),
+        if (_existing != null) ...[
+          const SizedBox(height: 16),
+          Text(
+            'ACP preview: ${jsonEncode(_existing!.toAcpConfig())}',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  fontFamily: 'monospace',
+                ),
+          ),
+        ],
+      ],
+    );
+
+    if (widget.embedded) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 0, 4, 0),
+            child: Row(
+              children: [
+                IconButton(
+                  tooltip: 'Back',
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: _backToSettings,
+                ),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: Theme.of(context).textTheme.titleMedium,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (_existing != null)
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: _delete,
+                  ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(child: form),
+        ],
+      );
     }
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(_existing == null ? 'Add MCP' : _existing!.name),
+        title: Text(title),
         actions: [
           if (_existing != null)
             IconButton(
@@ -216,129 +422,7 @@ class _McpEditScreenState extends ConsumerState<McpEditScreen> {
             ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          TextField(
-            controller: _name,
-            decoration: const InputDecoration(
-              labelText: 'Name',
-              hintText: 'filesystem',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          SegmentedButton<McpTransport>(
-            segments: const [
-              ButtonSegment(value: McpTransport.stdio, label: Text('stdio'), icon: Icon(Icons.terminal)),
-              ButtonSegment(value: McpTransport.http, label: Text('HTTP'), icon: Icon(Icons.cloud_outlined)),
-            ],
-            selected: {_transport},
-            onSelectionChanged: (s) => setState(() => _transport = s.first),
-          ),
-          const SizedBox(height: 12),
-          if (_transport == McpTransport.stdio) ...[
-            TextField(
-              controller: _command,
-              decoration: const InputDecoration(
-                labelText: 'Command',
-                hintText: 'npx',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _args,
-              decoration: const InputDecoration(
-                labelText: 'Args',
-                hintText: '-y @modelcontextprotocol/server-filesystem /path',
-                border: OutlineInputBorder(),
-              ),
-            ),
-          ] else
-            TextField(
-              controller: _url,
-              decoration: const InputDecoration(
-                labelText: 'URL',
-                hintText: 'https://mcp.example.com/sse',
-                border: OutlineInputBorder(),
-              ),
-            ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _env,
-            minLines: 2,
-            maxLines: 5,
-            decoration: const InputDecoration(
-              labelText: 'Env (KEY=value per line)',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 16),
-          FilledButton(
-            onPressed: _saving ? null : _saveOnly,
-            child: Text(_saving ? 'Saving…' : 'Save MCP'),
-          ),
-          const SizedBox(height: 28),
-          Text('Visible on hosts', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Text(
-            'Toggle a host to install or remove this MCP over SSH (background).',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 8),
-          if (_hosts.isEmpty)
-            const Text('Add a host first in the Hosts tab.')
-          else
-            ..._hosts.map((host) {
-              final link = _links[host.id];
-              final enabled = link?.enabled == true &&
-                  link?.installStatus != McpHostInstallStatus.removed &&
-                  link?.installStatus != McpHostInstallStatus.failed;
-              final busy = _busyHosts.contains(host.id) ||
-                  link?.installStatus == McpHostInstallStatus.installing;
-              return SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: Text(host.displayLabel),
-                subtitle: Text(
-                  [
-                    host.endpointLabel,
-                    if (link?.installStatus != null) link!.installStatus.name,
-                    if (link?.installDetail != null &&
-                        link!.installDetail!.isNotEmpty)
-                      link.installDetail!,
-                  ].join(' · '),
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                value: enabled || busy && link?.enabled == true,
-                onChanged: busy
-                    ? null
-                    : (v) => unawaited(_toggleHost(host, v)),
-                secondary: busy
-                    ? const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : Icon(
-                        link?.installStatus == McpHostInstallStatus.installed
-                            ? Icons.check_circle_outline
-                            : Icons.dns_outlined,
-                      ),
-              );
-            }),
-          if (_existing != null) ...[
-            const SizedBox(height: 16),
-            Text(
-              'ACP preview: ${jsonEncode(_existing!.toAcpConfig())}',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    fontFamily: 'monospace',
-                  ),
-            ),
-          ],
-        ],
-      ),
+      body: form,
     );
   }
 }

@@ -474,6 +474,7 @@ class Daemon:
             mode=params.get("mode"),
             model_id=params.get("modelId"),
             permission_ask=bool(params.get("permissionAsk", False)),
+            force_new_session=bool(params.get("forceNewSession", False)),
         )
         await self._patch_agent_record(
             chat_id,
@@ -551,7 +552,15 @@ class Daemon:
         chat_id = str(params.get("chatId") or "")
         if not chat_id:
             raise ValueError("chatId required")
-        return {"messages": transcript_store.list_messages(chat_id)}
+        messages = transcript_store.list_messages(chat_id)
+        try:
+            limit = max(1, min(int(params.get("limit") or 900), 2000))
+        except (TypeError, ValueError):
+            limit = 900
+        return {
+            "messages": messages[-limit:],
+            "hasMore": len(messages) > limit,
+        }
 
     async def _transcript_sync(self, params: dict[str, Any]) -> dict[str, Any]:
         chat_id = str(params.get("chatId") or "")

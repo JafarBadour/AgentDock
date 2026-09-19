@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' show max;
+import 'dart:math' show max, min;
 
 import 'package:flutter/foundation.dart';
 
@@ -11,6 +11,7 @@ import '../data/models/chat_message.dart';
 import '../data/models/host.dart';
 import '../data/models/repo.dart';
 import '../data/secure/safe_log.dart';
+import 'mcp_deploy_service.dart';
 import 'ssh_service.dart';
 
 /// One agent metadata file under `~/.agentdock/agents/<id>.json`.
@@ -66,25 +67,26 @@ class AgentDockRecord {
   final String? modelId;
 
   Map<String, Object?> toJson() => {
-        'id': id,
-        'title': title,
-        'provider': provider,
-        'repo_path': repoPath,
-        'repo_name': repoName,
-        'tmux_session': tmuxSession,
-        'status': status,
-        'created_at': createdAt.toIso8601String(),
-        'updated_at': updatedAt.toIso8601String(),
-        if (titleUpdatedAt != null)
-          'title_updated_at': titleUpdatedAt!.toIso8601String(),
-        'last_read_at': lastReadAt?.toIso8601String(),
-        if (outboundQueue.isNotEmpty)
-          'outbound_queue':
-              outboundQueue.map((m) => m.toMap()).toList(growable: false),
-        if (acpSessionId != null) 'acp_session_id': acpSessionId,
-        if (journalOffset > 0) 'journal_offset': journalOffset,
-        if (modelId != null) 'model_id': modelId,
-      };
+    'id': id,
+    'title': title,
+    'provider': provider,
+    'repo_path': repoPath,
+    'repo_name': repoName,
+    'tmux_session': tmuxSession,
+    'status': status,
+    'created_at': createdAt.toIso8601String(),
+    'updated_at': updatedAt.toIso8601String(),
+    if (titleUpdatedAt != null)
+      'title_updated_at': titleUpdatedAt!.toIso8601String(),
+    'last_read_at': lastReadAt?.toIso8601String(),
+    if (outboundQueue.isNotEmpty)
+      'outbound_queue': outboundQueue
+          .map((m) => m.toMap())
+          .toList(growable: false),
+    if (acpSessionId != null) 'acp_session_id': acpSessionId,
+    if (journalOffset > 0) 'journal_offset': journalOffset,
+    if (modelId != null) 'model_id': modelId,
+  };
 
   factory AgentDockRecord.fromJson(Map<String, dynamic> json) {
     return AgentDockRecord(
@@ -97,12 +99,15 @@ class AgentDockRecord {
       repoName: (json['repo_name'] as String?) ?? 'repo',
       tmuxSession: json['tmux_session'] as String?,
       status: (json['status'] as String?) ?? ChatStatus.idle.name,
-      createdAt: DateTime.tryParse(json['created_at'] as String? ?? '') ??
+      createdAt:
+          DateTime.tryParse(json['created_at'] as String? ?? '') ??
           DateTime.now(),
-      updatedAt: DateTime.tryParse(json['updated_at'] as String? ?? '') ??
+      updatedAt:
+          DateTime.tryParse(json['updated_at'] as String? ?? '') ??
           DateTime.now(),
-      titleUpdatedAt:
-          DateTime.tryParse(json['title_updated_at'] as String? ?? ''),
+      titleUpdatedAt: DateTime.tryParse(
+        json['title_updated_at'] as String? ?? '',
+      ),
       lastReadAt: DateTime.tryParse(json['last_read_at'] as String? ?? ''),
       outboundQueue: _parseOutboundQueue(json['outbound_queue']),
       acpSessionId: json['acp_session_id'] as String?,
@@ -205,8 +210,7 @@ class AgentDockRecord {
   static Chat mergeSessionState(Chat local, AgentDockRecord remote) {
     var acpSessionId = local.acpSessionId;
     if (remote.acpSessionId != null &&
-        (acpSessionId == null ||
-            !local.updatedAt.isAfter(remote.updatedAt))) {
+        (acpSessionId == null || !local.updatedAt.isAfter(remote.updatedAt))) {
       acpSessionId = remote.acpSessionId;
     }
     var modelId = local.modelId;
@@ -233,6 +237,9 @@ class AgentDockService {
   void Function(String chatId)? onChatRemoved;
 
   final Map<String, Timer> _pushTimers = {};
+  final Set<String> _dirtyChats = {};
+  Future<String?>? _catalogSyncInFlight;
+  Future<void>? _flushInFlight;
 
   /// `~/.agentdock` per host — resolving it costs a round trip, so cache it.
   final Map<String, String> _rootCache = {};
@@ -241,21 +248,36 @@ class AgentDockService {
   /// sends what is new instead of rewriting the whole transcript every time.
   final Map<String, int> _pushedLines = {};
 
-  /// Content fingerprint of what we last pushed, so an edit to an already-sent
-  /// message is noticed even though the line count is unchanged.
+  /// Fingerprint only the mutable edge of the pushed prefix. Streaming edits
+  /// update the latest row; hashing every byte of a multi-year transcript on
+  /// every debounce was pure UI-isolate work.
   final Map<String, int> _pushedPrefixHash = {};
 
-  static int _hashContents(Iterable<ChatMessage> messages) =>
-      Object.hashAll(messages.map((m) => m.content));
+  static int _hashPrefixTail(List<ChatMessage> messages, int prefixLength) {
+    const tailSize = 12;
+    final end = min(prefixLength, messages.length);
+    final start = max(0, end - tailSize);
+    return Object.hashAll([
+      for (var i = start; i < end; i++)
+        Object.hash(
+          messages[i].id,
+          messages[i].content.length,
+          messages[i].content.hashCode,
+        ),
+    ]);
+  }
 
   static const _marker = '===AGENTDOCK===';
 
-  static String normalizePath(String path) => SshService.normalizeRemotePath(path);
+  static String normalizePath(String path) =>
+      SshService.normalizeRemotePath(path);
 
   /// Debounced push of one chat's metadata + messages (after local writes).
   void schedulePushChat(String chatId) {
+    _dirtyChats.add(chatId);
     _pushTimers[chatId]?.cancel();
     _pushTimers[chatId] = Timer(const Duration(seconds: 5), () {
+      _pushTimers.remove(chatId);
       unawaited(pushChatById(chatId));
     });
   }
@@ -263,6 +285,7 @@ class AgentDockService {
   /// Push immediately — used after rename so other devices see the name before
   /// the next catalog sync, without waiting for the debounce.
   void pushChatNow(String chatId) {
+    _dirtyChats.add(chatId);
     _pushTimers[chatId]?.cancel();
     _pushTimers.remove(chatId);
     unawaited(pushChatById(chatId));
@@ -270,13 +293,23 @@ class AgentDockService {
 
   /// Push metadata and any new transcript lines in a single round trip.
   Future<void> pushChatById(String chatId) async {
+    _dirtyChats.add(chatId);
     try {
       final chat = await _db.getChat(chatId);
-      if (chat == null) return;
+      if (chat == null) {
+        _dirtyChats.remove(chatId);
+        return;
+      }
       final repo = await _db.getRepo(chat.repoId);
-      if (repo == null) return;
+      if (repo == null) {
+        _dirtyChats.remove(chatId);
+        return;
+      }
       final host = await _db.getHost(repo.hostId);
-      if (host == null) return;
+      if (host == null) {
+        _dirtyChats.remove(chatId);
+        return;
+      }
 
       // Another device may have deleted this agent — honor the tombstone and
       // drop the local copy instead of resurrecting it on the host.
@@ -284,17 +317,19 @@ class AgentDockService {
         await _db.deleteChat(chatId);
         _pushedLines.remove(chatId);
         _pushedPrefixHash.remove(chatId);
+        _dirtyChats.remove(chatId);
         onChatRemoved?.call(chatId);
         return;
       }
 
-      final localMessages = await _db.listMessages(chatId);
+      final localCount = await _db.countMessages(chatId);
       final queue = await _db.getOutboundQueue(chatId);
 
       final root = await _root(host);
       final record = AgentDockRecord.fromChat(chat, repo, outboundQueue: queue);
-      final agentJson =
-          const JsonEncoder.withIndent('  ').convert(record.toJson());
+      final agentJson = const JsonEncoder.withIndent(
+        '  ',
+      ).convert(record.toJson());
       final agentPath = '$root/agents/$chatId.json';
       final messagePath = '$root/messages/$chatId.jsonl';
       final q = SshService.shellQuote;
@@ -302,16 +337,47 @@ class AgentDockService {
       final pushed = _pushedLines[chatId] ?? 0;
       // A streaming turn is checkpointed in place, so a message we already
       // pushed can change without the count moving. Appending would leave the
-      // host holding the truncated copy, so verify the prefix first.
-      final prefixHash = _hashContents(localMessages.take(pushed));
-      final canAppend = pushed > 0 &&
-          pushed <= localMessages.length &&
-          _pushedPrefixHash[chatId] == prefixHash;
+      // host holding the truncated copy, so verify only the mutable prefix tail.
+      var prefixTail = const <ChatMessage>[];
+      var appendSafely =
+          pushed > 0 &&
+          pushed <= localCount &&
+          _pushedPrefixHash.containsKey(chatId);
+      if (appendSafely) {
+        const tailSize = 12;
+        final offset = max(0, pushed - tailSize);
+        prefixTail = await _db.listMessagePage(
+          chatId,
+          offset: offset,
+          limit: pushed - offset,
+        );
+        appendSafely =
+            _pushedPrefixHash[chatId] ==
+            _hashPrefixTail(prefixTail, prefixTail.length);
+      }
+      if (appendSafely) {
+        final count = await _ssh.exec(
+          host,
+          'wc -l < ${q(messagePath)} 2>/dev/null || echo 0',
+        );
+        appendSafely = int.tryParse(count.trim()) == pushed;
+      }
 
-      // Full rewrite must union with the host file — ADSM may have appended
-      // turns the phone has not pulled yet, and a blind overwrite would drop them.
-      var messages = localMessages;
-      if (!canAppend) {
+      late final List<ChatMessage> slice;
+      late final List<ChatMessage> finalTail;
+      late final int finalCount;
+      if (appendSafely) {
+        // Stable SQL page: normal pushes deserialize only newly appended rows,
+        // not the entire chat archive.
+        slice = await _db.listMessagePage(chatId, offset: pushed);
+        finalTail = [...prefixTail, ...slice];
+        finalCount = pushed + slice.length;
+      } else {
+        // Full rewrite must union with the host file — ADSM may have appended
+        // turns the phone has not pulled yet, and a blind overwrite would drop
+        // them. This expensive path is only first sync / watermark mismatch.
+        final localMessages = await _db.listMessages(chatId);
+        var messages = localMessages;
         try {
           final remote = await pullMessages(host, chatId);
           if (remote.isNotEmpty) {
@@ -323,8 +389,10 @@ class AgentDockService {
         } catch (e) {
           SafeLog.d('agentdock merge remote before push failed', e);
         }
+        slice = messages;
+        finalTail = messages;
+        finalCount = messages.length;
       }
-      final slice = canAppend ? localMessages.sublist(pushed) : messages;
 
       final buf = StringBuffer();
       for (final m in slice) {
@@ -337,21 +405,17 @@ class AgentDockService {
       ];
       if (buf.isNotEmpty) {
         final payload = q(base64Encode(utf8.encode(buf.toString())));
-        // Verify the remote line count still matches our watermark before
-        // appending; if anything else touched the file, rewrite it whole.
         commands.add(
-          canAppend
-              ? 'if [ "\$(wc -l < ${q(messagePath)} 2>/dev/null || echo 0)" = "$pushed" ]; then '
-                  'printf %s $payload | base64 -d >> ${q(messagePath)}; '
-                  'else printf %s ${q(base64Encode(utf8.encode(_encodeAll(messages))))} '
-                  '| base64 -d > ${q(messagePath)}; fi'
+          appendSafely
+              ? 'printf %s $payload | base64 -d >> ${q(messagePath)}'
               : 'printf %s $payload | base64 -d > ${q(messagePath)}',
         );
       }
 
       await _ssh.exec(host, 'sh -c ${q(commands.join('\n'))}');
-      _pushedLines[chatId] = messages.length;
-      _pushedPrefixHash[chatId] = _hashContents(messages);
+      _pushedLines[chatId] = finalCount;
+      _pushedPrefixHash[chatId] = _hashPrefixTail(finalTail, finalTail.length);
+      _dirtyChats.remove(chatId);
     } catch (e) {
       SafeLog.d('agentdock pushChat failed', e);
       // Force a full rewrite next time; the remote state is now unknown.
@@ -379,13 +443,12 @@ class AgentDockService {
     );
   }
 
-  Future<void> deleteAgent({
-    required Host host,
-    required String chatId,
-  }) async {
+  Future<void> deleteAgent({required Host host, required String chatId}) async {
     final root = await _root(host);
     _pushedLines.remove(chatId);
     _pushedPrefixHash.remove(chatId);
+    _dirtyChats.remove(chatId);
+    _pushTimers.remove(chatId)?.cancel();
     final q = SshService.shellQuote;
     final tombstone = jsonEncode({
       'id': chatId,
@@ -416,7 +479,8 @@ class AgentDockService {
   Future<Set<String>> pullDeletedAgentIds(Host host) async {
     final root = await _root(host);
     final q = SshService.shellQuote;
-    final script = 'for f in ${q('$root/deleted')}/*.json; do '
+    final script =
+        'for f in ${q('$root/deleted')}/*.json; do '
         '[ -f "\$f" ] || continue; '
         'echo ${q(_marker)}; '
         'cat "\$f"; '
@@ -445,7 +509,11 @@ class AgentDockService {
     required List<ChatMessage> messages,
   }) async {
     final root = await _root(host);
-    await _writeFile(host, '$root/messages/$chatId.jsonl', _encodeAll(messages));
+    await _writeFile(
+      host,
+      '$root/messages/$chatId.jsonl',
+      _encodeAll(messages),
+    );
     _pushedLines[chatId] = messages.length;
   }
 
@@ -453,7 +521,8 @@ class AgentDockService {
   Future<List<AgentDockRecord>> pullAgents(Host host) async {
     final root = await _root(host);
     final q = SshService.shellQuote;
-    final script = 'for f in ${q('$root/agents')}/*.json; do '
+    final script =
+        'for f in ${q('$root/agents')}/*.json; do '
         '[ -f "\$f" ] || continue; '
         'echo ${q(_marker)}; '
         'cat "\$f"; '
@@ -530,8 +599,7 @@ class AgentDockService {
   static List<ChatMessage> unionMessagesForTest(
     List<ChatMessage> a,
     List<ChatMessage> b,
-  ) =>
-      _unionMessages(a, b);
+  ) => _unionMessages(a, b);
 
   /// Pull all agents for [host] into local DB (create repos by path as needed).
   ///
@@ -539,8 +607,9 @@ class AgentDockService {
   /// under `~/.agentdock/deleted/`).
   Future<int> syncHostCatalog(Host host) async {
     final remote = await pullAgents(host).timeout(const Duration(seconds: 12));
-    final deletedIds = await pullDeletedAgentIds(host)
-        .timeout(const Duration(seconds: 8), onTimeout: () => <String>{});
+    final deletedIds = await pullDeletedAgentIds(
+      host,
+    ).timeout(const Duration(seconds: 8), onTimeout: () => <String>{});
     var merged = 0;
     final remoteIds = <String>{};
     for (final record in remote) {
@@ -582,8 +651,10 @@ class AgentDockService {
         // Local is newer for status, but title / session handles may still
         // have been updated on another device.
         final withTitle = AgentDockRecord.mergeTitle(local, record);
-        final withSession =
-            AgentDockRecord.mergeSessionState(withTitle, record);
+        final withSession = AgentDockRecord.mergeSessionState(
+          withTitle,
+          record,
+        );
         if (withSession.title != local.title ||
             withSession.titleUpdatedAt != local.titleUpdatedAt ||
             withSession.acpSessionId != local.acpSessionId ||
@@ -599,11 +670,10 @@ class AgentDockService {
         await _db.markChatRead(record.id, at: record.lastReadAt);
       }
       await _db.setOutboundQueue(record.id, record.outboundQueue);
-      try {
-        await syncChatMessages(host: host, chatId: record.id);
-      } catch (e) {
-        SafeLog.d('agentdock message sync ${record.id} failed', e);
-      }
+      // Catalog refresh intentionally stops at metadata. Pulling every full
+      // transcript here made one refresh O(hosts × chats × transcript size)
+      // and parsed all of that JSON on Flutter's UI isolate. The selected chat
+      // performs its targeted transcript merge after Connect instead.
     }
 
     merged += await _pruneDeletedLocals(
@@ -611,6 +681,14 @@ class AgentDockService {
       deletedIds: deletedIds,
       remoteIds: remoteIds,
     );
+    try {
+      await McpDeployService(
+        _ssh,
+        _db,
+      ).syncRemoteMcpState(host).timeout(const Duration(seconds: 20));
+    } catch (e) {
+      SafeLog.d('remote MCP probe ${host.alias} failed', e);
+    }
     return merged;
   }
 
@@ -638,6 +716,8 @@ class AgentDockService {
         await _db.deleteChat(chat.id);
         _pushedLines.remove(chat.id);
         _pushedPrefixHash.remove(chat.id);
+        _dirtyChats.remove(chat.id);
+        _pushTimers.remove(chat.id)?.cancel();
         onChatRemoved?.call(chat.id);
         pruned++;
       }
@@ -677,8 +757,10 @@ class AgentDockService {
     required Host host,
     required String chatId,
   }) async {
-    final remote = await pullMessages(host, chatId)
-        .timeout(const Duration(seconds: 12));
+    final remote = await pullMessages(
+      host,
+      chatId,
+    ).timeout(const Duration(seconds: 12));
     if (remote.isEmpty) return false;
     final changed = await _db.mergeMessages(chatId, remote);
     if (changed > 0) {
@@ -697,8 +779,10 @@ class AgentDockService {
     required Host host,
     required String chatId,
   }) async {
-    final record = await pullAgentRecord(host, chatId)
-        .timeout(const Duration(seconds: 8));
+    final record = await pullAgentRecord(
+      host,
+      chatId,
+    ).timeout(const Duration(seconds: 8));
     if (record == null) return false;
     final local = await _db.getChat(chatId);
     if (local == null) return false;
@@ -736,23 +820,50 @@ class AgentDockService {
 
   /// Push pending chat writes immediately — used when the app backgrounds so
   /// another device can pull the latest transcript from the host.
-  Future<void> flushPendingPushes() async {
+  Future<void> flushPendingPushes() {
+    final active = _flushInFlight;
+    if (active != null) return active;
+    late final Future<void> run;
+    run = _flushPendingPushes().whenComplete(() {
+      if (identical(_flushInFlight, run)) _flushInFlight = null;
+    });
+    _flushInFlight = run;
+    return run;
+  }
+
+  Future<void> _flushPendingPushes() async {
+    final pending = <String>{..._dirtyChats, ..._pushTimers.keys};
     for (final timer in _pushTimers.values) {
       timer.cancel();
     }
     _pushTimers.clear();
-    final chats = await _db.listAllChats();
-    for (final chat in chats) {
+    // The old implementation uploaded every chat ever created whenever the
+    // app lost focus. On desktop that can happen while switching windows and
+    // caused minutes of hidden SSH/JSON work. Only dirty chats need flushing.
+    for (final chatId in pending) {
       try {
-        await pushChatById(chat.id);
+        await pushChatById(chatId);
       } catch (e) {
-        SafeLog.d('agentdock flush push ${chat.id} failed', e);
+        SafeLog.d('agentdock flush push $chatId failed', e);
       }
     }
   }
 
   /// Best-effort catalog sync for every host (used by Agents refresh).
-  Future<String?> syncAllHostsCatalog() async {
+  Future<String?> syncAllHostsCatalog() {
+    final active = _catalogSyncInFlight;
+    if (active != null) return active;
+    late final Future<String?> run;
+    run = _syncAllHostsCatalog().whenComplete(() {
+      if (identical(_catalogSyncInFlight, run)) {
+        _catalogSyncInFlight = null;
+      }
+    });
+    _catalogSyncInFlight = run;
+    return run;
+  }
+
+  Future<String?> _syncAllHostsCatalog() async {
     final hosts = await _db.listHosts();
     if (hosts.isEmpty) return null;
     final errors = <String>[];
@@ -760,7 +871,10 @@ class AgentDockService {
     // Cap parallelism — many hosts share one ProxyJump (bastion), and blasting
     // every catalog sync at once surfaces as "ssh open failed" / create-agent
     // failures on jumped machines like RTX.
-    const maxConcurrent = 2;
+    // One host at a time. Even where dartssh2 offloads key exchange, packet
+    // decoding, JSON parsing, and local merges return to Flutter's isolate;
+    // parallel sweeps create bursty frame starvation.
+    const maxConcurrent = 1;
     var next = 0;
     Future<void> worker() async {
       while (true) {
@@ -814,5 +928,6 @@ class AgentDockService {
       t.cancel();
     }
     _pushTimers.clear();
+    _dirtyChats.clear();
   }
 }

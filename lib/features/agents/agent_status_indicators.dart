@@ -481,6 +481,7 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
     required this.bridgeOpen,
     this.provider,
     this.onReconnect,
+    this.onNewSession,
     this.onReauthed,
     this.onStopped,
   });
@@ -489,6 +490,9 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
   final bool bridgeOpen;
   final AgentProvider? provider;
   final VoidCallback? onReconnect;
+
+  /// Mint a fresh ACP session so newly deployed MCPs attach.
+  final VoidCallback? onNewSession;
   final VoidCallback? onReauthed;
 
   /// Called after ADSM was stopped and the sheet closes.
@@ -500,6 +504,7 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
     required bool bridgeOpen,
     AgentProvider? provider,
     VoidCallback? onReconnect,
+    VoidCallback? onNewSession,
     VoidCallback? onReauthed,
     VoidCallback? onStopped,
   }) {
@@ -512,6 +517,7 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
         bridgeOpen: bridgeOpen,
         provider: provider,
         onReconnect: onReconnect,
+        onNewSession: onNewSession,
         onReauthed: onReauthed,
         onStopped: onStopped,
       ),
@@ -874,6 +880,29 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
                       },
                 icon: const Icon(Icons.link),
                 label: const Text('Reconnect'),
+              ),
+            ],
+            if (widget.onNewSession != null) ...[
+              const SizedBox(height: 12),
+              FilledButton.tonalIcon(
+                onPressed: busy
+                    ? null
+                    : () {
+                        Navigator.pop(context);
+                        widget.onNewSession!();
+                      },
+                icon: const Icon(Icons.refresh),
+                label: const Text('Start a new session'),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  'Opens a fresh ACP session so newly added MCP tools attach. '
+                  'Chat history is kept on the host.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
               ),
             ],
             const SizedBox(height: 12),

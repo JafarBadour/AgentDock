@@ -34,15 +34,25 @@ bool isDesktopPanelRoot(String path) {
       path == '/settings';
 }
 
-/// Nested routes (edit host, schedule, MCP, terminal) that must render
+/// Nested routes (edit host, schedule, terminal) that must render
 /// via [StatefulNavigationShell] in the center column on desktop.
+///
+/// Settings MCP / API-key subpages stay in the right Settings panel instead.
 bool isDesktopDetailRoute(String path) {
   if (path.startsWith('/agents')) return false;
   if (isDesktopPanelRoot(path)) return false;
+  if (isDesktopSettingsSubroute(path)) return false;
   return path.startsWith('/hosts') ||
       path.startsWith('/automate') ||
-      path.startsWith('/settings') ||
       path.startsWith('/vpn');
+}
+
+/// MCP editor and API-key screens opened from the Settings panel.
+bool isDesktopSettingsSubroute(String path) {
+  if (!path.startsWith('/settings/')) return false;
+  final segs = Uri.tryParse(path)?.pathSegments ?? const <String>[];
+  if (segs.length < 2 || segs[0] != 'settings') return false;
+  return segs[1] == 'mcp' || segs[1] == 'keys';
 }
 
 /// Host id for `/hosts/terminal/:hostId`, if [path] is a terminal session.
@@ -87,5 +97,34 @@ void openAppPanel(
     case DesktopRightPanel.files:
     case DesktopRightPanel.none:
       break;
+  }
+}
+
+/// Open a Settings subpage (MCP editor, API keys). On desktop this stays in the
+/// right panel and keeps the current chat; on phone it uses go_router.
+void openSettingsSubpage(
+  BuildContext context,
+  WidgetRef ref,
+  String route,
+) {
+  if (useDesktopShell(context)) {
+    ref.read(desktopRightPanelProvider.notifier).state =
+        DesktopRightPanel.settings;
+    ref.read(desktopSettingsOverlayProvider.notifier).state = route;
+    return;
+  }
+  context.push(route);
+}
+
+/// Back to Settings home (desktop overlay) or pop the phone stack.
+void closeSettingsSubpage(BuildContext context, WidgetRef ref) {
+  if (useDesktopShell(context)) {
+    ref.read(desktopSettingsOverlayProvider.notifier).state = null;
+    return;
+  }
+  if (context.canPop()) {
+    context.pop();
+  } else {
+    context.go('/settings');
   }
 }

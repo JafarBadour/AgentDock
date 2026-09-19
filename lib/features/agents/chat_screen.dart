@@ -65,11 +65,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Repo? _repo;
   Host? _host;
   bool _loading = true;
-  bool _connecting = false;
   bool _sending = false;
-  String? _connectStatus;
+
+  /// SSH/ADSM bring-up — ValueNotifiers so progress never setStates the
+  /// whole transcript (that was freezing scroll/typing on the UI isolate).
+  final ValueNotifier<bool> _connectingN = ValueNotifier(false);
+  final ValueNotifier<String?> _connectStatusN = ValueNotifier(null);
+  bool get _connecting => _connectingN.value;
+  set _connecting(bool value) => _connectingN.value = value;
+  String? get _connectStatus => _connectStatusN.value;
+  set _connectStatus(String? value) => _connectStatusN.value = value;
   String? _error;
+
+  /// Next connect should mint `session/new` (e.g. after deploying MCPs).
+  bool _forceFreshSession = false;
+
+  /// Message typed while SSH/ADSM is still coming up — delivered after connect.
+  String? _deferredSendText;
+  List<ChatImageRef> _deferredSendImages = const [];
   bool _showSdkInstallGuide = false;
+
   /// Avoid looping ClaudeLoginSheet when the same auth error stays sticky.
   bool _authReauthPrompted = false;
   bool _authReauthInFlight = false;
@@ -88,12 +103,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Timer? _markReadTimer;
   Timer? _runtimeUiCoalesce;
   bool _runtimeUiDirty = false;
+
+  /// Streaming invalidates only the transcript/chrome builder, never the
+  /// composer subtree.
+  final ValueNotifier<int> _runtimeUiEpoch = ValueNotifier(0);
+  final ValueNotifier<int> _composerUiEpoch = ValueNotifier(0);
+  final ValueNotifier<({bool streaming, bool connected, int queuedCount})>
+  _composerRuntimeN = ValueNotifier((
+    streaming: false,
+    connected: false,
+    queuedCount: 0,
+  ));
   bool _wasWorking = false;
   int _lastOutboundQueueLen = 0;
   bool _landedAtBottom = false;
+
   /// Jump-to-latest FAB — ValueNotifier so toggling it never setStates the
   /// whole chat (that used to re-run build() on every scroll threshold cross).
   final ValueNotifier<bool> _showJumpToLatest = ValueNotifier(false);
+
   /// When true, keep the viewport pinned to new agent output.
   /// Cleared as soon as the user scrolls away from the bottom.
   bool _followOutput = true;
@@ -104,10 +132,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _composerHasText = false;
   bool _recordingVoice = false;
   bool _transcribingVoice = false;
+
   /// Bumped when a new transcription starts or is abandoned so late results drop.
   int _transcribeEpoch = 0;
   bool _showSlashMenu = false;
   bool _compressing = false;
+
   /// Sliding window over the transcript: mount a page, grow upward, trim
   /// older pages when scrolling back to the live end.
   final TranscriptWindow _transcriptWindow = TranscriptWindow(
@@ -159,7 +189,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (saved != null && saved.isNotEmpty) {
       _composer.text = saved;
       _composerHasText = saved.trim().isNotEmpty;
-      _showSlashMenu = saved.startsWith('/') &&
+      _showSlashMenu =
+          saved.startsWith('/') &&
           !saved.contains('\n') &&
           !saved.contains(' ');
     }
@@ -173,18 +204,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   void _onComposerChanged() {
     final raw = _composer.text;
-    _syncComposerDraft(raw);
+    // The controller already owns the live text. Publishing a copied Riverpod
+    // map on every keystroke needlessly woke the whole provider graph; the
+    // draft is captured when this screen is disposed (and when Send clears it).
     final has = raw.trim().isNotEmpty;
-    final slash = raw.startsWith('/') && !raw.contains('\n') && !raw.contains(' ');
+    final slash =
+        raw.startsWith('/') && !raw.contains('\n') && !raw.contains(' ');
     if (has != _composerHasText || slash != _showSlashMenu) {
-      if (mounted) {
-        setState(() {
-          _composerHasText = has;
-          _showSlashMenu = slash;
-        });
-      }
+      _composerHasText = has;
+      _showSlashMenu = slash;
+      if (mounted) _composerUiEpoch.value++;
     } else if (mounted && slash) {
-      setState(() {}); // refresh filter highlight
+      _composerUiEpoch.value++; // refresh slash-command filtering only
     }
   }
 
@@ -330,7 +361,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     final repo = await db.getRepo(chat.repoId);
     final host = repo == null ? null : await db.getHost(repo.hostId);
-    final messages = await db.listMessages(chat.id);
+    final messages = await db.listRecentMessages(chat.id, limit: 250);
 
     _dbEntries
       ..clear()
@@ -348,72 +379,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (existing != null) {
       _bindRuntime(existing);
-      // Closed runtimes reconnect in the background — do not leave the UI
-      // stuck on a stale DB-only transcript until the user taps Connect.
-      unawaited(existing.syncTranscriptFromDb());
-      if (existing.closed) {
-        existing.resume();
+      // A live runtime already owns the current tail. Re-reading and merging
+      // hundreds of DB rows on every tab switch made chat selection stutter.
+      if (existing.entries.isEmpty) {
+        unawaited(existing.syncTranscriptFromDb());
       }
-    } else if (chat.provider.isAvailable) {
-      // Connect as soon as the chat is selected — fire-and-forget so the
-      // transcript stays interactive while SSH/ADSM comes up.
-      unawaited(() async {
-        final host = _host;
-        if (host == null) return;
-        if (!await ref
-            .read(secureStoreProvider)
-            .canAuthenticateToHost(host.id)) {
-          return;
-        }
-        if (!mounted) return;
-        await _ensureAcp();
-      }());
     }
-
-    unawaited(_syncFromRemote());
-  }
-
-  Future<void> _syncFromRemote() async {
-    final host = _host;
-    if (host == null) return;
-    try {
-      if (!await ref.read(secureStoreProvider).canAuthenticateToHost(host.id)) {
-        return;
-      }
-      final dock = ref.read(agentDockServiceProvider);
-      final recordChanged = await dock.syncChatRecord(
-        host: host,
-        chatId: widget.chatId,
-      );
-      if (recordChanged && mounted) {
-        final refreshed =
-            await ref.read(appDatabaseProvider).getChat(widget.chatId);
-        if (refreshed != null) _chat = refreshed;
-      }
-      final changed = await dock.syncChatMessages(
-            host: host,
-            chatId: widget.chatId,
-          );
-      if (!mounted) return;
-      final runtime = _runtime;
-      if (runtime != null) {
-        if (changed) {
-          await runtime.syncTranscriptFromDb();
-        }
-        return;
-      }
-      if (!changed) return;
-      final messages =
-          await ref.read(appDatabaseProvider).listMessages(widget.chatId);
-      if (!mounted || _runtime != null) return;
-      setState(() {
-        _dbEntries
-          ..clear()
-          ..addAll(_entriesFromMessages(messages));
-      });
-    } catch (e) {
-      SafeLog.d('agentdock message sync failed', e);
-    }
+    // Do NOT auto-run SSH/ADSM or remote sync on open. Key decoding, SSH packet
+    // handling, transcript JSON, and merge notifications contend with Flutter
+    // frames. Connect happens on send or an explicit Connect tap.
   }
 
   List<TranscriptEntry> _entriesFromMessages(List<ChatMessage> messages) =>
@@ -443,7 +417,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// keep the read watermark moving. Debounced: a streaming turn notifies far
   /// too often to write on every tick.
   void _scheduleMarkRead() {
-    _markReadTimer ??= Timer(const Duration(milliseconds: 600), () {
+    _markReadTimer ??= Timer(const Duration(seconds: 3), () {
       _markReadTimer = null;
       if (!mounted) return;
       unawaited(
@@ -453,6 +427,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }),
       );
     });
+  }
+
+  void _syncComposerRuntime(ChatSessionRuntime? runtime) {
+    final next = (
+      streaming: runtime?.isWorking ?? false,
+      connected: runtime != null && !runtime.closed,
+      queuedCount: runtime?.outboundQueue.length ?? 0,
+    );
+    if (_composerRuntimeN.value != next) {
+      _composerRuntimeN.value = next;
+    }
   }
 
   void _bindRuntime(ChatSessionRuntime runtime) {
@@ -510,7 +495,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final queueLen = runtime.outboundQueue.length;
       final queueChanged = queueLen != _lastOutboundQueueLen;
       _lastOutboundQueueLen = queueLen;
-      final needsImmediate = turnEnded ||
+      _syncComposerRuntime(runtime);
+      final needsImmediate =
+          turnEnded ||
           queueChanged ||
           runtime.pendingPermission != null ||
           (runtime.lastError != null &&
@@ -531,12 +518,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     };
     runtime.addListener(_runtimeListener!);
     _lastOutboundQueueLen = runtime.outboundQueue.length;
+    _syncComposerRuntime(runtime);
     setState(() {});
     _scrollToEnd();
     // Coming back to a chat whose turn already finished should drain the queue.
     runtime.resumeOutboundQueue();
     unawaited(runtime.recoverTrailingUserPromptIfStuck());
-    unawaited(_prefetchModelCatalogIfNeeded(runtime));
     final stickyAuth = runtime.lastError ?? _error;
     if (stickyAuth != null && isAgentAuthFailureText(stickyAuth)) {
       _scheduleAuthReauthPrompt(stickyAuth);
@@ -553,7 +540,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
     if (_runtimeUiCoalesce?.isActive ?? false) return;
-    _runtimeUiCoalesce = Timer(const Duration(milliseconds: 100), () {
+    // Five visual updates/sec is enough for streaming text and leaves ample
+    // frame budget for typing/scrolling on long markdown transcripts.
+    _runtimeUiCoalesce = Timer(const Duration(milliseconds: 200), () {
       _runtimeUiCoalesce = null;
       _flushRuntimeUi();
     });
@@ -562,7 +551,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void _flushRuntimeUi() {
     if (!mounted || !_runtimeUiDirty) return;
     _runtimeUiDirty = false;
-    setState(() {});
+    _runtimeUiEpoch.value++;
     _scrollToEnd();
     _scheduleMarkRead();
   }
@@ -580,8 +569,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final host = _host;
     if (host == null) return;
     try {
-      final mcps =
-          await ref.read(appDatabaseProvider).listEnabledMcpsForHost(host.id);
+      final mcps = await ref
+          .read(appDatabaseProvider)
+          .listEnabledMcpsForHost(host.id);
       await runtime.ensureModelCatalog(
         mcps.map((m) => m.toAcpConfig()).toList(growable: false),
       );
@@ -606,7 +596,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     if (!mounted) return;
 
-    var runtime = _runtime ??
+    var runtime =
+        _runtime ??
         ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
 
     if (runtime != null && !runtime.closed) {
@@ -625,13 +616,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     if (!mounted) return;
 
-    runtime = _runtime ??
+    runtime =
+        _runtime ??
         ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
 
     final models = runtime?.availableModels ?? const <AgentModel>[];
     if (models.isEmpty) {
       final connected = runtime != null && !runtime.closed;
-      final detail = connectError ??
+      final detail =
+          connectError ??
           _error ??
           runtime?.lastError ??
           runtime?.deliveryError;
@@ -641,8 +634,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             detail != null && detail.trim().isNotEmpty
                 ? 'Cannot get the model list: $detail'
                 : connected
-                    ? 'No models from the agent yet. Wait for Connect to finish, then try again.'
-                    : 'Connect to the agent first — models load from the live session.',
+                ? 'No models from the agent yet. Wait for Connect to finish, then try again.'
+                : 'Connect to the agent first — models load from the live session.',
           ),
         ),
       );
@@ -663,8 +656,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         // Offline: remember it so the next connect applies it.
         final chat = _chat;
         if (chat != null) {
-          final updated =
-              chat.copyWith(modelId: chosen, updatedAt: DateTime.now());
+          final updated = chat.copyWith(
+            modelId: chosen,
+            updatedAt: DateTime.now(),
+          );
           await ref.read(appDatabaseProvider).upsertChat(updated);
           ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
         }
@@ -675,9 +670,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } catch (e) {
       SafeLog.d('setModel failed', e);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_friendlySetModelError(e))),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(_friendlySetModelError(e))));
       }
     }
   }
@@ -693,6 +688,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return 'Could not switch model: this agent needs a restart to change '
           'models. Reconnect and try again, or update claude-agent-acp on the host.';
     }
+    if (isTransientBridgeError(e)) {
+      return 'Could not switch model: host agent paused (FIFO). '
+          'Wait for reconnect, then try the model picker again.';
+    }
     final compact = text
         .replaceFirst(RegExp(r'^Exception:\s*'), '')
         .replaceAll(RegExp(r'\s+'), ' ')
@@ -706,11 +705,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// One-line connect failure for the compact banner (full text on tap).
   static String _compactConnectError(Object error, {required bool isClaude}) {
     var msg = error.toString().trim();
-    const prefixes = [
-      'TimeoutException: ',
-      'Exception: ',
-      'StateError: ',
-    ];
+    const prefixes = ['TimeoutException: ', 'Exception: ', 'StateError: '];
     for (final p in prefixes) {
       if (msg.startsWith(p)) msg = msg.substring(p.length).trim();
     }
@@ -739,7 +734,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         r'on ([^\s.]+)',
         caseSensitive: false,
       ).firstMatch(msg)?.group(1);
-      return host != null ? 'ADSM timed out on $host' : 'ADSM connect timed out';
+      return host != null
+          ? 'ADSM timed out on $host'
+          : 'ADSM connect timed out';
     }
     if (lower.contains('timed out installing/starting adsm')) {
       return 'ADSM install timed out';
@@ -760,9 +757,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Connection error'),
-        content: SingleChildScrollView(
-          child: SelectableText(full),
-        ),
+        content: SingleChildScrollView(child: SelectableText(full)),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
@@ -782,15 +777,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   void _cancelConnect() {
     _connectEpoch++;
-    if (!mounted) return;
-    setState(() {
-      _connecting = false;
-      _connectStatus = null;
-    });
+    final host = _host;
+    if (host != null) {
+      ref.read(sshServiceProvider).abandonAdsmEnsure(host.id);
+      ref.read(sshServiceProvider).clearAdsmReady(host.id);
+    }
+    _connecting = false;
+    _connectStatus = null;
   }
 
-  bool _connectStillCurrent(int epoch) =>
-      mounted && epoch == _connectEpoch;
+  bool _connectStillCurrent(int epoch) => mounted && epoch == _connectEpoch;
 
   Future<void> _showConnectionControls({
     required bool connecting,
@@ -814,8 +810,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   connecting
                       ? (status ?? 'Connecting…')
                       : connected
-                          ? 'Agent connected'
-                          : 'Agent disconnected',
+                      ? 'Agent connected'
+                      : 'Agent disconnected',
                 ),
                 subtitle: Text(host.displayLabel),
               ),
@@ -841,6 +837,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   onTap: () => Navigator.pop(ctx, 'disconnect'),
                 ),
               ListTile(
+                leading: const Icon(Icons.refresh),
+                title: const Text('Start a new session'),
+                subtitle: const Text(
+                  'Fresh ACP session so newly added MCP tools attach',
+                ),
+                onTap: () => Navigator.pop(ctx, 'new_session'),
+              ),
+              ListTile(
                 leading: Icon(
                   Icons.power_settings_new,
                   color: Theme.of(ctx).colorScheme.error,
@@ -865,11 +869,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _cancelConnect();
         await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
         if (mounted) {
+          _syncComposerRuntime(null);
           setState(() {
             _runtime = null;
             _error = null;
           });
         }
+      case 'new_session':
+        unawaited(_startFreshSession());
       case 'stop_adsm':
         final ok = await showDialog<bool>(
           context: context,
@@ -897,20 +904,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
           await ref.read(sshServiceProvider).stopAdsm(host);
           if (mounted) {
+            _syncComposerRuntime(null);
             setState(() {
               _runtime = null;
               _error = null;
             });
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('ADSM turned off')),
-            );
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(const SnackBar(content: Text('ADSM turned off')));
           }
         } catch (e) {
           SafeLog.d('stop ADSM from connecting sheet failed', e);
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Could not stop ADSM: $e')),
-            );
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('Could not stop ADSM: $e')));
           }
         }
     }
@@ -983,8 +991,60 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _runtime?.deliveryError = null;
     await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
     if (!mounted) return;
+    _syncComposerRuntime(null);
     setState(() => _runtime = null);
     await _ensureAcp();
+  }
+
+  /// Kill the live ACP peer and open `session/new` with current MCPs.
+  ///
+  /// Resume/load keeps the old tool set — newly deployed MCP servers only
+  /// bind when the agent mints a fresh session.
+  Future<void> _startFreshSession() async {
+    final chat = _chat;
+    final host = _host;
+    if (chat == null || host == null) return;
+
+    _cancelConnect();
+    setState(() {
+      _error = null;
+      _showSdkInstallGuide = false;
+      _forceFreshSession = true;
+    });
+    _runtime?.lastError = null;
+    _runtime?.deliveryError = null;
+
+    try {
+      final cleared = chat.copyWith(
+        clearAcpSessionId: true,
+        updatedAt: DateTime.now(),
+      );
+      await ref.read(appDatabaseProvider).upsertChat(cleared);
+      ref.read(agentDockServiceProvider).schedulePushChat(cleared.id);
+      if (mounted) setState(() => _chat = cleared);
+      await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+      if (!mounted) return;
+      _syncComposerRuntime(null);
+      setState(() => _runtime = null);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Starting a new session so MCP tools can attach…',
+            ),
+          ),
+        );
+      }
+      await _ensureAcp();
+    } catch (e) {
+      SafeLog.d('start fresh session failed', e);
+      if (mounted) {
+        setState(() => _forceFreshSession = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not start a new session: $e')),
+        );
+      }
+    }
   }
 
   /// A closure that can open a transport for this chat at any later time.
@@ -1005,17 +1065,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // Fallbacks for the first connect, before a runtime exists.
     final fallbackMode = _mode;
     final fallbackPermission = _permission;
+    // Consume once — background reconnects must resume the new session id.
+    var forceNewOnce = _forceFreshSession;
+    if (forceNewOnce) _forceFreshSession = false;
 
     return () async {
+      final forceNew = forceNewOnce;
+      forceNewOnce = false;
       final live = sessions.get(chatId);
       final mode = live?.preferredMode ?? fallbackMode;
-      final permission =
-          live?.preferredPermissionPolicy ?? fallbackPermission;
+      final permission = live?.preferredPermissionPolicy ?? fallbackPermission;
 
       void status(String message) {
-        // Factory outlives the screen; only paint when this chat is open.
-        if (!mounted) return;
-        setState(() => _connectStatus = message);
+        // Never setState the chat for SSH progress — only the toolbar listens.
+        if (!mounted || !_connecting) return;
+        _connectStatus = message;
       }
 
       status(
@@ -1033,12 +1097,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       // Skip tmux install probe when we already know the agent binary — cold
       // reconnects used to hang here forever on ProxyJump SSH.
       if (!adsmReady && cachedBinary == null) {
-        await ssh.ensureTmux(host, onProgress: status).timeout(
-          const Duration(seconds: 45),
-          onTimeout: () => throw TimeoutException(
-            'Timed out checking tmux on the remote.',
-          ),
-        );
+        await ssh
+            .ensureTmux(host, onProgress: status)
+            .timeout(
+              const Duration(seconds: 45),
+              onTimeout: () => throw TimeoutException(
+                'Timed out checking tmux on the remote.',
+              ),
+            );
       }
 
       final String binary;
@@ -1054,44 +1120,47 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         );
       } else {
         binary = switch (provider) {
-          AgentProvider.cursor => await ssh
-              .ensureCursorCli(host, onProgress: status)
-              .timeout(
-                const Duration(minutes: 8),
-                onTimeout: () => throw TimeoutException(
-                  'Timed out installing/finding Cursor CLI on the remote.',
+          AgentProvider.cursor =>
+            await ssh
+                .ensureCursorCli(host, onProgress: status)
+                .timeout(
+                  const Duration(minutes: 8),
+                  onTimeout: () => throw TimeoutException(
+                    'Timed out installing/finding Cursor CLI on the remote.',
+                  ),
                 ),
-              ),
-          AgentProvider.claude => await ssh
-              .ensureClaudeAcpBinary(host, onProgress: status)
-              .timeout(
-                const Duration(seconds: 90),
-                onTimeout: () => throw TimeoutException(
-                  'Timed out finding Claude ACP on the remote. '
-                  'Open Hosts → terminal and check `claude-code-acp`.',
+          AgentProvider.claude =>
+            await ssh
+                .ensureClaudeAcpBinary(host, onProgress: status)
+                .timeout(
+                  const Duration(seconds: 90),
+                  onTimeout: () => throw TimeoutException(
+                    'Timed out finding Claude ACP on the remote. '
+                    'Open Hosts → terminal and check `claude-code-acp`.',
+                  ),
                 ),
-              ),
         };
       }
 
       status(adsmReady ? 'Connecting to ADSM…' : 'Starting ADSM…');
       try {
-        await ssh.ensureAdsm(
-          host,
-          onProgress: status,
-          allowUpgrade: !adsmReady,
-        ).timeout(
-          adsmReady
-              ? const Duration(seconds: 75)
-              : const Duration(minutes: 3),
-          onTimeout: () => throw TimeoutException(
-            adsmReady
-                ? 'Timed out connecting to ADSM on ${host.displayLabel}'
-                : 'Timed out installing/starting ADSM',
-          ),
-        );
+        await ssh
+            .ensureAdsm(host, onProgress: status, allowUpgrade: !adsmReady)
+            .timeout(
+              adsmReady
+                  ? const Duration(seconds: 60)
+                  : const Duration(seconds: 90),
+              onTimeout: () => throw TimeoutException(
+                adsmReady
+                    ? 'Timed out connecting to ADSM on ${host.displayLabel}. '
+                          'Check VPN/SSH, tap Cancel, then reconnect.'
+                    : 'Timed out installing/starting ADSM on ${host.displayLabel}. '
+                          'Check VPN/SSH, tap Cancel, then reconnect.',
+              ),
+            );
       } on TimeoutException {
         ssh.clearAdsmReady(host.id);
+        ssh.abandonAdsmEnsure(host.id);
         rethrow;
       }
 
@@ -1112,7 +1181,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         mcpServers: mcps.map((m) => m.toAcpConfig()).toList(),
         initialMode: mode,
         permissionPolicy: permission,
-        resumeSessionId: latest?.acpSessionId,
+        resumeSessionId: forceNew ? null : latest?.acpSessionId,
+        forceNewSession: forceNew,
         preferredModelId: latest?.modelId,
       ).timeout(
         const Duration(seconds: 90),
@@ -1131,8 +1201,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_chat == null || repo == null || host == null) return;
     var chat = _chat!;
 
-    final canAuth =
-        await ref.read(secureStoreProvider).canAuthenticateToHost(host.id);
+    final canAuth = await ref
+        .read(secureStoreProvider)
+        .canAuthenticateToHost(host.id);
     if (!canAuth) {
       if (mounted) {
         setState(() {
@@ -1179,34 +1250,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
 
-    setState(() {
-      _connecting = true;
-      // Never say "Preparing Claude" before we can reach the host — that
-      // hid offline/VPN failures behind a misleading agent label.
-      _connectStatus = 'Reaching ${host.displayLabel}…';
-      _error = null;
-      _showSdkInstallGuide = false;
-    });
+    _connecting = true;
+    // Never say "Preparing Claude" before we can reach the host — that
+    // hid offline/VPN failures behind a misleading agent label.
+    _connectStatus = 'Reaching ${host.displayLabel}…';
+    if (mounted) {
+      setState(() {
+        _error = null;
+        _showSdkInstallGuide = false;
+      });
+    }
     final epoch = ++_connectEpoch;
 
     try {
       try {
-        await ref.read(sshServiceProvider).connect(host).timeout(
-          const Duration(seconds: 20),
-          onTimeout: () => throw TimeoutException(
-            'Timed out reaching ${host.displayLabel}',
-          ),
-        );
+        await ref
+            .read(sshServiceProvider)
+            .connect(host)
+            .timeout(
+              const Duration(seconds: 20),
+              onTimeout: () => throw TimeoutException(
+                'Timed out reaching ${host.displayLabel}',
+              ),
+            );
       } catch (e) {
         if (!_connectStillCurrent(epoch)) return;
         SafeLog.d('host unreachable before ACP connect', e);
-        setState(() {
-          _connecting = false;
-          _connectStatus = null;
-          _error =
-              'Can\'t reach ${host.displayLabel} — check VPN or network, then Retry.';
-          _showSdkInstallGuide = false;
-        });
+        _connecting = false;
+        _connectStatus = null;
+        if (mounted) {
+          setState(() {
+            _error =
+                'Can\'t reach ${host.displayLabel} — check VPN or network, then Retry.';
+            _showSdkInstallGuide = false;
+          });
+        }
         return;
       }
       if (!_connectStillCurrent(epoch)) return;
@@ -1214,20 +1292,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       // Pull the live session id Mac wrote before we attach — without it the
       // agent starts over and only sees messages sent on this device.
       try {
-        if (mounted) {
-          setState(() => _connectStatus = 'Syncing chat…');
-        }
+        _connectStatus = 'Syncing chat…';
         final changed = await ref
             .read(agentDockServiceProvider)
-            .syncChatRecord(
-              host: host,
-              chatId: chat.id,
-            )
+            .syncChatRecord(host: host, chatId: chat.id)
             .timeout(const Duration(seconds: 12));
         if (!_connectStillCurrent(epoch)) return;
         if (changed) {
-          final refreshed =
-              await ref.read(appDatabaseProvider).getChat(chat.id);
+          final refreshed = await ref
+              .read(appDatabaseProvider)
+              .getChat(chat.id);
           if (!_connectStillCurrent(epoch)) return;
           if (refreshed != null) {
             chat = refreshed;
@@ -1239,29 +1313,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
 
       if (chat.provider == AgentProvider.claude) {
-        final apiKey =
-            await ref.read(secureStoreProvider).readAnthropicApiKey();
+        final apiKey = await ref
+            .read(secureStoreProvider)
+            .readAnthropicApiKey();
         if (!_connectStillCurrent(epoch)) return;
         if (apiKey == null || apiKey.isEmpty) {
-          if (mounted) {
-            setState(() => _connectStatus = 'Checking Claude login…');
-          }
+          _connectStatus = 'Checking Claude login…';
           final auth = ClaudeRemoteAuth(ref.read(sshServiceProvider));
-          if (!await auth.isLoggedIn(host).timeout(
-                const Duration(seconds: 25),
-                onTimeout: () => false,
-              )) {
+          if (!await auth
+              .isLoggedIn(host)
+              .timeout(const Duration(seconds: 25), onTimeout: () => false)) {
             if (!_connectStillCurrent(epoch)) return;
-            setState(() => _connectStatus = 'Sign in required…');
-            final signedIn =
-                await ClaudeLoginSheet.show(context, host: host);
+            _connectStatus = 'Sign in required…';
+            final signedIn = await ClaudeLoginSheet.show(context, host: host);
             if (!_connectStillCurrent(epoch)) return;
             if (signedIn != true) {
-              setState(() {
-                _connecting = false;
-                _connectStatus = null;
-                _error = 'Claude sign-in required. Open Settings to continue.';
-              });
+              _connecting = false;
+              _connectStatus = null;
+              if (mounted) {
+                setState(() {
+                  _error =
+                      'Claude sign-in required. Open Settings to continue.';
+                });
+              }
               return;
             }
           }
@@ -1269,14 +1343,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
 
       if (!_connectStillCurrent(epoch)) return;
-      if (mounted) {
-        setState(
-          () => _connectStatus = chat.provider == AgentProvider.claude
-              ? 'Starting Claude…'
-              : 'Starting Cursor…',
-        );
-      }
-      final factory = _buildSessionFactory(chatId: chat.id, cwd: repo.remotePath);
+      _connectStatus = chat.provider == AgentProvider.claude
+          ? 'Starting Claude…'
+          : 'Starting Cursor…';
+      final factory = _buildSessionFactory(
+        chatId: chat.id,
+        cwd: repo.remotePath,
+      );
 
       final session = await factory();
       if (!_connectStillCurrent(epoch)) {
@@ -1286,11 +1359,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         return;
       }
 
-      final runtime = await ref.read(activeAcpSessionsProvider.notifier).attach(
-            chatId: chat.id,
-            session: session,
-            sessionFactory: factory,
-          );
+      final runtime = await ref
+          .read(activeAcpSessionsProvider.notifier)
+          .attach(chatId: chat.id, session: session, sessionFactory: factory);
       if (!_connectStillCurrent(epoch)) {
         await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
         return;
@@ -1301,11 +1372,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final sessionId = session.sessionId;
       if (sessionId != null) {
         unawaited(
-          ref.read(agentRuntimeHostProvider).writeSessionId(
-                host,
-                chat.id,
-                sessionId,
-              ),
+          ref
+              .read(agentRuntimeHostProvider)
+              .writeSessionId(host, chat.id, sessionId),
         );
       }
 
@@ -1325,9 +1394,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           _resumedInPlace = session.resumedInPlace;
         });
       }
-      if (session.resumedInPlace) {
-        unawaited(_prefetchModelCatalogIfNeeded(runtime));
-      }
     } on MissingToolException catch (e) {
       if (!_connectStillCurrent(epoch)) return;
       if (mounted) {
@@ -1338,24 +1404,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           _showSdkInstallGuide = true;
           _error = isAdsm
               ? (mismatch
-                  ? 'ADSM mismatch — cannot run until the host matches this app '
-                      '(needs v$kRequiredAdsmVersion).\n'
-                      'Agent Dock tried to update automatically. Leave this chat '
-                      'and open it again to retry, or update ADSM on the remote.\n\n'
-                      '${e.installHint}'
-                  : 'Could not install ADSM on ${host.displayLabel}.\n'
-                      'Agent Dock tried automatically — run the setup below on the '
-                      'remote, then Connect again.\n\n'
-                      '${e.tool} still missing.')
+                    ? 'ADSM mismatch — cannot run until the host matches this app '
+                          '(needs v$kRequiredAdsmVersion).\n'
+                          'Agent Dock tried to update automatically. Leave this chat '
+                          'and open it again to retry, or update ADSM on the remote.\n\n'
+                          '${e.installHint}'
+                    : 'Could not install ADSM on ${host.displayLabel}.\n'
+                          'Agent Dock tried automatically — run the setup below on the '
+                          'remote, then Connect again.\n\n'
+                          '${e.tool} still missing.')
               : isClaude
-                  ? 'Could not install Claude on ${host.displayLabel}.\n'
-                      'Agent Dock tried automatically — run the setup below on the '
-                      'remote (or fix network/sudo), then Connect again.\n\n'
-                      '${e.tool} still missing.'
-                  : 'Could not install Cursor CLI on ${host.displayLabel}.\n'
-                      'Agent Dock tried automatically — run the setup below on the '
-                      'remote, then Connect again.\n\n'
-                      '${e.tool} still missing.';
+              ? 'Could not install Claude on ${host.displayLabel}.\n'
+                    'Agent Dock tried automatically — run the setup below on the '
+                    'remote (or fix network/sudo), then Connect again.\n\n'
+                    '${e.tool} still missing.'
+              : 'Could not install Cursor CLI on ${host.displayLabel}.\n'
+                    'Agent Dock tried automatically — run the setup below on the '
+                    'remote, then Connect again.\n\n'
+                    '${e.tool} still missing.';
         });
       }
     } catch (e) {
@@ -1363,7 +1429,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       SafeLog.d('ACP connect failed', e);
       final lower = e.toString().toLowerCase();
       final isClaude = chat.provider == AgentProvider.claude;
-      final looksLikeMissingSdk = lower.contains('cursor') ||
+      final looksLikeMissingSdk =
+          lower.contains('cursor') ||
           lower.contains('claude') ||
           lower.contains('claude-code-acp') ||
           lower.contains('agent') ||
@@ -1375,28 +1442,69 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           _showSdkInstallGuide = looksLikeMissingSdk;
           _error = looksLikeMissingSdk
               ? (isClaude
-                  ? 'Could not start Claude — install may have failed on the remote.\n$e'
-                  : 'Could not start Cursor — install may have failed on the remote.\n$e')
+                    ? 'Could not start Claude — install may have failed on the remote.\n$e'
+                    : 'Could not start Cursor — install may have failed on the remote.\n$e')
               : _compactConnectError(e, isClaude: isClaude);
         });
       }
-      final updated = chat.copyWith(status: ChatStatus.error, updatedAt: DateTime.now());
+      final updated = chat.copyWith(
+        status: ChatStatus.error,
+        updatedAt: DateTime.now(),
+      );
       await ref.read(appDatabaseProvider).upsertChat(updated);
       ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
       if (mounted) setState(() => _chat = updated);
     } finally {
       if (_connectStillCurrent(epoch)) {
-        setState(() {
-          _connecting = false;
-          _connectStatus = null;
-        });
+        _connecting = false;
+        _connectStatus = null;
+        unawaited(_flushDeferredSend());
       }
+    }
+  }
+
+  Future<void> _flushDeferredSend() async {
+    final text = _deferredSendText;
+    if (text == null) return;
+    final images = List<ChatImageRef>.from(_deferredSendImages);
+    final runtime = ref
+        .read(activeAcpSessionsProvider.notifier)
+        .get(widget.chatId);
+    if (runtime == null || runtime.closed) {
+      // Connect failed — put the draft back.
+      if (!mounted) return;
+      _composer.text = text;
+      setState(() {
+        _deferredSendText = null;
+        _deferredSendImages = const [];
+        _pendingImages
+          ..clear()
+          ..addAll(images);
+      });
+      return;
+    }
+    _deferredSendText = null;
+    _deferredSendImages = const [];
+    _bindRuntime(runtime);
+    try {
+      await runtime.enqueueOrPrompt(text, images: images);
+      _scrollToEnd(force: true);
+    } catch (e) {
+      SafeLog.d('deferred send failed', e);
+      if (!mounted) return;
+      _composer.text = text;
+      setState(() {
+        _pendingImages
+          ..clear()
+          ..addAll(images);
+      });
     }
   }
 
   Future<void> _setMode(AgentSessionMode mode) async {
     setState(() => _mode = mode);
-    final runtime = _runtime ??
+    final runtime =
+        _runtime ??
         ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
     if (runtime == null) return;
     try {
@@ -1404,9 +1512,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } catch (e) {
       SafeLog.d('setMode failed', e);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not set mode: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Could not set mode: $e')));
       }
     }
   }
@@ -1436,7 +1544,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   m == _mode
                       ? Icons.radio_button_checked
                       : Icons.radio_button_unchecked,
-                  color: m == _mode ? Theme.of(context).colorScheme.primary : null,
+                  color: m == _mode
+                      ? Theme.of(context).colorScheme.primary
+                      : null,
                 ),
                 title: Text(m.label),
                 subtitle: Text(m.subtitle),
@@ -1451,7 +1561,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   void _setPermission(PermissionPolicy policy) {
     setState(() => _permission = policy);
-    final runtime = _runtime ??
+    final runtime =
+        _runtime ??
         ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
     if (runtime == null) return;
     // Keep reconnect factory current even before apply finishes.
@@ -1512,9 +1623,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         } catch (e) {
           SafeLog.d('store image failed', e);
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('$e')),
-            );
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('$e')));
           }
         }
       }
@@ -1523,9 +1634,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } catch (e) {
       SafeLog.d('pick images failed', e);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not pick images: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Could not pick images: $e')));
       }
     } finally {
       if (mounted) setState(() => _pickingImages = false);
@@ -1548,66 +1659,64 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (!_chat!.provider.isAvailable) return;
 
     // Composer stays usable while a turn runs — messages go on the outbound
-    // queue. Only block the button briefly while we ensure the transport.
+    // queue. Never hold the send button across SSH/ADSM bring-up.
     _composer.clear();
     _syncComposerDraft('');
     setState(() {
-      _sending = true;
       _pendingImages.clear();
       _showSlashMenu = false;
     });
-    try {
-      await _ensureAcp();
-      final runtime =
-          ref.read(activeAcpSessionsProvider.notifier).get(_chat!.id);
-      if (runtime == null || runtime.closed) {
-        // Put the text / images back so the user does not lose them.
-        _composer.text = text;
+
+    final live = ref.read(activeAcpSessionsProvider.notifier).get(_chat!.id);
+    if (live != null && !live.closed) {
+      setState(() => _sending = true);
+      try {
+        _bindRuntime(live);
+        await live.enqueueOrPrompt(text, images: images);
+        _scrollToEnd(force: true);
+      } catch (e) {
+        SafeLog.d('send failed', e);
         if (mounted) {
-          setState(() => _pendingImages
-            ..clear()
-            ..addAll(images));
+          _composer.text = text;
+          setState(() {
+            _pendingImages
+              ..clear()
+              ..addAll(images);
+            _showSdkInstallGuide = false;
+            if (!isTransientBridgeError(e)) {
+              _error = 'Send failed: $e';
+            }
+          });
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(
-                _error ??
-                    'Could not connect to agent. Check Connect / SSH, then try again.',
+                isTransientBridgeError(e)
+                    ? 'Connection blip — reconnecting and will retry send…'
+                    : 'Send failed: $e',
               ),
             ),
           );
         }
-        return;
+      } finally {
+        if (mounted) setState(() => _sending = false);
       }
-      _bindRuntime(runtime);
-      // Returns as soon as the message is appended (and queued if busy).
-      // The turn itself runs in the background on the runtime.
-      await runtime.enqueueOrPrompt(text, images: images);
-      _scrollToEnd(force: true);
-    } catch (e) {
-      SafeLog.d('send failed', e);
-      if (mounted) {
-        _composer.text = text;
-        setState(() {
-          _pendingImages
-            ..clear()
-            ..addAll(images);
-          _showSdkInstallGuide = false;
-          if (!isTransientBridgeError(e)) {
-            _error = 'Send failed: $e';
-          }
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              isTransientBridgeError(e)
-                  ? 'Connection blip — reconnecting and will retry send…'
-                  : 'Send failed: $e',
-            ),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _sending = false);
+      return;
+    }
+
+    // Not connected yet — park the message and keep the UI free while SSH
+    // finishes in the background (same fire-and-forget path as open-chat).
+    setState(() {
+      _deferredSendText = text;
+      _deferredSendImages = images;
+    });
+    unawaited(_ensureAcp());
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Queued — will send when the host connects'),
+          duration: Duration(seconds: 2),
+        ),
+      );
     }
   }
 
@@ -1639,7 +1748,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Unknown command /$cmd — try /compress or /schedule')),
+        SnackBar(
+          content: Text('Unknown command /$cmd — try /compress or /schedule'),
+        ),
       );
     }
   }
@@ -1649,8 +1760,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     setState(() => _compressing = true);
     try {
       await _ensureAcp();
-      final runtime =
-          ref.read(activeAcpSessionsProvider.notifier).get(_chat!.id);
+      final runtime = ref
+          .read(activeAcpSessionsProvider.notifier)
+          .get(_chat!.id);
       if (runtime == null || runtime.closed) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -1686,8 +1798,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('compressed_ctx_${widget.chatId}', summary);
       if (mounted) {
-        final preview =
-            summary.length > 100 ? '${summary.substring(0, 100)}…' : summary;
+        final preview = summary.length > 100
+            ? '${summary.substring(0, 100)}…'
+            : summary;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Compressed context saved: $preview')),
         );
@@ -1695,9 +1808,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } catch (e) {
       SafeLog.d('compress failed', e);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Compress failed: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Compress failed: $e')));
       }
     } finally {
       if (mounted) setState(() => _compressing = false);
@@ -1721,7 +1834,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Widget _buildSlashMenu(ThemeData theme) {
-    final filter = _composer.text.trimLeft().replaceFirst('/', '').toLowerCase();
+    final filter = _composer.text
+        .trimLeft()
+        .replaceFirst('/', '')
+        .toLowerCase();
     final matches = _slashCommands
         .where((c) => filter.isEmpty || c.cmd.startsWith(filter))
         .toList();
@@ -1753,7 +1869,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _forceRun({String? messageId}) async {
-    final runtime = _runtime ??
+    final runtime =
+        _runtime ??
         ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
     if (runtime == null) return;
     try {
@@ -1762,9 +1879,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } catch (e) {
       SafeLog.d('force-run failed', e);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Force run failed: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Force run failed: $e')));
       }
     }
   }
@@ -1882,8 +1999,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
     await ref.read(appDatabaseProvider).upsertChat(updated);
     ref.read(agentDockServiceProvider).pushChatNow(chat.id);
-    final runtime =
-        ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
+    final runtime = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (runtime != null) runtime.chatMeta = updated;
     ref.read(chatActivityTickProvider.notifier).state++;
     if (mounted) setState(() => _chat = updated);
@@ -1900,6 +2016,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     _markReadTimer?.cancel();
     _runtimeUiCoalesce?.cancel();
+    _runtimeUiEpoch.dispose();
+    _composerUiEpoch.dispose();
+    _composerRuntimeN.dispose();
+    _connectingN.dispose();
+    _connectStatusN.dispose();
     _voiceTick?.cancel();
     _voicePulse.dispose();
     _showJumpToLatest.dispose();
@@ -1970,8 +2091,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _voiceTick = Timer.periodic(const Duration(seconds: 1), (_) {
         if (!mounted || _voiceStartedAt == null) return;
         setState(() {
-          _voiceElapsedSec =
-              DateTime.now().difference(_voiceStartedAt!).inSeconds;
+          _voiceElapsedSec = DateTime.now()
+              .difference(_voiceStartedAt!)
+              .inSeconds;
         });
       });
       if (_voiceReleasePending) {
@@ -2102,8 +2224,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           const SnackBar(content: Text('No speech detected — try again.')),
         );
       } else {
-        _composer.text =
-            baseline.trim().isEmpty ? text : '${baseline.trim()} $text';
+        _composer.text = baseline.trim().isEmpty
+            ? text
+            : '${baseline.trim()} $text';
         _composer.selection = TextSelection.collapsed(
           offset: _composer.text.length,
         );
@@ -2175,10 +2298,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final label = cancel
         ? 'Release to cancel'
         : locked
-            ? 'Locked — tap stop when done'
-            : lockHint
-                ? 'Release to lock'
-                : 'Slide left to cancel · up to lock';
+        ? 'Locked — tap stop when done'
+        : lockHint
+        ? 'Release to lock'
+        : 'Slide left to cancel · up to lock';
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
@@ -2272,7 +2395,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return KeyEventResult.ignored;
     }
     final pressed = HardwareKeyboard.instance.logicalKeysPressed;
-    final shift = pressed.contains(LogicalKeyboardKey.shiftLeft) ||
+    final shift =
+        pressed.contains(LogicalKeyboardKey.shiftLeft) ||
         pressed.contains(LogicalKeyboardKey.shiftRight);
     if (shift) return KeyEventResult.ignored;
     if (!_sending && !_compressing) {
@@ -2288,7 +2412,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     int queuedCount = 0,
   }) {
     const fieldRadius = 26.0;
-    final fill = theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.55);
+    final fill = theme.colorScheme.surfaceContainerHighest.withValues(
+      alpha: 0.55,
+    );
     final outline = theme.colorScheme.outlineVariant;
 
     final hint = () {
@@ -2321,9 +2447,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           children: [
             Expanded(
               child: Focus(
-                onKeyEvent: useDesktopShell()
-                    ? _composerDesktopEnterKey
-                    : null,
+                onKeyEvent: useDesktopShell() ? _composerDesktopEnterKey : null,
                 child: TextField(
                   controller: _composer,
                   minLines: 1,
@@ -2374,15 +2498,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final hasPayload = _composerHasText || _pendingImages.isNotEmpty;
     final isStop = streaming && !hasPayload;
     final isQueue = streaming && hasPayload;
-    final enabled = !busy &&
-        _chat!.provider.isAvailable &&
-        (streaming || hasPayload);
+    final enabled =
+        !busy && _chat!.provider.isAvailable && (streaming || hasPayload);
 
     final tooltip = isStop
         ? 'Stop'
         : isQueue
-            ? 'Queue message'
-            : 'Send';
+        ? 'Queue message'
+        : 'Send';
 
     return Tooltip(
       message: tooltip,
@@ -2397,7 +2520,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ? null
               : () async {
                   if (isStop) {
-                    final rt = _runtime ??
+                    final rt =
+                        _runtime ??
                         ref
                             .read(activeAcpSessionsProvider.notifier)
                             .get(widget.chatId);
@@ -2429,8 +2553,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       isStop
                           ? Icons.stop_rounded
                           : isQueue
-                              ? Icons.playlist_add
-                              : Icons.arrow_upward_rounded,
+                          ? Icons.playlist_add
+                          : Icons.arrow_upward_rounded,
                       size: isStop ? 20 : 22,
                       color: theme.colorScheme.surface,
                     ),
@@ -2472,12 +2596,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       onPointerDown: busy || !_chat!.provider.isAvailable
           ? null
           : (_) => unawaited(_startVoiceHold()),
-      onPointerMove:
-          !_recordingVoice ? null : (e) => _onVoiceDragUpdate(e.delta),
-      onPointerUp:
-          !_recordingVoice ? null : (_) => unawaited(_onVoicePointerUp()),
-      onPointerCancel:
-          !_recordingVoice ? null : (_) => unawaited(_onVoicePointerUp()),
+      onPointerMove: !_recordingVoice
+          ? null
+          : (e) => _onVoiceDragUpdate(e.delta),
+      onPointerUp: !_recordingVoice
+          ? null
+          : (_) => unawaited(_onVoicePointerUp()),
+      onPointerCancel: !_recordingVoice
+          ? null
+          : (_) => unawaited(_onVoicePointerUp()),
       child: AnimatedBuilder(
         animation: _voicePulse,
         builder: (context, _) {
@@ -2512,21 +2639,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     color: cancel
                         ? theme.colorScheme.error
                         : recording
-                            ? Color.lerp(
-                                theme.colorScheme.error,
-                                const Color(0xFFE53935),
-                                pulse,
-                              )!
-                            : Colors.transparent,
+                        ? Color.lerp(
+                            theme.colorScheme.error,
+                            const Color(0xFFE53935),
+                            pulse,
+                          )!
+                        : Colors.transparent,
                     shape: const CircleBorder(),
                     clipBehavior: Clip.antiAlias,
                     child: SizedBox(
                       width: 36,
                       height: 36,
                       child: Icon(
-                        cancel
-                            ? Icons.delete_outline
-                            : Icons.mic_none_outlined,
+                        cancel ? Icons.delete_outline : Icons.mic_none_outlined,
                         size: 22,
                         color: cancel || recording
                             ? theme.colorScheme.onError
@@ -2566,934 +2691,1018 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       );
     }
 
-    final theme = Theme.of(context);
+    return ListenableBuilder(
+      listenable: _runtimeUiEpoch,
+      child: _buildIsolatedComposer(),
+      builder: (context, composerChild) {
+        final theme = Theme.of(context);
 
-    final runtime = _runtime;
-    final adsmSession = runtime?.session is AdsmSession
-        ? runtime!.session as AdsmSession
-        : null;
-    final queue = runtime?.outboundQueue ?? const <ChatMessage>[];
-    final queuedIds = {for (final m in queue) m.id};
-    // Queued messages live in the DB but stay out of [entries] until promoted,
-    // so filter defensively in case a stale row is still present.
-    final rawEntries = runtime?.entries ?? _dbEntries;
-    final liveAssistantId = runtime?.liveAssistantMessageId;
-    final liveAssistantText = (runtime?.assistantBuffer ?? '').trim();
-    final filtered = [
-      for (final e in rawEntries)
-        if (e.messageId == null ||
-            (!queuedIds.contains(e.messageId) &&
-                e.messageId != liveAssistantId &&
-                // Same text as the live bubble (id race / re-stream) — show once.
-                !(liveAssistantText.isNotEmpty &&
-                    e.message?.role == MessageRole.assistant &&
-                    e.message!.content.trim() == liveAssistantText)))
-          e,
-    ];
-    // System thoughts are folded into assistant bubbles by [buildTranscriptBlocks].
-    final entries = entriesByTime(filtered);
-    final thoughtBuffer = runtime?.thoughtBuffer ?? '';
-    final assistantBuffer = runtime?.assistantBuffer ?? '';
-    // Composer no longer locks for the whole turn — only the live buffer
-    // counts as "working" for the agent bubble.
-    final streaming = runtime?.isWorking ?? false;
-    final blocks = _blocksForMemoized(entries, openTurnActive: streaming);
-    _syncWindowToBlocks(blocks.length);
-    final visibleBlocks = _transcriptWindow.visibleSlice(blocks);
-    final hiddenOlder = _transcriptWindow.hiddenOlder();
-    final liveError = runtime?.lastError;
-    final deliveryError = runtime?.deliveryError;
-    final rawError = _error ?? liveError ?? deliveryError;
-    final trimmedError = rawError?.trim();
-    // Blank / whitespace-only errors still opened the red banner (ListTile +
-    // SingleChildScrollView collapsed the title to 0px — empty red strip).
-    final displayError =
-        (trimmedError == null || trimmedError.isEmpty) ? null : trimmedError;
-    final guide = () {
-      final err = (displayError ?? '').toLowerCase();
-      if (err.contains('tmux')) return kRemoteTmuxSetupGuide;
-      if (err.contains('adsm')) return kRemoteAdsmSetupGuide;
-      return _chat!.provider == AgentProvider.claude
-          ? kRemoteClaudeSetupGuide
-          : kRemoteCursorSetupGuide;
-    }();
-    final connected = runtime != null && !runtime.closed;
-    final reconnecting = runtime?.reconnecting ?? false;
-    final remoteRunning = runtime?.remoteTurnActive == true;
-    final sending = runtime?.sendingToHost == true;
-    final activeToolEntries = runtime == null
-        ? const <ToolCallState>[]
-        : [
-            for (final e in runtime.entries)
-              if (e.tool?.isActive ?? false) e.tool!,
-          ];
-    final activeTools = activeToolEntries.length;
-    final pollingTools = [
-      for (final t in activeToolEntries)
-        if (t.isPollingWait) t,
-    ];
-    final isPolling = pollingTools.isNotEmpty;
-    final activityLabel = runtime?.activityLabel;
-    final statusLabel = switch (true) {
-      _ when _connecting =>
-        ' · ${_connectStatus ?? 'Connecting…'}',
-      _ when reconnecting => ' · reconnecting…',
-      _ when remoteRunning && !connected => ' · running on host',
-      _ when sending =>
-        ' · ${activityLabel?.isNotEmpty == true ? activityLabel! : 'Sending to host…'}',
-      _ when streaming && isPolling =>
-        ' · Polling · ${pollingTools.first.displayTitle}',
-      _ when streaming && activityLabel != null && activityLabel.isNotEmpty =>
-        ' · $activityLabel',
-      _ when streaming && activeTools == 1 =>
-        ' · working · ${activeToolEntries.first.displayTitle}',
-      _ when streaming && activeTools > 1 =>
-        ' · working · $activeTools tools',
-      _ when streaming => ' · Thinking',
-      _ when connected && _resumedInPlace => ' · live · resumed',
-      _ when connected => ' · live',
-      _ => '',
-    };
+        final runtime = _runtime;
+        final adsmSession = runtime?.session is AdsmSession
+            ? runtime!.session as AdsmSession
+            : null;
+        final queue = runtime?.outboundQueue ?? const <ChatMessage>[];
+        final queuedIds = {for (final m in queue) m.id};
+        // Queued messages live in the DB but stay out of [entries] until promoted,
+        // so filter defensively in case a stale row is still present.
+        final rawEntries = runtime?.entries ?? _dbEntries;
+        final liveAssistantId = runtime?.liveAssistantMessageId;
+        final filtered = [
+          for (final e in rawEntries)
+            if (e.messageId == null ||
+                (!queuedIds.contains(e.messageId) &&
+                    e.messageId != liveAssistantId))
+              e,
+        ];
+        // System thoughts are folded into assistant bubbles by [buildTranscriptBlocks].
+        final entries = entriesByTime(filtered);
+        final thoughtBuffer = runtime?.thoughtBuffer ?? '';
+        final assistantBuffer = runtime?.assistantBuffer ?? '';
+        // Composer no longer locks for the whole turn — only the live buffer
+        // counts as "working" for the agent bubble.
+        final streaming = runtime?.isWorking ?? false;
+        final blocks = _blocksForMemoized(entries, openTurnActive: streaming);
+        _syncWindowToBlocks(blocks.length);
+        final visibleBlocks = _transcriptWindow.visibleSlice(blocks);
+        final hiddenOlder = _transcriptWindow.hiddenOlder();
+        final liveError = runtime?.lastError;
+        final deliveryError = runtime?.deliveryError;
+        final rawError = _error ?? liveError ?? deliveryError;
+        final trimmedError = rawError?.trim();
+        // Blank / whitespace-only errors still opened the red banner (ListTile +
+        // SingleChildScrollView collapsed the title to 0px — empty red strip).
+        final displayError = (trimmedError == null || trimmedError.isEmpty)
+            ? null
+            : trimmedError;
+        final guide = () {
+          final err = (displayError ?? '').toLowerCase();
+          if (err.contains('tmux')) return kRemoteTmuxSetupGuide;
+          if (err.contains('adsm')) return kRemoteAdsmSetupGuide;
+          return _chat!.provider == AgentProvider.claude
+              ? kRemoteClaudeSetupGuide
+              : kRemoteCursorSetupGuide;
+        }();
+        final connected = runtime != null && !runtime.closed;
+        final reconnecting = runtime?.reconnecting ?? false;
+        final remoteRunning = runtime?.remoteTurnActive == true;
+        final sending = runtime?.sendingToHost == true;
+        final activeToolEntries = runtime == null
+            ? const <ToolCallState>[]
+            : [
+                for (final e in runtime.entries)
+                  if (e.tool?.isActive ?? false) e.tool!,
+              ];
+        final activeTools = activeToolEntries.length;
+        final pollingTools = [
+          for (final t in activeToolEntries)
+            if (t.isPollingWait) t,
+        ];
+        final isPolling = pollingTools.isNotEmpty;
+        final activityLabel = runtime?.activityLabel;
+        final statusLabel = switch (true) {
+          // Connecting status lives on the toolbar spinner (ValueNotifier) —
+          // do not bake it into this label or every SSH step rebuilds the chat.
+          _ when reconnecting => ' · reconnecting…',
+          _ when remoteRunning && !connected => ' · running on host',
+          _ when sending =>
+            ' · ${activityLabel?.isNotEmpty == true ? activityLabel! : 'Sending to host…'}',
+          _ when streaming && isPolling =>
+            ' · Polling · ${pollingTools.first.displayTitle}',
+          _
+              when streaming &&
+                  activityLabel != null &&
+                  activityLabel.isNotEmpty =>
+            ' · $activityLabel',
+          _ when streaming && activeTools == 1 =>
+            ' · working · ${activeToolEntries.first.displayTitle}',
+          _ when streaming && activeTools > 1 =>
+            ' · working · $activeTools tools',
+          _ when streaming => ' · Thinking',
+          _ when connected && _resumedInPlace => ' · live · resumed',
+          _ when connected => ' · live',
+          _ => '',
+        };
 
-    final extra = <Widget>[];
-    // Keep live text visible even if isWorking cleared a tick before flush —
-    // that race used to make the answer vanish until reopen.
-    if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
-      if (thoughtBuffer.isNotEmpty) {
-        extra.add(
-          _ThinkingFold(
-            text: thoughtBuffer,
-            streaming: streaming,
-            initiallyExpanded: streaming,
-          ),
-        );
-      }
-      // Live answer stays above queued user bubbles so the current turn can
-      // finish without burying what the user just scheduled.
-      if (assistantBuffer.isNotEmpty) {
-        extra.add(
-          _Bubble(
-            role: MessageRole.assistant,
-            text: assistantBuffer,
-            streaming: true,
-          ),
-        );
-      }
-    }
-    for (final m in queue) {
-      extra.add(
-        _Bubble(
-          role: MessageRole.user,
-          text: m.content,
-          at: m.createdAt,
-          queued: true,
-        ),
-      );
-    }
-
-    return Scaffold(
-      appBar: AppBar(
-        automaticallyImplyLeading: !useDesktopShell(context),
-        title: InkWell(
-          onTap: _renameChat,
-          borderRadius: BorderRadius.circular(8),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Flexible(
-                      child: Text(
-                        _chat!.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Icon(
-                      Icons.edit_outlined,
-                      size: 14,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ],
-                ),
-                Text(
-                  '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
-                  style: theme.textTheme.bodySmall,
-                ),
-              ],
-            ),
-          ),
-        ),
-        actions: [
-          if (_repo != null && _host != null)
-            IconButton(
-              tooltip: 'Project files',
-              onPressed: () {
-                ProjectFilesScreen.open(
-                  context,
-                  host: _host!,
-                  rootPath: _repo!.remotePath,
-                  title: _repo!.name,
-                );
-              },
-              icon: const Icon(Icons.folder_open_outlined),
-            ),
-          if (_repo != null && _host != null)
-            IconButton(
-              tooltip: 'Terminal in project',
-              onPressed: () {
-                final loc = Uri(
-                  path: '/hosts/terminal/${_host!.id}',
-                  queryParameters: {'cwd': _repo!.remotePath},
-                ).toString();
-                if (useDesktopShell(context)) {
-                  context.go(loc);
-                } else {
-                  context.push(loc);
-                }
-              },
-              icon: const Icon(Icons.terminal),
-            ),
-          if (_connecting || reconnecting)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Tooltip(
-                message: _connectStatus ??
-                    'Reconnecting (${runtime?.reconnectAttempts ?? 0})…',
-                child: const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
+        final extra = <Widget>[];
+        // Keep live text visible even if isWorking cleared a tick before flush —
+        // that race used to make the answer vanish until reopen.
+        if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
+          if (thoughtBuffer.isNotEmpty) {
+            extra.add(
+              _ThinkingFold(
+                text: thoughtBuffer,
+                streaming: streaming,
+                initiallyExpanded: streaming,
               ),
-            ),
-          IconButton(
-            tooltip: _connecting
-                ? (_connectStatus ?? 'Connecting — tap for controls')
-                : reconnecting
-                    ? 'Reconnecting — tap for controls'
-                    : adsmSession != null
-                        ? 'ADSM host status'
-                        : connected
-                            ? 'Agent live — keeps running on the host if you disconnect'
-                            : 'Reconnect ACP',
-            onPressed: () {
-              if (adsmSession != null) {
-                unawaited(
-                  AdsmHealthSheet.show(
-                    context,
-                    session: adsmSession,
-                    bridgeOpen: connected,
-                    provider: _chat?.provider,
-                    onReconnect: connected || _connecting ? null : _ensureAcp,
-                    onReauthed: () {
-                      unawaited(_reconnectAfterReauth());
-                    },
-                    onStopped: () {
-                      unawaited(() async {
-                        _cancelConnect();
-                        final chat = _chat;
-                        if (chat == null) return;
-                        await ref
-                            .read(activeAcpSessionsProvider.notifier)
-                            .close(chat.id);
-                        if (mounted) {
-                          setState(() {
-                            _runtime = null;
-                            _error = null;
-                          });
-                        }
-                      }());
-                    },
-                  ),
-                );
-                return;
-              }
-              unawaited(_showConnectionControls(
-                connecting: _connecting || reconnecting,
-                connected: connected,
-              ));
-            },
-            icon: Icon(
-              _connecting || reconnecting
-                  ? Icons.power_settings_new
-                  : connected
-                      ? Icons.sensors
-                      : Icons.link,
-            ),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Material(
-            color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-              child: Row(
-                children: [
-                  _ToolbarChip(
-                    icon: Icons.tune,
-                    label: _mode.label,
-                    opensMenu: true,
-                    onTap: _pickMode,
-                  ),
-                  const SizedBox(width: 8),
-                  _ToolbarChip(
-                    icon: Icons.auto_awesome_outlined,
-                    label: _selectedModel?.name ?? 'Model',
-                    detail: () {
-                      final usage = TurnMetricsLabel.formatContextUsage(
-                        runtime?.usageTokensUsed,
-                        runtime?.usageContextSize,
-                      );
-                      if (usage != null) return usage;
-                      final badges = _selectedModel?.badges.join(' · ');
-                      return (badges != null && badges.isNotEmpty)
-                          ? badges
-                          : null;
-                    }(),
-                    opensMenu: true,
-                    onTap: _pickModel,
-                  ),
-                  const SizedBox(width: 8),
-                  _ToolbarChip(
-                    icon: _permission == PermissionPolicy.allowAll
-                        ? Icons.verified_user_outlined
-                        : Icons.privacy_tip_outlined,
-                    label: _permission.label,
-                    selected: _permission == PermissionPolicy.allowAll,
-                    onTap: () => _setPermission(
-                      _permission == PermissionPolicy.allowAll
-                          ? PermissionPolicy.ask
-                          : PermissionPolicy.allowAll,
-                    ),
-                  ),
-                ],
+            );
+          }
+          // Live answer stays above queued user bubbles so the current turn can
+          // finish without burying what the user just scheduled.
+          if (assistantBuffer.isNotEmpty) {
+            extra.add(
+              _Bubble(
+                role: MessageRole.assistant,
+                text: assistantBuffer,
+                streaming: true,
               ),
+            );
+          }
+        }
+        for (final m in queue) {
+          extra.add(
+            _Bubble(
+              role: MessageRole.user,
+              text: m.content,
+              at: m.createdAt,
+              queued: true,
             ),
-          ),
-          if (_connecting || reconnecting)
-            Material(
-              color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
+          );
+        }
+
+        return Scaffold(
+          appBar: AppBar(
+            automaticallyImplyLeading: !useDesktopShell(context),
+            title: InkWell(
+              onTap: _renameChat,
+              borderRadius: BorderRadius.circular(8),
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-                child: Row(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: theme.colorScheme.primary,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _connectStatus ??
-                            (reconnecting
-                                ? 'Reconnecting (${runtime?.reconnectAttempts ?? 0})…'
-                                : 'Connecting…'),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: theme.colorScheme.onPrimaryContainer,
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            _chat!.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
-                      ),
+                        const SizedBox(width: 4),
+                        Icon(
+                          Icons.edit_outlined,
+                          size: 14,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ],
                     ),
-                    TextButton(
-                      style: TextButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                      ),
-                      onPressed: () {
-                        _cancelConnect();
-                        if (reconnecting && runtime != null) {
-                          unawaited(
-                            ref
-                                .read(activeAcpSessionsProvider.notifier)
-                                .close(widget.chatId),
-                          );
-                          setState(() {
-                            _runtime = null;
-                            _error = null;
-                          });
-                        }
-                      },
-                      child: const Text('Cancel'),
+                    Text(
+                      '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
+                      style: theme.textTheme.bodySmall,
                     ),
                   ],
                 ),
               ),
             ),
-          if (displayError != null &&
-              (_showSdkInstallGuide ||
-                  displayError.toLowerCase().contains('tmux') ||
-                  displayError.toLowerCase().contains('not installed')))
-            ConstrainedBox(
-              constraints: BoxConstraints(
-                maxHeight: MediaQuery.sizeOf(context).height * 0.38,
-              ),
-              child: SingleChildScrollView(
-                child: AgentSetupErrorBanner(
-                  message: displayError,
-                  setupGuide: guide,
-                  onDismiss: () => setState(() {
-                    _error = null;
-                    _showSdkInstallGuide = false;
-                  }),
+            actions: [
+              if (_repo != null && _host != null)
+                IconButton(
+                  tooltip: 'Project files',
+                  onPressed: () {
+                    ProjectFilesScreen.open(
+                      context,
+                      host: _host!,
+                      rootPath: _repo!.remotePath,
+                      title: _repo!.name,
+                    );
+                  },
+                  icon: const Icon(Icons.folder_open_outlined),
                 ),
-              ),
-            )
-          else if (displayError != null)
-            Material(
-              color: theme.colorScheme.errorContainer.withValues(alpha: 0.9),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(8, 2, 0, 2),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.error_outline,
-                      size: 18,
-                      color: theme.colorScheme.onErrorContainer,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: InkWell(
-                        onTap: () => unawaited(
-                          _showFullConnectError(displayError),
-                        ),
-                        child: Text(
-                          _compactConnectError(
-                            displayError,
-                            isClaude: _chat?.provider == AgentProvider.claude,
-                          ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.colorScheme.onErrorContainer,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ),
-                    ),
-                    if (!connected)
-                      TextButton(
-                        style: TextButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                        ),
-                        onPressed: _connecting
-                            ? null
-                            : () {
-                                setState(() {
-                                  _error = null;
-                                  _showSdkInstallGuide = false;
-                                });
-                                runtime?.lastError = null;
-                                runtime?.deliveryError = null;
-                                unawaited(() async {
-                                  await runtime?.resyncBusyFromHost();
-                                  await _ensureAcp();
-                                }());
-                              },
-                        child: const Text('Retry'),
-                      ),
-                    IconButton(
-                      tooltip: 'Connection controls',
-                      visualDensity: VisualDensity.compact,
-                      icon: Icon(
-                        Icons.power_settings_new,
-                        size: 20,
-                        color: theme.colorScheme.onErrorContainer,
-                      ),
-                      onPressed: () {
-                        if (adsmSession != null) {
-                          unawaited(
-                            AdsmHealthSheet.show(
-                              context,
-                              session: adsmSession,
-                              bridgeOpen: connected,
-                              provider: _chat?.provider,
-                              onReconnect:
-                                  connected || _connecting ? null : _ensureAcp,
-                              onReauthed: () {
-                                unawaited(_reconnectAfterReauth());
-                              },
-                              onStopped: () {
-                                unawaited(() async {
-                                  _cancelConnect();
-                                  final chat = _chat;
-                                  if (chat == null) return;
-                                  await ref
-                                      .read(activeAcpSessionsProvider.notifier)
-                                      .close(chat.id);
-                                  if (mounted) {
-                                    setState(() {
-                                      _runtime = null;
-                                      _error = null;
-                                    });
-                                  }
-                                }());
-                              },
+              if (_repo != null && _host != null)
+                IconButton(
+                  tooltip: 'Terminal in project',
+                  onPressed: () {
+                    final loc = Uri(
+                      path: '/hosts/terminal/${_host!.id}',
+                      queryParameters: {'cwd': _repo!.remotePath},
+                    ).toString();
+                    if (useDesktopShell(context)) {
+                      context.go(loc);
+                    } else {
+                      context.push(loc);
+                    }
+                  },
+                  icon: const Icon(Icons.terminal),
+                ),
+              ListenableBuilder(
+                listenable: Listenable.merge([_connectingN, _connectStatusN]),
+                builder: (context, _) {
+                  final connecting = _connecting;
+                  final connectStatus = _connectStatus;
+                  return Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (connecting || reconnecting)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: Tooltip(
+                            message:
+                                connectStatus ??
+                                'Reconnecting (${runtime?.reconnectAttempts ?? 0})…',
+                            child: const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
                             ),
-                          );
-                        } else {
+                          ),
+                        ),
+                      IconButton(
+                        tooltip: connecting
+                            ? (connectStatus ?? 'Connecting — tap for controls')
+                            : reconnecting
+                            ? 'Reconnecting — tap for controls'
+                            : adsmSession != null
+                            ? 'ADSM host status'
+                            : connected
+                            ? 'Agent live — keeps running on the host if you disconnect'
+                            : 'Connect agent',
+                        onPressed: () {
+                          if (adsmSession != null) {
+                            unawaited(
+                              AdsmHealthSheet.show(
+                                context,
+                                session: adsmSession,
+                                bridgeOpen: connected,
+                                provider: _chat?.provider,
+                                onReconnect: connected || connecting
+                                    ? null
+                                    : _ensureAcp,
+                                onNewSession: () {
+                                  unawaited(_startFreshSession());
+                                },
+                                onReauthed: () {
+                                  unawaited(_reconnectAfterReauth());
+                                },
+                                onStopped: () {
+                                  unawaited(() async {
+                                    _cancelConnect();
+                                    final chat = _chat;
+                                    if (chat == null) return;
+                                    await ref
+                                        .read(
+                                          activeAcpSessionsProvider.notifier,
+                                        )
+                                        .close(chat.id);
+                                    if (mounted) {
+                                      _syncComposerRuntime(null);
+                                      setState(() {
+                                        _runtime = null;
+                                        _error = null;
+                                      });
+                                    }
+                                  }());
+                                },
+                              ),
+                            );
+                            return;
+                          }
+                          if (!connected && !connecting) {
+                            unawaited(_ensureAcp());
+                            return;
+                          }
                           unawaited(
                             _showConnectionControls(
-                              connecting: _connecting || reconnecting,
+                              connecting: connecting || reconnecting,
                               connected: connected,
                             ),
                           );
-                        }
-                      },
-                    ),
-                    if (isAgentAuthFailureText(displayError))
-                      TextButton(
-                        style: TextButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                        },
+                        icon: Icon(
+                          connecting || reconnecting
+                              ? Icons.power_settings_new
+                              : connected
+                              ? Icons.sensors
+                              : Icons.link,
                         ),
-                        onPressed: (_connecting || _authReauthInFlight)
-                            ? null
-                            : () => unawaited(
-                                  _promptAuthReauth(fromUser: true),
-                                ),
-                        child: const Text('Reauth'),
                       ),
-                    IconButton(
-                      tooltip: 'Dismiss',
-                      visualDensity: VisualDensity.compact,
-                      icon: Icon(
-                        Icons.close,
-                        size: 18,
-                        color: theme.colorScheme.onErrorContainer,
+                    ],
+                  );
+                },
+              ),
+            ],
+          ),
+          body: Column(
+            children: [
+              Material(
+                color: theme.colorScheme.surfaceContainerHighest.withValues(
+                  alpha: 0.4,
+                ),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                  child: Row(
+                    children: [
+                      _ToolbarChip(
+                        icon: Icons.tune,
+                        label: _mode.label,
+                        opensMenu: true,
+                        onTap: _pickMode,
                       ),
-                      onPressed: () {
-                        setState(() {
-                          _error = null;
-                          _showSdkInstallGuide = false;
-                        });
-                        runtime?.lastError = null;
-                        runtime?.deliveryError = null;
-                      },
-                    ),
-                  ],
+                      const SizedBox(width: 8),
+                      _ToolbarChip(
+                        icon: Icons.auto_awesome_outlined,
+                        label: _selectedModel?.name ?? 'Model',
+                        detail: () {
+                          final usage = TurnMetricsLabel.formatContextUsage(
+                            runtime?.usageTokensUsed,
+                            runtime?.usageContextSize,
+                          );
+                          if (usage != null) return usage;
+                          final badges = _selectedModel?.badges.join(' · ');
+                          return (badges != null && badges.isNotEmpty)
+                              ? badges
+                              : null;
+                        }(),
+                        opensMenu: true,
+                        onTap: _pickModel,
+                      ),
+                      const SizedBox(width: 8),
+                      _ToolbarChip(
+                        icon: _permission == PermissionPolicy.allowAll
+                            ? Icons.verified_user_outlined
+                            : Icons.privacy_tip_outlined,
+                        label: _permission.label,
+                        selected: _permission == PermissionPolicy.allowAll,
+                        onTap: () => _setPermission(
+                          _permission == PermissionPolicy.allowAll
+                              ? PermissionPolicy.ask
+                              : PermissionPolicy.allowAll,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ),
-          Expanded(
-            child: Stack(
-              children: [
-                NotificationListener<UserScrollNotification>(
-                  onNotification: (notification) {
-                    if (_programmaticScroll ||
-                        _shiftingWindow ||
-                        !_landedAtBottom) {
-                      return false;
-                    }
-                    // reverse = toward older messages (top); stop auto-follow.
-                    if (notification.direction == ScrollDirection.reverse) {
-                      if (_followOutput) _setFollowOutput(false);
-                      _maybeLoadOlderHistory();
-                    } else if (notification.direction ==
-                        ScrollDirection.forward) {
-                      if (_isNearBottom && !_followOutput) {
-                        _setFollowOutput(true);
-                      }
-                      // Past softMax (~370): ditch oldest page when heading down.
-                      _maybeTrimOlderHistory();
-                    }
-                    return false;
-                  },
-                  child: GptMarkdownTheme(
-                      gptThemeData: chatGptMarkdownTheme(theme),
-                      child: ListView.builder(
-                  controller: _scroll,
-                  // Desktop: Cursor-like side margins. Phone: tighter inset so
-                  // bubbles aren't pushed inward like a desktop column.
-                  padding: EdgeInsets.fromLTRB(
-                    useDesktopShell(context) ? 40 : 16,
-                    12,
-                    useDesktopShell(context) ? 40 : 16,
-                    16,
+              ListenableBuilder(
+                listenable: Listenable.merge([_connectingN, _connectStatusN]),
+                builder: (context, _) {
+                  if (_deferredSendText == null) return const SizedBox.shrink();
+                  return Material(
+                    color: theme.colorScheme.surfaceContainerHighest.withValues(
+                      alpha: 0.7,
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.schedule,
+                            size: 16,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _connecting
+                                  ? 'Message queued — ${_connectStatus ?? 'connecting…'}'
+                                  : 'Message queued — waiting for host',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodySmall,
+                            ),
+                          ),
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                              ),
+                            ),
+                            onPressed: () {
+                              final text = _deferredSendText;
+                              final images = List<ChatImageRef>.from(
+                                _deferredSendImages,
+                              );
+                              setState(() {
+                                _deferredSendText = null;
+                                _deferredSendImages = const [];
+                                if (text != null) _composer.text = text;
+                                _pendingImages
+                                  ..clear()
+                                  ..addAll(images);
+                              });
+                            },
+                            child: const Text('Edit'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+              if (displayError != null &&
+                  (_showSdkInstallGuide ||
+                      displayError.toLowerCase().contains('tmux') ||
+                      displayError.toLowerCase().contains('not installed')))
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.sizeOf(context).height * 0.38,
                   ),
-                  // Keep scroll physics interactive even while the agent streams.
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  cacheExtent: 280,
-                  itemCount: (hiddenOlder > 0 ? 1 : 0) +
-                      visibleBlocks.length +
-                      extra.length,
-                  itemBuilder: (context, index) {
-                    var cursor = index;
-                    if (hiddenOlder > 0) {
-                      if (cursor == 0) {
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Center(
-                            child: TextButton(
-                              onPressed: _loadingOlderHistory
-                                  ? null
-                                  : () => _maybeLoadOlderHistory(
-                                        fromUserTap: true,
+                  child: SingleChildScrollView(
+                    child: AgentSetupErrorBanner(
+                      message: displayError,
+                      setupGuide: guide,
+                      onDismiss: () => setState(() {
+                        _error = null;
+                        _showSdkInstallGuide = false;
+                      }),
+                    ),
+                  ),
+                )
+              else if (displayError != null)
+                Material(
+                  color: theme.colorScheme.errorContainer.withValues(
+                    alpha: 0.9,
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 2, 0, 2),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.error_outline,
+                          size: 18,
+                          color: theme.colorScheme.onErrorContainer,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: InkWell(
+                            onTap: () =>
+                                unawaited(_showFullConnectError(displayError)),
+                            child: Text(
+                              _compactConnectError(
+                                displayError,
+                                isClaude:
+                                    _chat?.provider == AgentProvider.claude,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onErrorContainer,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                        ),
+                        if (!connected)
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                              ),
+                            ),
+                            onPressed: _connecting
+                                ? null
+                                : () {
+                                    setState(() {
+                                      _error = null;
+                                      _showSdkInstallGuide = false;
+                                    });
+                                    runtime?.lastError = null;
+                                    runtime?.deliveryError = null;
+                                    unawaited(() async {
+                                      await runtime?.resyncBusyFromHost();
+                                      await _ensureAcp();
+                                    }());
+                                  },
+                            child: const Text('Retry'),
+                          ),
+                        IconButton(
+                          tooltip: 'Connection controls',
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(
+                            Icons.power_settings_new,
+                            size: 20,
+                            color: theme.colorScheme.onErrorContainer,
+                          ),
+                          onPressed: () {
+                            if (adsmSession != null) {
+                              unawaited(
+                                AdsmHealthSheet.show(
+                                  context,
+                                  session: adsmSession,
+                                  bridgeOpen: connected,
+                                  provider: _chat?.provider,
+                                  onReconnect: connected || _connecting
+                                      ? null
+                                      : _ensureAcp,
+                                  onNewSession: () {
+                                    unawaited(_startFreshSession());
+                                  },
+                                  onReauthed: () {
+                                    unawaited(_reconnectAfterReauth());
+                                  },
+                                  onStopped: () {
+                                    unawaited(() async {
+                                      _cancelConnect();
+                                      final chat = _chat;
+                                      if (chat == null) return;
+                                      await ref
+                                          .read(
+                                            activeAcpSessionsProvider.notifier,
+                                          )
+                                          .close(chat.id);
+                                      if (mounted) {
+                                        _syncComposerRuntime(null);
+                                        setState(() {
+                                          _runtime = null;
+                                          _error = null;
+                                        });
+                                      }
+                                    }());
+                                  },
+                                ),
+                              );
+                            } else {
+                              unawaited(
+                                _showConnectionControls(
+                                  connecting: _connecting || reconnecting,
+                                  connected: connected,
+                                ),
+                              );
+                            }
+                          },
+                        ),
+                        if (isAgentAuthFailureText(displayError))
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                              ),
+                            ),
+                            onPressed: (_connecting || _authReauthInFlight)
+                                ? null
+                                : () => unawaited(
+                                    _promptAuthReauth(fromUser: true),
+                                  ),
+                            child: const Text('Reauth'),
+                          ),
+                        IconButton(
+                          tooltip: 'Dismiss',
+                          visualDensity: VisualDensity.compact,
+                          icon: Icon(
+                            Icons.close,
+                            size: 18,
+                            color: theme.colorScheme.onErrorContainer,
+                          ),
+                          onPressed: () {
+                            setState(() {
+                              _error = null;
+                              _showSdkInstallGuide = false;
+                            });
+                            runtime?.lastError = null;
+                            runtime?.deliveryError = null;
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              Expanded(
+                child: Stack(
+                  children: [
+                    NotificationListener<UserScrollNotification>(
+                      onNotification: (notification) {
+                        if (_programmaticScroll ||
+                            _shiftingWindow ||
+                            !_landedAtBottom) {
+                          return false;
+                        }
+                        // reverse = toward older messages (top); stop auto-follow.
+                        if (notification.direction == ScrollDirection.reverse) {
+                          if (_followOutput) _setFollowOutput(false);
+                          _maybeLoadOlderHistory();
+                        } else if (notification.direction ==
+                            ScrollDirection.forward) {
+                          if (_isNearBottom && !_followOutput) {
+                            _setFollowOutput(true);
+                          }
+                          // Past softMax (~370): ditch oldest page when heading down.
+                          _maybeTrimOlderHistory();
+                        }
+                        return false;
+                      },
+                      child: GptMarkdownTheme(
+                        gptThemeData: chatGptMarkdownTheme(theme),
+                        child: ListView.builder(
+                          controller: _scroll,
+                          // Desktop: Cursor-like side margins. Phone: tighter inset so
+                          // bubbles aren't pushed inward like a desktop column.
+                          padding: EdgeInsets.fromLTRB(
+                            useDesktopShell(context) ? 40 : 16,
+                            12,
+                            useDesktopShell(context) ? 40 : 16,
+                            16,
+                          ),
+                          // Keep scroll physics interactive even while the agent streams.
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          cacheExtent: 280,
+                          itemCount:
+                              (hiddenOlder > 0 ? 1 : 0) +
+                              visibleBlocks.length +
+                              extra.length,
+                          itemBuilder: (context, index) {
+                            var cursor = index;
+                            if (hiddenOlder > 0) {
+                              if (cursor == 0) {
+                                return Padding(
+                                  padding: const EdgeInsets.only(bottom: 8),
+                                  child: Center(
+                                    child: TextButton(
+                                      onPressed: _loadingOlderHistory
+                                          ? null
+                                          : () => _maybeLoadOlderHistory(
+                                              fromUserTap: true,
+                                            ),
+                                      child: Text(
+                                        _loadingOlderHistory
+                                            ? 'Loading earlier…'
+                                            : '↑ $hiddenOlder earlier · tap to load',
+                                        style: theme.textTheme.labelSmall
+                                            ?.copyWith(
+                                              color: theme.colorScheme.primary,
+                                            ),
                                       ),
-                              child: Text(
-                                _loadingOlderHistory
-                                    ? 'Loading earlier…'
-                                    : '↑ $hiddenOlder earlier · tap to load',
-                                style: theme.textTheme.labelSmall?.copyWith(
-                                  color: theme.colorScheme.primary,
+                                    ),
+                                  ),
+                                );
+                              }
+                              cursor--;
+                            }
+                            if (cursor < visibleBlocks.length) {
+                              final historyIndex = cursor;
+                              final absoluteIndex =
+                                  _transcriptWindow.start + historyIndex;
+                              final block = visibleBlocks[historyIndex];
+                              final prevAt = historyIndex > 0
+                                  ? visibleBlocks[historyIndex - 1].createdAt
+                                  : null;
+                              final at = block.createdAt;
+                              final showDate =
+                                  at != null &&
+                                  (prevAt == null ||
+                                      prevAt.year != at.year ||
+                                      prevAt.month != at.month ||
+                                      prevAt.day != at.day);
+
+                              final Widget body;
+                              final tools = block.tools;
+                              if (block.thinkingOnly != null) {
+                                body = _ThinkingFold(text: block.thinkingOnly!);
+                              } else if (tools != null) {
+                                body = ToolCallGroupCard(
+                                  tools: [for (final e in tools) e.tool!],
+                                );
+                              } else if (block.entry!.tool != null) {
+                                body = ToolCallCard(tool: block.entry!.tool!);
+                              } else {
+                                final m = block.entry!.message!;
+                                final bubble = _Bubble(
+                                  role: m.role,
+                                  text: m.content,
+                                  at: m.createdAt,
+                                );
+                                final thinking = block.thinking;
+                                if (thinking != null && thinking.isNotEmpty) {
+                                  body = Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: [
+                                      _ThinkingFold(text: thinking),
+                                      bubble,
+                                    ],
+                                  );
+                                } else {
+                                  body = bubble;
+                                }
+                              }
+                              final stats = block.turnStats;
+                              final withStats =
+                                  stats != null && stats.isNotEmpty
+                                  ? Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        body,
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            left: 6,
+                                            top: 2,
+                                            bottom: 4,
+                                          ),
+                                          child: TurnMetricsLabel(
+                                            added: stats.added,
+                                            removed: stats.removed,
+                                            files: stats.files,
+                                          ),
+                                        ),
+                                      ],
+                                    )
+                                  : body;
+                              final keyed = KeyedSubtree(
+                                key: ValueKey(
+                                  block.thinkingOnly != null
+                                      ? 'think-$absoluteIndex-${block.thinkingOnly.hashCode}'
+                                      : tools != null
+                                      ? 'tools-$absoluteIndex-${tools.length}-'
+                                            '${tools.first.messageId ?? tools.first.createdAt}'
+                                      : block.entry!.messageId ??
+                                            block.entry!.tool?.toolCallId ??
+                                            'e-$absoluteIndex',
+                                ),
+                                child: RepaintBoundary(child: withStats),
+                              );
+                              if (!showDate) return keyed;
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [_DateChip(at), keyed],
+                              );
+                            }
+                            cursor -= visibleBlocks.length;
+                            return extra[cursor];
+                          },
+                        ),
+                      ),
+                    ),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _showJumpToLatest,
+                      builder: (context, showJump, _) {
+                        if (!showJump) return const SizedBox.shrink();
+                        return Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 12,
+                          child: Center(
+                            child: Material(
+                              elevation: 3,
+                              color: theme.colorScheme.primaryContainer,
+                              shape: const CircleBorder(),
+                              child: IconButton(
+                                tooltip: 'Jump to latest',
+                                onPressed: () {
+                                  _pinWindowToLatest();
+                                  _flushRuntimeUi();
+                                  _scrollToEnd(force: true);
+                                },
+                                icon: Icon(
+                                  Icons.keyboard_arrow_down_rounded,
+                                  color: theme.colorScheme.onPrimaryContainer,
                                 ),
                               ),
                             ),
                           ),
                         );
-                      }
-                      cursor--;
-                    }
-                    if (cursor < visibleBlocks.length) {
-                      final historyIndex = cursor;
-                      final absoluteIndex =
-                          _transcriptWindow.start + historyIndex;
-                      final block = visibleBlocks[historyIndex];
-                      final prevAt = historyIndex > 0
-                          ? visibleBlocks[historyIndex - 1].createdAt
-                          : null;
-                      final at = block.createdAt;
-                      final showDate = at != null &&
-                          (prevAt == null ||
-                              prevAt.year != at.year ||
-                              prevAt.month != at.month ||
-                              prevAt.day != at.day);
-
-                      final Widget body;
-                      final tools = block.tools;
-                      if (block.thinkingOnly != null) {
-                        body = _ThinkingFold(text: block.thinkingOnly!);
-                      } else if (tools != null) {
-                        body = ToolCallGroupCard(
-                          tools: [for (final e in tools) e.tool!],
-                        );
-                      } else if (block.entry!.tool != null) {
-                        body = ToolCallCard(tool: block.entry!.tool!);
-                      } else {
-                        final m = block.entry!.message!;
-                        final bubble = _Bubble(
-                          role: m.role,
-                          text: m.content,
-                          at: m.createdAt,
-                        );
-                        final thinking = block.thinking;
-                        if (thinking != null && thinking.isNotEmpty) {
-                          body = Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              _ThinkingFold(text: thinking),
-                              bubble,
-                            ],
-                          );
-                        } else {
-                          body = bubble;
-                        }
-                      }
-                      final stats = block.turnStats;
-                      final withStats = stats != null && stats.isNotEmpty
-                          ? Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                body,
-                                Padding(
-                                  padding: const EdgeInsets.only(
-                                    left: 6,
-                                    top: 2,
-                                    bottom: 4,
-                                  ),
-                                  child: TurnMetricsLabel(
-                                    added: stats.added,
-                                    removed: stats.removed,
-                                    files: stats.files,
-                                  ),
-                                ),
-                              ],
-                            )
-                          : body;
-                      final keyed = KeyedSubtree(
-                        key: ValueKey(
-                          block.thinkingOnly != null
-                              ? 'think-$absoluteIndex-${block.thinkingOnly.hashCode}'
-                              : tools != null
-                                  ? 'tools-$absoluteIndex-${tools.length}-'
-                                      '${tools.first.messageId ?? tools.first.createdAt}'
-                                  : block.entry!.messageId ??
-                                      block.entry!.tool?.toolCallId ??
-                                      'e-$absoluteIndex',
-                        ),
-                        child: RepaintBoundary(child: withStats),
-                      );
-                      if (!showDate) return keyed;
-                      return Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          _DateChip(at),
-                          keyed,
-                        ],
-                      );
-                    }
-                    cursor -= visibleBlocks.length;
-                    return extra[cursor];
-                  },
-                ),
-                  ),
-                ),
-                ValueListenableBuilder<bool>(
-                  valueListenable: _showJumpToLatest,
-                  builder: (context, showJump, _) {
-                    if (!showJump) return const SizedBox.shrink();
-                    return Positioned(
-                      left: 0,
-                      right: 0,
-                      bottom: 12,
-                      child: Center(
-                        child: Material(
-                          elevation: 3,
-                          color: theme.colorScheme.primaryContainer,
-                          shape: const CircleBorder(),
-                          child: IconButton(
-                            tooltip: 'Jump to latest',
-                            onPressed: () {
-                              _pinWindowToLatest();
-                              _flushRuntimeUi();
-                              _scrollToEnd(force: true);
-                            },
-                            icon: Icon(
-                              Icons.keyboard_arrow_down_rounded,
-                              color: theme.colorScheme.onPrimaryContainer,
-                            ),
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ],
-            ),
-          ),
-          if (queue.isNotEmpty)
-            _OutboundQueueBar(
-              queue: queue,
-              busy: streaming,
-              onForceRun: (id) => unawaited(_forceRun(messageId: id)),
-              onForceRunNext: () => unawaited(_forceRun()),
-              onRemove: (id) =>
-                  unawaited(runtime?.removeFromQueue(id) ?? Future<void>.value()),
-            ),
-          if (runtime?.pendingPermission != null)
-            _PermissionPromptBar(
-              request: runtime!.pendingPermission!,
-              onSelect: (optionId) {
-                runtime.resolvePermission(
-                  runtime.pendingPermission!.requestId,
-                  optionId,
-                );
-              },
-            ),
-          if (streaming)
-            Material(
-              color: theme.colorScheme.errorContainer.withValues(alpha: 0.35),
-              child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Shimmer(
-                        child: Builder(
-                          builder: (context) {
-                            final explore = runtime?.turnExploreStats;
-                            final style =
-                                theme.textTheme.bodyMedium?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
-                              fontWeight: FontWeight.w500,
-                              fontFeatures: const [FontFeature.tabularFigures()],
-                            );
-                            // Polling waits are the thing users confuse with
-                            // "stuck" — surface that above explore totals.
-                            if (isPolling) {
-                              final label =
-                                  '${pollingTools.first.displayTitle} · Polling';
-                              final text = label.endsWith('…') ||
-                                      label.endsWith('...')
-                                  ? label
-                                  : '$label…';
-                              return Text(text, style: style);
-                            }
-                            if (explore != null && explore.isNotEmpty) {
-                              return ExploreStatsLabel(
-                                files: explore.fileCount,
-                                searches: explore.searchCount,
-                                style: style,
-                                showEllipsis: true,
-                              );
-                            }
-                            final String label;
-                            if (sending) {
-                              label = activityLabel?.isNotEmpty == true
-                                  ? activityLabel!
-                                  : 'Sending to host…';
-                            } else if (activityLabel != null &&
-                                activityLabel.isNotEmpty) {
-                              label = activityLabel;
-                            } else if (activeTools == 1) {
-                              label = activeToolEntries.first.displayTitle;
-                            } else if (activeTools > 1) {
-                              label = 'Working · $activeTools tools';
-                            } else {
-                              label = 'Thinking';
-                            }
-                            final text =
-                                label.endsWith('…') || label.endsWith('...')
-                                    ? label
-                                    : '$label…';
-                            return Text(text, style: style);
-                          },
-                        ),
-                      ),
+                      },
                     ),
                   ],
                 ),
               ),
-            ),
-          SafeArea(
-            top: false,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_recordingVoice || _transcribingVoice)
-                    _buildVoiceHintBar(theme),
-                  if (_pendingImages.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: SizedBox(
-                        height: 72,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          itemCount: _pendingImages.length,
-                          separatorBuilder: (_, __) => const SizedBox(width: 8),
-                          itemBuilder: (context, i) {
-                            final img = _pendingImages[i];
-                            final path = img.absolutePath;
-                            return Stack(
-                              clipBehavior: Clip.none,
-                              children: [
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(10),
-                                  child: path == null
-                                      ? Container(
-                                          width: 72,
-                                          height: 72,
-                                          color: theme.colorScheme
-                                              .surfaceContainerHighest,
-                                          child: const Icon(Icons.image),
-                                        )
-                                      : Image.file(
-                                          File(path),
-                                          width: 72,
-                                          height: 72,
-                                          fit: BoxFit.cover,
-                                        ),
-                                ),
-                                Positioned(
-                                  top: -6,
-                                  right: -6,
-                                  child: IconButton.filledTonal(
-                                    visualDensity: VisualDensity.compact,
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(
-                                      minWidth: 28,
-                                      minHeight: 28,
+              if (queue.isNotEmpty)
+                _OutboundQueueBar(
+                  queue: queue,
+                  busy: streaming,
+                  onForceRun: (id) => unawaited(_forceRun(messageId: id)),
+                  onForceRunNext: () => unawaited(_forceRun()),
+                  onRemove: (id) => unawaited(
+                    runtime?.removeFromQueue(id) ?? Future<void>.value(),
+                  ),
+                ),
+              if (runtime?.pendingPermission != null)
+                _PermissionPromptBar(
+                  request: runtime!.pendingPermission!,
+                  onSelect: (optionId) {
+                    runtime.resolvePermission(
+                      runtime.pendingPermission!.requestId,
+                      optionId,
+                    );
+                  },
+                ),
+              if (streaming)
+                Material(
+                  color: theme.colorScheme.errorContainer.withValues(
+                    alpha: 0.35,
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 4,
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Shimmer(
+                            enabled: false,
+                            child: Builder(
+                              builder: (context) {
+                                final explore = runtime?.turnExploreStats;
+                                final style = theme.textTheme.bodyMedium
+                                    ?.copyWith(
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                      fontWeight: FontWeight.w500,
+                                      fontFeatures: const [
+                                        FontFeature.tabularFigures(),
+                                      ],
+                                    );
+                                // Polling waits are the thing users confuse with
+                                // "stuck" — surface that above explore totals.
+                                if (isPolling) {
+                                  final label =
+                                      '${pollingTools.first.displayTitle} · Polling';
+                                  final text =
+                                      label.endsWith('…') ||
+                                          label.endsWith('...')
+                                      ? label
+                                      : '$label…';
+                                  return Text(text, style: style);
+                                }
+                                if (explore != null && explore.isNotEmpty) {
+                                  return ExploreStatsLabel(
+                                    files: explore.fileCount,
+                                    searches: explore.searchCount,
+                                    style: style,
+                                    showEllipsis: true,
+                                  );
+                                }
+                                final String label;
+                                if (sending) {
+                                  label = activityLabel?.isNotEmpty == true
+                                      ? activityLabel!
+                                      : 'Sending to host…';
+                                } else if (activityLabel != null &&
+                                    activityLabel.isNotEmpty) {
+                                  label = activityLabel;
+                                } else if (activeTools == 1) {
+                                  label = activeToolEntries.first.displayTitle;
+                                } else if (activeTools > 1) {
+                                  label = 'Working · $activeTools tools';
+                                } else {
+                                  label = 'Thinking';
+                                }
+                                final text =
+                                    label.endsWith('…') || label.endsWith('...')
+                                    ? label
+                                    : '$label…';
+                                return Text(text, style: style);
+                              },
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              composerChild!,
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildIsolatedComposer() {
+    return ValueListenableBuilder<
+      ({bool streaming, bool connected, int queuedCount})
+    >(
+      valueListenable: _composerRuntimeN,
+      builder: (context, runtimeState, _) {
+        return ValueListenableBuilder<int>(
+          valueListenable: _composerUiEpoch,
+          builder: (context, _, __) {
+            final theme = Theme.of(context);
+            return RepaintBoundary(
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (_recordingVoice || _transcribingVoice)
+                        _buildVoiceHintBar(theme),
+                      if (_pendingImages.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: SizedBox(
+                            height: 72,
+                            child: ListView.separated(
+                              scrollDirection: Axis.horizontal,
+                              itemCount: _pendingImages.length,
+                              separatorBuilder: (_, _) =>
+                                  const SizedBox(width: 8),
+                              itemBuilder: (context, i) {
+                                final img = _pendingImages[i];
+                                final path = img.absolutePath;
+                                return Stack(
+                                  clipBehavior: Clip.none,
+                                  children: [
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(10),
+                                      child: path == null
+                                          ? Container(
+                                              width: 72,
+                                              height: 72,
+                                              color: theme
+                                                  .colorScheme
+                                                  .surfaceContainerHighest,
+                                              child: const Icon(Icons.image),
+                                            )
+                                          : Image.file(
+                                              File(path),
+                                              width: 72,
+                                              height: 72,
+                                              fit: BoxFit.cover,
+                                            ),
                                     ),
-                                    onPressed: () => _removePendingImage(i),
-                                    icon: const Icon(Icons.close, size: 14),
-                                  ),
+                                    Positioned(
+                                      top: -6,
+                                      right: -6,
+                                      child: IconButton.filledTonal(
+                                        visualDensity: VisualDensity.compact,
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(
+                                          minWidth: 28,
+                                          minHeight: 28,
+                                        ),
+                                        onPressed: () => _removePendingImage(i),
+                                        icon: const Icon(Icons.close, size: 14),
+                                      ),
+                                    ),
+                                  ],
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                tooltip: 'Attach image',
+                                visualDensity: VisualDensity.compact,
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(
+                                  minWidth: 40,
+                                  minHeight: 36,
+                                ),
+                                onPressed:
+                                    _pickingImages ||
+                                        !_chat!.provider.isAvailable
+                                    ? null
+                                    : () => unawaited(_pickImages()),
+                                icon: _pickingImages
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.add_photo_alternate_outlined,
+                                      ),
+                              ),
+                              _buildComposerModelHint(theme),
+                            ],
+                          ),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                if (_showSlashMenu) _buildSlashMenu(theme),
+                                _buildComposerField(
+                                  theme: theme,
+                                  streaming: runtimeState.streaming,
+                                  connected: runtimeState.connected,
+                                  queuedCount: runtimeState.queuedCount,
                                 ),
                               ],
-                            );
-                          },
-                        ),
-                      ),
-                    ),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            tooltip: 'Attach image',
-                            visualDensity: VisualDensity.compact,
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints(
-                              minWidth: 40,
-                              minHeight: 36,
                             ),
-                            onPressed: _pickingImages ||
-                                    !_chat!.provider.isAvailable
-                                ? null
-                                : () => unawaited(_pickImages()),
-                            icon: _pickingImages
-                                ? const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : const Icon(
-                                    Icons.add_photo_alternate_outlined,
-                                  ),
                           ),
-                          _buildComposerModelHint(theme),
                         ],
-                      ),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            if (_showSlashMenu) _buildSlashMenu(theme),
-                            _buildComposerField(
-                              theme: theme,
-                              streaming: streaming,
-                              connected: connected,
-                              queuedCount: queue.length,
-                            ),
-                          ],
-                        ),
                       ),
                     ],
                   ),
-                ],
+                ),
               ),
-            ),
-          ),
-        ],
-      ),
+            );
+          },
+        );
+      },
     );
   }
 
   /// Model chip under the attach button, beside the composer.
   Widget _buildComposerModelHint(ThemeData theme) {
     final model = _selectedModel;
-    final label = model?.summary ??
+    final label =
+        model?.summary ??
         (_chat?.modelId != null && _chat!.modelId!.isNotEmpty
             ? AgentModel.parse(_chat!.modelId!).summary
             : null);
@@ -3577,7 +3786,9 @@ class _ThinkingFoldState extends State<_ThinkingFold> {
             maxWidth: MediaQuery.sizeOf(context).width * 0.88,
           ),
           child: Material(
-            color: theme.colorScheme.surfaceContainerHigh.withValues(alpha: 0.55),
+            color: theme.colorScheme.surfaceContainerHigh.withValues(
+              alpha: 0.55,
+            ),
             borderRadius: BorderRadius.circular(12),
             child: Padding(
               padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
@@ -3597,7 +3808,7 @@ class _ThinkingFoldState extends State<_ThinkingFold> {
                         const SizedBox(width: 6),
                         Expanded(
                           child: Shimmer(
-                            enabled: widget.streaming,
+                            enabled: false,
                             child: Text(
                               widget.streaming ? 'Thinking…' : 'Thinking',
                               style: theme.textTheme.labelMedium?.copyWith(
@@ -3622,6 +3833,7 @@ class _ThinkingFoldState extends State<_ThinkingFold> {
                     MessageBody(
                       text: widget.text,
                       dense: true,
+                      live: widget.streaming,
                       style: theme.textTheme.bodySmall?.copyWith(
                         fontStyle: FontStyle.italic,
                         color: theme.colorScheme.onSurfaceVariant,
@@ -3658,8 +3870,9 @@ class _Bubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isUser = role == MessageRole.user;
-    final imageRefs =
-        isUser ? ChatImageCodec.listRefs(text) : const <ChatImageRef>[];
+    final imageRefs = isUser
+        ? ChatImageCodec.listRefs(text)
+        : const <ChatImageRef>[];
     final stripped = ChatImageCodec.displayText(text);
     final autoNumber = isUser ? AutoRunTag.parseNumber(stripped) : null;
     final bodyText = isUser ? AutoRunTag.displayBody(stripped) : stripped;
@@ -3670,7 +3883,11 @@ class _Bubble extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(Icons.psychology_alt, size: 14, color: theme.colorScheme.outline),
+            Icon(
+              Icons.psychology_alt,
+              size: 14,
+              color: theme.colorScheme.outline,
+            ),
             const SizedBox(width: 6),
             Expanded(
               child: MessageBody(
@@ -3700,13 +3917,15 @@ class _Bubble extends StatelessWidget {
 
     final column = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: useDesktopShell(context) ? MainAxisSize.max : MainAxisSize.min,
+      mainAxisSize: useDesktopShell(context)
+          ? MainAxisSize.max
+          : MainAxisSize.min,
       children: [
         if (!isUser && streaming)
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: Shimmer(
-              enabled: true,
+              enabled: false,
               child: Text(
                 'Thinking',
                 style: theme.textTheme.labelMedium?.copyWith(
@@ -3741,9 +3960,7 @@ class _Bubble extends StatelessWidget {
           ),
         if (imageRefs.isNotEmpty)
           Padding(
-            padding: EdgeInsets.only(
-              bottom: bodyText.trim().isEmpty ? 0 : 8,
-            ),
+            padding: EdgeInsets.only(bottom: bodyText.trim().isEmpty ? 0 : 8),
             child: _BubbleImages(refs: imageRefs),
           ),
         if (streaming && bodyText.isEmpty && imageRefs.isEmpty)
@@ -3773,8 +3990,10 @@ class _Bubble extends StatelessWidget {
                     tooltip: 'Copy text for Teams',
                     visualDensity: VisualDensity.compact,
                     padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints(minWidth: 28, minHeight: 28),
+                    constraints: const BoxConstraints(
+                      minWidth: 28,
+                      minHeight: 28,
+                    ),
                     onPressed: () => copyMessageForTeams(context, bodyText),
                     icon: Icon(
                       Icons.copy_rounded,
@@ -3786,10 +4005,11 @@ class _Bubble extends StatelessWidget {
                     tooltip: 'Copy HTML for Teams',
                     visualDensity: VisualDensity.compact,
                     padding: EdgeInsets.zero,
-                    constraints:
-                        const BoxConstraints(minWidth: 28, minHeight: 28),
-                    onPressed: () =>
-                        copyMessageHtmlForTeams(context, bodyText),
+                    constraints: const BoxConstraints(
+                      minWidth: 28,
+                      minHeight: 28,
+                    ),
+                    onPressed: () => copyMessageHtmlForTeams(context, bodyText),
                     icon: Icon(
                       Icons.html,
                       size: 15,
@@ -3821,7 +4041,8 @@ class _Bubble extends StatelessWidget {
         alignment: Alignment.centerLeft,
         child: ConstrainedBox(
           constraints: BoxConstraints(
-            maxWidth: MediaQuery.sizeOf(context).width * (desktop ? 0.92 : 0.88),
+            maxWidth:
+                MediaQuery.sizeOf(context).width * (desktop ? 0.92 : 0.88),
           ),
           child: Container(
             // Full-width pill on desktop; shrink-wrap on phone so short
@@ -3914,8 +4135,7 @@ class _BubbleImagesState extends State<_BubbleImages> {
                     errorBuilder: (_, __, ___) => Container(
                       width: 120,
                       height: 120,
-                      color:
-                          Theme.of(context).colorScheme.surfaceContainerHigh,
+                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
                       child: const Icon(Icons.broken_image_outlined),
                     ),
                   ),
@@ -3970,8 +4190,18 @@ class _DateChip extends StatelessWidget {
   }
 
   static const _months = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
   ];
   static String _month(int m) => _months[m - 1];
 }
@@ -4004,12 +4234,14 @@ class _OutboundQueueBar extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.schedule, size: 14, color: theme.colorScheme.primary),
+                Icon(
+                  Icons.schedule,
+                  size: 14,
+                  color: theme.colorScheme.primary,
+                ),
                 const SizedBox(width: 6),
                 Text(
-                  busy
-                      ? 'Queued · agent is working'
-                      : 'Queued',
+                  busy ? 'Queued · agent is working' : 'Queued',
                   style: theme.textTheme.labelMedium?.copyWith(
                     fontWeight: FontWeight.w600,
                   ),
@@ -4057,10 +4289,7 @@ class _OutboundQueueBar extends StatelessWidget {
 
 /// Ask-mode approval strip — compact card above the composer.
 class _PermissionPromptBar extends StatelessWidget {
-  const _PermissionPromptBar({
-    required this.request,
-    required this.onSelect,
-  });
+  const _PermissionPromptBar({required this.request, required this.onSelect});
 
   final PendingPermissionRequest request;
   final void Function(String optionId) onSelect;
@@ -4097,7 +4326,8 @@ class _PermissionPromptBar extends StatelessWidget {
           ];
 
     // Prefer Allow → Always → Deny so the primary action sits first.
-    final sorted = [...options]..sort((a, b) {
+    final sorted = [...options]
+      ..sort((a, b) {
         int rank(PermissionOption o) {
           if (o.isAllowOnce) return 0;
           if (o.isAllowAlways) return 1;
@@ -4252,13 +4482,13 @@ class _ToolbarChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final foreground = selected ? scheme.onSecondaryContainer : scheme.onSurface;
+    final foreground = selected
+        ? scheme.onSecondaryContainer
+        : scheme.onSurface;
 
     return Material(
       color: selected ? scheme.secondaryContainer : scheme.surface,
-      shape: StadiumBorder(
-        side: BorderSide(color: scheme.outlineVariant),
-      ),
+      shape: StadiumBorder(side: BorderSide(color: scheme.outlineVariant)),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
@@ -4296,7 +4526,11 @@ class _ToolbarChip extends StatelessWidget {
                 ),
               ),
               if (opensMenu)
-                Icon(Icons.expand_more, size: 16, color: scheme.onSurfaceVariant),
+                Icon(
+                  Icons.expand_more,
+                  size: 16,
+                  color: scheme.onSurfaceVariant,
+                ),
             ],
           ),
         ),

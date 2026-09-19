@@ -33,21 +33,20 @@ class TranscriptEntry {
   }) : _createdAt = createdAt;
 
   factory TranscriptEntry.message(ChatMessage message) => TranscriptEntry._(
-        message: message,
-        messageId: message.id,
-        createdAt: message.createdAt,
-      );
+    message: message,
+    messageId: message.id,
+    createdAt: message.createdAt,
+  );
 
   factory TranscriptEntry.tool(
     ToolCallState tool, {
     String? messageId,
     DateTime? createdAt,
-  }) =>
-      TranscriptEntry._(
-        tool: tool,
-        messageId: messageId,
-        createdAt: createdAt ?? DateTime.now(),
-      );
+  }) => TranscriptEntry._(
+    tool: tool,
+    messageId: messageId,
+    createdAt: createdAt ?? DateTime.now(),
+  );
 
   final ChatMessage? message;
   final ToolCallState? tool;
@@ -70,14 +69,20 @@ class ChatSessionRuntime extends ChangeNotifier {
     this.onTransportReady,
     this.sessionFactory,
     this.onAssistantText,
-  })  : _session = session,
-        _db = db,
-        preferredMode = session.mode,
-        preferredPermissionPolicy = session.permissionPolicy;
+    this.shouldAutoReconnect,
+  }) : _session = session,
+       _db = db,
+       preferredMode = session.mode,
+       preferredPermissionPolicy = session.permissionPolicy;
 
   /// Maximum automatic attempts before we stop and wait for the user.
   static const maxReconnectAttempts = 10;
   static const _maxBackoff = Duration(seconds: 30);
+
+  /// Runtime/UI memory is a live tail, not the transcript archive. SQLite and
+  /// the host remain authoritative for older history.
+  static const residentTranscriptLimit = 900;
+  static const transcriptPushTail = 64;
 
   final String chatId;
   final AppDatabase _db;
@@ -89,6 +94,10 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// Local notify hook for assistant text deltas (not tools/thoughts).
   final void Function(String snippet)? onAssistantText;
 
+  /// Background chats are host-durable and do not need to fight for a new SSH
+  /// transport. The owner allows retries only while this chat is focused.
+  final bool Function()? shouldAutoReconnect;
+
   /// Opens a fresh transport for this chat. Set by the owner so the runtime can
   /// recover on its own after a drop, even with no chat screen mounted.
   Future<AgentSession> Function()? sessionFactory;
@@ -98,14 +107,44 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   final List<TranscriptEntry> entries = [];
   final Map<String, String> _toolMessageIds = {};
+  final Map<String, int> _toolEntryIndexes = {};
   final _random = Random();
 
   /// Serializes tool upserts so parallel tool_call / tool_call_update events
   /// cannot insert two SQLite rows for the same toolCallId.
   Future<void> _toolUpsertTail = Future<void>.value();
+  final Map<String, ToolCallState> _pendingToolUpdates = {};
+  Timer? _toolFlushTimer;
 
-  String assistantBuffer = '';
-  String thoughtBuffer = '';
+  StringBuffer _assistantText = StringBuffer();
+  String? _assistantTextCache = '';
+  StringBuffer _thoughtText = StringBuffer();
+  String? _thoughtTextCache = '';
+
+  String get assistantBuffer =>
+      _assistantTextCache ??= _assistantText.toString();
+
+  set assistantBuffer(String value) {
+    _assistantText = StringBuffer(value);
+    _assistantTextCache = value;
+  }
+
+  String get thoughtBuffer => _thoughtTextCache ??= _thoughtText.toString();
+
+  set thoughtBuffer(String value) {
+    _thoughtText = StringBuffer(value);
+    _thoughtTextCache = value;
+  }
+
+  void _appendAssistantText(String value) {
+    _assistantText.write(value);
+    _assistantTextCache = null;
+  }
+
+  void _appendThoughtText(String value) {
+    _thoughtText.write(value);
+    _thoughtTextCache = null;
+  }
 
   /// Row id for the agent turn currently streaming, so progressive writes
   /// update one message instead of appending fragments.
@@ -117,7 +156,7 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   /// Id of the assistant row currently mirrored from [assistantBuffer], if any.
   String? get liveAssistantMessageId =>
-      assistantBuffer.trim().isEmpty ? null : _assistantMessageId;
+      assistantBuffer.isEmpty ? null : _assistantMessageId;
 
   /// True while decoded output exists that SQLite has not caught up with.
   ///
@@ -147,8 +186,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// True while a local prompt is in flight, the host is still producing, or
   /// any tool call is still pending/running — so the UI stays on "working"
   /// through long tool chains, not only while text is streaming.
-  bool get hasActiveTools =>
-      entries.any((e) => e.tool?.isActive ?? false);
+  bool get hasActiveTools => entries.any((e) => e.tool?.isActive ?? false);
 
   bool get isWorking =>
       !reconnecting &&
@@ -230,6 +268,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   bool reconnecting = false;
   int reconnectAttempts = 0;
   Timer? _retryTimer;
+
   /// Clears stale "working" after reconnect when the host already went idle
   /// while we were away (we miss that `turnComplete` in the journal gap).
   Timer? _hostBusyWatchdog;
@@ -255,7 +294,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
     _uiNotifyDirty = true;
     if (_uiNotifyCoalesce?.isActive ?? false) return;
-    _uiNotifyCoalesce = Timer(const Duration(milliseconds: 64), () {
+    _uiNotifyCoalesce = Timer(const Duration(milliseconds: 100), () {
       _uiNotifyCoalesce = null;
       if (_disposed || !_uiNotifyDirty) return;
       _uiNotifyDirty = false;
@@ -280,6 +319,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   void hydrateFromMessages(List<ChatMessage> messages) {
     entries.clear();
     _toolMessageIds.clear();
+    _toolEntryIndexes.clear();
     final queuedIds = {for (final m in outboundQueue) m.id};
     final seenToolIds = <String>{};
     for (final m in messages) {
@@ -290,8 +330,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           final tid = tool.toolCallId;
           if (seenToolIds.contains(tid)) {
             // Prefer the later row (usually a richer status/output update).
-            final index =
-                entries.indexWhere((e) => e.tool?.toolCallId == tid);
+            final index = _toolEntryIndexes[tid] ?? -1;
             if (index >= 0) {
               final prev = entries[index].tool!;
               final orphanId = entries[index].messageId;
@@ -323,33 +362,40 @@ class ChatSessionRuntime extends ChangeNotifier {
           }
           seenToolIds.add(tid);
           entries.add(
-            TranscriptEntry.tool(
-              tool,
-              messageId: m.id,
-              createdAt: m.createdAt,
-            ),
+            TranscriptEntry.tool(tool, messageId: m.id, createdAt: m.createdAt),
           );
+          _toolEntryIndexes[tid] = entries.length - 1;
           _toolMessageIds[tid] = m.id;
           continue;
         }
       }
       entries.add(TranscriptEntry.message(m));
     }
+    _trimResidentTranscript();
     _scheduleCodeDeltaPersist();
-    notifyListeners();
+    _notifyUi(immediate: true);
   }
 
   /// Merge remote/local DB rows into the live transcript without clearing
   /// in-flight assistant or thought buffers.
   void absorbMessages(List<ChatMessage> messages) {
     final queuedIds = {for (final m in outboundQueue) m.id};
+    final messageIndex = <String, int>{};
+    final toolIndex = <String, int>{};
+    for (var i = 0; i < entries.length; i++) {
+      final entry = entries[i];
+      final messageId = entry.messageId;
+      if (messageId != null) messageIndex[messageId] = i;
+      final toolId = entry.tool?.toolCallId;
+      if (toolId != null) toolIndex[toolId] = i;
+    }
+
     for (final m in messages) {
       if (queuedIds.contains(m.id)) continue;
       if (m.role == MessageRole.tool) {
         final tool = ToolCallState.tryParseContent(m.content);
         if (tool == null) continue;
-        final index =
-            entries.indexWhere((e) => e.tool?.toolCallId == tool.toolCallId);
+        final index = toolIndex[tool.toolCallId] ?? -1;
         if (index >= 0) {
           final prev = entries[index].tool!;
           entries[index] = TranscriptEntry.tool(
@@ -369,11 +415,14 @@ class ChatSessionRuntime extends ChangeNotifier {
           entries.add(
             TranscriptEntry.tool(tool, messageId: m.id, createdAt: m.createdAt),
           );
+          toolIndex[tool.toolCallId] = entries.length - 1;
+          _toolEntryIndexes[tool.toolCallId] = entries.length - 1;
+          messageIndex[m.id] = entries.length - 1;
           _toolMessageIds[tool.toolCallId] = m.id;
         }
         continue;
       }
-      final index = entries.indexWhere((e) => e.messageId == m.id);
+      final index = messageIndex[m.id] ?? -1;
       if (index >= 0) {
         final prev = entries[index].message;
         if (prev != null && m.content.length > prev.content.length) {
@@ -381,33 +430,61 @@ class ChatSessionRuntime extends ChangeNotifier {
         }
       } else {
         entries.add(TranscriptEntry.message(m));
+        messageIndex[m.id] = entries.length - 1;
       }
     }
-    notifyListeners();
+    _trimResidentTranscript();
+    _notifyUi(immediate: true);
   }
 
-  /// Pull the on-disk transcript (and queue) into memory after a remote sync.
+  void _trimResidentTranscript() {
+    if (entries.length <= residentTranscriptLimit) return;
+    final originalOrder = <TranscriptEntry, int>{
+      for (var i = 0; i < entries.length; i++) entries[i]: i,
+    };
+    entries.sort((a, b) {
+      final at = a.createdAt;
+      final bt = b.createdAt;
+      if (at == null && bt == null) {
+        return originalOrder[a]!.compareTo(originalOrder[b]!);
+      }
+      if (at == null) return 1;
+      if (bt == null) return -1;
+      final byTime = at.compareTo(bt);
+      if (byTime != 0) return byTime;
+      return originalOrder[a]!.compareTo(originalOrder[b]!);
+    });
+    entries.removeRange(0, entries.length - residentTranscriptLimit);
+    final retainedTools = <String, String>{};
+    _toolEntryIndexes.clear();
+    for (var i = 0; i < entries.length; i++) {
+      final entry = entries[i];
+      final toolId = entry.tool?.toolCallId;
+      final messageId = entry.messageId;
+      if (toolId != null && messageId != null) {
+        retainedTools[toolId] = messageId;
+        _toolEntryIndexes[toolId] = i;
+      }
+    }
+    _toolMessageIds
+      ..clear()
+      ..addAll(retainedTools);
+  }
+
+  void _rebuildToolEntryIndexes() {
+    _toolEntryIndexes.clear();
+    for (var i = 0; i < entries.length; i++) {
+      final toolId = entries[i].tool?.toolCallId;
+      if (toolId != null) _toolEntryIndexes[toolId] = i;
+    }
+  }
+
+  /// Pull the recent on-disk tail (and queue) into memory after remote sync.
   Future<void> syncTranscriptFromDb() async {
     await restoreOutboundQueue();
-    absorbMessages(await _db.listMessages(chatId));
-  }
-
-  /// Pull host-durable messages over ADSM and merge into SQLite + memory.
-  Future<void> pullHostTranscriptAndSync() async {
-    final session = _session;
-    if (session is! AdsmSession) {
-      await syncTranscriptFromDb();
-      return;
-    }
-    try {
-      final remote = await session.pullTranscript();
-      if (remote.isNotEmpty) {
-        await _db.mergeMessages(chatId, remote);
-      }
-    } catch (e) {
-      SafeLog.d('pull host transcript failed', e);
-    }
-    await syncTranscriptFromDb();
+    absorbMessages(
+      await _db.listRecentMessages(chatId, limit: residentTranscriptLimit),
+    );
   }
 
   /// Push local SQLite messages into the host ADSM store.
@@ -415,7 +492,12 @@ class ChatSessionRuntime extends ChangeNotifier {
     final session = _session;
     if (session is! AdsmSession || closed) return;
     try {
-      final local = await _db.listMessages(chatId);
+      // ADSM merges by id, so only the mutable live tail needs periodic sync.
+      // AgentDockService separately persists the durable archive.
+      final local = await _db.listRecentMessages(
+        chatId,
+        limit: transcriptPushTail,
+      );
       await session.syncTranscriptToHost(local);
     } catch (e) {
       SafeLog.d('push transcript to host failed', e);
@@ -429,12 +511,15 @@ class ChatSessionRuntime extends ChangeNotifier {
       ..clear()
       ..addAll(queued);
     if (queued.isEmpty) {
-      notifyListeners();
+      _notifyUi(immediate: true);
       return;
     }
     final ids = {for (final m in queued) m.id};
-    entries.removeWhere((e) => e.messageId != null && ids.contains(e.messageId));
-    notifyListeners();
+    entries.removeWhere(
+      (e) => e.messageId != null && ids.contains(e.messageId),
+    );
+    _rebuildToolEntryIndexes();
+    _notifyUi(immediate: true);
   }
 
   /// If the agent is idle and work is waiting, start the next queued prompt.
@@ -442,7 +527,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     if (_disposed || closed || promptInFlight || outboundQueue.isEmpty) return;
     final next = outboundQueue.removeAt(0);
     unawaited(_persistOutboundQueue());
-    notifyListeners();
+    _notifyUi(immediate: true);
     unawaited(() async {
       await _promoteQueuedMessage(next);
       await _runPrompt(
@@ -470,20 +555,23 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   void startListening() {
     _sub?.cancel();
-    _sub = _session.updates.listen(_onUpdate, onError: (Object e) {
-      if (isTransientBridgeError(e)) {
-        // Same as a clean closed event — reconnect quietly.
-        SafeLog.d('session stream dropped', e);
-        lastError = null;
-        if (!closed && sessionFactory != null && !_suspended) {
-          closed = true;
-          _scheduleReconnect(immediate: true);
+    _sub = _session.updates.listen(
+      _onUpdate,
+      onError: (Object e) {
+        if (isTransientBridgeError(e)) {
+          // Same as a clean closed event — reconnect quietly.
+          SafeLog.d('session stream dropped', e);
+          lastError = null;
+          if (!closed && sessionFactory != null && !_suspended) {
+            closed = true;
+            _scheduleReconnect(immediate: true);
+          }
+        } else {
+          lastError = e.toString();
         }
-      } else {
-        lastError = e.toString();
-      }
-      notifyListeners();
-    });
+        notifyListeners();
+      },
+    );
   }
 
   void replaceSession(AgentSession session) {
@@ -499,6 +587,10 @@ class ChatSessionRuntime extends ChangeNotifier {
     session.mode = preferredMode;
     session.permissionPolicy = preferredPermissionPolicy;
     pendingPermission = null;
+    // An explicit Connect/Send after app suspension owns this new transport.
+    // Leaving the runtime marked suspended disabled later recovery even though
+    // the replacement session was live.
+    _suspended = false;
     closed = false;
     lastError = null;
     reconnecting = false;
@@ -551,7 +643,6 @@ class ChatSessionRuntime extends ChangeNotifier {
     unawaited(rememberSessionId());
     notifyListeners();
     onTransportReady?.call(chatId);
-    unawaited(pullHostTranscriptAndSync());
     // Pick up anything that was waiting while the socket was down.
     if (!remoteTurnActive && !promptInFlight) {
       resumeOutboundQueue();
@@ -576,13 +667,13 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
     if (_session is! AdsmSession || closed) return;
     final st =
-        ((await (_session as AdsmSession).refreshDaemonStatus(forceEmit: true)) ??
+        ((await (_session as AdsmSession).refreshDaemonStatus(
+                  forceEmit: true,
+                )) ??
                 '')
             .toLowerCase();
     if (_disposed) return;
-    if (st == 'running' ||
-        st == 'waiting_permission' ||
-        st == 'starting') {
+    if (st == 'running' || st == 'waiting_permission' || st == 'starting') {
       remoteTurnActive = true;
       promptInFlight = true;
       activityLabel = st == 'waiting_permission'
@@ -629,8 +720,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       '${lastUser.id} chat=$chatId',
     );
     _needsRedelivery = true;
-    deliveryError =
-        'Last message may not have reached the host. Retrying…';
+    deliveryError = 'Last message may not have reached the host. Retrying…';
     await _requeueUndeliveredUser(lastUser.id);
     notifyListeners();
     resumeOutboundQueue();
@@ -718,7 +808,8 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
 
     final durable = _session.transport == AcpTransport.durable;
-    if (durable && (promptInFlight || _session.isPromptActive || sendingToHost)) {
+    if (durable &&
+        (promptInFlight || _session.isPromptActive || sendingToHost)) {
       // Hand the turn to the host: complete the local await so the UI unlocks,
       // then tear down only the SSH ADSM client channel. Daemon + tmux keep working.
       remoteTurnActive = true;
@@ -759,13 +850,18 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   void _scheduleReconnect({bool immediate = false}) {
     if (_disposed || _suspended) return;
+    if (!(shouldAutoReconnect?.call() ?? true)) {
+      reconnecting = false;
+      return;
+    }
     final factory = sessionFactory;
     if (factory == null) return;
     if (_retryTimer != null) return;
 
     if (reconnectAttempts >= maxReconnectAttempts) {
       reconnecting = false;
-      lastError = 'Could not reconnect after $maxReconnectAttempts attempts. '
+      lastError =
+          'Could not reconnect after $maxReconnectAttempts attempts. '
           'Tap Reconnect to try again — your chat history is kept.';
       notifyListeners();
       return;
@@ -791,6 +887,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     _retryTimer = Timer(delay, () async {
       _retryTimer = null;
       if (_disposed || _suspended) return;
+      if (!(shouldAutoReconnect?.call() ?? true)) {
+        reconnecting = false;
+        _notifyUi(immediate: true);
+        return;
+      }
       try {
         final session = await factory();
         replaceSession(session);
@@ -896,11 +997,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     try {
       final prefs = await SharedPreferences.getInstance();
       final encoded = jsonEncode([
-        for (final m in models)
-          {
-            'modelId': m.modelId,
-            'name': m.name,
-          },
+        for (final m in models) {'modelId': m.modelId, 'name': m.name},
       ]);
       await prefs.setString(_modelCatalogPrefsKey(chatId), encoded);
     } catch (e) {
@@ -918,8 +1015,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       if (decoded is! List) return;
       final models = <AgentModel>[
         for (final item in decoded)
-          if (item is Map)
-            AgentModel.fromJson(Map<String, dynamic>.from(item)),
+          if (item is Map) AgentModel.fromJson(Map<String, dynamic>.from(item)),
       ];
       if (models.isEmpty) return;
       _session.seedModelCatalog(models);
@@ -939,6 +1035,18 @@ class ChatSessionRuntime extends ChangeNotifier {
       await _persistModelPreference(modelId);
       await _restartSessionForModel(modelId);
       return;
+    } catch (e) {
+      // Host idle-stop / recycled FIFO — revive the worker then apply the model.
+      if (isTransientBridgeError(e) && sessionFactory != null) {
+        SafeLog.d(
+          'setModel hit dead FIFO/bridge; reconnecting with model=$modelId',
+          e,
+        );
+        await _persistModelPreference(modelId);
+        await _restartSessionForModel(modelId);
+        return;
+      }
+      rethrow;
     }
     await _persistModelPreference(modelId);
     notifyListeners();
@@ -981,9 +1089,8 @@ class ChatSessionRuntime extends ChangeNotifier {
       closed = true;
       final session = await factory();
       replaceSession(session);
-      // Fresh process should already be on [modelId]; keep local chip in sync.
-      if (session.currentModelId == null || session.currentModelId!.isEmpty) {
-        // Seed from preference when the agent omitted currentModelId.
+      // Prefer startup --model / preferredModelId; force RPC if still wrong.
+      if (session.currentModelId != modelId) {
         try {
           await session.setModel(modelId);
         } on AcpModelSwitchUnsupported {
@@ -1022,10 +1129,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     final trimmed = text.trim();
     if (trimmed.isEmpty && images.isEmpty) return;
 
-    final content = ChatImageCodec.encodeMessage(
-      text: trimmed,
-      images: images,
-    );
+    final content = ChatImageCodec.encodeMessage(text: trimmed, images: images);
 
     final message = ChatMessage(
       id: const Uuid().v4(),
@@ -1116,8 +1220,7 @@ class ChatSessionRuntime extends ChangeNotifier {
 
     _skipAutoDrain = true;
     try {
-      _ignoreHostRunningUntil =
-          DateTime.now().add(const Duration(seconds: 20));
+      _ignoreHostRunningUntil = DateTime.now().add(const Duration(seconds: 20));
       try {
         await _session.cancel().timeout(const Duration(seconds: 8));
       } catch (e) {
@@ -1168,6 +1271,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
     entries.add(TranscriptEntry.message(stamped));
+    _trimResidentTranscript();
     _writesInFlight++;
     try {
       await _db.upsertMessage(stamped);
@@ -1260,15 +1364,15 @@ class ChatSessionRuntime extends ChangeNotifier {
           lastError = e;
           SafeLog.d('prompt delivery attempt $attempt failed', e);
           final msg = e.toString().toLowerCase();
-          final retryable = msg.contains('channel closed') ||
+          final retryable =
+              msg.contains('channel closed') ||
               msg.contains('timed out') ||
               msg.contains('timeout') ||
               msg.contains('adsm write') ||
               msg.contains('connection') ||
               msg.contains('socket') ||
               msg.contains('broken pipe');
-          if (msg.contains('unknown chatid') ||
-              msg.contains('agents.ensure')) {
+          if (msg.contains('unknown chatid') || msg.contains('agents.ensure')) {
             // Daemon lost this worker — reconnect runs agents.ensure again.
             if (!closed && sessionFactory != null) {
               closed = true;
@@ -1317,7 +1421,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           await _requeueUndeliveredUser(userMessageId);
         }
         _armHostBusyWatchdog();
-        notifyListeners();
+        _notifyUi();
         return;
       } else if (isTransientBridgeError(e)) {
         // Quiet reconnect — do not leave "Bad state: ADSM channel closed" up.
@@ -1388,6 +1492,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
     if (msg == null) return;
     entries.removeWhere((e) => e.messageId == messageId);
+    _rebuildToolEntryIndexes();
     if (!outboundQueue.any((m) => m.id == messageId)) {
       outboundQueue.insert(0, msg);
     }
@@ -1443,19 +1548,15 @@ class ChatSessionRuntime extends ChangeNotifier {
     // bridges; on ADSM, ask the host before clearing busy chrome.
     final answered = _turnHasAssistantReply;
     final toolStaleAfter = durable
-        ? (answered
-            ? const Duration(minutes: 2)
-            : const Duration(minutes: 3))
+        ? (answered ? const Duration(minutes: 2) : const Duration(minutes: 3))
         : (answered
-            ? const Duration(seconds: 25)
-            : const Duration(seconds: 45));
+              ? const Duration(seconds: 25)
+              : const Duration(seconds: 45));
     final promptStaleAfter = durable
-        ? (answered
-            ? const Duration(minutes: 3)
-            : const Duration(minutes: 4))
+        ? (answered ? const Duration(minutes: 3) : const Duration(minutes: 4))
         : (answered
-            ? const Duration(seconds: 40)
-            : const Duration(seconds: 90));
+              ? const Duration(seconds: 40)
+              : const Duration(seconds: 90));
 
     // Durable: host status is authoritative when we can reach ADSM. A failed
     // poll must not keep recycling a stale "running" forever (VPN off, etc.).
@@ -1502,8 +1603,8 @@ class ChatSessionRuntime extends ChangeNotifier {
         activityLabel = host == 'waiting_permission'
             ? 'Waiting for permission'
             : (activityLabel?.isNotEmpty == true
-                ? activityLabel
-                : 'Working on host…');
+                  ? activityLabel
+                  : 'Working on host…');
         remoteTurnActive = true;
         promptInFlight = true;
         notifyListeners();
@@ -1614,7 +1715,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     promptInFlight = false;
     sendingToHost = false;
     activityLabel = null;
-    notifyListeners();
+    _notifyUi(immediate: true);
     if (!closed) _drainOutboundQueue();
   }
 
@@ -1623,7 +1724,9 @@ class ChatSessionRuntime extends ChangeNotifier {
     for (var i = entries.length - 1; i >= 0; i--) {
       final m = entries[i].message;
       if (m != null && m.role == MessageRole.user) break;
-      if (m != null && m.role == MessageRole.assistant && m.content.trim().isNotEmpty) {
+      if (m != null &&
+          m.role == MessageRole.assistant &&
+          m.content.trim().isNotEmpty) {
         return true;
       }
       if (entries[i].tool != null) return true;
@@ -1664,7 +1767,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       deliveryError =
           'Lost contact with the host — status may be stale. Tap Retry or check VPN.';
     }
-    notifyListeners();
+    _notifyUi(immediate: true);
     if (!closed) _drainOutboundQueue();
   }
 
@@ -1719,7 +1822,9 @@ class ChatSessionRuntime extends ChangeNotifier {
       if (!closed && !promptInFlight) _drainOutboundQueue();
       return;
     }
-    SafeLog.d('finalizing ${active.length} stale tool(s) ($reason) chat=$chatId');
+    SafeLog.d(
+      'finalizing ${active.length} stale tool(s) ($reason) chat=$chatId',
+    );
     for (final tool in active) {
       await _upsertTool(
         tool.merge(status: 'completed', rawOutput: tool.rawOutput ?? ''),
@@ -1757,8 +1862,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     // Always cancel — after ADSM prompt-accept, [isPromptActive] is false while
     // the durable turn (and long shell polls) keep running on the host. Skipping
     // cancel left Stop as a no-op and "Thinking…" stuck forever.
-    _ignoreHostRunningUntil =
-        DateTime.now().add(const Duration(seconds: 20));
+    _ignoreHostRunningUntil = DateTime.now().add(const Duration(seconds: 20));
     try {
       await _session.cancel().timeout(const Duration(seconds: 8));
     } catch (e) {
@@ -1834,6 +1938,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           sendingToHost = false;
           remoteTurnActive = false;
           activityLabel = null;
+          _completePendingToolUpdates();
           if (_session.isPromptActive && _session is AdsmSession) {
             (_session as AdsmSession).handOffPrompt();
           }
@@ -1880,7 +1985,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (thoughtBuffer.isNotEmpty) {
           unawaited(commitThought());
         }
-        assistantBuffer += update.text;
+        _appendAssistantText(update.text);
         // Assign id immediately so the live bubble and the checkpointed row
         // share one identity (avoids double-painting when id was still null).
         _assistantMessageId ??= const Uuid().v4();
@@ -1900,7 +2005,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
         }
-        thoughtBuffer += update.text;
+        _appendThoughtText(update.text);
         _notifyUi();
       case AcpUpdateKind.tool:
         final tool = update.tool;
@@ -1956,6 +2061,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           promptInFlight = false;
         }
         activityLabel = null;
+        _completePendingToolUpdates();
         unawaited(flushAssistantBuffer());
         unawaited(commitThought());
         closed = true;
@@ -1988,6 +2094,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         sendingToHost = false;
         remoteTurnActive = false;
         activityLabel = null;
+        _completePendingToolUpdates();
         if (hasActiveTools) {
           // end_turn with rows still "in_progress" — agent will not send more
           // updates for them. Finalize so the UI does not choke forever.
@@ -2036,6 +2143,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
     entries.add(TranscriptEntry.message(message));
+    _trimResidentTranscript();
     _writesInFlight++;
     try {
       await _db.insertMessage(message);
@@ -2073,7 +2181,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     final text = thoughtBuffer.trim();
     thoughtBuffer = '';
     if (text.isEmpty) {
-      notifyListeners();
+      _notifyUi();
       return;
     }
     final message = ChatMessage(
@@ -2084,6 +2192,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       createdAt: DateTime.now(),
     );
     entries.add(TranscriptEntry.message(message));
+    _trimResidentTranscript();
     _writesInFlight++;
     try {
       await _db.insertMessage(message);
@@ -2093,7 +2202,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     } finally {
       _writesInFlight--;
     }
-    notifyListeners();
+    _notifyUi(immediate: true);
   }
 
   /// Checkpoint the streaming turn to disk shortly after output stops arriving.
@@ -2103,7 +2212,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// the user could already read on screen.
   void _scheduleAssistantPersist() {
     _assistantPersistTimer?.cancel();
-    _assistantPersistTimer = Timer(const Duration(milliseconds: 700), () {
+    _assistantPersistTimer = Timer(const Duration(seconds: 2), () {
       _assistantPersistTimer = null;
       unawaited(_writeAssistantProgress());
     });
@@ -2145,6 +2254,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       entries[index] = TranscriptEntry.message(message);
     } else {
       entries.add(TranscriptEntry.message(message));
+      _trimResidentTranscript();
     }
   }
 
@@ -2165,7 +2275,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     if (text.isEmpty) return;
     final message = _assistantSnapshot(text);
     // Disk checkpoint only — do not mutate [entries] while the live buffer is
-    // painting. Updating entries every 700ms invalidated the transcript block
+    // painting. Updating entries on every checkpoint invalidated the transcript block
     // cache and re-parsed every visible GptMarkdown bubble.
     _writesInFlight++;
     try {
@@ -2179,6 +2289,47 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   Future<void> _upsertTool(ToolCallState tool) {
+    if (tool.isActive) {
+      // Tool stdout/progress can arrive dozens of times a second. Keep only
+      // the newest state for each tool and persist a short batch.
+      _pendingToolUpdates[tool.toolCallId] = tool;
+      _toolFlushTimer ??= Timer(const Duration(milliseconds: 250), () {
+        _toolFlushTimer = null;
+        unawaited(_flushPendingToolUpdates());
+      });
+      return Future<void>.value();
+    }
+
+    // A terminal update must win over any queued active snapshot.
+    _pendingToolUpdates.remove(tool.toolCallId);
+    return _serializeToolUpsert(tool);
+  }
+
+  Future<void> _flushPendingToolUpdates() async {
+    if (_pendingToolUpdates.isEmpty) return;
+    final batch = _pendingToolUpdates.values.toList(growable: false);
+    _pendingToolUpdates.clear();
+    for (final tool in batch) {
+      await _serializeToolUpsert(tool);
+    }
+  }
+
+  void _completePendingToolUpdates() {
+    if (_pendingToolUpdates.isEmpty) return;
+    _toolFlushTimer?.cancel();
+    _toolFlushTimer = null;
+    final pending = _pendingToolUpdates.values.toList(growable: false);
+    _pendingToolUpdates.clear();
+    for (final tool in pending) {
+      unawaited(
+        _serializeToolUpsert(
+          tool.merge(status: 'completed', rawOutput: tool.rawOutput ?? ''),
+        ),
+      );
+    }
+  }
+
+  Future<void> _serializeToolUpsert(ToolCallState tool) {
     final run = _toolUpsertTail.then((_) => _upsertToolUnlocked(tool));
     _toolUpsertTail = run.catchError((Object e) {
       SafeLog.d('tool upsert failed', e);
@@ -2187,11 +2338,15 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   Future<void> _upsertToolUnlocked(ToolCallState tool) async {
-    // Collapse any duplicate in-memory rows for this tool (legacy race).
-    final dupIndexes = <int>[
-      for (var i = 0; i < entries.length; i++)
-        if (entries[i].tool?.toolCallId == tool.toolCallId) i,
-    ];
+    // The index makes repeated output updates O(1). Only scan when importing a
+    // legacy runtime that has not populated the index yet.
+    final knownIndex = _toolEntryIndexes[tool.toolCallId];
+    final dupIndexes = knownIndex == null
+        ? <int>[
+            for (var i = 0; i < entries.length; i++)
+              if (entries[i].tool?.toolCallId == tool.toolCallId) i,
+          ]
+        : <int>[knownIndex];
     if (dupIndexes.length > 1) {
       final keep = dupIndexes.first;
       var mergedTool = entries[keep].tool!;
@@ -2221,7 +2376,8 @@ class ChatSessionRuntime extends ChangeNotifier {
           SafeLog.d('delete dup tool row failed', e);
         }
       }
-      final keepId = entries[keep].messageId ?? _toolMessageIds[tool.toolCallId];
+      final keepId =
+          entries[keep].messageId ?? _toolMessageIds[tool.toolCallId];
       entries[keep] = TranscriptEntry.tool(
         mergedTool.merge(
           title: tool.title,
@@ -2251,12 +2407,13 @@ class ChatSessionRuntime extends ChangeNotifier {
           SafeLog.d('update merged tool failed', e);
         }
       }
+      _rebuildToolEntryIndexes();
       _scheduleCodeDeltaPersist();
       _notifyUi();
       return;
     }
 
-    final index = entries.indexWhere((e) => e.tool?.toolCallId == tool.toolCallId);
+    final index = knownIndex ?? (dupIndexes.isEmpty ? -1 : dupIndexes.first);
     if (index >= 0) {
       final prev = entries[index].tool!;
       final merged = prev.merge(
@@ -2268,7 +2425,8 @@ class ChatSessionRuntime extends ChangeNotifier {
         rawOutput: tool.rawOutput,
         content: tool.content,
       );
-      final msgId = entries[index].messageId ?? _toolMessageIds[tool.toolCallId];
+      final msgId =
+          entries[index].messageId ?? _toolMessageIds[tool.toolCallId];
       entries[index] = TranscriptEntry.tool(
         merged,
         messageId: msgId,
@@ -2294,6 +2452,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       final msgId = existingId ?? const Uuid().v4();
       _toolMessageIds[tool.toolCallId] = msgId;
       entries.add(TranscriptEntry.tool(tool, messageId: msgId));
+      _toolEntryIndexes[tool.toolCallId] = entries.length - 1;
       final message = ChatMessage(
         id: msgId,
         chatId: chatId,
@@ -2312,13 +2471,14 @@ class ChatSessionRuntime extends ChangeNotifier {
         SafeLog.d('insert tool message failed', e);
       }
     }
+    _trimResidentTranscript();
     _scheduleCodeDeltaPersist();
     _notifyUi();
   }
 
   void _scheduleCodeDeltaPersist() {
     _codeDeltaPersistTimer?.cancel();
-    _codeDeltaPersistTimer = Timer(const Duration(milliseconds: 400), () {
+    _codeDeltaPersistTimer = Timer(const Duration(seconds: 2), () {
       unawaited(_persistCodeDelta());
     });
   }
@@ -2329,19 +2489,20 @@ class ChatSessionRuntime extends ChangeNotifier {
     final meta = chatMeta;
     if (meta == null) return;
     final today = codeDeltaLocalDayKey();
-    final sameDay =
-        meta.codeDeltaDay == null || meta.codeDeltaDay == today;
+    final sameDay = meta.codeDeltaDay == null || meta.codeDeltaDay == today;
     // New local day — do not carry yesterday's persisted totals forward.
     final added = sameDay
         ? (stats.added > meta.linesAdded ? stats.added : meta.linesAdded)
         : stats.added;
     final removed = sameDay
-        ? (stats.removed > meta.linesRemoved ? stats.removed : meta.linesRemoved)
+        ? (stats.removed > meta.linesRemoved
+              ? stats.removed
+              : meta.linesRemoved)
         : stats.removed;
     final files = sameDay
         ? (stats.fileCount > meta.filesChanged
-            ? stats.fileCount
-            : meta.filesChanged)
+              ? stats.fileCount
+              : meta.filesChanged)
         : stats.fileCount;
     if (sameDay &&
         meta.linesAdded == added &&
@@ -2363,14 +2524,15 @@ class ChatSessionRuntime extends ChangeNotifier {
     } catch (e) {
       SafeLog.d('persist code delta failed', e);
     }
-    notifyListeners();
+    _notifyUi();
   }
 
   Future<void> appendUserMessage(ChatMessage message) async {
     entries.add(TranscriptEntry.message(message));
+    _trimResidentTranscript();
     await _db.insertMessage(message);
     onLocalChange?.call(chatId);
-    notifyListeners();
+    _notifyUi(immediate: true);
   }
 
   Future<void> disposeRuntime() async {
@@ -2384,6 +2546,12 @@ class ChatSessionRuntime extends ChangeNotifier {
     _assistantPersistTimer = null;
     _codeDeltaPersistTimer?.cancel();
     _codeDeltaPersistTimer = null;
+    _toolFlushTimer?.cancel();
+    _toolFlushTimer = null;
+    await _flushPendingToolUpdates();
+    try {
+      await _toolUpsertTail;
+    } catch (_) {}
     await _sub?.cancel();
     _sub = null;
     try {

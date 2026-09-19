@@ -4,11 +4,12 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
+import '../../data/models/host.dart';
 import '../../data/models/mcp_server.dart';
 import '../../data/secure/safe_log.dart';
 import '../agents/agents_screen.dart';
@@ -16,7 +17,15 @@ import '../connect/connect_screen.dart';
 import '../hosts/hosts_screen.dart';
 
 final mcpListProvider = FutureProvider.autoDispose<List<McpServer>>((ref) {
+  ref.watch(agentsCatalogEpochProvider);
   return ref.watch(appDatabaseProvider).listMcpServers();
+});
+
+final mcpHostLinksProvider = FutureProvider.autoDispose<List<McpHostLink>>((
+  ref,
+) {
+  ref.watch(agentsCatalogEpochProvider);
+  return ref.watch(appDatabaseProvider).listMcpHostLinks();
 });
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -40,8 +49,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   Future<void> _loadBackgroundPref() async {
-    final enabled =
-        await ref.read(backgroundKeepAliveProvider).isEnabled();
+    final enabled = await ref.read(backgroundKeepAliveProvider).isEnabled();
     if (mounted) setState(() => _runInBackground = enabled);
   }
 
@@ -95,9 +103,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       final saved = await backup.exportToFile(path);
       if (!mounted) return;
       setState(() => _status = 'Exported to $saved');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Exported config to $saved')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Exported config to $saved')));
     } catch (e) {
       SafeLog.d('export .ag failed', e);
       // Some desktops fail saveFile — fall back to Documents.
@@ -107,19 +115,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           dir.path,
           'agent-dock-${DateTime.now().millisecondsSinceEpoch}.ag',
         );
-        final saved =
-            await ref.read(configBackupServiceProvider).exportToFile(fallback);
+        final saved = await ref
+            .read(configBackupServiceProvider)
+            .exportToFile(fallback);
         if (!mounted) return;
         setState(() => _status = 'Exported to $saved');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Exported config to $saved')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Exported config to $saved')));
       } catch (e2) {
         if (!mounted) return;
         setState(() => _status = 'Export failed: $e2');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Export failed: $e2')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Export failed: $e2')));
       }
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -152,24 +161,26 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         throw StateError('Could not read picked file path');
       }
 
-      final imported =
-          await ref.read(configBackupServiceProvider).importFromFile(path);
+      final imported = await ref
+          .read(configBackupServiceProvider)
+          .importFromFile(path);
       ref.invalidate(mcpListProvider);
+      ref.invalidate(mcpHostLinksProvider);
       ref.invalidate(hostsListProvider);
       ref.invalidate(agentsTreeProvider);
 
       if (!mounted) return;
       setState(() => _status = imported.summary);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(imported.summary)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(imported.summary)));
     } catch (e) {
       SafeLog.d('import .ag failed', e);
       if (!mounted) return;
       setState(() => _status = 'Import failed: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Import failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Import failed: $e')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -178,120 +189,142 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final mcps = ref.watch(mcpListProvider);
+    final links = ref.watch(mcpHostLinksProvider);
+    final hostsAsync = ref.watch(hostsListProvider);
 
     final body = ListView(
-        padding: EdgeInsets.fromLTRB(16, 12, 16, widget.embedded ? 16 : 88),
-        children: [
-          Text(
-            'Keys & credentials',
-            style: Theme.of(context).textTheme.titleMedium,
+      padding: EdgeInsets.fromLTRB(16, 12, 16, widget.embedded ? 16 : 88),
+      children: [
+        Text('SSH & device', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        const ConnectScreen(embedded: true, nestedInParentScroll: true),
+        const SizedBox(height: 28),
+        Text('API keys', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Cursor, Anthropic, and related agent keys.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        Card(
+          margin: EdgeInsets.zero,
+          child: ListTile(
+            leading: const Icon(Icons.key_outlined),
+            title: const Text('API keys'),
+            subtitle: const Text('View and set Cursor, Anthropic, …'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => openSettingsSubpage(context, ref, '/settings/keys'),
           ),
-          const SizedBox(height: 8),
-          const ConnectScreen(embedded: true, nestedInParentScroll: true),
-          const SizedBox(height: 28),
-          if (!kIsWeb &&
-              (defaultTargetPlatform == TargetPlatform.android ||
-                  defaultTargetPlatform == TargetPlatform.iOS)) ...[
-            Text('Background', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 4),
-            Text(
-              'Stay running when you switch apps (same idea as a pedometer). '
-              'Shows a persistent notification and keeps agent connections warm.',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Run in background'),
-              subtitle: Text(
-                _runInBackground == true
-                    ? 'On — notification stays up'
-                    : 'Off — reconnect after leaving the app',
-              ),
-              value: _runInBackground ?? true,
-              onChanged: _runInBackground == null ? null : _setRunInBackground,
-            ),
-            const SizedBox(height: 28),
-          ],
-          Text('Backup', style: Theme.of(context).textTheme.titleMedium),
+        ),
+        const SizedBox(height: 28),
+        if (!kIsWeb &&
+            (defaultTargetPlatform == TargetPlatform.android ||
+                defaultTargetPlatform == TargetPlatform.iOS)) ...[
+          Text('Background', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 4),
           Text(
-            'Export hosts, repos, and MCP configs to a .ag file (JSON). '
-            'SSH keys and API keys are never included.',
+            'Stay running when you switch apps (same idea as a pedometer). '
+            'Shows a persistent notification and keeps agent connections warm.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Run in background'),
+            subtitle: Text(
+              _runInBackground == true
+                  ? 'On — notification stays up'
+                  : 'Off — reconnect after leaving the app',
+            ),
+            value: _runInBackground ?? true,
+            onChanged: _runInBackground == null ? null : _setRunInBackground,
+          ),
+          const SizedBox(height: 28),
+        ],
+        Text('Backup', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Export hosts, repos, and MCP configs to a .ag file (JSON). '
+          'SSH keys and API keys are never included.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            FilledButton.tonalIcon(
+              onPressed: _busy ? null : _exportAg,
+              icon: const Icon(Icons.upload_file),
+              label: const Text('Export .ag'),
+            ),
+            const SizedBox(width: 12),
+            OutlinedButton.icon(
+              onPressed: _busy ? null : _importAg,
+              icon: const Icon(Icons.download),
+              label: const Text('Import .ag'),
+            ),
+          ],
+        ),
+        if (_busy) ...[
           const SizedBox(height: 12),
-          Row(
-            children: [
-              FilledButton.tonalIcon(
-                onPressed: _busy ? null : _exportAg,
-                icon: const Icon(Icons.upload_file),
-                label: const Text('Export .ag'),
-              ),
-              const SizedBox(width: 12),
-              OutlinedButton.icon(
-                onPressed: _busy ? null : _importAg,
-                icon: const Icon(Icons.download),
-                label: const Text('Import .ag'),
-              ),
-            ],
-          ),
-          if (_busy) ...[
-            const SizedBox(height: 12),
-            const LinearProgressIndicator(),
-          ],
-          if (_status != null) ...[
-            const SizedBox(height: 8),
-            Text(_status!, style: Theme.of(context).textTheme.bodySmall),
-          ],
-          const SizedBox(height: 28),
-          Text('MCP servers', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 4),
-          Text(
-            'Define servers here, then choose which hosts can see them. '
-            'Enabling a host writes ~/.cursor/mcp.json over SSH in the background.',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 16),
-          mcps.when(
-            data: (list) {
-              if (list.isEmpty) {
-                return const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 24),
-                  child: Text('No MCP servers yet.'),
-                );
-              }
-              return Column(
-                children: [
-                  for (final mcp in list)
-                    Card(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      child: ListTile(
-                        leading: Icon(
-                          mcp.transport == McpTransport.http
-                              ? Icons.cloud_outlined
-                              : Icons.terminal,
-                        ),
-                        title: Text(mcp.name),
-                        subtitle: Text(
-                          mcp.transport == McpTransport.http
-                              ? (mcp.url ?? 'HTTP')
-                              : '${mcp.command ?? ''} ${(mcp.args).join(' ')}'
-                                  .trim(),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        trailing: const Icon(Icons.chevron_right),
-                        onTap: () => context.push('/settings/mcp/${mcp.id}'),
+          const LinearProgressIndicator(),
+        ],
+        if (_status != null) ...[
+          const SizedBox(height: 8),
+          Text(_status!, style: Theme.of(context).textTheme.bodySmall),
+        ],
+        const SizedBox(height: 28),
+        Text('MCP servers', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Define servers here, then choose which hosts can see them. '
+          'Enabling a host always writes ~/.cursor/mcp.json, ~/.claude.json, '
+          'and ~/.codex/config.toml over SSH in the background.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 16),
+        mcps.when(
+          data: (list) {
+            if (list.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Text('No MCP servers yet.'),
+              );
+            }
+            final linkRows = links.valueOrNull ?? const <McpHostLink>[];
+            final hosts = hostsAsync.valueOrNull ?? const <Host>[];
+            final hostById = {for (final h in hosts) h.id: h};
+            return Column(
+              children: [
+                for (final mcp in list)
+                  Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: Icon(
+                        mcp.transport == McpTransport.http
+                            ? Icons.cloud_outlined
+                            : Icons.terminal,
+                      ),
+                      title: Text(mcp.name),
+                      subtitle: Text(
+                        _mcpListSubtitle(mcp, linkRows, hostById),
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => openSettingsSubpage(
+                        context,
+                        ref,
+                        '/settings/mcp/${mcp.id}',
                       ),
                     ),
-                ],
-              );
-            },
-            loading: () => const Center(child: CircularProgressIndicator()),
-            error: (e, _) => Text('Error: $e'),
-          ),
-        ],
-      );
+                  ),
+              ],
+            );
+          },
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => Text('Error: $e'),
+        ),
+      ],
+    );
 
     if (widget.embedded) {
       return Column(
@@ -302,7 +335,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             child: Align(
               alignment: Alignment.centerRight,
               child: FilledButton.tonalIcon(
-                onPressed: () => context.push('/settings/mcp/new'),
+                onPressed: () =>
+                    openSettingsSubpage(context, ref, '/settings/mcp/new'),
                 icon: const Icon(Icons.add),
                 label: const Text('Add MCP'),
               ),
@@ -316,11 +350,42 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/settings/mcp/new'),
+        onPressed: () => openSettingsSubpage(context, ref, '/settings/mcp/new'),
         icon: const Icon(Icons.add),
         label: const Text('Add MCP'),
       ),
       body: body,
     );
   }
+}
+
+String _mcpListSubtitle(
+  McpServer mcp,
+  List<McpHostLink> links,
+  Map<String, Host> hostById,
+) {
+  final base = mcp.transport == McpTransport.http
+      ? (mcp.url ?? 'HTTP')
+      : '${mcp.command ?? ''} ${(mcp.args).join(' ')}'.trim();
+  final bits = <String>[if (base.isNotEmpty) base];
+  for (final link in links) {
+    if (link.mcpId != mcp.id) continue;
+    if (!link.enabled && link.installStatus != McpHostInstallStatus.installed) {
+      continue;
+    }
+    if (link.targets.isEmpty &&
+        link.installStatus != McpHostInstallStatus.installed) {
+      continue;
+    }
+    final host = hostById[link.hostId];
+    final hostName = host?.displayLabel ?? link.hostId;
+    final clients = link.targetsLabel.isNotEmpty
+        ? link.targetsLabel
+        : (link.installStatus == McpHostInstallStatus.installed
+              ? 'installed'
+              : '');
+    if (clients.isEmpty) continue;
+    bits.add('$hostName ($clients)');
+  }
+  return bits.join(' · ');
 }

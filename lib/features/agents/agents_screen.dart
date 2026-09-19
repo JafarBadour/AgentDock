@@ -37,11 +37,20 @@ class AgentsTree {
 final agentsTreeProvider = FutureProvider.autoDispose<AgentsTree>((ref) async {
   ref.watch(agentsCatalogEpochProvider);
   final db = ref.watch(appDatabaseProvider);
-  final hosts = await db.listHosts();
-  final repos = await db.listRepos();
+  final results = await Future.wait<Object>([
+    db.listHosts(),
+    db.listRepos(),
+    db.listAllChats(),
+  ]);
+  final hosts = results[0] as List<Host>;
+  final repos = results[1] as List<Repo>;
+  final chats = results[2] as List<Chat>;
   final chatsByRepo = <String, List<Chat>>{};
+  for (final chat in chats) {
+    chatsByRepo.putIfAbsent(chat.repoId, () => []).add(chat);
+  }
   for (final repo in repos) {
-    chatsByRepo[repo.id] = await db.listChats(repo.id);
+    chatsByRepo.putIfAbsent(repo.id, () => []);
   }
   return AgentsTree(hosts: hosts, repos: repos, chatsByRepo: chatsByRepo);
 });
@@ -49,51 +58,16 @@ final agentsTreeProvider = FutureProvider.autoDispose<AgentsTree>((ref) async {
 /// Unread agent replies per chat id. Recomputed on [chatActivityTickProvider]
 /// (debounced ~8s while a turn runs). The Agents screen must not watch this at
 /// the list root — only badge widgets — or the sidebar remounts and flickers.
-final unreadCountsProvider =
-    FutureProvider.autoDispose<Map<String, int>>((ref) async {
+final unreadCountsProvider = FutureProvider.autoDispose<Map<String, int>>((
+  ref,
+) async {
   ref.watch(chatActivityTickProvider);
   return ref.watch(appDatabaseProvider).unreadCounts();
 });
 
-/// Background catalog sync — runs once per Agents screen lifetime, not on a
-/// timer. Manual refresh re-invalidates this provider.
-final agentsSyncProvider = FutureProvider.autoDispose<String?>((ref) async {
-  final hasKey = await ref.watch(secureStoreProvider).hasSshPrivateKey();
-  // Catalog sync needs some form of SSH auth; password-only hosts are fine —
-  // syncAllHostsCatalog will skip hosts it can't reach.
-  final store = ref.watch(secureStoreProvider);
-  final hosts = await ref.watch(appDatabaseProvider).listHosts();
-  var canAuth = hasKey;
-  if (!canAuth) {
-    for (final h in hosts) {
-      if (await store.hasHostPassword(h.id)) {
-        canAuth = true;
-        break;
-      }
-    }
-  }
-  if (!canAuth) return null;
-  try {
-    final note = await ref.read(agentDockServiceProvider).syncAllHostsCatalog();
-    // Only reload the tree when something actually merged — otherwise the
-    // sidebar flashes for a no-op sync.
-    if (note != null && note.startsWith('Synced')) {
-      ref.invalidate(agentsTreeProvider);
-    }
-    return note;
-  } catch (e) {
-    SafeLog.d('agentdock catalog sync failed', e);
-    return 'Could not sync agents from remotes';
-  }
-});
-
 /// Flat chat row for the Agents list (phone + desktop sidebar).
 class _FlatChat {
-  const _FlatChat({
-    required this.chat,
-    required this.host,
-    required this.repo,
-  });
+  const _FlatChat({required this.chat, required this.host, required this.repo});
 
   final Chat chat;
   final Host host;
@@ -101,11 +75,7 @@ class _FlatChat {
 }
 
 class AgentsScreen extends ConsumerStatefulWidget {
-  const AgentsScreen({
-    super.key,
-    this.embedded = false,
-    this.selectedChatId,
-  });
+  const AgentsScreen({super.key, this.embedded = false, this.selectedChatId});
 
   /// Sidebar mode for macOS / desktop shell.
   final bool embedded;
@@ -158,7 +128,9 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       sections.add(_DirSection(repo: repo, host: host, chats: chats));
     }
     sections.sort((a, b) {
-      final byName = a.repo.name.toLowerCase().compareTo(b.repo.name.toLowerCase());
+      final byName = a.repo.name.toLowerCase().compareTo(
+        b.repo.name.toLowerCase(),
+      );
       if (byName != 0) return byName;
       return a.host.alias.toLowerCase().compareTo(b.host.alias.toLowerCase());
     });
@@ -175,15 +147,17 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       final agents = [...(byHost[host.id] ?? const <_FlatChat>[])];
       // Under a host: group/sort by directory name, then recency within dir.
       agents.sort((a, b) {
-        final byDir =
-            a.repo.name.toLowerCase().compareTo(b.repo.name.toLowerCase());
+        final byDir = a.repo.name.toLowerCase().compareTo(
+          b.repo.name.toLowerCase(),
+        );
         if (byDir != 0) return byDir;
         return b.chat.updatedAt.compareTo(a.chat.updatedAt);
       });
       sections.add(_HostSection(host: host, agents: agents));
     }
     sections.sort(
-      (a, b) => a.host.alias.toLowerCase().compareTo(b.host.alias.toLowerCase()),
+      (a, b) =>
+          a.host.alias.toLowerCase().compareTo(b.host.alias.toLowerCase()),
     );
     return sections;
   }
@@ -327,18 +301,16 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
   @override
   Widget build(BuildContext context) {
     final treeAsync = ref.watch(agentsTreeProvider);
-    // Only rebuild when the sync *message* changes, not while loading.
-    final syncNote = ref.watch(
-      agentsSyncProvider.select((async) => async.hasValue
-          ? async.valueOrNull
-          : (async.isLoading ? 'Syncing agents from remotes…' : null)),
+    final sync = ref.watch(catalogSyncProvider);
+    final syncNote = sync.when(
+      data: (note) => note,
+      loading: () => 'Syncing hosts…',
+      error: (_, _) => 'Could not sync hosts',
     );
     // Watch presence (chat ids), not map identity — reconnect used to copy the
     // whole map and rebuild this list while SSH was still busy.
     final presence = ref.watch(
-      activeAcpSessionsProvider.select(
-        (m) => Set<String>.of(m.keys),
-      ),
+      activeAcpSessionsProvider.select((m) => Set<String>.of(m.keys)),
     );
     final runtimes = {
       for (final id in presence)
@@ -354,8 +326,11 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       skipLoadingOnRefresh: true,
       data: (tree) => switch (mode) {
         AgentsSidebarMode.agents => _buildFlatList(tree, runtimes, syncNote),
-        AgentsSidebarMode.directories =>
-          _buildDirectoryList(tree, runtimes, syncNote),
+        AgentsSidebarMode.directories => _buildDirectoryList(
+          tree,
+          runtimes,
+          syncNote,
+        ),
         AgentsSidebarMode.hosts => _buildHostsList(tree, runtimes, syncNote),
       },
       loading: () => const Center(child: CircularProgressIndicator()),
@@ -378,10 +353,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
           IconButton(
             tooltip: 'Refresh / sync ~/.agentdock',
             onPressed: () {
-              setState(_dismissedChats.clear);
-              ref.invalidate(agentsTreeProvider);
-              ref.invalidate(agentsSyncProvider);
-              ref.invalidate(unreadCountsProvider);
+              unawaited(_refreshLists());
             },
             icon: const Icon(Icons.refresh),
           ),
@@ -393,9 +365,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
 
   Future<void> _refreshLists() async {
     setState(_dismissedChats.clear);
-    ref.invalidate(agentsSyncProvider);
-    await ref.read(agentsSyncProvider.future);
-    ref.invalidate(agentsTreeProvider);
+    await ref.read(catalogSyncProvider.notifier).refresh();
     ref.invalidate(unreadCountsProvider);
     await ref.read(agentsTreeProvider.future);
   }
@@ -524,9 +494,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
             key: ValueKey('host-${section.host.id}'),
             title: section.host.alias,
             titleIcon: Icons.dns_outlined,
-            subtitle: n == 0
-                ? 'No agents'
-                : '$n agent${n == 1 ? '' : 's'}',
+            subtitle: n == 0 ? 'No agents' : '$n agent${n == 1 ? '' : 's'}',
             collapsed: collapsed,
             onToggle: () => _toggleHost(section.host.id),
             children: [
@@ -617,12 +585,8 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       },
     );
 
-    return RefreshIndicator(
-      onRefresh: _refreshLists,
-      child: list,
-    );
+    return RefreshIndicator(onRefresh: _refreshLists, child: list);
   }
-
 }
 
 class _DirSection {
@@ -729,9 +693,7 @@ class _CollapsibleSection extends StatelessWidget {
               ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(6, 4, 6, 6),
-                child: Column(
-                  children: children,
-                ),
+                child: Column(children: children),
               ),
             ],
           ],
@@ -855,17 +817,15 @@ class _NestedAgentRow extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.bodyMedium?.copyWith(
-                          fontWeight:
-                              selected ? FontWeight.w600 : FontWeight.w500,
+                          fontWeight: selected
+                              ? FontWeight.w600
+                              : FontWeight.w500,
                           color: live || selected
                               ? null
                               : scheme.onSurface.withValues(alpha: 0.72),
                         ),
                       ),
-                      if (tag != null) ...[
-                        const SizedBox(height: 4),
-                        tag!,
-                      ],
+                      if (tag != null) ...[const SizedBox(height: 4), tag!],
                     ],
                   ),
                 ),
@@ -913,9 +873,9 @@ class _EmptyState extends ConsumerWidget {
             Text(
               hasHosts
                   ? 'No agents yet. Tap + to pick a host and folder, '
-                      'then start a chat.'
+                        'then start a chat.'
                   : 'Add a host first, then tap + to create an agent '
-                      'in a remote folder.',
+                        'in a remote folder.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
@@ -927,11 +887,8 @@ class _EmptyState extends ConsumerWidget {
               )
             else
               FilledButton(
-                onPressed: () => openAppPanel(
-                  context,
-                  ref,
-                  DesktopRightPanel.hosts,
-                ),
+                onPressed: () =>
+                    openAppPanel(context, ref, DesktopRightPanel.hosts),
                 child: const Text('Go to Hosts'),
               ),
           ],
@@ -940,7 +897,6 @@ class _EmptyState extends ConsumerWidget {
     );
   }
 }
-
 
 class _ChatUnreadBadge extends ConsumerWidget {
   const _ChatUnreadBadge({required this.chatId});
@@ -1002,7 +958,6 @@ class _HostTag extends StatelessWidget {
     );
   }
 }
-
 
 class _PhoneChatCard extends StatelessWidget {
   const _PhoneChatCard({
@@ -1096,8 +1051,9 @@ class _PhoneChatCard extends StatelessWidget {
           onSecondaryTapDown: (d) => _showMenu(context, d.globalPosition),
           onLongPress: () => _showMenu(
             context,
-            (context.findRenderObject() as RenderBox)
-                .localToGlobal(Offset.zero),
+            (context.findRenderObject() as RenderBox).localToGlobal(
+              Offset.zero,
+            ),
           ),
           child: Padding(
             padding: EdgeInsets.fromLTRB(
@@ -1123,7 +1079,9 @@ class _PhoneChatCard extends StatelessWidget {
                             size: 18,
                             color: selected || live
                                 ? AppColors.accent
-                                : scheme.onSurfaceVariant.withValues(alpha: 0.55),
+                                : scheme.onSurfaceVariant.withValues(
+                                    alpha: 0.55,
+                                  ),
                           ),
                     const SizedBox(width: 10),
                     Expanded(
@@ -1132,8 +1090,9 @@ class _PhoneChatCard extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.titleSmall?.copyWith(
-                          fontWeight:
-                              selected ? FontWeight.w700 : FontWeight.w600,
+                          fontWeight: selected
+                              ? FontWeight.w700
+                              : FontWeight.w600,
                           color: live || selected
                               ? null
                               : scheme.onSurface.withValues(alpha: 0.72),
@@ -1233,7 +1192,6 @@ class _FolderTag extends StatelessWidget {
     );
   }
 }
-
 
 class _DeleteBackground extends StatelessWidget {
   const _DeleteBackground();

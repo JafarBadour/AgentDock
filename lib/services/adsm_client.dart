@@ -67,20 +67,17 @@ class AdsmBridgePool {
         // Stale connect — loop and open a fresh one.
         continue;
       }
-      final entry = _entries.putIfAbsent(
-        host.id,
-        () {
-          unawaited(
-            client.done.whenComplete(() {
-              final cur = _entries[host.id];
-              if (cur != null && identical(cur.client, client)) {
-                _entries.remove(host.id);
-              }
-            }),
-          );
-          return _AdsmBridgeEntry(client);
-        },
-      );
+      final entry = _entries.putIfAbsent(host.id, () {
+        unawaited(
+          client.done.whenComplete(() {
+            final cur = _entries[host.id];
+            if (cur != null && identical(cur.client, client)) {
+              _entries.remove(host.id);
+            }
+          }),
+        );
+        return _AdsmBridgeEntry(client);
+      });
       if (!identical(entry.client, client) || !entry.client.isOpen) {
         continue;
       }
@@ -123,9 +120,7 @@ class _AdsmBridgeEntry {
 class AdsmClient {
   AdsmClient._ssh(this._sshClient, this._session) : _process = null;
 
-  AdsmClient._local(this._process)
-      : _sshClient = null,
-        _session = null;
+  AdsmClient._local(this._process) : _sshClient = null, _session = null;
 
   /// Dedicated SSH connection — not pooled, so periodic pool health checks
   /// cannot tear down a long-lived ADSM bridge mid-turn.
@@ -204,14 +199,16 @@ fi
     final adsm = AdsmClient._ssh(client, session);
     adsm._listen();
     // Warm ping — also learns protocol version for wire chunking.
-    final pong =
-        await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    final pong = await adsm
+        .request('ping', {})
+        .timeout(const Duration(seconds: 8));
     adsm.protocolVersion = pong['version']?.toString();
     return adsm;
   }
 
   static Future<AdsmClient> _connectLocal() async {
-    final home = Platform.environment['HOME'] ??
+    final home =
+        Platform.environment['HOME'] ??
         Platform.environment['USERPROFILE'] ??
         '';
     final path = [
@@ -224,15 +221,13 @@ fi
       Platform.isWindows ? 'bash' : '/bin/bash',
       ['-lc', _clientLaunch],
       workingDirectory: home.isEmpty ? null : home,
-      environment: {
-        ...Platform.environment,
-        'PATH': path,
-      },
+      environment: {...Platform.environment, 'PATH': path},
     );
     final adsm = AdsmClient._local(process);
     adsm._listen();
-    final pong =
-        await adsm.request('ping', {}).timeout(const Duration(seconds: 8));
+    final pong = await adsm
+        .request('ping', {})
+        .timeout(const Duration(seconds: 8));
     adsm.protocolVersion = pong['version']?.toString();
     return adsm;
   }
@@ -356,11 +351,7 @@ fi
     final id = _nextId++;
     final c = Completer<Map<String, dynamic>>();
     _pending[id] = c;
-    final payload = jsonEncode({
-      'id': id,
-      'method': method,
-      'params': params,
-    });
+    final payload = jsonEncode({'id': id, 'method': method, 'params': params});
     try {
       _writeRequest(id, payload);
     } catch (e) {
@@ -474,8 +465,7 @@ class AdsmHostHealth {
   final String? acpSessionId;
   final String? fetchError;
 
-  bool get versionMeets =>
-      adsmVersionMeets(pingVersion, requiredVersion);
+  bool get versionMeets => adsmVersionMeets(pingVersion, requiredVersion);
 
   bool get daemonReachable =>
       bridgeOpen && fetchError == null && daemonPid != null;
@@ -485,7 +475,8 @@ class AdsmHostHealth {
     return st != 'dead' && st != 'error';
   }
 
-  bool get healthy => bridgeOpen && versionMeets && daemonReachable && agentHealthy;
+  bool get healthy =>
+      bridgeOpen && versionMeets && daemonReachable && agentHealthy;
 }
 
 /// Durable agent session mediated by ADSM (not a raw ACP journal bridge).
@@ -495,8 +486,8 @@ class AdsmSession implements AgentSession {
     required this.chatId,
     required AdsmClient client,
     AdsmBridgePool? bridgePool,
-  })  : _client = client,
-        _bridgePool = bridgePool;
+  }) : _client = client,
+       _bridgePool = bridgePool;
 
   final Host host;
   final String chatId;
@@ -579,10 +570,7 @@ class AdsmSession implements AgentSession {
   }
 
   /// Apply a shared `agents.list` result to this session (no extra RPC).
-  String? applyAgentsList(
-    Map<String, dynamic> list, {
-    bool forceEmit = false,
-  }) {
+  String? applyAgentsList(Map<String, dynamic> list, {bool forceEmit = false}) {
     if (_updates.isClosed) return _daemonStatus;
     final agents = list['agents'];
     if (agents is! List) return _daemonStatus;
@@ -668,8 +656,11 @@ class AdsmSession implements AgentSession {
     }
 
     try {
-      final pong = await _client
-          .request('ping', {}, timeout: const Duration(seconds: 6));
+      final pong = await _client.request(
+        'ping',
+        {},
+        timeout: const Duration(seconds: 6),
+      );
       pingVersion = pong['version']?.toString() ?? pingVersion;
       _client.protocolVersion = pingVersion;
     } catch (e) {
@@ -695,7 +686,9 @@ class AdsmSession implements AgentSession {
         {},
         timeout: const Duration(seconds: 6),
       );
-      pid = daemon['pid'] is int ? daemon['pid'] as int : int.tryParse('${daemon['pid']}');
+      pid = daemon['pid'] is int
+          ? daemon['pid'] as int
+          : int.tryParse('${daemon['pid']}');
       workers = daemon['workers'] is int
           ? daemon['workers'] as int
           : int.tryParse('${daemon['workers']}');
@@ -759,6 +752,7 @@ class AdsmSession implements AgentSession {
     String? resumeSessionId,
     String? preferredModelId,
     AdsmBridgePool? bridgePool,
+    bool forceNewSession = false,
   }) async {
     final apiKey = switch (provider) {
       AgentProvider.cursor => await secureStore.readCursorApiKey(),
@@ -798,35 +792,34 @@ class AdsmSession implements AgentSession {
         'afterSeq': 0,
       });
 
-      final snap = await client.request(
-        'agents.ensure',
-        {
-          'chatId': chatId,
-          'cwd': cwd,
-          'binary': binary,
-          'provider': provider.id,
-          if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
-          'fullAccess': permissionPolicy.fullAccess,
-          'permissionAsk': !permissionPolicy.fullAccess,
-          if (resumeSessionId != null) 'resumeSessionId': resumeSessionId,
-          'mcpServers': mcpServers,
-          'mode': initialMode.id,
-          if (preferredModelId != null && preferredModelId.isNotEmpty)
-            'modelId': preferredModelId,
-        },
-        timeout: const Duration(seconds: 90),
-      );
+      final snap = await client.request('agents.ensure', {
+        'chatId': chatId,
+        'cwd': cwd,
+        'binary': binary,
+        'provider': provider.id,
+        if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+        'fullAccess': permissionPolicy.fullAccess,
+        'permissionAsk': !permissionPolicy.fullAccess,
+        if (!forceNewSession && resumeSessionId != null)
+          'resumeSessionId': resumeSessionId,
+        if (forceNewSession) 'forceNewSession': true,
+        'mcpServers': mcpServers,
+        'mode': initialMode.id,
+        if (preferredModelId != null && preferredModelId.isNotEmpty)
+          'modelId': preferredModelId,
+      }, timeout: const Duration(seconds: 90));
 
       session._applySnapshot(snap);
       // If ensure returned RUNNING attach without re-init, treat as resume.
       final state = snap['status']?.toString();
-      if (state == 'idle' &&
+      if (!forceNewSession &&
+          state == 'idle' &&
           (resumeSessionId != null || session.sessionId != null)) {
         session.resumedInPlace = snap['acpSessionId'] == resumeSessionId;
       }
       // Pull durable host transcript ASAP — before UI settles on SQLite-only.
       try {
-        session.hostTranscript = await session.pullTranscript();
+        session.hostTranscript = await session.pullTranscript(limit: 300);
       } catch (e) {
         SafeLog.d('ADSM transcript.pull failed', e);
       }
@@ -848,9 +841,10 @@ class AdsmSession implements AgentSession {
   /// Messages pulled from host `~/.agentdock/messages/<chatId>.jsonl`.
   List<ChatMessage> hostTranscript = const [];
 
-  Future<List<ChatMessage>> pullTranscript() async {
+  Future<List<ChatMessage>> pullTranscript({int limit = 300}) async {
     final result = await _client.request('transcript.pull', {
       'chatId': chatId,
+      'limit': limit,
     });
     final raw = result['messages'];
     if (raw is! List) return const [];
@@ -952,7 +946,8 @@ class AdsmSession implements AgentSession {
             }
           }
         }
-        final title = params['title']?.toString() ??
+        final title =
+            params['title']?.toString() ??
             params['text']?.toString() ??
             'Allow this action?';
         if (reqId != null) {
@@ -1034,9 +1029,9 @@ class AdsmSession implements AgentSession {
         if (params['models'] is Map) {
           _applySnapshot({
             ...params,
-            'availableModels':
-                (params['models'] as Map)['availableModels'],
-            'modelId': (params['models'] as Map)['currentModelId'] ??
+            'availableModels': (params['models'] as Map)['availableModels'],
+            'modelId':
+                (params['models'] as Map)['currentModelId'] ??
                 params['modelId'],
           });
         }
@@ -1101,20 +1096,16 @@ class AdsmSession implements AgentSession {
     try {
       // ADSM ≥0.4.3 returns {accepted:true} immediately; older hosts block
       // until the full turn. Delivery retries must not wait for the turn.
-      final result = await _client.request(
-        'session.prompt',
-        {
-          'chatId': chatId,
-          'text': text,
-          if (images.isNotEmpty)
-            'images': [for (final img in images) img.toWire()],
-          if (userMessageId != null && userMessageId.isNotEmpty)
-            'userMessageId': userMessageId,
-          if (userCreatedAt != null)
-            'userCreatedAt': userCreatedAt.toUtc().toIso8601String(),
-        },
-        timeout: const Duration(seconds: 25),
-      );
+      final result = await _client.request('session.prompt', {
+        'chatId': chatId,
+        'text': text,
+        if (images.isNotEmpty)
+          'images': [for (final img in images) img.toWire()],
+        if (userMessageId != null && userMessageId.isNotEmpty)
+          'userMessageId': userMessageId,
+        if (userCreatedAt != null)
+          'userCreatedAt': userCreatedAt.toUtc().toIso8601String(),
+      }, timeout: const Duration(seconds: 25));
 
       final accepted = result['accepted'] == true;
       if (accepted) {
@@ -1162,14 +1153,10 @@ class AdsmSession implements AgentSession {
   @override
   Future<void> setModel(String modelId) async {
     // May relaunch the remote tmux worker when the ACP adapter lacks model RPCs.
-    final snap = await _client.request(
-      'session.set_model',
-      {
-        'chatId': chatId,
-        'modelId': modelId,
-      },
-      timeout: const Duration(seconds: 90),
-    );
+    final snap = await _client.request('session.set_model', {
+      'chatId': chatId,
+      'modelId': modelId,
+    }, timeout: const Duration(seconds: 90));
     _applySnapshot(snap);
     currentModelId = snap['modelId']?.toString() ?? modelId;
   }
@@ -1182,14 +1169,16 @@ class AdsmSession implements AgentSession {
   @override
   void resolvePermission(Object requestId, String optionId) {
     unawaited(
-      _client.request('session.respond_permission', {
-        'chatId': chatId,
-        'requestId': '$requestId',
-        'optionId': optionId,
-      }).catchError((Object e) {
-        SafeLog.d('ADSM respond_permission failed', e);
-        return <String, dynamic>{};
-      }),
+      _client
+          .request('session.respond_permission', {
+            'chatId': chatId,
+            'requestId': '$requestId',
+            'optionId': optionId,
+          })
+          .catchError((Object e) {
+            SafeLog.d('ADSM respond_permission failed', e);
+            return <String, dynamic>{};
+          }),
     );
     _updates.add(AcpUpdate.permission(optionId));
   }
@@ -1205,14 +1194,10 @@ class AdsmSession implements AgentSession {
   }) async {
     if (availableModels.isNotEmpty) return;
     try {
-      final snap = await _client.request(
-        'session.refresh_models',
-        {
-          'chatId': chatId,
-          'mcpServers': mcpServers,
-        },
-        timeout: const Duration(seconds: 90),
-      );
+      final snap = await _client.request('session.refresh_models', {
+        'chatId': chatId,
+        'mcpServers': mcpServers,
+      }, timeout: const Duration(seconds: 90));
       _applySnapshot(snap);
     } catch (e) {
       SafeLog.d('ADSM model catalog refresh failed', e);

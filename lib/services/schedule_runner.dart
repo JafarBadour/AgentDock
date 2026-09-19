@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import '../data/local/app_database.dart';
 import '../data/models/scheduled_job.dart';
 import '../data/secure/safe_log.dart';
@@ -15,33 +13,20 @@ class ScheduleRunner {
     required ScheduleSyncService sync,
     required AgentDockService dock,
     this.onJobsChanged,
-  })  : _db = db,
-        _sync = sync,
-        _dock = dock;
+  }) : _db = db,
+       _sync = sync,
+       _dock = dock;
 
   final AppDatabase _db;
   final ScheduleSyncService _sync;
   final AgentDockService _dock;
   final void Function()? onJobsChanged;
 
-  Timer? _timer;
   bool _ticking = false;
 
-  void start() {
-    _timer?.cancel();
-    // Occasional pull so UI reflects host nextRunAt / disable after runs.
-    _timer = Timer.periodic(const Duration(minutes: 2), (_) {
-      unawaited(tick());
-    });
-    unawaited(tick());
-  }
-
-  void stop() {
-    _timer?.cancel();
-    _timer = null;
-  }
-
-  void dispose() => stop();
+  // Due execution is host-owned. Host pulls are explicit from Automations so a
+  // periodic all-host sweep can never interrupt typing or scrolling.
+  void dispose() {}
 
   /// Ask the host ADSM to run [jobId] immediately.
   Future<void> runNow(String jobId) async {

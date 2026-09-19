@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
@@ -86,7 +87,8 @@ SshFailureKind classifySshFailure(Object error) {
   }
   if (error is StateError) {
     final message = error.message.toLowerCase();
-    if (message.contains('no ssh private key')) return SshFailureKind.missingKey;
+    if (message.contains('no ssh private key'))
+      return SshFailureKind.missingKey;
     if (message.contains('passphrase') || message.contains('parse')) {
       return SshFailureKind.missingKey;
     }
@@ -231,9 +233,7 @@ class HostSystemMetrics {
   final String? error;
 
   bool get hasAny =>
-      cpuPercent != null ||
-      memTotalBytes != null ||
-      diskFreeBytes != null;
+      cpuPercent != null || memTotalBytes != null || diskFreeBytes != null;
 
   String get cpuLabel {
     final c = cpuPercent;
@@ -297,6 +297,13 @@ class SshService {
   /// Cached absolute paths for Cursor / Claude binaries per host.
   final Map<String, String> _toolPathCache = {};
 
+  /// Parsed private keys are immutable and can be reused by every connection.
+  /// PEM decoding (especially RSA) is CPU-heavy pure Dart work; parsing the
+  /// same key once per host made bulk refresh visibly stop Flutter frames.
+  String? _cachedIdentityPem;
+  String? _cachedIdentityPassphrase;
+  List<SSHKeyPair>? _cachedIdentities;
+
   /// Serializes [ensureAdsm] per host so parallel chats cannot double-upgrade.
   final Map<String, Future<void>> _adsmEnsureInflight = {};
 
@@ -317,12 +324,15 @@ class SshService {
     _adsmVerifiedVersion.remove(hostId);
   }
 
+  /// Drop a stuck [ensureAdsm] waiter so the next connect is not blocked.
+  void abandonAdsmEnsure(String hostId) {
+    _adsmEnsureInflight.remove(hostId);
+  }
+
   /// Stop the ADSM daemon on [host] (local shell or SSH). Clears ready cache.
   Future<void> stopAdsm(Host host) async {
     clearAdsmReady(host.id);
-    await exec(
-      host,
-      r'''
+    await exec(host, r'''
 set +e
 export PATH="$HOME/.local/bin:$PATH"
 if command -v agentdock-adsm >/dev/null 2>&1; then
@@ -333,9 +343,7 @@ pkill -f 'python -m adsm serve' 2>/dev/null || true
 rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
 rm -f "$HOME/.agentdock/adsm.pid" 2>/dev/null || true
 exit 0
-''',
-      timeout: const Duration(seconds: 20),
-    );
+''', timeout: const Duration(seconds: 20));
   }
 
   /// CPU / memory / free disk on [host]. Hard-capped at [timeout] (default 1s).
@@ -344,11 +352,7 @@ exit 0
     Duration timeout = const Duration(seconds: 1),
   }) async {
     try {
-      final out = await exec(
-        host,
-        _hostMetricsScript,
-        timeout: timeout,
-      );
+      final out = await exec(host, _hostMetricsScript, timeout: timeout);
       return _parseHostSystemMetrics(out);
     } on TimeoutException {
       return const HostSystemMetrics(error: 'Timed out (>1s)');
@@ -456,9 +460,7 @@ exit 0
           diskTotal = int.tryParse(val);
       }
     }
-    if (cpu == null &&
-        memTotal == null &&
-        diskFree == null) {
+    if (cpu == null && memTotal == null && diskFree == null) {
       return const HostSystemMetrics(error: 'No metrics returned');
     }
     return HostSystemMetrics(
@@ -613,26 +615,41 @@ exit 0
       var pem = await _secureStore.readSshPrivateKey();
       // Local this-computer host: fall back to ~/.ssh/id_* so coding on the
       // same Mac/PC works without pasting a key into Settings first.
-      if ((pem == null || pem.trim().isEmpty) && isLocalThisComputerHost(host)) {
+      if ((pem == null || pem.trim().isEmpty) &&
+          isLocalThisComputerHost(host)) {
         pem = await readDefaultSshPrivateKeyPem();
       }
       if (pem == null || pem.trim().isEmpty) {
         throw StateError(
           isLocalThisComputerHost(host)
               ? 'No SSH key for this computer. Enable Remote Login (Mac) or '
-                  'OpenSSH Server (Windows), then add your key in Settings, '
-                  'or set a password on this host. Default ~/.ssh/id_ed25519 '
-                  'or id_rsa is also tried automatically.'
+                    'OpenSSH Server (Windows), then add your key in Settings, '
+                    'or set a password on this host. Default ~/.ssh/id_ed25519 '
+                    'or id_rsa is also tried automatically.'
               : 'No SSH private key in Settings, and no password on this host. '
-                  'Add a key in Settings or set a password when editing the host.',
+                    'Add a key in Settings or set a password when editing the host.',
         );
       }
       final passphrase = await _secureStore.readSshPassphrase();
       try {
-        pairs = SSHKeyPair.fromPem(
-          pem,
-          (passphrase != null && passphrase.isNotEmpty) ? passphrase : null,
-        );
+        final identityPem = pem;
+        final normalizedPassphrase =
+            (passphrase != null && passphrase.isNotEmpty) ? passphrase : null;
+        if (_cachedIdentityPem == identityPem &&
+            _cachedIdentityPassphrase == normalizedPassphrase &&
+            _cachedIdentities != null) {
+          pairs = _cachedIdentities;
+        } else {
+          // PEM/ASN.1 and encrypted-key decoding are synchronous CPU work.
+          // Keep them off Flutter's event loop; the parsed immutable keypairs
+          // are sendable and then cached for all later host connections.
+          pairs = await Isolate.run(
+            () => SSHKeyPair.fromPem(identityPem, normalizedPassphrase),
+          );
+          _cachedIdentityPem = identityPem;
+          _cachedIdentityPassphrase = normalizedPassphrase;
+          _cachedIdentities = pairs;
+        }
       } catch (e) {
         throw StateError(
           'Could not parse SSH private key (wrong passphrase?).',
@@ -804,25 +821,21 @@ exit 0
     String command, {
     Duration timeout = const Duration(seconds: 12),
   }) async {
-    final home = Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'];
+    final home =
+        Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
     final pathPrefix = [
       if (home != null && home.isNotEmpty) '$home/.local/bin',
       if (Platform.isMacOS) '/opt/homebrew/bin',
       '/usr/local/bin',
       Platform.environment['PATH'] ?? '',
     ].where((s) => s.isNotEmpty).join(':');
-    final env = <String, String>{
-      ...Platform.environment,
-      'PATH': pathPrefix,
-    };
+    final env = <String, String>{...Platform.environment, 'PATH': pathPrefix};
     late final ProcessResult result;
     try {
       result = await Process.run(
         Platform.isWindows ? 'bash' : '/bin/bash',
         ['-lc', command],
-        workingDirectory:
-            home != null && home.isNotEmpty ? home : null,
+        workingDirectory: home != null && home.isNotEmpty ? home : null,
         environment: env,
         stdoutEncoding: utf8,
         stderrEncoding: utf8,
@@ -833,16 +846,14 @@ exit 0
       throw StateError(
         Platform.isWindows
             ? 'Could not run bash on This PC ($e). Install Git Bash '
-                'or enable OpenSSH Server for agents.'
+                  'or enable OpenSSH Server for agents.'
             : 'Could not run local shell: $e',
       );
     }
     if (result.exitCode != 0) {
       final err = (result.stderr as String).trim();
       throw Exception(
-        err.isEmpty
-            ? 'Command failed (exit ${result.exitCode})'
-            : err,
+        err.isEmpty ? 'Command failed (exit ${result.exitCode})' : err,
       );
     }
     return result.stdout as String;
@@ -856,7 +867,16 @@ exit 0
   }) async {
     final gate = _pool[hostId]?.gate;
     Future<String> body() async {
-      final session = await client.execute(command);
+      // Cap execute() too — a hung open-channel left connects stuck on
+      // "Starting ADSM…" with no progress forever.
+      final session = await client
+          .execute(command)
+          .timeout(
+            timeout,
+            onTimeout: () => throw TimeoutException(
+              'Remote command timed out after $timeout (open)',
+            ),
+          );
       try {
         // Read stdout + stderr in parallel — sequential reads can deadlock SSH channels.
         final chunks = await Future.wait<Uint8List>([
@@ -914,9 +934,7 @@ exit 0
           : 'Installing tmux on the remote…',
     );
     try {
-      await exec(
-        host,
-        r'''
+      await exec(host, r'''
 set -e
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 if command -v tmux >/dev/null 2>&1; then command -v tmux; exit 0; fi
@@ -956,9 +974,7 @@ else
   exit 1
 fi
 command -v tmux
-''',
-        timeout: const Duration(minutes: 5),
-      );
+''', timeout: const Duration(minutes: 5));
     } catch (e) {
       SafeLog.d('tmux auto-install failed', e);
     }
@@ -1044,9 +1060,7 @@ exit 1
     if (!installed) {
       onProgress?.call('Trying Cursor official installer…');
       try {
-        await exec(
-          host,
-          r'''
+        await exec(host, r'''
 set -e
 export PATH="$HOME/.local/bin:$HOME/.cursor/bin:$PATH"
 curl -fsSL https://cursor.com/install | bash
@@ -1055,9 +1069,7 @@ if command -v agent >/dev/null 2>&1 && ! command -v cursor-agent >/dev/null 2>&1
   ln -sfn "$(command -v agent)" "$HOME/.local/bin/cursor-agent"
 fi
 command -v cursor-agent >/dev/null || command -v agent >/dev/null
-''',
-          timeout: const Duration(minutes: 5),
-        );
+''', timeout: const Duration(minutes: 5));
       } catch (e) {
         SafeLog.d('Cursor official installer failed', e);
       }
@@ -1130,9 +1142,7 @@ command -v cursor-agent >/dev/null || command -v agent >/dev/null
         final code = session.exitCode ?? 0;
         if (code != 0) {
           final err = stderr.toString().trim();
-          throw Exception(
-            err.isEmpty ? 'Command failed (exit $code)' : err,
-          );
+          throw Exception(err.isEmpty ? 'Command failed (exit $code)' : err);
         }
         return stdout.toString();
       } on TimeoutException {
@@ -1255,9 +1265,7 @@ test -x "$HOME/.local/bin/claude-code-acp"
       return path;
     }
 
-    onProgress?.call(
-      'First Claude setup on this host — usually 3–8 minutes…',
-    );
+    onProgress?.call('First Claude setup on this host — usually 3–8 minutes…');
 
     // Fast path: npm/nvm only (tmux + ADSM are handled separately).
     try {
@@ -1316,8 +1324,22 @@ test -x "$HOME/.local/bin/claude-code-acp"
     final prev = _adsmEnsureInflight[host.id];
     final run = () async {
       if (prev != null) {
+        onProgress?.call('Waiting for ADSM setup on this host…');
         try {
-          await prev;
+          await prev.timeout(const Duration(seconds: 30));
+          if (isAdsmReady(host.id) && !allowUpgrade) {
+            onProgress?.call('ADSM ready');
+            return;
+          }
+        } on TimeoutException {
+          SafeLog.d(
+            'prior ensureAdsm still running for ${host.id}; abandoning wait',
+          );
+          if (identical(_adsmEnsureInflight[host.id], prev)) {
+            _adsmEnsureInflight.remove(host.id);
+          }
+          onProgress?.call('Retrying ADSM…');
+          invalidate(host.id);
         } catch (_) {}
       }
       await _ensureAdsmBody(
@@ -1392,10 +1414,10 @@ test -x "$HOME/.local/bin/claude-code-acp"
           t.contains('socket has been shut down');
     }
 
-    Future<({bool ok, bool hasBin, String? version, String raw})> quickPing() async {
+    Future<({bool ok, bool hasBin, String? version, String raw})>
+    quickPing() async {
       try {
-        final out = await runCmd(
-          r'''
+        final out = await runCmd(r'''
 set +e
 python3 - <<'PY' 2>/dev/null
 import json, os, socket, sys
@@ -1430,9 +1452,7 @@ finally:
         pass
 sys.exit(0)
 PY
-''',
-          timeout: const Duration(seconds: 15),
-        );
+''', timeout: const Duration(seconds: 15));
         lastProbe = out.trim();
         String? version;
         for (final line in out.split('\n')) {
@@ -1454,10 +1474,10 @@ PY
       }
     }
 
-    Future<({bool ok, bool hasBin, String? version, String raw})> probe() async {
+    Future<({bool ok, bool hasBin, String? version, String raw})>
+    probe() async {
       try {
-        final out = await runCmd(
-          r'''
+        final out = await runCmd(r'''
 set +e
 export PATH="$HOME/.local/bin:$PATH"
 BIN="$(command -v agentdock-adsm 2>/dev/null)"
@@ -1542,9 +1562,7 @@ else
 fi
 "$BIN" status 2>/dev/null | head -1 || true
 exit 0
-''',
-          timeout: const Duration(seconds: 35),
-        );
+''', timeout: const Duration(seconds: 20));
         lastProbe = out.trim();
         SafeLog.d('ADSM probe: $lastProbe');
         String? version;
@@ -1597,10 +1615,10 @@ exit 0
         throw MissingToolException(
           'ADSM',
           'Could not upload the ADSM package bundled with this app '
-          '(v$kRequiredAdsmVersion). GitHub install was skipped because '
-          'main can lag this build and would restart the daemon on every '
-          'retry.\n\nCheck SSH/SFTP to the host and reconnect.\n\n'
-          '# Probe:\n$lastProbe',
+              '(v$kRequiredAdsmVersion). GitHub install was skipped because '
+              'main can lag this build and would restart the daemon on every '
+              'retry.\n\nCheck SSH/SFTP to the host and reconnect.\n\n'
+              '# Probe:\n$lastProbe',
         );
       }
 
@@ -1613,16 +1631,13 @@ exit 0
       if (!installed) {
         onProgress?.call('Starting ADSM…');
         try {
-          await runCmd(
-            r'''
+          await runCmd(r'''
 set +e
 export PATH="$HOME/.local/bin:$PATH"
 command -v agentdock-adsm >/dev/null || exit 1
 agentdock-adsm ensure-running
 exit 0
-''',
-            timeout: const Duration(seconds: 45),
-          );
+''', timeout: const Duration(seconds: 45));
         } catch (e) {
           SafeLog.d('ADSM ensure-running after failed install failed', e);
         }
@@ -1633,8 +1648,7 @@ exit 0
       for (var i = 0; i < attempts; i++) {
         await Future<void>.delayed(Duration(milliseconds: 400 + i * 200));
         final state = await probe();
-        if (state.ok &&
-            adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+        if (state.ok && adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
           _markAdsmReady(host.id, state.version!);
           onProgress?.call('ADSM ready (v${state.version})');
           return true;
@@ -1697,13 +1711,12 @@ exit 0
       throw MissingToolException(
         'ADSM',
         'ADSM is not running on the host and upgrade was skipped '
-        '(reconnect path).\n\n# Probe:\n$lastProbe',
+            '(reconnect path).\n\n# Probe:\n$lastProbe',
       );
     }
 
     // Running but too old (or version unknown on an old build).
-    if (state.ok &&
-        !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+    if (state.ok && !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
       final have = state.version ?? 'unknown';
       await installOrUpgrade(
         reason:
@@ -1714,21 +1727,22 @@ exit 0
       throw MissingToolException(
         'ADSM',
         'ADSM mismatch — cannot run until the host is on '
-        'v$kRequiredAdsmVersion (host still reports '
-        '${state.version ?? "unknown"}).\n'
-        'Open this agent again to retry the automatic update.\n\n'
-        '# Probe:\n$lastProbe',
+            'v$kRequiredAdsmVersion (host still reports '
+            '${state.version ?? "unknown"}).\n'
+            'Open this agent again to retry the automatic update.\n\n'
+            '# Probe:\n$lastProbe',
       );
     }
 
     // Binary present but daemon not healthy — start/repair only first.
     if (state.hasBin) {
       onProgress?.call('Starting ADSM…');
-      for (var i = 0; i < 5; i++) {
-        await Future<void>.delayed(Duration(milliseconds: 400 + i * 250));
+      for (var i = 0; i < 3; i++) {
+        onProgress?.call('Starting ADSM… (${i + 1}/3)');
+        // Yield so Flutter can paint / handle input between SSH probes.
+        await Future<void>.delayed(Duration(milliseconds: 50 + i * 100));
         state = await probe();
-        if (state.ok &&
-            adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+        if (state.ok && adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
           _markAdsmReady(host.id, state.version!);
           onProgress?.call('ADSM ready (v${state.version})');
           return;
@@ -1738,8 +1752,7 @@ exit 0
           break; // fall through to upgrade
         }
       }
-      if (state.ok &&
-          !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+      if (state.ok && !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
         final have = state.version ?? 'unknown';
         await installOrUpgrade(
           reason:
@@ -1751,7 +1764,7 @@ exit 0
         throw MissingToolException(
           'ADSM',
           '${kRemoteAdsmSetupGuide.trim()}\n\n'
-          '# Probe (daemon binary found but not healthy):\n$lastProbe',
+              '# Probe (daemon binary found but not healthy):\n$lastProbe',
         );
       }
     }
@@ -1769,13 +1782,12 @@ exit 0
     if (await waitForRequired()) return;
 
     state = await probe();
-    if (state.ok &&
-        !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
+    if (state.ok && !adsmVersionMeets(state.version, kRequiredAdsmVersion)) {
       throw MissingToolException(
         'ADSM',
         'ADSM mismatch — cannot run. Host is still '
-        'v${state.version ?? "unknown"}; this app needs v$kRequiredAdsmVersion.\n'
-        'Reconnect to retry the automatic update.\n\n# Probe:\n$lastProbe',
+            'v${state.version ?? "unknown"}; this app needs v$kRequiredAdsmVersion.\n'
+            'Reconnect to retry the automatic update.\n\n# Probe:\n$lastProbe',
       );
     }
 
@@ -1842,8 +1854,8 @@ agentdock-adsm ensure-running
     }
 
     try {
-      final home = Platform.environment['HOME'] ??
-          Platform.environment['USERPROFILE'];
+      final home =
+          Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
       if (home == null || home.isEmpty) {
         throw StateError('HOME is not set');
       }
@@ -1901,11 +1913,7 @@ agentdock-adsm ensure-running
     }
 
     try {
-      await _pushBundledAdsmViaSftp(
-        client,
-        hostId: hostId,
-        payloads: payloads,
-      );
+      await _pushBundledAdsmViaSftp(client, hostId: hostId, payloads: payloads);
       onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
       return _BundledAdsmPush.ok;
     } catch (e) {
@@ -2012,7 +2020,8 @@ agentdock-adsm ensure-running
         final remote = '$share/${entry.key}';
         final remoteFile = await sftp.open(
           remote,
-          mode: SftpFileOpenMode.create |
+          mode:
+              SftpFileOpenMode.create |
               SftpFileOpenMode.truncate |
               SftpFileOpenMode.write,
         );
@@ -2026,7 +2035,8 @@ agentdock-adsm ensure-running
       final wrapperPath = '$binDir/agentdock-adsm';
       final wrapperFile = await sftp.open(
         wrapperPath,
-        mode: SftpFileOpenMode.create |
+        mode:
+            SftpFileOpenMode.create |
             SftpFileOpenMode.truncate |
             SftpFileOpenMode.write,
       );
@@ -2062,18 +2072,14 @@ agentdock-adsm ensure-running
       final url = '$kAgentDockScriptsBase/$scriptName';
       onProgress?.call('Running $scriptName…');
       try {
-        await exec(
-          host,
-          '''
+        await exec(host, '''
 set -e
 export AGENTDOCK_SKIP_TMUX=1
 export AGENTDOCK_SKIP_ADSM=1
 export PATH="\$HOME/.local/bin:\$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"
 [ -s "\$HOME/.nvm/nvm.sh" ] && . "\$HOME/.nvm/nvm.sh"
 curl -fsSL ${shellQuote(url)} | bash
-''',
-          timeout: timeout,
-        );
+''', timeout: timeout);
         return true;
       } catch (e) {
         SafeLog.d('Agent Dock install script $scriptName failed (local)', e);
@@ -2243,7 +2249,8 @@ exit 1
   /// (same idea as the local PTY terminal).
   Future<String> remoteHomeDirectory(Host host) async {
     if (_preferLocalFs(host)) {
-      final home = Platform.environment['HOME'] ??
+      final home =
+          Platform.environment['HOME'] ??
           Platform.environment['USERPROFILE'] ??
           '/';
       return normalizeRemotePath(home.replaceAll(r'\', '/'));
@@ -2593,7 +2600,8 @@ exit 1
     final sftp = await client.sftp();
     final remoteFile = await sftp.open(
       remote,
-      mode: SftpFileOpenMode.create |
+      mode:
+          SftpFileOpenMode.create |
           SftpFileOpenMode.truncate |
           SftpFileOpenMode.write,
     );
@@ -2666,7 +2674,11 @@ exit 1
 
   /// `command -v` with an extended PATH (non-login; avoids hanging .bashrc).
   // ignore: unused_element
-  Future<String?> _whichLogin(SSHClient client, String binary, String hostId) async {
+  Future<String?> _whichLogin(
+    SSHClient client,
+    String binary,
+    String hostId,
+  ) async {
     final name = binary.replaceAll("'", '');
     try {
       final out = await _run(
@@ -2682,7 +2694,8 @@ exit 1
     }
   }
 
-  static String shellQuote(String value) => "'${value.replaceAll("'", "'\\''")}'";
+  static String shellQuote(String value) =>
+      "'${value.replaceAll("'", "'\\''")}'";
 
   void dispose() {
     _healthTimer?.cancel();

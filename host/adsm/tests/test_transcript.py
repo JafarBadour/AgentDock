@@ -250,6 +250,11 @@ class TranscriptRpcTest(unittest.IsolatedAsyncioTestCase):
 
         pulled = await self.daemon._transcript_pull({"chatId": chat_id})
         self.assertEqual([m["id"] for m in pulled["messages"]], ["u1", "a1"])
+        tail = await self.daemon._transcript_pull(
+            {"chatId": chat_id, "limit": 1}
+        )
+        self.assertEqual([m["id"] for m in tail["messages"]], ["a1"])
+        self.assertTrue(tail["hasMore"])
 
 
 if __name__ == "__main__":

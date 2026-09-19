@@ -23,8 +23,9 @@ import '../services/ssh_socks_service.dart';
 
 final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
 
-final localNotificationServiceProvider =
-    Provider<LocalNotificationService>((ref) => LocalNotificationService());
+final localNotificationServiceProvider = Provider<LocalNotificationService>(
+  (ref) => LocalNotificationService(),
+);
 
 final gcpSpeechServiceProvider = Provider<GcpSpeechService>((ref) {
   final service = GcpSpeechService(ref.watch(secureStoreProvider));
@@ -93,9 +94,9 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
     // handled separately to avoid a Riverpod provider cycle with
     // activeAcpSessionsProvider.
     ref.read(agentsCatalogEpochProvider.notifier).state++;
-    ref.read(pendingRemoteDeletedChatIdsProvider.notifier).update(
-          (ids) => [...ids, chatId],
-        );
+    ref
+        .read(pendingRemoteDeletedChatIdsProvider.notifier)
+        .update((ids) => [...ids, chatId]);
   };
   ref.onDispose(service.dispose);
   return service;
@@ -104,9 +105,60 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
 /// Bumped when the host catalog removes chats (cross-device delete).
 final agentsCatalogEpochProvider = StateProvider<int>((ref) => 0);
 
+/// Explicit, deduplicated host-catalog refresh.
+///
+/// Bulk SSH work must never start merely because a widget was mounted. The
+/// previous FutureProvider did exactly that from the permanently mounted
+/// desktop sidebar, while app-resume and schedule startup launched overlapping
+/// sweeps. Key parsing, SSH packet handling, transcript decoding, and DB merge
+/// notifications then competed with every animation and keystroke.
+final catalogSyncProvider =
+    StateNotifierProvider<CatalogSyncController, AsyncValue<String?>>((ref) {
+      return CatalogSyncController(
+        ref.watch(agentDockServiceProvider),
+        onComplete: () {
+          ref.read(agentsCatalogEpochProvider.notifier).state++;
+        },
+      );
+    });
+
+class CatalogSyncController extends StateNotifier<AsyncValue<String?>> {
+  CatalogSyncController(this._dock, {required this.onComplete})
+    : super(const AsyncValue.data(null));
+
+  final AgentDockService _dock;
+  final void Function() onComplete;
+  Future<String?>? _inFlight;
+
+  Future<String?> refresh() {
+    final active = _inFlight;
+    if (active != null) return active;
+
+    state = const AsyncValue.loading();
+    late final Future<String?> run;
+    run = () async {
+      try {
+        final note = await _dock.syncAllHostsCatalog();
+        if (mounted) state = AsyncValue.data(note);
+        return note;
+      } catch (error, stack) {
+        SafeLog.d('catalog sync failed', error, stack);
+        if (mounted) state = AsyncValue.error(error, stack);
+        return 'Could not sync hosts';
+      } finally {
+        onComplete();
+        if (identical(_inFlight, run)) _inFlight = null;
+      }
+    }();
+    _inFlight = run;
+    return run;
+  }
+}
+
 /// Chat ids removed by host sync — drained by [remoteDeletedChatsPrunerProvider].
-final pendingRemoteDeletedChatIdsProvider =
-    StateProvider<List<String>>((ref) => const []);
+final pendingRemoteDeletedChatIdsProvider = StateProvider<List<String>>(
+  (ref) => const [],
+);
 
 /// Closes ACP runtimes for chats deleted on another device.
 final remoteDeletedChatsPrunerProvider = Provider<void>((ref) {
@@ -126,42 +178,44 @@ final configBackupServiceProvider = Provider<ConfigBackupService>(
 
 /// Long-lived ACP runtimes keyed by chat id — survive leaving the chat screen.
 final activeAcpSessionsProvider =
-    StateNotifierProvider<ActiveAcpSessions, Map<String, ChatSessionRuntime>>(
-  (ref) {
-    // Tool updates land many times a second while a turn streams; coalesce them
-    // so the agents list is not re-querying SQLite per token.
-    Timer? tick;
-    Timer? orderTick;
-    ref.onDispose(() {
-      tick?.cancel();
-      orderTick?.cancel();
+    StateNotifierProvider<ActiveAcpSessions, Map<String, ChatSessionRuntime>>((
+      ref,
+    ) {
+      // Tool updates land many times a second while a turn streams; coalesce them
+      // so the agents list is not re-querying SQLite per token.
+      Timer? tick;
+      Timer? orderTick;
+      ref.onDispose(() {
+        tick?.cancel();
+        orderTick?.cancel();
+      });
+      return ActiveAcpSessions(
+        ref.watch(appDatabaseProvider),
+        keepAlive: ref.watch(backgroundKeepAliveProvider),
+        notifications: ref.watch(localNotificationServiceProvider),
+        isChatFocused: (chatId) {
+          final focused = ref.read(focusedChatIdProvider);
+          final foreground = ref.read(appInForegroundProvider);
+          return foreground && focused == chatId;
+        },
+        onLocalChange: (chatId) {
+          ref.read(agentDockServiceProvider).schedulePushChat(chatId);
+          // True debounce: wait until transcript writes go quiet. The previous
+          // `??=` timers fired every few seconds throughout a long turn, causing
+          // recurring SQLite queries/sidebar rebuilds while the user scrolled.
+          tick?.cancel();
+          tick = Timer(const Duration(seconds: 2), () {
+            tick = null;
+            ref.read(chatActivityTickProvider.notifier).state++;
+          });
+          orderTick?.cancel();
+          orderTick = Timer(const Duration(seconds: 3), () {
+            orderTick = null;
+            ref.read(agentsCatalogEpochProvider.notifier).state++;
+          });
+        },
+      );
     });
-    return ActiveAcpSessions(
-      ref.watch(appDatabaseProvider),
-      keepAlive: ref.watch(backgroundKeepAliveProvider),
-      notifications: ref.watch(localNotificationServiceProvider),
-      isChatFocused: (chatId) {
-        final focused = ref.read(focusedChatIdProvider);
-        final foreground = ref.read(appInForegroundProvider);
-        return foreground && focused == chatId;
-      },
-      onLocalChange: (chatId) {
-        ref.read(agentDockServiceProvider).schedulePushChat(chatId);
-        // Coalesce aggressively — Agents sidebar must not rebuild every token.
-        tick ??= Timer(const Duration(seconds: 8), () {
-          tick = null;
-          ref.read(chatActivityTickProvider.notifier).state++;
-        });
-        // Re-sort Agents list only every few seconds — 900ms during tool
-        // streams was SQLite-reloading the sidebar while you scrolled.
-        orderTick ??= Timer(const Duration(seconds: 4), () {
-          orderTick = null;
-          ref.read(agentsCatalogEpochProvider.notifier).state++;
-        });
-      },
-    );
-  },
-);
 
 class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
   ActiveAcpSessions(
@@ -170,10 +224,10 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     required LocalNotificationService notifications,
     required bool Function(String chatId) isChatFocused,
     this.onLocalChange,
-  })  : _keepAlive = keepAlive,
-        _notifications = notifications,
-        _isChatFocused = isChatFocused,
-        super({});
+  }) : _keepAlive = keepAlive,
+       _notifications = notifications,
+       _isChatFocused = isChatFocused,
+       super({});
 
   final AppDatabase _db;
   final BackgroundKeepAlive _keepAlive;
@@ -207,11 +261,9 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       _adsmStatusPollSoon = null;
       return;
     }
-    if (_adsmStatusPoll == null) {
-      _adsmStatusPoll = Timer.periodic(_adsmStatusPollInterval, (_) {
-        unawaited(_pollAllAdsmStatuses());
-      });
-    }
+    _adsmStatusPoll ??= Timer.periodic(_adsmStatusPollInterval, (_) {
+      unawaited(_pollAllAdsmStatuses());
+    });
     // Coalesce transport-ready storms (N chats reconnecting on one host)
     // instead of firing N immediate agents.list sweeps that jank the UI.
     if (kickSoon) {
@@ -294,7 +346,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       if (sessionFactory != null) existing.sessionFactory = sessionFactory;
       existing.replaceSession(session);
       // Host/DB may have advanced while the bridge was down.
-      unawaited(existing.pullHostTranscriptAndSync());
+      unawaited(existing.syncTranscriptFromDb());
       // Do NOT copy the map here — identity churn rebuilt Agents sidebar +
       // ChatScreen on every reconnect while the runtime instance is unchanged.
       _syncKeepAlive();
@@ -310,6 +362,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       onLocalChange: _onRuntimeLocalChange,
       onTransportReady: _onTransportReady,
       sessionFactory: sessionFactory,
+      shouldAutoReconnect: () => _isChatFocused(chatId),
       onAssistantText: (snippet) {
         final title = runtime.chatMeta?.title ?? 'Agent';
         unawaited(
@@ -323,14 +376,15 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       },
     );
     await runtime.restoreOutboundQueue();
-    final messages = await _db.listMessages(chatId);
+    final messages = await _db.listRecentMessages(
+      chatId,
+      limit: ChatSessionRuntime.residentTranscriptLimit,
+    );
     runtime.hydrateFromMessages(messages);
     runtime.startListening();
     await runtime.rememberSessionId();
     state = {...state, chatId: runtime};
     runtime.resumeOutboundQueue();
-    // Push any local-only rows up so the host stays complete.
-    unawaited(runtime.pushTranscriptToHost());
     _syncKeepAlive();
     _syncAdsmStatusPoll(kickSoon: true);
     return runtime;
@@ -340,7 +394,8 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
     if (!state.containsKey(chatId)) return;
     // Runtime instance is stable across reconnect — ChatScreen already listens
     // to it. Copying the Riverpod map was rebuilding the whole Agents list.
-    unawaited(state[chatId]?.syncTranscriptFromDb());
+    // attach already merged the bounded host transcript; do not launch a
+    // second concurrent DB merge here.
     _syncKeepAlive();
     _syncAdsmStatusPoll(kickSoon: true);
   }
@@ -497,8 +552,8 @@ class ChatComposerDrafts extends StateNotifier<Map<String, String>> {
 
 final chatComposerDraftsProvider =
     StateNotifierProvider<ChatComposerDrafts, Map<String, String>>(
-  (ref) => ChatComposerDrafts(),
-);
+      (ref) => ChatComposerDrafts(),
+    );
 
 /// Chat currently open in the UI — used to suppress local notifications.
 final focusedChatIdProvider = StateProvider<String?>((ref) => null);
@@ -509,6 +564,7 @@ enum DesktopRightPanel {
   hosts,
   vpn,
   settings,
+
   /// Project file browser for the active chat's repo (opened from chat).
   files,
 }
@@ -527,18 +583,25 @@ class DesktopProjectFilesArgs {
 }
 
 /// Right-hand panel on macOS / desktop (Automate, Hosts, VPN, Settings, Files).
-final desktopRightPanelProvider =
-    StateProvider<DesktopRightPanel>((ref) => DesktopRightPanel.none);
+final desktopRightPanelProvider = StateProvider<DesktopRightPanel>(
+  (ref) => DesktopRightPanel.none,
+);
+
+/// In-panel Settings navigation on desktop (MCP / API keys) without leaving
+/// the current chat URL. Values like `/settings/keys` or `/settings/mcp/<id>`.
+final desktopSettingsOverlayProvider = StateProvider<String?>((ref) => null);
 
 /// Left-sidebar browse mode on macOS: recency agents, directories, or hosts.
 enum AgentsSidebarMode { agents, directories, hosts }
 
-final agentsSidebarModeProvider =
-    StateProvider<AgentsSidebarMode>((ref) => AgentsSidebarMode.agents);
+final agentsSidebarModeProvider = StateProvider<AgentsSidebarMode>(
+  (ref) => AgentsSidebarMode.agents,
+);
 
 /// Host + path for [DesktopRightPanel.files]; cleared when the panel closes.
-final desktopProjectFilesProvider =
-    StateProvider<DesktopProjectFilesArgs?>((ref) => null);
+final desktopProjectFilesProvider = StateProvider<DesktopProjectFilesArgs?>(
+  (ref) => null,
+);
 
 /// True while the Flutter app is in the resumed lifecycle state.
 final appInForegroundProvider = StateProvider<bool>((ref) => true);

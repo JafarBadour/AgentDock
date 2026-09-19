@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' show max, min;
 
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -22,19 +23,36 @@ class AppDatabase {
   final String? overridePath;
 
   Database? _db;
+  Future<Database>? _opening;
 
   Future<Database> get database async {
     if (_db != null) return _db!;
-    _db = await _open();
-    return _db!;
+    // Several providers start together on the first frame. Without memoizing
+    // the in-flight open, each caller can race through `_db == null` and open
+    // the same SQLite file independently (including concurrent migrations).
+    // Besides lock contention, result decoding from those duplicate opens can
+    // starve Flutter's UI isolate.
+    final opening = _opening ??= _open();
+    try {
+      final db = await opening;
+      _db = db;
+      return db;
+    } catch (_) {
+      if (identical(_opening, opening)) _opening = null;
+      rethrow;
+    }
   }
 
   Future<Database> _open() async {
-    final path = overridePath ??
-        p.join((await getApplicationDocumentsDirectory()).path, 'agentic_phone.db');
+    final path =
+        overridePath ??
+        p.join(
+          (await getApplicationDocumentsDirectory()).path,
+          'agentic_phone.db',
+        );
     return openDatabase(
       path,
-      version: 15,
+      version: 17,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -97,6 +115,14 @@ CREATE TABLE messages (
         await db.execute('CREATE INDEX idx_repos_host ON repos(host_id)');
         await db.execute('CREATE INDEX idx_chats_repo ON chats(repo_id)');
         await db.execute('CREATE INDEX idx_messages_chat ON messages(chat_id)');
+        await db.execute(
+          'CREATE INDEX idx_messages_chat_created '
+          'ON messages(chat_id, created_at DESC)',
+        );
+        await db.execute(
+          'CREATE INDEX idx_messages_unread '
+          'ON messages(role, chat_id, created_at)',
+        );
         await _createMcpTables(db);
         await _createScheduledJobsTable(db);
       },
@@ -151,9 +177,7 @@ CREATE TABLE messages (
           );
         }
         if (oldVersion < 13) {
-          await db.execute(
-            'ALTER TABLE chats ADD COLUMN code_delta_day TEXT',
-          );
+          await db.execute('ALTER TABLE chats ADD COLUMN code_delta_day TEXT');
           final today = codeDeltaLocalDayKey();
           await db.update(
             'chats',
@@ -197,6 +221,21 @@ AND (
 )
 ''');
         }
+        if (oldVersion < 16) {
+          await db.execute(
+            'ALTER TABLE mcp_host_links ADD COLUMN targets_json TEXT',
+          );
+        }
+        if (oldVersion < 17) {
+          await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_chat_created '
+            'ON messages(chat_id, created_at DESC)',
+          );
+          await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_unread '
+            'ON messages(role, chat_id, created_at)',
+          );
+        }
       },
     );
   }
@@ -235,7 +274,9 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     final info = await db.rawQuery('PRAGMA table_info(scheduled_jobs)');
     final names = {for (final c in info) c['name'] as String?};
     if (!names.contains('done_prompt')) {
-      await db.execute('ALTER TABLE scheduled_jobs ADD COLUMN done_prompt TEXT');
+      await db.execute(
+        'ALTER TABLE scheduled_jobs ADD COLUMN done_prompt TEXT',
+      );
     }
     if (!names.contains('context_summary')) {
       await db.execute(
@@ -259,10 +300,7 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
         'ALTER TABLE scheduled_jobs ADD COLUMN number INTEGER NOT NULL DEFAULT 0',
       );
     }
-    final rows = await db.query(
-      'scheduled_jobs',
-      orderBy: 'created_at ASC',
-    );
+    final rows = await db.query('scheduled_jobs', orderBy: 'created_at ASC');
     for (var i = 0; i < rows.length; i++) {
       final current = rows[i]['number'] as int? ?? 0;
       if (current > 0) continue;
@@ -352,6 +390,7 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   enabled INTEGER NOT NULL DEFAULT 1,
   install_status TEXT NOT NULL DEFAULT 'pending',
   install_detail TEXT,
+  targets_json TEXT,
   PRIMARY KEY (mcp_id, host_id),
   FOREIGN KEY (mcp_id) REFERENCES mcp_servers (id) ON DELETE CASCADE,
   FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
@@ -398,7 +437,11 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
 
   Future<void> upsertHost(Host host) async {
     final db = await database;
-    await db.insert('hosts', host.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+      'hosts',
+      host.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   Future<void> deleteHost(String id) async {
@@ -470,7 +513,9 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     final path = _normalizePath(remotePath);
     final existing = await findRepoByHostAndPath(hostId, path);
     if (existing != null) return existing;
-    final base = path == '/' ? 'root' : path.split('/').where((s) => s.isNotEmpty).last;
+    final base = path == '/'
+        ? 'root'
+        : path.split('/').where((s) => s.isNotEmpty).last;
     final repo = Repo(
       id: const Uuid().v4(),
       hostId: hostId,
@@ -495,7 +540,11 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
 
   Future<void> upsertRepo(Repo repo) async {
     final db = await database;
-    await db.insert('repos', repo.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+      'repos',
+      repo.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   Future<void> deleteRepo(String id) async {
@@ -578,10 +627,7 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   }
 
   /// Persist the in-memory outbound prompt queue for [chatId].
-  Future<void> setOutboundQueue(
-    String chatId,
-    List<ChatMessage> queue,
-  ) async {
+  Future<void> setOutboundQueue(String chatId, List<ChatMessage> queue) async {
     final db = await database;
     final payload = queue.isEmpty
         ? null
@@ -629,7 +675,44 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
       'messages',
       where: 'chat_id = ?',
       whereArgs: [chatId],
-      orderBy: 'created_at ASC',
+      orderBy: 'created_at ASC, rowid ASC',
+    );
+    return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Newest [limit] messages (ASC order) — for fast chat open without loading
+  /// the full history into memory on the UI isolate.
+  Future<List<ChatMessage>> listRecentMessages(
+    String chatId, {
+    int limit = 250,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'messages',
+      where: 'chat_id = ?',
+      whereArgs: [chatId],
+      // Reverse below restores chronological + insertion order, including
+      // deterministic ordering when two events share the same timestamp.
+      orderBy: 'created_at DESC, rowid DESC',
+      limit: limit,
+    );
+    return rows.reversed.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Stable chronological page without materializing the whole transcript.
+  Future<List<ChatMessage>> listMessagePage(
+    String chatId, {
+    required int offset,
+    int? limit,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'messages',
+      where: 'chat_id = ?',
+      whereArgs: [chatId],
+      orderBy: 'created_at ASC, rowid ASC',
+      limit: limit ?? -1,
+      offset: offset,
     );
     return rows.map(ChatMessage.fromMap).toList();
   }
@@ -714,7 +797,10 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   }
 
   /// Replace all messages for a chat (destructive; only for an explicit reset).
-  Future<void> replaceMessages(String chatId, List<ChatMessage> messages) async {
+  Future<void> replaceMessages(
+    String chatId,
+    List<ChatMessage> messages,
+  ) async {
     final db = await database;
     await db.transaction((txn) async {
       await txn.delete('messages', where: 'chat_id = ?', whereArgs: [chatId]);
@@ -739,22 +825,44 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
     final db = await database;
     var changed = 0;
     await db.transaction((txn) async {
-      final existing = await txn.query(
+      // Never deserialize the entire local transcript to merge a bounded host
+      // tail. Fetch exact ids in SQLite-sized chunks, plus a bounded recent
+      // window for cross-device duplicate-content detection.
+      final byId = <String, Map<String, Object?>>{};
+      final ids = incoming.map((m) => m.id).toSet().toList(growable: false);
+      const idChunk = 300;
+      for (var i = 0; i < ids.length; i += idChunk) {
+        final end = min(i + idChunk, ids.length);
+        final chunk = ids.sublist(i, end);
+        final rows = await txn.query(
+          'messages',
+          where:
+              'chat_id = ? AND id IN (${List.filled(chunk.length, '?').join(',')})',
+          whereArgs: [chatId, ...chunk],
+        );
+        for (final row in rows) {
+          byId[row['id']! as String] = row;
+        }
+      }
+      final duplicateWindow = max(1800, incoming.length * 2);
+      final recent = await txn.query(
         'messages',
+        columns: ['id', 'role', 'content'],
         where: 'chat_id = ?',
         whereArgs: [chatId],
+        orderBy: 'created_at DESC, rowid DESC',
+        limit: duplicateWindow,
       );
-      final byId = {
-        for (final row in existing) row['id']! as String: row,
-      };
-      final contentKeys = <String>{
-        for (final row in existing)
-          '${row['role']}|${row['content']}',
+      final contentKeys = <(String, String)>{
+        for (final row in recent)
+          (row['role']! as String, row['content']! as String),
+        for (final row in byId.values)
+          (row['role']! as String, row['content']! as String),
       };
       for (final m in incoming) {
         final prev = byId[m.id];
         if (prev == null) {
-          final key = '${m.role.name}|${m.content}';
+          final key = (m.role.name, m.content);
           if (contentKeys.contains(key)) {
             // Same bubble already present under another id.
             continue;
@@ -777,8 +885,8 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
             where: 'id = ?',
             whereArgs: [m.id],
           );
-          contentKeys.remove('${m.role.name}|$prevContent');
-          contentKeys.add('${m.role.name}|${m.content}');
+          contentKeys.remove((m.role.name, prevContent));
+          contentKeys.add((m.role.name, m.content));
           changed++;
         }
       }
@@ -842,7 +950,11 @@ GROUP BY m.chat_id
 
   Future<McpServer?> getMcpServer(String id) async {
     final db = await database;
-    final rows = await db.query('mcp_servers', where: 'id = ?', whereArgs: [id]);
+    final rows = await db.query(
+      'mcp_servers',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
     if (rows.isEmpty) return null;
     return McpServer.fromMap(rows.first);
   }
@@ -861,7 +973,10 @@ GROUP BY m.chat_id
     await db.delete('mcp_servers', where: 'id = ?', whereArgs: [id]);
   }
 
-  Future<List<McpHostLink>> listMcpHostLinks({String? mcpId, String? hostId}) async {
+  Future<List<McpHostLink>> listMcpHostLinks({
+    String? mcpId,
+    String? hostId,
+  }) async {
     final db = await database;
     if (mcpId != null && hostId != null) {
       final rows = await db.query(
@@ -912,7 +1027,10 @@ GROUP BY m.chat_id
   /// MCP servers enabled for [hostId] (for ACP session/new).
   Future<List<McpServer>> listEnabledMcpsForHost(String hostId) async {
     final links = await listMcpHostLinks(hostId: hostId);
-    final enabledIds = links.where((l) => l.enabled).map((l) => l.mcpId).toSet();
+    final enabledIds = links
+        .where((l) => l.enabled)
+        .map((l) => l.mcpId)
+        .toSet();
     if (enabledIds.isEmpty) return const [];
     final all = await listMcpServers();
     return all.where((m) => enabledIds.contains(m.id)).toList();
