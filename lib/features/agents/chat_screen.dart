@@ -150,6 +150,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   DateTime? _lastScrollToEndAt;
   double _lastScrollMaxExtent = 0;
 
+  /// Bumped on every real user scroll so scheduled jumpTo/land callbacks abort
+  /// instead of fighting the trackpad (that made the scrollbar thrash).
+  int _userScrollGen = 0;
+
+  /// Distance-from-end thresholds with hysteresis so trackpad inertia near the
+  /// bottom cannot flip follow on/off every frame.
+  static const double _unfollowFromEndPx = 72;
+  static const double _refollowFromEndPx = 28;
+
   /// Fingerprint of transcript content; activity-only changes skip list rebuild.
   String _lastTranscriptFp = '';
   int _emptyLandIdleFrames = 0;
@@ -230,6 +239,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final showJump = !follow;
     if (_showJumpToLatest.value != showJump) {
       _showJumpToLatest.value = showJump;
+    }
+  }
+
+  /// Apply follow hysteresis from a user-driven scroll. Keeps the scrollbar
+  /// stable while reading just above the live edge.
+  void _onUserScrollIntent(
+    ScrollDirection direction,
+    ScrollMetrics metrics,
+  ) {
+    _userScrollGen++;
+    // Abort initial land-at-bottom pinning if the user already took over.
+    if (!_landedAtBottom) {
+      _landedAtBottom = true;
+      _emptyLandIdleFrames = 99;
+    }
+    final max = metrics.maxScrollExtent;
+    final fromEnd = max <= 0 ? 0.0 : max - metrics.pixels;
+    if (fromEnd > _unfollowFromEndPx) {
+      if (_followOutput) _setFollowOutput(false);
+      return;
+    }
+    if (fromEnd <= _refollowFromEndPx &&
+        direction == ScrollDirection.forward) {
+      if (!_followOutput) _setFollowOutput(true);
     }
   }
 
@@ -1970,9 +2003,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// The list is lazy, so its scroll extent keeps growing for several frames as
   /// rows are built and markdown lays out. Animating would chase a target that
   /// is still moving and stop short, so pin to the end until it settles.
-  void _landAtBottom({int framesLeft = 3}) {
+  void _landAtBottom({int framesLeft = 3, int? gen}) {
+    final landGen = gen ?? _userScrollGen;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      // User took over — stop pinning.
+      if (landGen != _userScrollGen || !_followOutput) {
+        _landedAtBottom = true;
+        return;
+      }
       if (_scroll.hasClients) {
         final max = _scroll.position.maxScrollExtent;
         // Empty / near-empty transcripts: don't burn frames jumping to 0.
@@ -1995,20 +2034,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }
       }
       if (framesLeft > 1) {
-        _landAtBottom(framesLeft: framesLeft - 1);
+        _landAtBottom(framesLeft: framesLeft - 1, gen: landGen);
       } else {
         _landedAtBottom = true;
         _setFollowOutput(true);
       }
     });
-  }
-
-  /// Close enough to the end that the user is following the live turn rather
-  /// than reading back through history.
-  bool get _isNearBottom {
-    if (!_scroll.hasClients) return true;
-    final position = _scroll.position;
-    return position.maxScrollExtent - position.pixels < 160;
   }
 
   void _scrollToEnd({bool force = false}) {
@@ -2019,10 +2050,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _setFollowOutput(true);
     }
     if (!force && (!_landedAtBottom || !_followOutput)) return;
+    final gen = _userScrollGen;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients) return;
       // Re-check: user may have scrolled away since this was scheduled.
-      if (!force && !_followOutput) return;
+      if (!force && (!_followOutput || gen != _userScrollGen)) return;
       final max = _scroll.position.maxScrollExtent;
       if (max < 1) {
         _lastScrollMaxExtent = max;
@@ -2050,7 +2082,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       // jumpTo (not animateTo): streaming fires many times per second and
       // stacked animations lock the user out of manual scrolling.
       _scroll.jumpTo(max);
-      _setFollowOutput(true);
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _programmaticScroll = false;
       });
@@ -2841,20 +2872,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }();
         final connected = runtime != null && !runtime.closed;
         final reconnecting = runtime?.reconnecting ?? false;
-        final sending = runtime?.sendingToHost == true;
-        final activeToolEntries = runtime == null
-            ? const <ToolCallState>[]
-            : [
-                for (final e in runtime.entries)
-                  if (e.tool?.isActive ?? false) e.tool!,
-              ];
-        final activeTools = activeToolEntries.length;
-        final pollingTools = [
-          for (final t in activeToolEntries)
-            if (t.isPollingWait) t,
-        ];
-        final isPolling = pollingTools.isNotEmpty;
-        final activityLabel = runtime?.activityLabel;
 
         final extra = <Widget>[];
         // Keep live text visible even if isWorking cleared a tick before flush —
@@ -2927,6 +2944,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         final statusLabel = _chromeStatusLabel(_runtime);
                         return Text(
                           '${_repo?.name ?? ''} · ${_chat!.provider.label}$statusLabel',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: theme.textTheme.bodySmall,
                         );
                       },
@@ -3343,24 +3362,46 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               Expanded(
                 child: Stack(
                   children: [
-                    NotificationListener<UserScrollNotification>(
+                    NotificationListener<ScrollNotification>(
                       onNotification: (notification) {
-                        if (_programmaticScroll ||
-                            _shiftingWindow ||
-                            !_landedAtBottom) {
+                        if (_programmaticScroll || _shiftingWindow) {
                           return false;
                         }
-                        // reverse = toward older messages (top); stop auto-follow.
-                        if (notification.direction == ScrollDirection.reverse) {
-                          if (_followOutput) _setFollowOutput(false);
-                          _maybeLoadOlderHistory();
-                        } else if (notification.direction ==
-                            ScrollDirection.forward) {
-                          if (_isNearBottom && !_followOutput) {
-                            _setFollowOutput(true);
+                        // Trackpad / wheel / touch: UserScrollNotification.
+                        if (notification is UserScrollNotification) {
+                          if (notification.direction != ScrollDirection.idle) {
+                            _onUserScrollIntent(
+                              notification.direction,
+                              notification.metrics,
+                            );
                           }
-                          // Past softMax (~370): ditch oldest page when heading down.
-                          _maybeTrimOlderHistory();
+                          if (notification.direction ==
+                              ScrollDirection.reverse) {
+                            _maybeLoadOlderHistory();
+                          } else if (notification.direction ==
+                              ScrollDirection.forward) {
+                            // Past softMax (~370): ditch oldest page near live end.
+                            _maybeTrimOlderHistory();
+                          }
+                          return false;
+                        }
+                        // Scrollbar thumb / drag may only emit ScrollUpdate.
+                        if (notification is ScrollUpdateNotification &&
+                            notification.dragDetails != null &&
+                            notification.scrollDelta != null &&
+                            notification.scrollDelta != 0) {
+                          final direction = notification.scrollDelta! > 0
+                              ? ScrollDirection.forward
+                              : ScrollDirection.reverse;
+                          _onUserScrollIntent(
+                            direction,
+                            notification.metrics,
+                          );
+                          if (direction == ScrollDirection.reverse) {
+                            _maybeLoadOlderHistory();
+                          } else {
+                            _maybeTrimOlderHistory();
+                          }
                         }
                         return false;
                       },
@@ -3560,76 +3601,90 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   },
                 ),
               if (streaming)
-                Material(
-                  color: theme.colorScheme.errorContainer.withValues(
-                    alpha: 0.35,
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 4,
+                // Fixed height so activity-label churn cannot resize the
+                // transcript viewport (that made the scrollbar jump).
+                SizedBox(
+                  height: 32,
+                  child: Material(
+                    color: theme.colorScheme.errorContainer.withValues(
+                      alpha: 0.35,
                     ),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Shimmer(
-                            enabled: false,
-                            child: Builder(
-                              builder: (context) {
-                                final explore = runtime?.turnExploreStats;
-                                final style = theme.textTheme.bodyMedium
-                                    ?.copyWith(
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                      fontWeight: FontWeight.w500,
-                                      fontFeatures: const [
-                                        FontFeature.tabularFigures(),
-                                      ],
-                                    );
-                                // Polling waits are the thing users confuse with
-                                // "stuck" — surface that above explore totals.
-                                if (isPolling) {
-                                  final label =
-                                      '${pollingTools.first.displayTitle} · Polling';
-                                  final text =
-                                      label.endsWith('…') ||
-                                          label.endsWith('...')
-                                      ? label
-                                      : '$label…';
-                                  return Text(text, style: style);
-                                }
-                                if (explore != null && explore.isNotEmpty) {
-                                  return ExploreStatsLabel(
-                                    files: explore.fileCount,
-                                    searches: explore.searchCount,
-                                    style: style,
-                                    showEllipsis: true,
-                                  );
-                                }
-                                final String label;
-                                if (sending) {
-                                  label = activityLabel?.isNotEmpty == true
-                                      ? activityLabel!
-                                      : 'Sending to host…';
-                                } else if (activityLabel != null &&
-                                    activityLabel.isNotEmpty) {
-                                  label = activityLabel;
-                                } else if (activeTools == 1) {
-                                  label = activeToolEntries.first.displayTitle;
-                                } else if (activeTools > 1) {
-                                  label = 'Working · $activeTools tools';
-                                } else {
-                                  label = 'Thinking';
-                                }
-                                final text =
-                                    label.endsWith('…') || label.endsWith('...')
-                                    ? label
-                                    : '$label…';
-                                return Text(text, style: style);
-                              },
-                            ),
-                          ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: ListenableBuilder(
+                          listenable: _chromeUiEpoch,
+                          builder: (context, _) {
+                            final rt = _runtime;
+                            final explore = rt?.turnExploreStats;
+                            final style = theme.textTheme.bodyMedium?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                              fontWeight: FontWeight.w500,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            );
+                            final active = rt == null
+                                ? const <ToolCallState>[]
+                                : [
+                                    for (final e in rt.entries)
+                                      if (e.tool?.isActive ?? false) e.tool!,
+                                  ];
+                            final polling = [
+                              for (final t in active)
+                                if (t.isPollingWait) t,
+                            ];
+                            final act = rt?.activityLabel;
+                            if (polling.isNotEmpty) {
+                              final label =
+                                  '${polling.first.displayTitle} · Polling';
+                              final text =
+                                  label.endsWith('…') || label.endsWith('...')
+                                  ? label
+                                  : '$label…';
+                              return Text(
+                                text,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: style,
+                              );
+                            }
+                            if (explore != null && explore.isNotEmpty) {
+                              return ExploreStatsLabel(
+                                files: explore.fileCount,
+                                searches: explore.searchCount,
+                                style: style,
+                                showEllipsis: true,
+                              );
+                            }
+                            final String label;
+                            if (rt?.sendingToHost == true) {
+                              label = act?.isNotEmpty == true
+                                  ? act!
+                                  : 'Sending to host…';
+                            } else if (act != null && act.isNotEmpty) {
+                              label = act;
+                            } else if (active.length == 1) {
+                              label = active.first.displayTitle;
+                            } else if (active.length > 1) {
+                              label = 'Working · ${active.length} tools';
+                            } else {
+                              label = 'Thinking';
+                            }
+                            final text =
+                                label.endsWith('…') || label.endsWith('...')
+                                ? label
+                                : '$label…';
+                            return Text(
+                              text,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: style,
+                            );
+                          },
                         ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
