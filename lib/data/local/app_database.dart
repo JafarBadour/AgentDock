@@ -263,20 +263,38 @@ AND (
           );
         }
         if (oldVersion < 20) {
-          await db.execute(
-            "ALTER TABLE skills ADD COLUMN bundle_json TEXT NOT NULL DEFAULT '[]'",
+          // Skills created in the <19 step already include these columns when
+          // using the current CREATE TABLE — only ALTER for DBs that had v19
+          // without bundle/targets.
+          await _addColumnIfMissing(
+            db,
+            table: 'skills',
+            column: 'bundle_json',
+            sql:
+                "ALTER TABLE skills ADD COLUMN bundle_json TEXT NOT NULL DEFAULT '[]'",
           );
-          try {
-            await db.execute(
-              'ALTER TABLE skill_host_links ADD COLUMN targets_json TEXT',
-            );
-          } catch (_) {
-            // Column may already exist on fresh installs that used updated
-            // CREATE TABLE from this same schema version.
-          }
+          await _addColumnIfMissing(
+            db,
+            table: 'skill_host_links',
+            column: 'targets_json',
+            sql: 'ALTER TABLE skill_host_links ADD COLUMN targets_json TEXT',
+          );
         }
       },
     );
+  }
+
+  /// SQLite has no IF NOT EXISTS for ADD COLUMN — check first.
+  static Future<void> _addColumnIfMissing(
+    Database db, {
+    required String table,
+    required String column,
+    required String sql,
+  }) async {
+    final rows = await db.rawQuery('PRAGMA table_info($table)');
+    final exists = rows.any((r) => '${r['name']}' == column);
+    if (exists) return;
+    await db.execute(sql);
   }
 
   bool _mcpDeduped = false;
