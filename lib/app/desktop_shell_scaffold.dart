@@ -13,6 +13,7 @@ import '../features/hosts/hosts_screen.dart';
 import '../features/settings/api_keys_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
+import '../features/settings/skill_edit_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
 import '../features/vpn/vpn_screen.dart';
 import 'app_theme.dart';
@@ -589,6 +590,20 @@ _SettingsPanelPage? _desktopSettingsBody(String path) {
     return _SettingsPanelPage(
       title: 'MCP',
       child: McpEditScreen(mcpId: id, embedded: true),
+    );
+  }
+  if (segs[1] == 'skills') {
+    if (segs.length < 3) return null;
+    final id = segs[2];
+    if (id == 'new') {
+      return const _SettingsPanelPage(
+        title: 'Add skill',
+        child: SkillEditScreen(embedded: true),
+      );
+    }
+    return _SettingsPanelPage(
+      title: 'Skill',
+      child: SkillEditScreen(skillId: id, embedded: true),
     );
   }
   if (segs[1] == 'keys') {

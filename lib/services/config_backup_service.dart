@@ -5,6 +5,7 @@ import '../data/local/app_database.dart';
 import '../data/models/host.dart';
 import '../data/models/mcp_server.dart';
 import '../data/models/repo.dart';
+import '../data/models/skill.dart';
 import '../data/secure/safe_log.dart';
 
 /// Portable config backup (`.ag` = JSON). Never includes SSH keys or API keys.
@@ -22,6 +23,8 @@ class ConfigBackupService {
     final repos = await _db.listRepos();
     final mcps = await _db.listMcpServers();
     final links = await _db.listMcpHostLinks();
+    final skills = await _db.listSkills();
+    final skillLinks = await _db.listSkillHostLinks();
 
     return {
       'format': formatId,
@@ -46,6 +49,16 @@ class ConfigBackupService {
           'host_id': l.hostId,
           'enabled': l.enabled ? 1 : 0,
           'install_status': McpHostInstallStatus.pending.name,
+          'install_detail': null,
+        };
+      }).toList(),
+      'skills': skills.map((s) => s.toMap()).toList(),
+      'skillHostLinks': skillLinks.map((l) {
+        return {
+          'skill_id': l.skillId,
+          'host_id': l.hostId,
+          'enabled': l.enabled ? 1 : 0,
+          'install_status': SkillHostInstallStatus.pending.name,
           'install_detail': null,
         };
       }).toList(),
@@ -87,6 +100,8 @@ class ConfigBackupService {
     var reposN = 0;
     var mcpsN = 0;
     var linksN = 0;
+    var skillsN = 0;
+    var skillLinksN = 0;
 
     final hostsRaw = root['hosts'];
     if (hostsRaw is List) {
@@ -172,12 +187,55 @@ class ConfigBackupService {
       }
     }
 
-    SafeLog.d('Imported .ag hosts=$hostsN repos=$reposN mcps=$mcpsN links=$linksN');
+    final skillsRaw = root['skills'];
+    if (skillsRaw is List) {
+      for (final item in skillsRaw) {
+        if (item is! Map) continue;
+        final skill = AgentSkill.fromMap(Map<String, Object?>.from(item));
+        final existing = await _db.findSkillByName(skill.name);
+        if (existing != null && existing.id != skill.id) {
+          final preferIncoming = skill.bodyMarkdown.trim().length >
+              existing.bodyMarkdown.trim().length;
+          await _db.upsertSkill(
+            preferIncoming
+                ? AgentSkill(
+                    id: existing.id,
+                    name: skill.name.trim(),
+                    description: skill.description,
+                    bodyMarkdown: skill.bodyMarkdown,
+                    disableModelInvocation: skill.disableModelInvocation,
+                    createdAt: existing.createdAt,
+                  )
+                : existing,
+          );
+        } else {
+          await _db.upsertSkill(skill);
+        }
+        skillsN++;
+      }
+    }
+
+    final skillLinksRaw = root['skillHostLinks'];
+    if (skillLinksRaw is List) {
+      for (final item in skillLinksRaw) {
+        if (item is! Map) continue;
+        final link = SkillHostLink.fromMap(Map<String, Object?>.from(item));
+        await _db.upsertSkillHostLink(link);
+        skillLinksN++;
+      }
+    }
+
+    SafeLog.d(
+      'Imported .ag hosts=$hostsN repos=$reposN mcps=$mcpsN links=$linksN '
+      'skills=$skillsN skillLinks=$skillLinksN',
+    );
     return ConfigImportResult(
       hosts: hostsN,
       repos: reposN,
       mcpServers: mcpsN,
       mcpHostLinks: linksN,
+      skills: skillsN,
+      skillHostLinks: skillLinksN,
     );
   }
 }
@@ -188,14 +246,19 @@ class ConfigImportResult {
     required this.repos,
     required this.mcpServers,
     required this.mcpHostLinks,
+    this.skills = 0,
+    this.skillHostLinks = 0,
   });
 
   final int hosts;
   final int repos;
   final int mcpServers;
   final int mcpHostLinks;
+  final int skills;
+  final int skillHostLinks;
 
   String get summary =>
-      'Imported $hosts host(s), $repos repo(s), $mcpServers MCP(s), $mcpHostLinks link(s). '
+      'Imported $hosts host(s), $repos repo(s), $mcpServers MCP(s), '
+      '$mcpHostLinks MCP link(s), $skills skill(s), $skillHostLinks skill link(s). '
       'SSH keys are not included — add them in Settings.';
 }

@@ -12,6 +12,7 @@ import '../data/models/host.dart';
 import '../data/models/repo.dart';
 import '../data/secure/safe_log.dart';
 import 'mcp_deploy_service.dart';
+import 'skill_deploy_service.dart';
 import 'ssh_service.dart';
 
 /// One agent metadata file under `~/.agentdock/agents/<id>.json`.
@@ -688,6 +689,14 @@ class AgentDockService {
       ).syncRemoteMcpState(host).timeout(const Duration(seconds: 20));
     } catch (e) {
       SafeLog.d('remote MCP probe ${host.alias} failed', e);
+    }
+    try {
+      await SkillDeployService(
+        _ssh,
+        _db,
+      ).syncRemoteSkillState(host).timeout(const Duration(seconds: 20));
+    } catch (e) {
+      SafeLog.d('remote skill probe ${host.alias} failed', e);
     }
     return merged;
   }

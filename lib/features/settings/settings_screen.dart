@@ -11,6 +11,7 @@ import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
 import '../../data/models/mcp_server.dart';
+import '../../data/models/skill.dart';
 import '../../data/secure/safe_log.dart';
 import '../agents/agents_screen.dart';
 import '../connect/connect_screen.dart';
@@ -26,6 +27,18 @@ final mcpHostLinksProvider = FutureProvider.autoDispose<List<McpHostLink>>((
 ) {
   ref.watch(agentsCatalogEpochProvider);
   return ref.watch(appDatabaseProvider).listMcpHostLinks();
+});
+
+final skillListProvider = FutureProvider.autoDispose<List<AgentSkill>>((ref) {
+  ref.watch(agentsCatalogEpochProvider);
+  return ref.watch(appDatabaseProvider).listSkills();
+});
+
+final skillHostLinksProvider = FutureProvider.autoDispose<List<SkillHostLink>>((
+  ref,
+) {
+  ref.watch(agentsCatalogEpochProvider);
+  return ref.watch(appDatabaseProvider).listSkillHostLinks();
 });
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -166,6 +179,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           .importFromFile(path);
       ref.invalidate(mcpListProvider);
       ref.invalidate(mcpHostLinksProvider);
+      ref.invalidate(skillListProvider);
+      ref.invalidate(skillHostLinksProvider);
       ref.invalidate(hostsListProvider);
       ref.invalidate(agentsTreeProvider);
 
@@ -190,6 +205,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Widget build(BuildContext context) {
     final mcps = ref.watch(mcpListProvider);
     final links = ref.watch(mcpHostLinksProvider);
+    final skills = ref.watch(skillListProvider);
+    final skillLinks = ref.watch(skillHostLinksProvider);
     final hostsAsync = ref.watch(hostsListProvider);
 
     final body = ListView(
@@ -323,6 +340,69 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           loading: () => const Center(child: CircularProgressIndicator()),
           error: (e, _) => Text('Error: $e'),
         ),
+        const SizedBox(height: 28),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Skills',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            TextButton.icon(
+              onPressed: () =>
+                  openSettingsSubpage(context, ref, '/settings/skills/new'),
+              icon: const Icon(Icons.add, size: 18),
+              label: const Text('Add'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Markdown Agent Skills (SKILL.md). Enable a host to install under '
+          '~/.cursor/skills/<name>/ and ~/.claude/skills/<name>/.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 16),
+        skills.when(
+          data: (list) {
+            if (list.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Text('No skills yet.'),
+              );
+            }
+            final linkRows =
+                skillLinks.valueOrNull ?? const <SkillHostLink>[];
+            final hosts = hostsAsync.valueOrNull ?? const <Host>[];
+            final hostById = {for (final h in hosts) h.id: h};
+            return Column(
+              children: [
+                for (final skill in list)
+                  Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: const Icon(Icons.auto_awesome_outlined),
+                      title: Text(skill.name),
+                      subtitle: Text(
+                        _skillListSubtitle(skill, linkRows, hostById),
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => openSettingsSubpage(
+                        context,
+                        ref,
+                        '/settings/skills/${skill.id}',
+                      ),
+                    ),
+                  ),
+              ],
+            );
+          },
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => Text('Error: $e'),
+        ),
       ],
     );
 
@@ -386,6 +466,27 @@ String _mcpListSubtitle(
               : '');
     if (clients.isEmpty) continue;
     bits.add('$hostName ($clients)');
+  }
+  return bits.join(' · ');
+}
+
+String _skillListSubtitle(
+  AgentSkill skill,
+  List<SkillHostLink> links,
+  Map<String, Host> hostById,
+) {
+  final bits = <String>[
+    if (skill.description.trim().isNotEmpty) skill.description.trim(),
+  ];
+  for (final link in links) {
+    if (link.skillId != skill.id) continue;
+    if (!link.enabled &&
+        link.installStatus != SkillHostInstallStatus.installed) {
+      continue;
+    }
+    final host = hostById[link.hostId];
+    final hostName = host?.displayLabel ?? link.hostId;
+    bits.add('$hostName (${link.installStatus.name})');
   }
   return bits.join(' · ');
 }
