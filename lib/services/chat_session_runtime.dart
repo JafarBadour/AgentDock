@@ -226,7 +226,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       if (tool == null) continue;
       final at = e.createdAt;
       if (at != null && at.isBefore(start)) continue;
-      yield tool;
+      yield _payloadOrSummary(tool)!;
     }
   }
 
@@ -245,7 +245,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
     for (var i = start; i < entries.length; i++) {
       final tool = entries[i].tool;
-      if (tool != null) yield tool;
+      if (tool != null) yield _payloadOrSummary(tool)!;
     }
   }
 
@@ -327,10 +327,32 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// Ask-mode tool approval waiting for the user on this device.
   PendingPermissionRequest? pendingPermission;
 
+  /// Full tool payloads kept off the UI transcript — used for code/explore
+  /// stats only. Expand loads details from ADSM / SQLite instead.
+  final Map<String, ToolCallState> _toolPayloads = {};
+
+  void _rememberToolPayload(ToolCallState tool) {
+    if (tool.hasPayloads) {
+      _toolPayloads[tool.toolCallId] = tool;
+    }
+  }
+
+  /// Persist-ready full tool; UI-resident copy has no raw I/O blobs.
+  ToolCallState _uiToolSummary(ToolCallState tool) {
+    _rememberToolPayload(tool);
+    return tool.withoutPayloads();
+  }
+
+  ToolCallState? _payloadOrSummary(ToolCallState? tool) {
+    if (tool == null) return null;
+    return _toolPayloads[tool.toolCallId] ?? tool;
+  }
+
   void hydrateFromMessages(List<ChatMessage> messages) {
     entries.clear();
     _toolMessageIds.clear();
     _toolEntryIndexes.clear();
+    _toolPayloads.clear();
     final queuedIds = {for (final m in outboundQueue) m.id};
     final seenToolIds = <String>{};
     for (final m in messages) {
@@ -345,16 +367,17 @@ class ChatSessionRuntime extends ChangeNotifier {
             if (index >= 0) {
               final prev = entries[index].tool!;
               final orphanId = entries[index].messageId;
+              final merged = prev.merge(
+                title: tool.title,
+                kind: tool.kind,
+                status: tool.status,
+                locations: tool.locations.isEmpty ? null : tool.locations,
+                rawInput: tool.rawInput,
+                rawOutput: tool.rawOutput,
+                content: tool.content,
+              );
               entries[index] = TranscriptEntry.tool(
-                prev.merge(
-                  title: tool.title,
-                  kind: tool.kind,
-                  status: tool.status,
-                  locations: tool.locations.isEmpty ? null : tool.locations,
-                  rawInput: tool.rawInput,
-                  rawOutput: tool.rawOutput,
-                  content: tool.content,
-                ),
+                _uiToolSummary(merged),
                 messageId: m.id,
                 createdAt: entries[index].createdAt ?? m.createdAt,
               );
@@ -373,7 +396,11 @@ class ChatSessionRuntime extends ChangeNotifier {
           }
           seenToolIds.add(tid);
           entries.add(
-            TranscriptEntry.tool(tool, messageId: m.id, createdAt: m.createdAt),
+            TranscriptEntry.tool(
+              _uiToolSummary(tool),
+              messageId: m.id,
+              createdAt: m.createdAt,
+            ),
           );
           _toolEntryIndexes[tid] = entries.length - 1;
           _toolMessageIds[tid] = m.id;
@@ -408,23 +435,29 @@ class ChatSessionRuntime extends ChangeNotifier {
         if (tool == null) continue;
         final index = toolIndex[tool.toolCallId] ?? -1;
         if (index >= 0) {
-          final prev = entries[index].tool!;
+          final prevFull =
+              _payloadOrSummary(entries[index].tool!) ?? entries[index].tool!;
+          final merged = prevFull.merge(
+            title: tool.title,
+            kind: tool.kind,
+            status: tool.status,
+            locations: tool.locations.isEmpty ? null : tool.locations,
+            rawInput: tool.rawInput,
+            rawOutput: tool.rawOutput,
+            content: tool.content,
+          );
           entries[index] = TranscriptEntry.tool(
-            prev.merge(
-              title: tool.title,
-              kind: tool.kind,
-              status: tool.status,
-              locations: tool.locations.isEmpty ? null : tool.locations,
-              rawInput: tool.rawInput,
-              rawOutput: tool.rawOutput,
-              content: tool.content,
-            ),
+            _uiToolSummary(merged),
             messageId: entries[index].messageId ?? m.id,
             createdAt: entries[index].createdAt ?? m.createdAt,
           );
         } else {
           entries.add(
-            TranscriptEntry.tool(tool, messageId: m.id, createdAt: m.createdAt),
+            TranscriptEntry.tool(
+              _uiToolSummary(tool),
+              messageId: m.id,
+              createdAt: m.createdAt,
+            ),
           );
           toolIndex[tool.toolCallId] = entries.length - 1;
           _toolEntryIndexes[tool.toolCallId] = entries.length - 1;
@@ -503,6 +536,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     _toolMessageIds
       ..clear()
       ..addAll(retainedTools);
+    _toolPayloads.removeWhere((id, _) => !retainedTools.containsKey(id));
   }
 
   int _entryBytes(TranscriptEntry entry) {
@@ -2466,11 +2500,13 @@ class ChatSessionRuntime extends ChangeNotifier {
         : <int>[knownIndex];
     if (dupIndexes.length > 1) {
       final keep = dupIndexes.first;
-      var mergedTool = entries[keep].tool!;
+      var mergedTool =
+          _payloadOrSummary(entries[keep].tool!) ?? entries[keep].tool!;
       final orphanIds = <String>[];
       for (var d = 1; d < dupIndexes.length; d++) {
         final idx = dupIndexes[d];
-        final other = entries[idx].tool!;
+        final other =
+            _payloadOrSummary(entries[idx].tool!) ?? entries[idx].tool!;
         mergedTool = mergedTool.merge(
           title: other.title,
           kind: other.kind,
@@ -2495,16 +2531,17 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
       final keepId =
           entries[keep].messageId ?? _toolMessageIds[tool.toolCallId];
+      final full = mergedTool.merge(
+        title: tool.title,
+        kind: tool.kind,
+        status: tool.status,
+        locations: tool.locations.isEmpty ? null : tool.locations,
+        rawInput: tool.rawInput,
+        rawOutput: tool.rawOutput,
+        content: tool.content,
+      );
       entries[keep] = TranscriptEntry.tool(
-        mergedTool.merge(
-          title: tool.title,
-          kind: tool.kind,
-          status: tool.status,
-          locations: tool.locations.isEmpty ? null : tool.locations,
-          rawInput: tool.rawInput,
-          rawOutput: tool.rawOutput,
-          content: tool.content,
-        ),
+        _uiToolSummary(full),
         messageId: keepId,
         createdAt: entries[keep].createdAt,
       );
@@ -2516,7 +2553,7 @@ class ChatSessionRuntime extends ChangeNotifier {
               id: keepId,
               chatId: chatId,
               role: MessageRole.tool,
-              content: jsonEncode(entries[keep].tool!.toJson()),
+              content: jsonEncode(full.toJson()),
               createdAt: DateTime.now(),
             ),
           );
@@ -2532,7 +2569,8 @@ class ChatSessionRuntime extends ChangeNotifier {
 
     final index = knownIndex ?? (dupIndexes.isEmpty ? -1 : dupIndexes.first);
     if (index >= 0) {
-      final prev = entries[index].tool!;
+      final prev =
+          _payloadOrSummary(entries[index].tool!) ?? entries[index].tool!;
       final merged = prev.merge(
         title: tool.title,
         kind: tool.kind,
@@ -2545,7 +2583,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       final msgId =
           entries[index].messageId ?? _toolMessageIds[tool.toolCallId];
       entries[index] = TranscriptEntry.tool(
-        merged,
+        _uiToolSummary(merged),
         messageId: msgId,
         createdAt: entries[index].createdAt,
       );
@@ -2568,7 +2606,9 @@ class ChatSessionRuntime extends ChangeNotifier {
       final existingId = _toolMessageIds[tool.toolCallId];
       final msgId = existingId ?? const Uuid().v4();
       _toolMessageIds[tool.toolCallId] = msgId;
-      entries.add(TranscriptEntry.tool(tool, messageId: msgId));
+      entries.add(
+        TranscriptEntry.tool(_uiToolSummary(tool), messageId: msgId),
+      );
       _toolEntryIndexes[tool.toolCallId] = entries.length - 1;
       final message = ChatMessage(
         id: msgId,
@@ -2650,6 +2690,75 @@ class ChatSessionRuntime extends ChangeNotifier {
     await _db.insertMessage(message);
     onLocalChange?.call(chatId);
     _notifyUi(immediate: true);
+  }
+
+  /// Load full tool payloads for an expanded group (ephemeral UI only).
+  ///
+  /// Never returns in-memory payloads — always hits ADSM (when connected)
+  /// then SQLite so the expand spinner is real.
+  Future<List<ToolCallState>> resolveToolDetails({
+    required List<String> toolCallIds,
+    List<String?> messageIds = const [],
+  }) async {
+    if (toolCallIds.isEmpty) return const [];
+    final wanted = toolCallIds.toSet();
+    final byId = <String, ToolCallState>{};
+
+    if (session is AdsmSession) {
+      try {
+        final adsm = session as AdsmSession;
+        final remote = await adsm
+            .pullTranscript(limit: 800, maxBytes: kTranscriptChunkBytes)
+            .timeout(const Duration(seconds: 12));
+        for (final row in remote) {
+          if (row.role != MessageRole.tool) continue;
+          final tool = ToolCallState.tryParseContent(row.content);
+          if (tool == null || !wanted.contains(tool.toolCallId)) continue;
+          byId[tool.toolCallId] = tool;
+        }
+      } catch (e) {
+        SafeLog.d('resolveToolDetails ADSM pull failed', e);
+      }
+    }
+
+    final stillMissing = [
+      for (final id in toolCallIds)
+        if (!(byId[id]?.hasPayloads ?? false)) id,
+    ];
+    final missingIds = [
+      for (final id in messageIds)
+        if (id != null && id.isNotEmpty) id,
+    ];
+    if (stillMissing.isNotEmpty && missingIds.isNotEmpty) {
+      try {
+        final rows = await _db.getMessagesByIds(missingIds);
+        for (final row in rows) {
+          if (row.role != MessageRole.tool) continue;
+          final tool = ToolCallState.tryParseContent(row.content);
+          if (tool == null || !wanted.contains(tool.toolCallId)) continue;
+          byId[tool.toolCallId] = tool;
+        }
+      } catch (e) {
+        SafeLog.d('resolveToolDetails local load failed', e);
+      }
+    }
+
+    // Last resort: any remaining ids that only exist as summaries.
+    for (final id in toolCallIds) {
+      if (byId.containsKey(id)) continue;
+      for (final entry in entries) {
+        final tool = entry.tool;
+        if (tool?.toolCallId == id) {
+          byId[id] = tool!;
+          break;
+        }
+      }
+    }
+
+    return [
+      for (final id in toolCallIds)
+        if (byId[id] != null) byId[id]!,
+    ];
   }
 
   Future<void> disposeRuntime() async {

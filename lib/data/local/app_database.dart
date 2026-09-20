@@ -1046,6 +1046,29 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     await db.delete('messages', where: 'id = ?', whereArgs: [id]);
   }
 
+  Future<ChatMessage?> getMessage(String id) async {
+    final db = await database;
+    final rows = await db.query('messages', where: 'id = ?', whereArgs: [id]);
+    if (rows.isEmpty) return null;
+    return ChatMessage.fromMap(rows.first);
+  }
+
+  Future<List<ChatMessage>> getMessagesByIds(List<String> ids) async {
+    if (ids.isEmpty) return const [];
+    final db = await database;
+    final unique = ids.toSet().toList();
+    final placeholders = List.filled(unique.length, '?').join(',');
+    final rows = await db.query(
+      'messages',
+      where: 'id IN ($placeholders)',
+      whereArgs: unique,
+    );
+    final byId = {
+      for (final row in rows) row['id']! as String: ChatMessage.fromMap(row),
+    };
+    return [for (final id in ids) if (byId[id] != null) byId[id]!];
+  }
+
   Future<void> updateMessage(ChatMessage message) async {
     final db = await database;
     await db.update(

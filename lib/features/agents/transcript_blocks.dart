@@ -192,13 +192,17 @@ List<ChatBlock> buildTranscriptBlocks(
 
     void flushToolRun() {
       if (toolRun.isEmpty) return;
-      if (toolRun.length > 2) {
-        segmentBlocks.add(ChatBlock.tools(List<TranscriptEntry>.from(toolRun)));
-      } else {
-        for (final e in toolRun) {
-          segmentBlocks.add(ChatBlock.single(e));
-        }
-      }
+      // Always one count-only group — details load on expand, not in the list.
+      segmentBlocks.add(
+        ChatBlock.tools([
+          for (final e in toolRun)
+            TranscriptEntry.tool(
+              e.tool!.withoutPayloads(),
+              messageId: e.messageId,
+              createdAt: e.createdAt,
+            ),
+        ]),
+      );
       toolRun.clear();
     }
 

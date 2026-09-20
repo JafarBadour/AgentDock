@@ -5,14 +5,30 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../data/models/tool_call_state.dart';
 import 'agent_status_indicators.dart';
 
-/// Collapsed summary for a run of consecutive tool calls.
+/// Count-only row for a run of consecutive tool calls.
 ///
-/// More than two tools in a row would flood the transcript, so they collapse
-/// into one line that expands into the individual [ToolCallCard]s on tap.
+/// Details stay out of the transcript until the user expands — then they are
+/// fetched (local DB / live runtime / ADSM) and dropped again on collapse so
+/// the widget tree does not keep huge tool payloads mounted.
 class ToolCallGroupCard extends StatefulWidget {
-  const ToolCallGroupCard({super.key, required this.tools});
+  const ToolCallGroupCard({
+    super.key,
+    required this.tools,
+    this.messageIds = const [],
+    this.resolveDetails,
+  });
 
+  /// Lightweight summaries (no raw input/output) used for the count row.
   final List<ToolCallState> tools;
+
+  /// Parallel SQLite message ids for [tools], when known.
+  final List<String?> messageIds;
+
+  /// Loads full tool payloads when the group is expanded.
+  final Future<List<ToolCallState>> Function(
+    List<ToolCallState> summaries,
+    List<String?> messageIds,
+  )? resolveDetails;
 
   @override
   State<ToolCallGroupCard> createState() => _ToolCallGroupCardState();
@@ -20,6 +36,9 @@ class ToolCallGroupCard extends StatefulWidget {
 
 class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   bool _expanded = false;
+  bool _loading = false;
+  String? _loadError;
+  List<ToolCallState>? _details;
 
   bool get _anyActive => widget.tools.any((t) => t.isActive);
   bool get _hardFails => widget.tools.where((t) => t.isHardFail).isNotEmpty;
@@ -28,20 +47,66 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
 
   String get _groupLabel {
     final count = widget.tools.length;
-    final titles = <String>[];
-    final seen = <String>{};
-    for (final t in widget.tools) {
-      final label = t.displayTitle.trim();
-      if (label.isEmpty || !seen.add(label)) continue;
-      titles.add(label);
-      if (titles.length >= 3) break;
+    if (_anyActive) {
+      return count == 1 ? '1 tool running' : '$count tools running';
     }
-    if (titles.isEmpty) {
-      return count == 1 ? '1 tool call' : '$count tool calls';
+    return count == 1 ? '1 tool' : '$count tools';
+  }
+
+  Future<void> _toggle() async {
+    if (_expanded) {
+      // Drop payloads from the tree as soon as the user collapses.
+      setState(() {
+        _expanded = false;
+        _loading = false;
+        _loadError = null;
+        _details = null;
+      });
+      return;
     }
-    final joined = titles.join(' · ');
-    final extra = count > titles.length ? ' · +${count - titles.length}' : '';
-    return '$count tools · $joined$extra';
+
+    setState(() {
+      _expanded = true;
+      _loading = true;
+      _loadError = null;
+      _details = null;
+    });
+    // Let the pending spinner paint before we hit ADSM / SQLite.
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted || !_expanded) return;
+
+    try {
+      final loader = widget.resolveDetails;
+      final loaded = loader == null
+          ? widget.tools
+          : await loader(widget.tools, widget.messageIds);
+      if (!mounted || !_expanded) return;
+      setState(() {
+        _details = loaded.isEmpty ? widget.tools : loaded;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted || !_expanded) return;
+      setState(() {
+        _loading = false;
+        _loadError = '$e';
+        _details = widget.tools;
+      });
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant ToolCallGroupCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If the group identity changed while expanded, drop stale details.
+    if (_expanded &&
+        (oldWidget.tools.length != widget.tools.length ||
+            oldWidget.tools.first.toolCallId != widget.tools.first.toolCallId)) {
+      _details = null;
+      _expanded = false;
+      _loading = false;
+      _loadError = null;
+    }
   }
 
   @override
@@ -63,28 +128,38 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
           children: [
             InkWell(
               borderRadius: BorderRadius.circular(8),
-              onTap: () => setState(() => _expanded = !_expanded),
+              onTap: _loading ? null : () => _toggle(),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
                 child: Row(
                   children: [
-                    Icon(
-                      hard
-                          ? Icons.error_outline
-                          : Icons.auto_awesome_outlined,
-                      size: 14,
-                      color: hard
-                          ? scheme.error
-                          : _anyActive
-                              ? scheme.primary
-                              : scheme.outline,
-                    ),
+                    if (_loading)
+                      SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.5,
+                          color: scheme.primary,
+                        ),
+                      )
+                    else
+                      Icon(
+                        hard
+                            ? Icons.error_outline
+                            : Icons.auto_awesome_outlined,
+                        size: 14,
+                        color: hard
+                            ? scheme.error
+                            : _anyActive
+                                ? scheme.primary
+                                : scheme.outline,
+                      ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Shimmer(
-                        enabled: false,
+                        enabled: _anyActive && !_expanded,
                         child: Text(
-                          _groupLabel,
+                          _loading ? 'Loading tools…' : _groupLabel,
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: labelColor,
                             fontWeight: FontWeight.w500,
@@ -95,7 +170,7 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                         ),
                       ),
                     ),
-                    if (hard) ...[
+                    if (!_loading && hard) ...[
                       Text(
                         _hardFailCount == 1
                             ? 'Failed'
@@ -104,7 +179,7 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                             ?.copyWith(color: scheme.error),
                       ),
                       const SizedBox(width: 4),
-                    ] else if (softOnly) ...[
+                    ] else if (!_loading && softOnly) ...[
                       Text(
                         _softFailCount == 1
                             ? 'Exit 1'
@@ -125,15 +200,40 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                 ),
               ),
             ),
-            if (_expanded)
-              Padding(
-                padding: const EdgeInsets.only(left: 8),
-                child: Column(
-                  children: [
-                    for (final tool in widget.tools) ToolCallCard(tool: tool),
-                  ],
+            if (_expanded) ...[
+              if (_loading)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(22, 8, 8, 8),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                )
+              else ...[
+                if (_loadError != null)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(22, 4, 8, 4),
+                    child: Text(
+                      'Could not load full tool details',
+                      style: theme.textTheme.labelSmall
+                          ?.copyWith(color: scheme.error),
+                    ),
+                  ),
+                Padding(
+                  padding: const EdgeInsets.only(left: 8),
+                  child: Column(
+                    children: [
+                      for (final tool in _details ?? widget.tools)
+                        ToolCallCard(tool: tool),
+                    ],
+                  ),
                 ),
-              ),
+              ],
+            ],
           ],
         ),
       ),
@@ -143,9 +243,7 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
 
 /// One line of agent activity, expandable into the raw input/output.
 ///
-/// Deliberately understated: during a turn there may be a dozen of these
-/// between two sentences, so they read as a quiet log next to the agent's
-/// actual words rather than a stack of cards competing with them.
+/// Only mounted while a [ToolCallGroupCard] is expanded — collapse removes it.
 class ToolCallCard extends StatefulWidget {
   const ToolCallCard({super.key, required this.tool});
 
@@ -247,9 +345,6 @@ class _ToolCallCardState extends State<ToolCallCard> {
                                   : scheme.outline,
                     ),
                     const SizedBox(width: 8),
-                    // Title and detail are one line so they share the width
-                    // naturally and ellipsize as a unit, instead of each being
-                    // capped at its own slice of the row.
                     Expanded(
                       child: Shimmer(
                         enabled: false,

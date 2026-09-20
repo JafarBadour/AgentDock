@@ -1836,6 +1836,48 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     setState(() => _pendingImages.removeAt(index));
   }
 
+  /// Expand a tools group: pull full payloads, then drop them again on collapse.
+  Future<List<ToolCallState>> _resolveToolGroupDetails(
+    List<ToolCallState> summaries,
+    List<String?> messageIds,
+  ) async {
+    final ids = [for (final t in summaries) t.toolCallId];
+    final runtime =
+        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+    if (runtime != null) {
+      return runtime.resolveToolDetails(
+        toolCallIds: ids,
+        messageIds: messageIds,
+      );
+    }
+
+    final byId = <String, ToolCallState>{
+      for (final t in summaries) t.toolCallId: t,
+    };
+    final mids = [
+      for (final id in messageIds)
+        if (id != null && id.isNotEmpty) id,
+    ];
+    if (mids.isNotEmpty) {
+      try {
+        final rows =
+            await ref.read(appDatabaseProvider).getMessagesByIds(mids);
+        for (final row in rows) {
+          if (row.role != MessageRole.tool) continue;
+          final tool = ToolCallState.tryParseContent(row.content);
+          if (tool == null) continue;
+          byId[tool.toolCallId] = tool;
+        }
+      } catch (e) {
+        SafeLog.d('offline tool detail load failed', e);
+      }
+    }
+    return [
+      for (final id in ids)
+        if (byId[id] != null) byId[id]!,
+    ];
+  }
+
   Future<void> _send() async {
     final text = _composer.text.trim();
     if (text.startsWith('/')) {
@@ -3576,10 +3618,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 body = _ThinkingFold(text: block.thinkingOnly!);
                               } else if (tools != null) {
                                 body = ToolCallGroupCard(
-                                  tools: [for (final e in tools) e.tool!],
+                                  tools: [
+                                    for (final e in tools) e.tool!,
+                                  ],
+                                  messageIds: [
+                                    for (final e in tools) e.messageId,
+                                  ],
+                                  resolveDetails: _resolveToolGroupDetails,
                                 );
                               } else if (block.entry!.tool != null) {
-                                body = ToolCallCard(tool: block.entry!.tool!);
+                                final entry = block.entry!;
+                                body = ToolCallGroupCard(
+                                  tools: [entry.tool!.withoutPayloads()],
+                                  messageIds: [entry.messageId],
+                                  resolveDetails: _resolveToolGroupDetails,
+                                );
                               } else {
                                 final m = block.entry!.message!;
                                 final bubble = _Bubble(

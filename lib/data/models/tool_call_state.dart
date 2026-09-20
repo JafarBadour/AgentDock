@@ -326,6 +326,21 @@ class ToolCallState {
         content: content ?? this.content,
       );
 
+  /// True when input/output/content payloads are present (heavy for the UI).
+  bool get hasPayloads =>
+      (rawInput?.isNotEmpty ?? false) ||
+      (rawOutput?.isNotEmpty ?? false) ||
+      (content?.isNotEmpty ?? false);
+
+  /// Metadata-only copy for the transcript list — no raw I/O blobs.
+  ToolCallState withoutPayloads() => ToolCallState(
+        toolCallId: toolCallId,
+        title: title,
+        kind: kind,
+        status: status,
+        locations: locations.length > 8 ? locations.take(8).toList() : locations,
+      );
+
   Map<String, dynamic> toJson() => {
         'toolCallId': toolCallId,
         'title': title,
