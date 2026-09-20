@@ -13,6 +13,7 @@ import '../models/host.dart';
 import '../models/mcp_server.dart';
 import '../models/repo.dart';
 import '../models/scheduled_job.dart';
+import '../models/skill.dart';
 import '../../services/transcript_budget.dart';
 
 /// Local metadata only — never stores secrets.
@@ -53,7 +54,7 @@ class AppDatabase {
         );
     return openDatabase(
       path,
-      version: 18,
+      version: 19,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -125,10 +126,15 @@ CREATE TABLE messages (
           'ON messages(role, chat_id, created_at)',
         );
         await _createMcpTables(db);
+        await _createSkillTables(db);
         await _createScheduledJobsTable(db);
         await db.execute(
           'CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name_unique '
           'ON mcp_servers(name COLLATE NOCASE)',
+        );
+        await db.execute(
+          'CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_name_unique '
+          'ON skills(name COLLATE NOCASE)',
         );
       },
       onUpgrade: (db, oldVersion, newVersion) async {
@@ -247,6 +253,13 @@ AND (
           await db.execute(
             'CREATE INDEX IF NOT EXISTS idx_mcp_servers_name '
             'ON mcp_servers(name COLLATE NOCASE)',
+          );
+        }
+        if (oldVersion < 19) {
+          await _createSkillTables(db);
+          await db.execute(
+            'CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_name_unique '
+            'ON skills(name COLLATE NOCASE)',
           );
         }
       },
@@ -582,6 +595,29 @@ CREATE TABLE IF NOT EXISTS mcp_host_links (
   targets_json TEXT,
   PRIMARY KEY (mcp_id, host_id),
   FOREIGN KEY (mcp_id) REFERENCES mcp_servers (id) ON DELETE CASCADE,
+  FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
+)''');
+  }
+
+  static Future<void> _createSkillTables(Database db) async {
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS skills (
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  body_markdown TEXT NOT NULL DEFAULT '',
+  disable_model_invocation INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+)''');
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS skill_host_links (
+  skill_id TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  install_status TEXT NOT NULL DEFAULT 'pending',
+  install_detail TEXT,
+  PRIMARY KEY (skill_id, host_id),
+  FOREIGN KEY (skill_id) REFERENCES skills (id) ON DELETE CASCADE,
   FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE
 )''');
   }
@@ -1269,6 +1305,98 @@ GROUP BY m.chat_id
     if (enabledIds.isEmpty) return const [];
     final all = await listMcpServers();
     return all.where((m) => enabledIds.contains(m.id)).toList();
+  }
+
+  // --- Skills ---
+
+  Future<List<AgentSkill>> listSkills() async {
+    final db = await database;
+    final rows = await db.query('skills', orderBy: 'name COLLATE NOCASE');
+    return rows.map(AgentSkill.fromMap).toList();
+  }
+
+  Future<AgentSkill?> getSkill(String id) async {
+    final db = await database;
+    final rows = await db.query('skills', where: 'id = ?', whereArgs: [id]);
+    if (rows.isEmpty) return null;
+    return AgentSkill.fromMap(rows.first);
+  }
+
+  Future<AgentSkill?> findSkillByName(String name) async {
+    final key = name.trim().toLowerCase();
+    if (key.isEmpty) return null;
+    final db = await database;
+    final rows = await db.query('skills', orderBy: 'name COLLATE NOCASE');
+    for (final row in rows) {
+      final skill = AgentSkill.fromMap(row);
+      if (skill.name.trim().toLowerCase() == key) return skill;
+    }
+    return null;
+  }
+
+  Future<void> upsertSkill(AgentSkill skill) async {
+    final db = await database;
+    await db.insert(
+      'skills',
+      skill.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> deleteSkill(String id) async {
+    final db = await database;
+    await db.delete('skills', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<List<SkillHostLink>> listSkillHostLinks({
+    String? skillId,
+    String? hostId,
+  }) async {
+    final db = await database;
+    if (skillId != null && hostId != null) {
+      final rows = await db.query(
+        'skill_host_links',
+        where: 'skill_id = ? AND host_id = ?',
+        whereArgs: [skillId, hostId],
+      );
+      return rows.map(SkillHostLink.fromMap).toList();
+    }
+    if (skillId != null) {
+      final rows = await db.query(
+        'skill_host_links',
+        where: 'skill_id = ?',
+        whereArgs: [skillId],
+      );
+      return rows.map(SkillHostLink.fromMap).toList();
+    }
+    if (hostId != null) {
+      final rows = await db.query(
+        'skill_host_links',
+        where: 'host_id = ?',
+        whereArgs: [hostId],
+      );
+      return rows.map(SkillHostLink.fromMap).toList();
+    }
+    final rows = await db.query('skill_host_links');
+    return rows.map(SkillHostLink.fromMap).toList();
+  }
+
+  Future<void> upsertSkillHostLink(SkillHostLink link) async {
+    final db = await database;
+    await db.insert(
+      'skill_host_links',
+      link.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> deleteSkillHostLink(String skillId, String hostId) async {
+    final db = await database;
+    await db.delete(
+      'skill_host_links',
+      where: 'skill_id = ? AND host_id = ?',
+      whereArgs: [skillId, hostId],
+    );
   }
 
   Future<List<ScheduledJob>> listScheduledJobs() async {

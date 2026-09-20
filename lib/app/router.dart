@@ -11,6 +11,7 @@ import '../features/hosts/hosts_screen.dart';
 import '../features/settings/api_keys_screen.dart';
 import '../features/settings/mcp_edit_screen.dart';
 import '../features/settings/settings_screen.dart';
+import '../features/settings/skill_edit_screen.dart';
 import '../features/terminal/terminal_session_screen.dart';
 import '../features/vpn/vpn_screen.dart';
 import 'desktop_shell_scaffold.dart';
@@ -143,6 +144,16 @@ final goRouterProvider = Provider<GoRouter>((ref) {
                     path: 'mcp/:mcpId',
                     builder: (context, state) =>
                         McpEditScreen(mcpId: state.pathParameters['mcpId']),
+                  ),
+                  GoRoute(
+                    path: 'skills/new',
+                    builder: (context, state) => const SkillEditScreen(),
+                  ),
+                  GoRoute(
+                    path: 'skills/:skillId',
+                    builder: (context, state) => SkillEditScreen(
+                      skillId: state.pathParameters['skillId'],
+                    ),
                   ),
                 ],
               ),

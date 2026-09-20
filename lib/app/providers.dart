@@ -16,6 +16,7 @@ import '../services/config_backup_service.dart';
 import '../services/gcp_speech_service.dart';
 import '../services/local_notification_service.dart';
 import '../services/mcp_deploy_service.dart';
+import '../services/skill_deploy_service.dart';
 import '../services/schedule_runner.dart';
 import '../services/schedule_sync_service.dart';
 import '../services/ssh_service.dart';
@@ -80,6 +81,13 @@ final agentRuntimeHostProvider = Provider<AgentRuntimeHost>(
 
 final mcpDeployServiceProvider = Provider<McpDeployService>(
   (ref) => McpDeployService(
+    ref.watch(sshServiceProvider),
+    ref.watch(appDatabaseProvider),
+  ),
+);
+
+final skillDeployServiceProvider = Provider<SkillDeployService>(
+  (ref) => SkillDeployService(
     ref.watch(sshServiceProvider),
     ref.watch(appDatabaseProvider),
   ),
