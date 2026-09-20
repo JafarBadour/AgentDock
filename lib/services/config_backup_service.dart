@@ -60,6 +60,9 @@ class ConfigBackupService {
           'enabled': l.enabled ? 1 : 0,
           'install_status': SkillHostInstallStatus.pending.name,
           'install_detail': null,
+          'targets_json': jsonEncode(
+            l.targets.map((t) => t.name).toList(),
+          ),
         };
       }).toList(),
     };

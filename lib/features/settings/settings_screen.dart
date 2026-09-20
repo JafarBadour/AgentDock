@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:uuid/uuid.dart';
 
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
@@ -13,6 +14,7 @@ import '../../data/models/host.dart';
 import '../../data/models/mcp_server.dart';
 import '../../data/models/skill.dart';
 import '../../data/secure/safe_log.dart';
+import '../../services/skill_folder_importer.dart';
 import '../agents/agents_screen.dart';
 import '../connect/connect_screen.dart';
 import '../hosts/hosts_screen.dart';
@@ -79,6 +81,70 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _importSkillFolder() async {
+    setState(() {
+      _busy = true;
+      _status = 'Pick a skill folder…';
+    });
+    try {
+      final path = await FilePicker.getDirectoryPath(
+        dialogTitle: 'Import skill folder(s)',
+      );
+      if (path == null) {
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _status = null;
+          });
+        }
+        return;
+      }
+
+      final imports = await SkillFolderImporter.loadAll(path);
+      final db = ref.read(appDatabaseProvider);
+      String? firstId;
+      for (final item in imports) {
+        final existing = await db.findSkillByName(item.name);
+        final skill = AgentSkill(
+          id: existing?.id ?? const Uuid().v4(),
+          name: item.name,
+          description: item.description,
+          bodyMarkdown: item.bodyMarkdown,
+          disableModelInvocation: item.disableModelInvocation,
+          createdAt: existing?.createdAt ?? DateTime.now(),
+          bundleFiles: item.bundleFiles,
+        );
+        await db.upsertSkill(skill);
+        firstId ??= skill.id;
+      }
+      ref.invalidate(skillListProvider);
+      ref.invalidate(skillHostLinksProvider);
+      if (!mounted) return;
+      final label = imports.length == 1
+          ? 'Imported ${imports.first.name}'
+              '${imports.first.fileCount == 0 ? '' : ' (+${imports.first.fileCount} files)'}'
+          : 'Imported ${imports.length} skills';
+      setState(() {
+        _busy = false;
+        _status = label;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(label)));
+      if (firstId != null && imports.length == 1) {
+        openSettingsSubpage(context, ref, '/settings/skills/$firstId');
+      }
+    } catch (e) {
+      SafeLog.d('Skill folder import failed', e);
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _status = 'Import failed: $e';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Import failed: $e')),
+      );
+    }
   }
 
   Future<void> _exportAg() async {
@@ -350,6 +416,11 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
             ),
             TextButton.icon(
+              onPressed: _busy ? null : () => unawaited(_importSkillFolder()),
+              icon: const Icon(Icons.folder_open, size: 18),
+              label: const Text('Import folder'),
+            ),
+            TextButton.icon(
               onPressed: () =>
                   openSettingsSubpage(context, ref, '/settings/skills/new'),
               icon: const Icon(Icons.add, size: 18),
@@ -359,8 +430,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ),
         const SizedBox(height: 4),
         Text(
-          'Markdown Agent Skills (SKILL.md). Enable a host to install under '
-          '~/.cursor/skills/<name>/ and ~/.claude/skills/<name>/.',
+          'Markdown Agent Skills (SKILL.md + optional scripts/references/assets). '
+          'Import a skill folder, or a parent folder of several skills. '
+          'Refresh Agents to probe hosts for ~/.cursor/skills and ~/.claude/skills — '
+          'status shows under each skill.',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 16),
@@ -382,7 +455,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   Card(
                     margin: const EdgeInsets.only(bottom: 8),
                     child: ListTile(
-                      leading: const Icon(Icons.auto_awesome_outlined),
+                      leading: Icon(
+                        linkRows.any(
+                              (l) =>
+                                  l.skillId == skill.id &&
+                                  l.installStatus ==
+                                      SkillHostInstallStatus.installed,
+                            )
+                            ? Icons.check_circle_outline
+                            : Icons.auto_awesome_outlined,
+                      ),
                       title: Text(skill.name),
                       subtitle: Text(
                         _skillListSubtitle(skill, linkRows, hostById),
@@ -477,16 +559,33 @@ String _skillListSubtitle(
 ) {
   final bits = <String>[
     if (skill.description.trim().isNotEmpty) skill.description.trim(),
+    if (skill.bundleFiles.isNotEmpty)
+      '${skill.bundleFiles.length} bundled file'
+          '${skill.bundleFiles.length == 1 ? '' : 's'}',
   ];
+  final onHosts = <String>[];
   for (final link in links) {
     if (link.skillId != skill.id) continue;
-    if (!link.enabled &&
-        link.installStatus != SkillHostInstallStatus.installed) {
-      continue;
-    }
+    if (link.installStatus != SkillHostInstallStatus.installed) continue;
     final host = hostById[link.hostId];
     final hostName = host?.displayLabel ?? link.hostId;
-    bits.add('$hostName (${link.installStatus.name})');
+    final where = link.targetsLabel.isNotEmpty
+        ? link.targetsLabel
+        : 'installed';
+    onHosts.add('$hostName ($where)');
+  }
+  if (onHosts.isEmpty) {
+    // After a catalog refresh we record removed links per host — use that to
+    // show we probed, otherwise "not synced yet".
+    final probed = links.any(
+      (l) =>
+          l.skillId == skill.id &&
+          (l.installStatus == SkillHostInstallStatus.removed ||
+              l.installStatus == SkillHostInstallStatus.failed),
+    );
+    bits.add(probed ? 'Not on any host' : 'Host status unknown — tap refresh');
+  } else {
+    bits.addAll(onHosts);
   }
   return bits.join(' · ');
 }

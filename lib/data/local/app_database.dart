@@ -54,7 +54,7 @@ class AppDatabase {
         );
     return openDatabase(
       path,
-      version: 19,
+      version: 20,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -261,6 +261,19 @@ AND (
             'CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_name_unique '
             'ON skills(name COLLATE NOCASE)',
           );
+        }
+        if (oldVersion < 20) {
+          await db.execute(
+            "ALTER TABLE skills ADD COLUMN bundle_json TEXT NOT NULL DEFAULT '[]'",
+          );
+          try {
+            await db.execute(
+              'ALTER TABLE skill_host_links ADD COLUMN targets_json TEXT',
+            );
+          } catch (_) {
+            // Column may already exist on fresh installs that used updated
+            // CREATE TABLE from this same schema version.
+          }
         }
       },
     );
@@ -607,7 +620,8 @@ CREATE TABLE IF NOT EXISTS skills (
   description TEXT NOT NULL DEFAULT '',
   body_markdown TEXT NOT NULL DEFAULT '',
   disable_model_invocation INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  bundle_json TEXT NOT NULL DEFAULT '[]'
 )''');
     await db.execute('''
 CREATE TABLE IF NOT EXISTS skill_host_links (
@@ -616,6 +630,7 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
   enabled INTEGER NOT NULL DEFAULT 1,
   install_status TEXT NOT NULL DEFAULT 'pending',
   install_detail TEXT,
+  targets_json TEXT,
   PRIMARY KEY (skill_id, host_id),
   FOREIGN KEY (skill_id) REFERENCES skills (id) ON DELETE CASCADE,
   FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE CASCADE

@@ -1,8 +1,10 @@
 import 'dart:async';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 
 import '../../app/platform_layout.dart';
@@ -10,6 +12,7 @@ import '../../app/providers.dart';
 import '../../data/models/host.dart';
 import '../../data/models/skill.dart';
 import '../../data/secure/safe_log.dart';
+import '../../services/skill_folder_importer.dart';
 import 'settings_screen.dart';
 
 class SkillEditScreen extends ConsumerStatefulWidget {
@@ -33,6 +36,8 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
   List<Host> _hosts = const [];
   final Map<String, SkillHostLink> _links = {};
   final Set<String> _busyHosts = {};
+  List<SkillBundleFile> _bundleFiles = const [];
+  String? _bundleSourceLabel;
 
   @override
   void initState() {
@@ -51,6 +56,7 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
         _description.text = skill.description;
         _body.text = skill.bodyMarkdown;
         _disableModelInvocation = skill.disableModelInvocation;
+        _bundleFiles = skill.bundleFiles;
         final links = await db.listSkillHostLinks(skillId: skill.id);
         for (final link in links) {
           _links[link.hostId] = link;
@@ -131,12 +137,49 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
       bodyMarkdown: body,
       disableModelInvocation: _disableModelInvocation,
       createdAt: _existing?.createdAt ?? DateTime.now(),
+      bundleFiles: _bundleFiles,
     );
     await ref.read(appDatabaseProvider).upsertSkill(skill);
     ref.invalidate(skillListProvider);
     ref.invalidate(skillHostLinksProvider);
     setState(() => _existing = skill);
     return skill;
+  }
+
+  Future<void> _importFolder() async {
+    final path = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Select skill folder (contains SKILL.md)',
+    );
+    if (path == null) return;
+    try {
+      final imported = await SkillFolderImporter.load(path);
+      if (!mounted) return;
+      setState(() {
+        if (_existing == null || _name.text.trim().isEmpty) {
+          _name.text = imported.name;
+        }
+        _description.text = imported.description;
+        _body.text = imported.bodyMarkdown;
+        _disableModelInvocation = imported.disableModelInvocation;
+        _bundleFiles = imported.bundleFiles;
+        _bundleSourceLabel = p.basename(imported.sourcePath);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Loaded ${imported.name}'
+            '${imported.fileCount == 0 ? '' : ' + ${imported.fileCount} file(s)'}. '
+            'Save to keep, then enable hosts to deploy.',
+          ),
+        ),
+      );
+    } catch (e) {
+      SafeLog.d('Skill folder import failed', e);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Import failed: $e')),
+      );
+    }
   }
 
   Future<void> _saveOnly() async {
@@ -246,6 +289,23 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Keep host toggles in sync when Agents refresh probes remotes.
+    ref.listen(skillHostLinksProvider, (prev, next) {
+      next.whenData((links) {
+        if (_existing == null) return;
+        final mine = {
+          for (final l in links)
+            if (l.skillId == _existing!.id) l.hostId: l,
+        };
+        if (!mounted) return;
+        setState(() {
+          _links
+            ..clear()
+            ..addAll(mine);
+        });
+      });
+    });
+
     if (_loading) {
       if (widget.embedded) {
         return const Center(child: CircularProgressIndicator());
@@ -312,6 +372,55 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
           ),
           style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
         ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            OutlinedButton.icon(
+              onPressed: _saving ? null : () => unawaited(_importFolder()),
+              icon: const Icon(Icons.folder_open, size: 18),
+              label: const Text('Import folder'),
+            ),
+            if (_bundleFiles.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              TextButton(
+                onPressed: () => setState(() {
+                  _bundleFiles = const [];
+                  _bundleSourceLabel = null;
+                }),
+                child: const Text('Clear files'),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          _bundleFiles.isEmpty
+              ? 'Optional: import a skill folder to include scripts/, '
+                  'references/, assets/, and other files alongside SKILL.md.'
+              : 'Supporting files'
+                  '${_bundleSourceLabel == null ? '' : ' (from $_bundleSourceLabel)'}'
+                  ': ${_bundleFiles.length}',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        if (_bundleFiles.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          ..._bundleFiles.take(40).map(
+                (f) => Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text(
+                    '• ${f.relativePath} (${_formatBytes(f.sizeBytes)})',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          fontFamily: 'monospace',
+                        ),
+                  ),
+                ),
+              ),
+          if (_bundleFiles.length > 40)
+            Text(
+              '…and ${_bundleFiles.length - 40} more',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+        ],
         const SizedBox(height: 8),
         SwitchListTile(
           contentPadding: EdgeInsets.zero,
@@ -334,8 +443,8 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
         ),
         const SizedBox(height: 4),
         Text(
-          'Toggle a host to write ~/.cursor/skills/<name>/SKILL.md and '
-          '~/.claude/skills/<name>/SKILL.md over SSH.',
+          'Toggle a host to write the full skill folder under '
+          '~/.cursor/skills/<name>/ and ~/.claude/skills/<name>/ over SSH.',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 8),
@@ -344,20 +453,28 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
         else
           ..._hosts.map((host) {
             final link = _links[host.id];
-            final enabled = link?.enabled == true &&
-                link?.installStatus != SkillHostInstallStatus.removed &&
-                link?.installStatus != SkillHostInstallStatus.failed;
+            final enabled = link?.installStatus ==
+                    SkillHostInstallStatus.installed &&
+                link?.enabled == true;
             final busy = _busyHosts.contains(host.id) ||
                 link?.installStatus == SkillHostInstallStatus.installing;
+            final statusLabel = link == null
+                ? 'not synced'
+                : link.installStatus == SkillHostInstallStatus.installed
+                    ? (link.targetsLabel.isNotEmpty
+                        ? link.targetsLabel
+                        : 'installed')
+                    : link.installStatus.name;
             return SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: Text(host.displayLabel),
               subtitle: Text(
                 [
                   host.endpointLabel,
-                  if (link?.installStatus != null) link!.installStatus.name,
+                  statusLabel,
                   if (link?.installDetail != null &&
-                      link!.installDetail!.isNotEmpty)
+                      link!.installDetail!.isNotEmpty &&
+                      link.installStatus != SkillHostInstallStatus.installed)
                     link.installDetail!,
                 ].join(' · '),
                 maxLines: 6,
@@ -428,4 +545,10 @@ class _SkillEditScreenState extends ConsumerState<SkillEditScreen> {
       body: form,
     );
   }
+}
+
+String _formatBytes(int n) {
+  if (n < 1024) return '${n}B';
+  if (n < 1024 * 1024) return '${(n / 1024).toStringAsFixed(1)}KB';
+  return '${(n / (1024 * 1024)).toStringAsFixed(1)}MB';
 }

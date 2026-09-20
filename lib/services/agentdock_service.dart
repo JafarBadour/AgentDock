@@ -694,7 +694,7 @@ class AgentDockService {
       await SkillDeployService(
         _ssh,
         _db,
-      ).syncRemoteSkillState(host).timeout(const Duration(seconds: 20));
+      ).syncRemoteSkillState(host).timeout(const Duration(seconds: 30));
     } catch (e) {
       SafeLog.d('remote skill probe ${host.alias} failed', e);
     }
