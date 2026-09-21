@@ -51,6 +51,9 @@ flutter_launcher_icons:
   ios: true
   macos:
     generate: true
+  windows:
+    generate: true
+    icon_size: 256
   image_path: assets/branding/app_icon.png
   adaptive_icon_background: "#000000"
   adaptive_icon_foreground: assets/branding/app_icon.png
