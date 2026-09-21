@@ -194,9 +194,9 @@ void main() {
         ),
       );
     }
-    await Future<void>.delayed(const Duration(milliseconds: 320));
+    await Future<void>.delayed(const Duration(milliseconds: 500));
     expect(runtime.entries.where((e) => e.tool != null), hasLength(1));
-    expect(runtime.entries.single.tool?.rawOutput, 'chunk 99');
+    expect(runtime.entries.single.tool?.outputHead, 'chunk 99');
 
     session.emit(
       AcpUpdate.toolCall(
@@ -210,7 +210,7 @@ void main() {
     );
     await Future<void>.delayed(const Duration(milliseconds: 30));
     expect(runtime.entries.single.tool?.status, 'completed');
-    expect(runtime.entries.single.tool?.rawOutput, 'done');
+    expect(runtime.entries.single.tool?.outputHead, 'done');
 
     await runtime.disposeRuntime();
   });

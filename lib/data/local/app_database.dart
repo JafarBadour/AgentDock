@@ -233,8 +233,14 @@ AND (
 ''');
         }
         if (oldVersion < 16) {
-          await db.execute(
-            'ALTER TABLE mcp_host_links ADD COLUMN targets_json TEXT',
+          // Guarded: a DB whose schema already carries this column but whose
+          // user_version stayed behind would otherwise fail every open with
+          // "duplicate column name" and never reach the later steps.
+          await _addColumnIfMissing(
+            db,
+            table: 'mcp_host_links',
+            column: 'targets_json',
+            sql: 'ALTER TABLE mcp_host_links ADD COLUMN targets_json TEXT',
           );
         }
         if (oldVersion < 17) {
