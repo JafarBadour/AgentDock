@@ -107,6 +107,7 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
         .read(pendingRemoteDeletedChatIdsProvider.notifier)
         .update((ids) => [...ids, chatId]);
   };
+  unawaited(service.loadPersistedCaches());
   ref.onDispose(service.dispose);
   return service;
 });
@@ -389,7 +390,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       chatId,
       maxBytes: kTranscriptChunkBytes,
     );
-    runtime.hydrateFromMessages(page.messages);
+    await runtime.hydrateFromMessagesAsync(page.messages);
     runtime.hasMoreOlder =
         page.hasMore ||
         (session is AdsmSession && session.hostTranscriptHasMore);

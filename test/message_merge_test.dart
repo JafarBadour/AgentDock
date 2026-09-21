@@ -154,6 +154,35 @@ void main() {
     expect(all.last.content, 'done on host');
   });
 
+  test('merge dedupes emoji and long tool bodies under a different id',
+      () async {
+    final at = DateTime(2026, 1, 1, 10);
+    final emoji = 'Done ✅ 🚀 ' * 40; // non-BMP: SQLite/Dart lengths differ
+    final blob = '{"toolCallId":"t1","rawOutput":"${'x' * 20000}"}';
+    await db.mergeMessages('chat-1', [
+      _msg('a', emoji, at, role: MessageRole.assistant),
+      _msg('t', blob, at, role: MessageRole.tool),
+    ]);
+    // Same bodies again from another device under new ids: no duplicates.
+    final changed = await db.mergeMessages('chat-1', [
+      _msg('a2', emoji, at, role: MessageRole.assistant),
+      _msg('t2', blob, at, role: MessageRole.tool),
+      // Same fingerprint edges and length but a different middle: kept.
+      _msg('t3', blob.replaceRange(10000, 10001, 'y'), at,
+          role: MessageRole.tool),
+    ]);
+    expect(changed, 1);
+    final all = await db.listRecentMessages('chat-1', limit: 50);
+    expect(all.map((m) => m.id).toSet(), {'a', 't', 't3'});
+    // Re-merging the originals is a no-op (equal lengths → no update).
+    expect(
+      await db.mergeMessages('chat-1', [
+        _msg('a', emoji, at, role: MessageRole.assistant),
+      ]),
+      0,
+    );
+  });
+
   test('ChatMessage round-trips host snake_case maps', () {
     final map = <String, Object?>{
       'id': 'm1',

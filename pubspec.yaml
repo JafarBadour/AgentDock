@@ -38,6 +38,7 @@ dependencies:
   pdfrx: ^2.4.7
   sqflite_common_ffi: ^2.4.0+3
   flutter_pty: ^0.4.2
+  super_sliver_list: ^0.4.1
 
 dev_dependencies:
   flutter_test:

@@ -804,22 +804,35 @@ exit 0
     _startHealthTimer();
   }
 
+  /// Run [command] on [host]; [input], when given, is streamed to its stdin.
+  ///
+  /// Bulk payloads must go through [input]: a single `sh -c` argument is
+  /// capped at 128 KiB on Linux, so inlining data in [command] fails with
+  /// "Argument list too long" once a transcript grows past that.
   Future<String> exec(
     Host host,
     String command, {
     Duration timeout = const Duration(seconds: 12),
+    List<int>? input,
   }) async {
     if (_preferLocalFs(host)) {
-      return _execLocal(command, timeout: timeout);
+      return _execLocal(command, timeout: timeout, input: input);
     }
     final client = await connect(host);
-    return _run(client, command, hostId: host.id, timeout: timeout);
+    return _run(
+      client,
+      command,
+      hostId: host.id,
+      timeout: timeout,
+      input: input,
+    );
   }
 
   /// Run a shell command on This Mac/PC without SSH (same machine as the app).
   Future<String> _execLocal(
     String command, {
     Duration timeout = const Duration(seconds: 12),
+    List<int>? input,
   }) async {
     final home =
         Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
@@ -832,14 +845,30 @@ exit 0
     final env = <String, String>{...Platform.environment, 'PATH': pathPrefix};
     late final ProcessResult result;
     try {
-      result = await Process.run(
-        Platform.isWindows ? 'bash' : '/bin/bash',
-        ['-lc', command],
-        workingDirectory: home != null && home.isNotEmpty ? home : null,
-        environment: env,
-        stdoutEncoding: utf8,
-        stderrEncoding: utf8,
-      ).timeout(timeout);
+      if (input == null) {
+        result = await Process.run(
+          Platform.isWindows ? 'bash' : '/bin/bash',
+          ['-lc', command],
+          workingDirectory: home != null && home.isNotEmpty ? home : null,
+          environment: env,
+          stdoutEncoding: utf8,
+          stderrEncoding: utf8,
+        ).timeout(timeout);
+      } else {
+        result = await () async {
+          final proc = await Process.start(
+            Platform.isWindows ? 'bash' : '/bin/bash',
+            ['-lc', command],
+            workingDirectory: home != null && home.isNotEmpty ? home : null,
+            environment: env,
+          );
+          final out = utf8.decodeStream(proc.stdout);
+          final err = utf8.decodeStream(proc.stderr);
+          proc.stdin.add(input);
+          await proc.stdin.close();
+          return ProcessResult(proc.pid, await proc.exitCode, await out, await err);
+        }().timeout(timeout);
+      }
     } on TimeoutException {
       throw TimeoutException('Local command timed out after $timeout');
     } on ProcessException catch (e) {
@@ -864,6 +893,7 @@ exit 0
     String command, {
     required String hostId,
     Duration timeout = const Duration(seconds: 12),
+    List<int>? input,
   }) async {
     final gate = _pool[hostId]?.gate;
     Future<String> body() async {
@@ -878,6 +908,12 @@ exit 0
             ),
           );
       try {
+        if (input != null) {
+          session.stdin.add(
+            input is Uint8List ? input : Uint8List.fromList(input),
+          );
+          unawaited(session.stdin.close());
+        }
         // Read stdout + stderr in parallel — sequential reads can deadlock SSH channels.
         final chunks = await Future.wait<Uint8List>([
           _readAll(session.stdout),

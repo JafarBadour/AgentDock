@@ -37,6 +37,7 @@ import 'transcript_blocks.dart';
 import 'transcript_snapshot.dart';
 import 'transcript_view.dart';
 import '../../services/transcript_budget.dart';
+import '../../services/transcript_parse.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   const ChatScreen({super.key, required this.chatId});
@@ -279,7 +280,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _localHasMoreOlder = page.hasMore;
       return 0;
     }
-    final olderEntries = _entriesFromMessages(page.messages);
+    final olderEntries = await entriesFromMessagesOffThread(page.messages);
+    if (!mounted) return 0;
     _dbEntries.insertAll(0, olderEntries);
     _localHasMoreOlder = page.hasMore;
     _messageCount = _dbEntries.length;
@@ -306,9 +308,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
     final messages = page.messages;
 
+    // Tool JSON decodes in a worker isolate; the screen only ever holds
+    // summaries (same shape as the live runtime), so block building is cheap.
+    final entries = await entriesFromMessagesOffThread(messages);
+    if (!mounted) return;
     _dbEntries
       ..clear()
-      ..addAll(_entriesFromMessages(messages));
+      ..addAll(entries);
     _localHasMoreOlder = page.hasMore;
 
     setState(() {
@@ -334,9 +340,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // handling, transcript JSON, and merge notifications contend with Flutter
     // frames. Connect happens on send or an explicit Connect tap.
   }
-
-  List<TranscriptEntry> _entriesFromMessages(List<ChatMessage> messages) =>
-      entriesFromMessages(messages);
 
   List<ChatBlock> _blocksForMemoized(
     List<TranscriptEntry> entries, {

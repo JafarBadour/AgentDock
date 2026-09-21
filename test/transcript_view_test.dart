@@ -127,7 +127,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // Drag downward (reveals older rows in a reversed list).
-    await tester.drag(find.byType(ListView), const Offset(0, 600));
+    await tester.drag(find.byType(Scrollable).first, const Offset(0, 600));
     await tester.pumpAndSettle();
     expect(ctl.following.value, isFalse);
     expect(find.byIcon(Icons.keyboard_arrow_down_rounded), findsOneWidget);
@@ -201,7 +201,7 @@ void main() {
     // Reversed list: dragging down reveals older rows, up to the top button.
     for (var i = 0; i < 40; i++) {
       if (find.text('Load earlier messages').evaluate().isNotEmpty) break;
-      await tester.drag(find.byType(ListView), const Offset(0, 500));
+      await tester.drag(find.byType(Scrollable).first, const Offset(0, 500));
       await tester.pumpAndSettle();
     }
     expect(ctl.following.value, isFalse);

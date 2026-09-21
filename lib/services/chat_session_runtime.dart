@@ -23,6 +23,7 @@ import 'agent_session.dart';
 import 'cursor_acp_service.dart';
 import 'ssh_service.dart';
 import 'transcript_budget.dart';
+import 'transcript_parse.dart';
 
 /// One transcript row — message and/or live tool.
 class TranscriptEntry {
@@ -395,10 +396,13 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   /// Persist-ready full tool; UI-resident copy has no raw I/O blobs.
-  ToolCallState _uiToolSummary(ToolCallState tool) {
+  ///
+  /// [summary] is the precomputed `withoutPayloads()` when a worker isolate
+  /// already produced it (history hydration), so this stays O(1) on the UI.
+  ToolCallState _uiToolSummary(ToolCallState tool, {ToolCallState? summary}) {
     _rememberToolPayload(tool);
     _trackToolActivity(tool);
-    return tool.withoutPayloads();
+    return summary ?? tool.withoutPayloads();
   }
 
   ToolCallState? _payloadOrSummary(ToolCallState? tool) {
@@ -406,7 +410,14 @@ class ChatSessionRuntime extends ChangeNotifier {
     return _toolPayloads[tool.toolCallId] ?? tool;
   }
 
-  void hydrateFromMessages(List<ChatMessage> messages) {
+  void hydrateFromMessages(List<ChatMessage> messages) =>
+      hydrateParsed(parseTranscriptRows(messages));
+
+  /// [hydrateFromMessages] with the JSON decode off the UI isolate.
+  Future<void> hydrateFromMessagesAsync(List<ChatMessage> messages) async =>
+      hydrateParsed(await parseTranscriptRowsOffThread(messages));
+
+  void hydrateParsed(List<ParsedTranscriptRow> rows) {
     entries.clear();
     _toolMessageIds.clear();
     _toolEntryIndexes.clear();
@@ -414,10 +425,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     _activeToolIds.clear();
     final queuedIds = {for (final m in outboundQueue) m.id};
     final seenToolIds = <String>{};
-    for (final m in messages) {
+    for (final row in rows) {
+      final m = row.message;
       if (queuedIds.contains(m.id)) continue;
       if (m.role == MessageRole.tool) {
-        final tool = ToolCallState.tryParseContent(m.content);
+        final tool = row.tool;
         if (tool != null) {
           final tid = tool.toolCallId;
           if (seenToolIds.contains(tid)) {
@@ -456,7 +468,7 @@ class ChatSessionRuntime extends ChangeNotifier {
           seenToolIds.add(tid);
           entries.add(
             TranscriptEntry.tool(
-              _uiToolSummary(tool),
+              _uiToolSummary(tool, summary: row.summary),
               messageId: m.id,
               createdAt: m.createdAt,
             ),
@@ -475,7 +487,14 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   /// Merge remote/local DB rows into the live transcript without clearing
   /// in-flight assistant or thought buffers.
-  void absorbMessages(List<ChatMessage> messages) {
+  void absorbMessages(List<ChatMessage> messages) =>
+      absorbParsed(parseTranscriptRows(messages));
+
+  /// [absorbMessages] with the JSON decode off the UI isolate.
+  Future<void> absorbMessagesAsync(List<ChatMessage> messages) async =>
+      absorbParsed(await parseTranscriptRowsOffThread(messages));
+
+  void absorbParsed(List<ParsedTranscriptRow> rows) {
     final queuedIds = {for (final m in outboundQueue) m.id};
     final messageIndex = <String, int>{};
     final toolIndex = <String, int>{};
@@ -487,10 +506,11 @@ class ChatSessionRuntime extends ChangeNotifier {
       if (toolId != null) toolIndex[toolId] = i;
     }
 
-    for (final m in messages) {
+    for (final row in rows) {
+      final m = row.message;
       if (queuedIds.contains(m.id)) continue;
       if (m.role == MessageRole.tool) {
-        final tool = ToolCallState.tryParseContent(m.content);
+        final tool = row.tool;
         if (tool == null) continue;
         final index = toolIndex[tool.toolCallId] ?? -1;
         if (index >= 0) {
@@ -513,7 +533,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         } else {
           entries.add(
             TranscriptEntry.tool(
-              _uiToolSummary(tool),
+              _uiToolSummary(tool, summary: row.summary),
               messageId: m.id,
               createdAt: m.createdAt,
             ),
@@ -692,7 +712,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
 
     displayBudgetBytes += kTranscriptChunkBytes;
-    absorbMessages(older);
+    await absorbMessagesAsync(older);
     hasMoreOlder = hasMore;
     _notifyUi(immediate: true);
     return older.length;
@@ -716,7 +736,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       chatId,
       maxBytes: displayBudgetBytes,
     );
-    absorbMessages(page.messages);
+    await absorbMessagesAsync(page.messages);
     hasMoreOlder = page.hasMore || hasMoreOlder;
   }
 
