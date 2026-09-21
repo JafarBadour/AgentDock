@@ -193,16 +193,20 @@ void main() {
       expect(blocks.last.thinkingOnly, 'still thinking');
     });
 
-    test('<=2 tools stay as individual cards', () {
+    test('consecutive tools always collapse into one group', () {
       final blocks = buildTranscriptBlocks([
         _user('u1'),
         _tool('t1'),
         _tool('t2'),
         _assistant('a1'),
       ]);
-      final toolBlocks = blocks.where((b) => b.entry?.tool != null).toList();
-      expect(toolBlocks, hasLength(2));
-      expect(blocks.any((b) => b.tools != null), isFalse);
+      expect(blocks.any((b) => b.entry?.tool != null), isFalse);
+      final group = blocks.singleWhere((b) => b.tools != null);
+      expect(group.tools, hasLength(2));
+      expect(group.key, 'tools:t1');
+      // Summaries carry no payloads but keep the row label information.
+      expect(group.tools!.first.tool!.rawOutput, isNull);
+      expect(group.tools!.first.tool!.preview, 'a.dart');
     });
 
     test('>2 tools collapse into one tools group', () {

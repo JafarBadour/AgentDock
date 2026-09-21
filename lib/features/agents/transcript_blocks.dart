@@ -46,6 +46,23 @@ class ChatBlock {
       );
 
   DateTime? get createdAt => tools?.first.createdAt ?? entry?.createdAt;
+
+  /// Stable identity across rebuilds so list elements (and their expanded /
+  /// collapsed state) survive rows being inserted around them.
+  String get key {
+    final t = tools;
+    if (t != null && t.isNotEmpty) {
+      return 'tools:${t.first.tool?.toolCallId ?? t.first.messageId ?? ''}';
+    }
+    final e = entry;
+    if (e != null) {
+      final id = e.messageId ?? e.tool?.toolCallId;
+      if (id != null && id.isNotEmpty) return 'entry:$id';
+    }
+    final think = thinkingOnly;
+    if (think != null) return 'think:${think.hashCode}';
+    return 'block:$hashCode';
+  }
 }
 
 /// Stable chronological order for the transcript list.
