@@ -3,12 +3,9 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../app/app_theme.dart';
@@ -22,7 +19,6 @@ import '../../data/models/chat_message.dart';
 import '../../data/models/host.dart';
 import '../../data/models/prompt_image.dart';
 import '../../data/models/repo.dart';
-import '../../data/models/scheduled_job.dart';
 import '../../data/models/tool_call_state.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/adsm_client.dart';
@@ -35,14 +31,11 @@ import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
 import '../connect/claude_login_sheet.dart';
-import 'package:gpt_markdown/gpt_markdown.dart';
-
-import 'message_body.dart';
 import 'model_picker_sheet.dart';
 import 'project_files_screen.dart';
-import 'tool_call_card.dart';
 import 'transcript_blocks.dart';
-import 'transcript_window.dart';
+import 'transcript_snapshot.dart';
+import 'transcript_view.dart';
 import '../../services/transcript_budget.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
@@ -57,7 +50,6 @@ class ChatScreen extends ConsumerStatefulWidget {
 class _ChatScreenState extends ConsumerState<ChatScreen>
     with SingleTickerProviderStateMixin {
   final _composer = TextEditingController();
-  final _scroll = ScrollController();
 
   /// Offline / pre-connect transcript from DB.
   final List<TranscriptEntry> _dbEntries = [];
@@ -105,16 +97,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Timer? _runtimeUiCoalesce;
   bool _runtimeUiDirty = false;
 
-  /// Streaming invalidates chrome (status) and transcript separately so an
-  /// activity-label tick never rebuilds the ListView (that made scrolling choke).
+  /// Streaming invalidates the small status labels ([_chromeUiEpoch]) far
+  /// more often than the Scaffold chrome around the transcript
+  /// ([_transcriptUiEpoch]: queue bar, permission prompt, error banners).
+  /// The list itself listens to [_transcriptN] only.
   final ValueNotifier<int> _chromeUiEpoch = ValueNotifier(0);
   final ValueNotifier<int> _transcriptUiEpoch = ValueNotifier(0);
   final ValueNotifier<int> _composerUiEpoch = ValueNotifier(0);
-  /// Pauses shimmer / live-tickers under the ListView without rebuilding rows.
-  /// Cleared while the user owns a trackpad fling or has scrolled away (PDF).
-  final ValueNotifier<bool> _transcriptMotionN = ValueNotifier(true);
-  /// True while a user scroll gesture (including Mac ballistic fling) is active.
-  final ValueNotifier<bool> _scrollBusyN = ValueNotifier(false);
+
+  /// What the transcript list paints. Only [TranscriptView] listens, so a
+  /// stream flush never rebuilds the chrome around it.
+  final ValueNotifier<TranscriptSnapshot> _transcriptN =
+      ValueNotifier(TranscriptSnapshot.empty);
+  final TranscriptController _transcriptCtl = TranscriptController();
   final ValueNotifier<({bool streaming, bool connected, int queuedCount})>
   _composerRuntimeN = ValueNotifier((
     streaming: false,
@@ -123,16 +118,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   ));
   bool _wasWorking = false;
   int _lastOutboundQueueLen = 0;
-  bool _landedAtBottom = false;
-
-  /// Jump-to-latest FAB — ValueNotifier so toggling it never setStates the
-  /// whole chat (that used to re-run build() on every scroll threshold cross).
-  final ValueNotifier<bool> _showJumpToLatest = ValueNotifier(false);
-
-  /// When true, keep the viewport pinned to new agent output.
-  /// Cleared as soon as the user scrolls away from the bottom.
-  bool _followOutput = true;
-  bool _programmaticScroll = false;
   int _messageCount = 0;
   final List<ChatImageRef> _pendingImages = [];
   bool _pickingImages = false;
@@ -145,34 +130,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _showSlashMenu = false;
   bool _compressing = false;
 
-  /// Sliding window over the transcript: mount a page, grow upward, trim
-  /// older pages when scrolling back to the live end.
-  final TranscriptWindow _transcriptWindow = TranscriptWindow(
-    pageSize: 300,
-    softMax: 370,
-  );
+  /// Memoized [buildTranscriptBlocks] result (keyed on the cheap fingerprint).
   List<ChatBlock>? _cachedBlocks;
   String? _blocksCacheKey;
-  DateTime? _lastScrollToEndAt;
-  double _lastScrollMaxExtent = 0;
-
-  /// Bumped on every real user scroll so scheduled jumpTo/land callbacks abort
-  /// instead of fighting the trackpad (that made the scrollbar thrash).
-  int _userScrollGen = 0;
-
-  /// True while the user is actively scrolling / dragging the scrollbar.
-  /// Suppresses transcript rebuilds and auto jump-to-end mid-gesture.
-  bool _userScrollGesture = false;
-  ScrollDirection? _lastUserScrollDirection;
-
-  /// Distance-from-end thresholds with hysteresis so trackpad inertia near the
-  /// bottom cannot flip follow on/off every frame.
-  static const double _unfollowFromEndPx = 72;
-  static const double _refollowFromEndPx = 28;
 
   /// Fingerprint of transcript content; activity-only changes skip list rebuild.
   String _lastTranscriptFp = '';
-  int _emptyLandIdleFrames = 0;
 
   /// Telegram-style: recording continues after finger-up until stop.
   bool _voiceLocked = false;
@@ -219,8 +182,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           !saved.contains('\n') &&
           !saved.contains(' ');
     }
-    // No ScrollController listener — it fired on every pixel and setState'd the
-    // whole chat. Follow / jump-to-latest uses UserScrollNotification only.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(focusedChatIdProvider.notifier).state = widget.chatId;
     });
@@ -247,154 +208,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// When true, SQLite still has messages older than [_dbEntries] (offline).
   bool _localHasMoreOlder = false;
 
-  void _setFollowOutput(bool follow) {
-    if (follow == _followOutput) {
-      _transcriptWindow.pinnedToEnd = follow;
-      final showJump = !follow;
-      if (_showJumpToLatest.value != showJump) {
-        _showJumpToLatest.value = showJump;
-      }
-      _syncTranscriptMotion();
-      return;
-    }
-    _followOutput = follow;
-    _transcriptWindow.pinnedToEnd = follow;
-    _syncTranscriptMotion();
-    if (follow) {
-      // Resume live document — drop the PDF snapshot and keep only ~1 MiB.
-      _frozenTranscript = null;
-      _freezeCapturePending = false;
-      _runtime?.pinDisplayToLiveChunk();
-      _runtimeUiDirty = true;
-      // Never rebuild mid-gesture — wait until the finger/trackpad settles.
-      if (!_userScrollGesture) {
-        _scheduleRuntimeUi(immediate: true);
-      }
-    } else {
-      // Snapshot on the next transcript build *after* scroll ends so we don't
-      // rebuild the ListView under an active fling (that choked Mac scrolling).
-      _freezeCapturePending = true;
-      if (!_userScrollGesture) {
-        _transcriptUiEpoch.value++;
-      }
-    }
-    final showJump = !follow;
-    if (_showJumpToLatest.value != showJump) {
-      _showJumpToLatest.value = showJump;
-    }
-  }
-
-  void _syncTranscriptMotion() {
-    final allow = _followOutput && !_userScrollGesture;
-    if (_transcriptMotionN.value != allow) {
-      _transcriptMotionN.value = allow;
-    }
-    if (_scrollBusyN.value != _userScrollGesture) {
-      _scrollBusyN.value = _userScrollGesture;
-    }
-  }
-
-  /// Apply follow hysteresis from a user-driven scroll. Keeps the scrollbar
-  /// stable while reading just above the live edge.
-  void _onUserScrollIntent(
-    ScrollDirection direction,
-    ScrollMetrics metrics, {
-    bool fromScrollbarDrag = false,
-  }) {
-    _userScrollGen++;
-    _userScrollGesture = true;
-    _syncTranscriptMotion();
-    // Abort initial land-at-bottom pinning if the user already took over.
-    if (!_landedAtBottom) {
-      _landedAtBottom = true;
-      _emptyLandIdleFrames = 99;
-    }
-    // Scrollbar thumb fires every pixel — only react on direction changes.
-    if (fromScrollbarDrag &&
-        _lastUserScrollDirection == direction &&
-        !_followOutput) {
-      return;
-    }
-    _lastUserScrollDirection = direction;
-
-    final max = metrics.maxScrollExtent;
-    final fromEnd = max <= 0 ? 0.0 : max - metrics.pixels;
-    if (fromEnd > _unfollowFromEndPx) {
-      if (_followOutput) _setFollowOutput(false);
-    }
-    // Do not re-follow mid-scroll — that fights the trackpad. Scroll-end does.
-  }
-
-  void _onUserScrollEnded(ScrollMetrics metrics) {
-    _userScrollGesture = false;
-    _lastUserScrollDirection = null;
-    _syncTranscriptMotion();
-    final max = metrics.maxScrollExtent;
-    final fromEnd = max <= 0 ? 0.0 : max - metrics.pixels;
-    if (!_followOutput && fromEnd <= _refollowFromEndPx) {
-      _setFollowOutput(true);
-    } else if (_freezeCapturePending && !_followOutput) {
-      // One deferred rebuild to freeze the PDF snapshot after the gesture.
-      _transcriptUiEpoch.value++;
-    }
-    // Apply chrome / follow updates that were deferred mid-fling.
-    if (_runtimeUiDirty) {
-      _scheduleRuntimeUi(immediate: true);
-    }
-  }
-
-  bool get _shiftingWindow => _loadingOlderHistory;
-  bool _loadingOlderHistory = false;
-  int _blocksLength = 0;
-
-  /// PDF-mode snapshot of the transcript while the user reads history.
-  _FrozenTranscript? _frozenTranscript;
-  bool _freezeCapturePending = false;
-
-  void _syncWindowToBlocks(int total) {
-    // Resident entries are already byte-capped; mount the full working set.
-    if (_frozenTranscript != null && !_followOutput) {
-      _blocksLength = _frozenTranscript!.allBlocks.length;
-      return;
-    }
-    _blocksLength = total;
-    _transcriptWindow.visibleCount = total <= 0 ? _transcriptWindow.pageSize : total;
-    _transcriptWindow.sync(total, followOutput: _followOutput);
-  }
-
-  void _captureFrozenTranscript({
-    required List<ChatBlock> allBlocks,
-    required List<Widget> extras,
-    required int visibleCount,
-  }) {
-    final count = visibleCount.clamp(0, allBlocks.length);
-    _frozenTranscript = _FrozenTranscript(
-      allBlocks: List<ChatBlock>.from(allBlocks),
-      extras: List<Widget>.from(extras),
-      visibleCount: count == 0 && allBlocks.isNotEmpty
-          ? allBlocks.length
-          : count,
-    );
-    _freezeCapturePending = false;
-    _blocksLength = allBlocks.length;
-  }
-
   bool get _hasMoreOlderArchive =>
       _runtime?.hasMoreOlder ?? _localHasMoreOlder;
 
+  bool _loadingOlderHistory = false;
+
   /// Explicit "load earlier" — pulls another ~1 MiB from SQLite / host.
+  ///
+  /// Rows land at the far (top) end of a reversed list, so nothing on screen
+  /// moves and no scroll correction is needed.
   Future<void> _loadOlderHistoryChunk() async {
-    if (!mounted || _loadingOlderHistory || _programmaticScroll) return;
-
-    final hasScroll = _scroll.hasClients;
-    final before = hasScroll ? _scroll.position.pixels : 0.0;
-    final beforeMax = hasScroll ? _scroll.position.maxScrollExtent : 0.0;
-
+    if (!mounted || _loadingOlderHistory) return;
     _loadingOlderHistory = true;
-    _programmaticScroll = true;
-    if (_followOutput) _setFollowOutput(false);
-    _transcriptUiEpoch.value++;
-
+    _publishTranscript();
     try {
       final runtime = _runtime;
       final int added;
@@ -405,53 +231,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         added = await _loadOlderChunkOffline();
       }
       if (!mounted) return;
-
-      // Rebuild from the expanded resident set (clear PDF freeze).
-      _frozenTranscript = null;
-      _freezeCapturePending = true;
-      _transcriptUiEpoch.value++;
-
-      await Future<void>.delayed(Duration.zero);
-      if (!mounted) return;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        try {
-          if (_scroll.hasClients) {
-            final target = _transcriptWindow.preserveScrollAfterPrepend(
-              beforePixels: before,
-              beforeMax: beforeMax,
-              afterMax: _scroll.position.maxScrollExtent,
-            );
-            _scroll.jumpTo(target);
-          }
-          if (added > 0) {
-            final label = added == 1
-                ? 'Loaded 1 earlier message'
-                : 'Loaded $added earlier messages';
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(label),
-                duration: const Duration(seconds: 2),
-                behavior: SnackBarBehavior.floating,
-              ),
-            );
-          } else if (!_hasMoreOlderArchive) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('No earlier messages'),
-                duration: Duration(seconds: 2),
-                behavior: SnackBarBehavior.floating,
-              ),
-            );
-          }
-        } finally {
-          _programmaticScroll = false;
-          _loadingOlderHistory = false;
-        }
-      });
+      if (added == 0 && !_hasMoreOlderArchive) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No earlier messages'),
+            duration: Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
     } catch (e) {
-      _programmaticScroll = false;
-      _loadingOlderHistory = false;
       SafeLog.d('load older transcript chunk failed', e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -461,6 +250,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           ),
         );
       }
+    } finally {
+      _loadingOlderHistory = false;
+      if (mounted) _publishTranscript();
     }
   }
 
@@ -492,14 +284,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _localHasMoreOlder = page.hasMore;
     _messageCount = _dbEntries.length;
     return page.messages.length;
-  }
-
-  void _pinWindowToLatest() {
-    _frozenTranscript = null;
-    _freezeCapturePending = false;
-    _runtime?.pinDisplayToLiveChunk();
-    _transcriptWindow.pinToLatest(_blocksLength);
-    _setFollowOutput(true);
   }
 
   /// Paint from SQLite immediately; the network only ever upgrades what is
@@ -534,7 +318,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _messageCount = messages.length;
       _loading = false;
     });
-    _landAtBottom();
+    _publishTranscript();
 
     final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
     if (existing != null) {
@@ -665,17 +449,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               !isTransientBridgeErrorText(runtime.lastError!)) ||
           runtime.deliveryError != null;
 
-      // PDF mode and live mode share the coalesced flush — unfollow only
-      // refreshes chrome inside [_flushRuntimeUi], never the transcript.
       _scheduleRuntimeUi(immediate: needsImmediate);
     };
     runtime.addListener(_runtimeListener!);
     _lastOutboundQueueLen = runtime.outboundQueue.length;
     _syncComposerRuntime(runtime);
-    _lastTranscriptFp = '';
+    _lastTranscriptFp = _transcriptContentFingerprint(runtime);
+    _publishTranscript();
     _chromeUiEpoch.value++;
     _transcriptUiEpoch.value++;
-    _scrollToEnd(force: true);
+    _jumpToLatest();
     // Coming back to a chat whose turn already finished should drain the queue.
     runtime.resumeOutboundQueue();
     unawaited(runtime.recoverTrailingUserPromptIfStuck());
@@ -695,12 +478,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
     if (_runtimeUiCoalesce?.isActive ?? false) return;
-    // Follow: ~3 Hz chrome/transcript. Unfollow / mid-gesture: slower so Mac
-    // trackpad flings aren't fighting ACP-driven rebuilds.
-    final ms = _userScrollGesture
-        ? 500
-        : (_followOutput ? 320 : 400);
-    _runtimeUiCoalesce = Timer(Duration(milliseconds: ms), () {
+    // ~3 Hz: the list only repaints the streaming tail, so this is cheap.
+    _runtimeUiCoalesce = Timer(const Duration(milliseconds: 320), () {
       _runtimeUiCoalesce = null;
       _flushRuntimeUi();
     });
@@ -767,28 +546,61 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   void _flushRuntimeUi() {
     if (!mounted || !_runtimeUiDirty) return;
-    // User owns the scroll gesture — stay dirty and touch no notifiers. Even a
-    // chrome-only bump was enough to hitch Mac trackpad frames mid-fling.
-    if (_userScrollGesture) {
-      return;
-    }
     _runtimeUiDirty = false;
-    // Still reading history — keep the frozen document; only refresh chrome.
-    if (!_followOutput) {
-      _chromeUiEpoch.value++;
-      _scheduleMarkRead();
-      return;
-    }
     final fp = _transcriptContentFingerprint(_runtime);
-    final contentChanged = fp != _lastTranscriptFp;
-    if (contentChanged) {
+    if (fp != _lastTranscriptFp) {
       _lastTranscriptFp = fp;
+      _publishTranscript();
+      // Chrome that mirrors transcript state (queue bar, permission prompt,
+      // error banners) — cheap Scaffold rebuild, never the list itself.
       _transcriptUiEpoch.value++;
-      _scrollToEnd();
     }
-    // Status / activity / error chrome — never forces ListView rebuild.
+    // Status / activity / error chrome — never forces a list rebuild.
     _chromeUiEpoch.value++;
     _scheduleMarkRead();
+  }
+
+  /// Resume following and scroll the transcript to its live end.
+  void _jumpToLatest() => _transcriptCtl.jumpToLatest();
+
+  /// Session closed — paint the SQLite transcript instead.
+  void _dropRuntime() {
+    _runtime = null;
+    _lastTranscriptFp = '';
+    _publishTranscript();
+  }
+
+  /// Build the immutable picture the list paints and hand it to the view.
+  void _publishTranscript() {
+    if (!mounted) return;
+    final runtime = _runtime;
+    final queue = runtime?.outboundQueue ?? const <ChatMessage>[];
+    final queuedIds = {for (final m in queue) m.id};
+    // Queued messages live in the DB but stay out of [entries] until promoted,
+    // so filter defensively in case a stale row is still present.
+    final rawEntries = runtime?.entries ?? _dbEntries;
+    final liveAssistantId = runtime?.liveAssistantMessageId;
+    final filtered = [
+      for (final e in rawEntries)
+        if (e.messageId == null ||
+            (!queuedIds.contains(e.messageId) &&
+                e.messageId != liveAssistantId))
+          e,
+    ];
+    final entries = entriesByTime(filtered);
+    final streaming = runtime?.isWorking ?? false;
+    final blocks = _blocksForMemoized(entries, openTurnActive: streaming);
+    final next = TranscriptSnapshot(
+      blocks: blocks,
+      liveThinking: runtime?.thoughtBuffer ?? '',
+      liveAssistant: runtime?.assistantBuffer ?? '',
+      liveAssistantId: liveAssistantId,
+      streaming: streaming,
+      queued: queue.isEmpty ? const [] : List<ChatMessage>.from(queue),
+      hasMoreOlder: _hasMoreOlderArchive,
+      loadingOlder: _loadingOlderHistory,
+    );
+    _transcriptN.value = next;
   }
 
   Future<void> _prefetchModelCatalogIfNeeded(
@@ -1106,7 +918,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         if (mounted) {
           _syncComposerRuntime(null);
           setState(() {
-            _runtime = null;
+            _dropRuntime();
             _error = null;
           });
         }
@@ -1141,7 +953,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           if (mounted) {
             _syncComposerRuntime(null);
             setState(() {
-              _runtime = null;
+              _dropRuntime();
               _error = null;
             });
             ScaffoldMessenger.of(
@@ -1227,7 +1039,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
     if (!mounted) return;
     _syncComposerRuntime(null);
-    setState(() => _runtime = null);
+    setState(_dropRuntime);
     await _ensureAcp();
   }
 
@@ -1260,7 +1072,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
       if (!mounted) return;
       _syncComposerRuntime(null);
-      setState(() => _runtime = null);
+      setState(_dropRuntime);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -1723,7 +1535,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _bindRuntime(runtime);
     try {
       await runtime.enqueueOrPrompt(text, images: images);
-      _scrollToEnd(force: true);
+      _jumpToLatest();
     } catch (e) {
       SafeLog.d('deferred send failed', e);
       if (!mounted) return;
@@ -1950,7 +1762,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       try {
         _bindRuntime(live);
         await live.enqueueOrPrompt(text, images: images);
-        _scrollToEnd(force: true);
+        _jumpToLatest();
       } catch (e) {
         SafeLog.d('send failed', e);
         if (mounted) {
@@ -2152,7 +1964,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (runtime == null) return;
     try {
       await runtime.forceRun(messageId: messageId);
-      _scrollToEnd(force: true);
+      _jumpToLatest();
     } catch (e) {
       SafeLog.d('force-run failed', e);
       if (mounted) {
@@ -2161,98 +1973,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         ).showSnackBar(SnackBar(content: Text('Force run failed: $e')));
       }
     }
-  }
-
-  /// Open on the newest message rather than the top of the history.
-  ///
-  /// The list is lazy, so its scroll extent keeps growing for several frames as
-  /// rows are built and markdown lays out. Animating would chase a target that
-  /// is still moving and stop short, so pin to the end until it settles.
-  void _landAtBottom({int framesLeft = 3, int? gen}) {
-    final landGen = gen ?? _userScrollGen;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      // User took over — stop pinning.
-      if (landGen != _userScrollGen || !_followOutput) {
-        _landedAtBottom = true;
-        return;
-      }
-      if (_scroll.hasClients) {
-        final max = _scroll.position.maxScrollExtent;
-        // Empty / near-empty transcripts: don't burn frames jumping to 0.
-        if (max < 1) {
-          _emptyLandIdleFrames++;
-          if (_emptyLandIdleFrames >= 2 || framesLeft <= 1) {
-            _landedAtBottom = true;
-            _setFollowOutput(true);
-            return;
-          }
-        } else {
-          _emptyLandIdleFrames = 0;
-          if ((_scroll.position.pixels - max).abs() > 1) {
-            _programmaticScroll = true;
-            _scroll.jumpTo(max);
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              _programmaticScroll = false;
-            });
-          }
-        }
-      }
-      if (framesLeft > 1) {
-        _landAtBottom(framesLeft: framesLeft - 1, gen: landGen);
-      } else {
-        _landedAtBottom = true;
-        _setFollowOutput(true);
-      }
-    });
-  }
-
-  void _scrollToEnd({bool force = false}) {
-    // Don't fight the initial landing, and don't yank the view down while the
-    // user is scrolled up reading something.
-    if (force) {
-      _pinWindowToLatest();
-      _setFollowOutput(true);
-    }
-    if (!force && (!_landedAtBottom || !_followOutput || _userScrollGesture)) {
-      return;
-    }
-    final gen = _userScrollGen;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scroll.hasClients) return;
-      // Re-check: user may have scrolled away since this was scheduled.
-      if (!force && (!_followOutput || gen != _userScrollGen)) return;
-      final max = _scroll.position.maxScrollExtent;
-      if (max < 1) {
-        _lastScrollMaxExtent = max;
-        return;
-      }
-      final now = DateTime.now();
-      final lastAt = _lastScrollToEndAt;
-      final grew = max - _lastScrollMaxExtent;
-      // Streaming grows the extent constantly — jumping every flush fights the
-      // trackpad. Only follow when we moved enough or enough time passed.
-      if (!force &&
-          grew < 48 &&
-          lastAt != null &&
-          now.difference(lastAt) < const Duration(milliseconds: 280) &&
-          (_scroll.position.pixels - max).abs() < 64) {
-        return;
-      }
-      if ((_scroll.position.pixels - max).abs() < 1) {
-        _lastScrollMaxExtent = max;
-        return;
-      }
-      _lastScrollToEndAt = now;
-      _lastScrollMaxExtent = max;
-      _programmaticScroll = true;
-      // jumpTo (not animateTo): streaming fires many times per second and
-      // stacked animations lock the user out of manual scrolling.
-      _scroll.jumpTo(max);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _programmaticScroll = false;
-      });
-    });
   }
 
   Future<void> _renameChat() async {
@@ -2310,21 +2030,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _chromeUiEpoch.dispose();
     _transcriptUiEpoch.dispose();
     _composerUiEpoch.dispose();
-    _transcriptMotionN.dispose();
-    _scrollBusyN.dispose();
+    _transcriptN.dispose();
+    _transcriptCtl.dispose();
     _composerRuntimeN.dispose();
     _connectingN.dispose();
     _connectStatusN.dispose();
     _voiceTick?.cancel();
     _voicePulse.dispose();
-    _showJumpToLatest.dispose();
     _composer.removeListener(_onComposerChanged);
     _syncComposerDraft();
     if (_recordingVoice) {
       unawaited(ref.read(gcpSpeechServiceProvider).cancel());
     }
     _composer.dispose();
-    _scroll.dispose();
     super.dispose();
   }
 
@@ -2985,9 +2703,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       );
     }
 
-    // Transcript list only rebuilds on [_transcriptUiEpoch]. Activity/status
-    // chrome uses [_chromeUiEpoch] in small nested builders so scrolling while
-    // the agent runs is not fighting a full ListView rebuild every tick.
+    // Scaffold chrome rebuilds on [_transcriptUiEpoch] (content changes,
+    // ≤3 Hz); status labels on [_chromeUiEpoch]. The transcript list is a
+    // [TranscriptView] fed by [_transcriptN] and never rebuilt from here.
     return ListenableBuilder(
       listenable: _transcriptUiEpoch,
       child: _buildIsolatedComposer(),
@@ -2999,102 +2717,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ? runtime!.session as AdsmSession
             : null;
         final queue = runtime?.outboundQueue ?? const <ChatMessage>[];
-        final queuedIds = {for (final m in queue) m.id};
-        // Queued messages live in the DB but stay out of [entries] until promoted,
-        // so filter defensively in case a stale row is still present.
-        final rawEntries = runtime?.entries ?? _dbEntries;
-        final liveAssistantId = runtime?.liveAssistantMessageId;
-        final filtered = [
-          for (final e in rawEntries)
-            if (e.messageId == null ||
-                (!queuedIds.contains(e.messageId) &&
-                    e.messageId != liveAssistantId))
-              e,
-        ];
-        // System thoughts are folded into assistant bubbles by [buildTranscriptBlocks].
-        final entries = entriesByTime(filtered);
-        final thoughtBuffer = runtime?.thoughtBuffer ?? '';
-        final assistantBuffer = runtime?.assistantBuffer ?? '';
         // Composer no longer locks for the whole turn — only the live buffer
         // counts as "working" for the agent bubble.
         final streaming = runtime?.isWorking ?? false;
-
-        late final List<ChatBlock> visibleBlocks;
-        late final List<Widget> extra;
-        late final int windowStart;
-        final showLoadEarlier = _hasMoreOlderArchive;
-
-        final existingFreeze = _frozenTranscript;
-        if (!_followOutput &&
-            existingFreeze != null &&
-            !_freezeCapturePending) {
-          // PDF mode: immutable document — ignore live tools/thinking/tail.
-          visibleBlocks = existingFreeze.visibleBlocks;
-          extra = existingFreeze.extras;
-          windowStart = existingFreeze.start;
-          _blocksLength = existingFreeze.allBlocks.length;
-        } else {
-          final blocks = _blocksForMemoized(
-            entries,
-            openTurnActive: streaming,
-          );
-          _syncWindowToBlocks(blocks.length);
-          final liveExtra = <Widget>[];
-          // Keep live text visible even if isWorking cleared a tick before flush —
-          // that race used to make the answer vanish until reopen.
-          if (thoughtBuffer.isNotEmpty || assistantBuffer.isNotEmpty) {
-            if (thoughtBuffer.isNotEmpty) {
-              liveExtra.add(
-                _ThinkingFold(
-                  text: thoughtBuffer,
-                  // Freeze as static text so the fold cannot keep resizing.
-                  streaming: _followOutput && streaming,
-                  initiallyExpanded: streaming,
-                ),
-              );
-            }
-            // Live answer stays above queued user bubbles so the current turn can
-            // finish without burying what the user just scheduled.
-            if (assistantBuffer.isNotEmpty) {
-              liveExtra.add(
-                _Bubble(
-                  role: MessageRole.assistant,
-                  text: assistantBuffer,
-                  streaming: _followOutput && streaming,
-                ),
-              );
-            }
-          }
-          if (_followOutput) {
-            for (final m in queue) {
-              liveExtra.add(
-                _Bubble(
-                  role: MessageRole.user,
-                  text: m.content,
-                  at: m.createdAt,
-                  queued: true,
-                ),
-              );
-            }
-          }
-          if (!_followOutput) {
-            _captureFrozenTranscript(
-              allBlocks: blocks,
-              extras: liveExtra,
-              visibleCount: blocks.length,
-            );
-            final frozen = _frozenTranscript!;
-            visibleBlocks = frozen.visibleBlocks;
-            extra = frozen.extras;
-            windowStart = frozen.start;
-          } else {
-            _frozenTranscript = null;
-            _freezeCapturePending = false;
-            visibleBlocks = blocks;
-            extra = liveExtra;
-            windowStart = 0;
-          }
-        }
 
         final liveError = runtime?.lastError;
         final deliveryError = runtime?.deliveryError;
@@ -3253,7 +2878,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     if (mounted) {
                                       _syncComposerRuntime(null);
                                       setState(() {
-                                        _runtime = null;
+                                        _dropRuntime();
                                         _error = null;
                                       });
                                     }
@@ -3512,7 +3137,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                       if (mounted) {
                                         _syncComposerRuntime(null);
                                         setState(() {
-                                          _runtime = null;
+                                          _dropRuntime();
                                           _error = null;
                                         });
                                       }
@@ -3567,289 +3192,43 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   ),
                 ),
               Expanded(
-                child: Stack(
-                  children: [
-                    NotificationListener<ScrollNotification>(
-                      onNotification: (notification) {
-                        if (_programmaticScroll || _shiftingWindow) {
-                          return false;
-                        }
-                        // Trackpad / wheel / touch: UserScrollNotification.
-                        // Never auto-fetch history — only the top button does.
-                        //
-                        // Important (macOS): finger-up emits UserScroll idle
-                        // while ballistic inertia is still running. Ending the
-                        // gesture there freezes/rebuilds mid-fling and chokes
-                        // the trackpad — only ScrollEnd means the fling settled.
-                        if (notification is UserScrollNotification) {
-                          if (notification.direction != ScrollDirection.idle) {
-                            _onUserScrollIntent(
-                              notification.direction,
-                              notification.metrics,
-                            );
-                          }
-                          return false;
-                        }
-                        if (notification is ScrollEndNotification) {
-                          _onUserScrollEnded(notification.metrics);
-                          return false;
-                        }
-                        // Scrollbar thumb / drag may only emit ScrollUpdate.
-                        if (notification is ScrollUpdateNotification &&
-                            notification.dragDetails != null &&
-                            notification.scrollDelta != null &&
-                            notification.scrollDelta != 0) {
-                          final direction = notification.scrollDelta! > 0
-                              ? ScrollDirection.forward
-                              : ScrollDirection.reverse;
-                          _onUserScrollIntent(
-                            direction,
-                            notification.metrics,
-                            fromScrollbarDrag: true,
-                          );
-                        }
-                        return false;
-                      },
-                      child: GptMarkdownTheme(
-                        gptThemeData: chatGptMarkdownTheme(theme),
-                        child: ValueListenableBuilder<bool>(
-                          valueListenable: _scrollBusyN,
-                          builder: (context, busy, child) =>
-                              TranscriptScrollBusy(busy: busy, child: child!),
-                          child: ValueListenableBuilder<bool>(
-                            valueListenable: _transcriptMotionN,
-                            // Preserve the ListView element when motion toggles so
-                            // we only pause tickers (shimmer / live cursors) — no
-                            // mid-fling markdown rebuild.
-                            builder: (context, motion, child) =>
-                                TickerMode(enabled: motion, child: child!),
-                            child: ListView.builder(
-                          controller: _scroll,
-                          // Desktop: Cursor-like side margins. Phone: tighter inset so
-                          // bubbles aren't pushed inward like a desktop column.
-                          padding: EdgeInsets.fromLTRB(
-                            useDesktopShell(context) ? 40 : 16,
-                            12,
-                            useDesktopShell(context) ? 40 : 16,
-                            16,
-                          ),
-                          // Keep scroll physics interactive even while the agent streams.
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          // Slightly larger than before so Mac trackpad flings
-                          // hitch less when tall bubbles enter the viewport.
-                          cacheExtent: 720,
-                          itemCount:
-                              (showLoadEarlier ? 1 : 0) +
-                              visibleBlocks.length +
-                              extra.length,
-                          itemBuilder: (context, index) {
-                            var cursor = index;
-                            if (showLoadEarlier) {
-                              if (cursor == 0) {
-                                return Padding(
-                                  padding: const EdgeInsets.only(bottom: 8),
-                                  child: Center(
-                                    child: TextButton(
-                                      onPressed: _loadingOlderHistory
-                                          ? null
-                                          : () => unawaited(
-                                              _loadOlderHistoryChunk(),
-                                            ),
-                                      child: Text(
-                                        _loadingOlderHistory
-                                            ? 'Loading earlier…'
-                                            : '↑ Load earlier messages (~1 MB)',
-                                        style: theme.textTheme.labelSmall
-                                            ?.copyWith(
-                                              color: theme.colorScheme.primary,
-                                            ),
-                                      ),
-                                    ),
-                                  ),
-                                );
-                              }
-                              cursor--;
-                            }
-                            if (cursor < visibleBlocks.length) {
-                              final historyIndex = cursor;
-                              final absoluteIndex =
-                                  windowStart + historyIndex;
-                              final block = visibleBlocks[historyIndex];
-                              final prevAt = historyIndex > 0
-                                  ? visibleBlocks[historyIndex - 1].createdAt
-                                  : null;
-                              final at = block.createdAt;
-                              final showDate =
-                                  at != null &&
-                                  (prevAt == null ||
-                                      prevAt.year != at.year ||
-                                      prevAt.month != at.month ||
-                                      prevAt.day != at.day);
-
-                              final Widget body;
-                              final tools = block.tools;
-                              if (block.thinkingOnly != null) {
-                                body = _ThinkingFold(text: block.thinkingOnly!);
-                              } else if (tools != null) {
-                                body = ToolCallGroupCard(
-                                  tools: [
-                                    for (final e in tools) e.tool!,
-                                  ],
-                                  messageIds: [
-                                    for (final e in tools) e.messageId,
-                                  ],
-                                  resolveDetails: _resolveToolGroupDetails,
-                                  animate: _followOutput,
-                                );
-                              } else if (block.entry!.tool != null) {
-                                final entry = block.entry!;
-                                body = ToolCallGroupCard(
-                                  tools: [entry.tool!.withoutPayloads()],
-                                  messageIds: [entry.messageId],
-                                  resolveDetails: _resolveToolGroupDetails,
-                                  animate: _followOutput,
-                                );
-                              } else {
-                                final m = block.entry!.message!;
-                                final bubble = _Bubble(
-                                  role: m.role,
-                                  text: m.content,
-                                  at: m.createdAt,
-                                );
-                                final thinking = block.thinking;
-                                if (thinking != null && thinking.isNotEmpty) {
-                                  body = Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.stretch,
-                                    children: [
-                                      _ThinkingFold(text: thinking),
-                                      bubble,
-                                    ],
-                                  );
-                                } else {
-                                  body = bubble;
-                                }
-                              }
-                              final stats = block.turnStats;
-                              final withStats =
-                                  stats != null && stats.isNotEmpty
-                                  ? Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        body,
-                                        Padding(
-                                          padding: const EdgeInsets.only(
-                                            left: 6,
-                                            top: 2,
-                                            bottom: 4,
-                                          ),
-                                          child: TurnMetricsLabel(
-                                            added: stats.added,
-                                            removed: stats.removed,
-                                            files: stats.files,
-                                          ),
-                                        ),
-                                      ],
-                                    )
-                                  : body;
-                              final keyed = KeyedSubtree(
-                                key: ValueKey(
-                                  block.thinkingOnly != null
-                                      ? 'think-$absoluteIndex-${block.thinkingOnly.hashCode}'
-                                      : tools != null
-                                      ? 'tools-$absoluteIndex-${tools.length}-'
-                                            '${tools.first.messageId ?? tools.first.createdAt}'
-                                      : block.entry!.messageId ??
-                                            block.entry!.tool?.toolCallId ??
-                                            'e-$absoluteIndex',
-                                ),
-                                child: RepaintBoundary(child: withStats),
-                              );
-                              if (!showDate) return keyed;
-                              return Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [_DateChip(at), keyed],
-                              );
-                            }
-                            cursor -= visibleBlocks.length;
-                            return extra[cursor];
-                          },
+                child: TranscriptView(
+                  snapshot: _transcriptN,
+                  controller: _transcriptCtl,
+                  resolveToolDetails: _resolveToolGroupDetails,
+                  onLoadOlder: _loadOlderHistoryChunk,
+                  onJumpToLatest: () => _runtime?.pinDisplayToLiveChunk(),
+                  // Activity strip overlays the list so turn status cannot
+                  // resize the scroll viewport.
+                  overlay: ListenableBuilder(
+                    listenable: _chromeUiEpoch,
+                    builder: (context, _) {
+                      final rt = _runtime;
+                      if (rt == null || !rt.isWorking) {
+                        return const SizedBox.shrink();
+                      }
+                      return Material(
+                        color: theme.colorScheme.errorContainer.withValues(
+                          alpha: 0.35,
                         ),
-                        ),
-                        ),
-                      ),
-                    ),
-                    ValueListenableBuilder<bool>(
-                      valueListenable: _showJumpToLatest,
-                      builder: (context, showJump, _) {
-                        if (!showJump) return const SizedBox.shrink();
-                        return Positioned(
-                          left: 0,
-                          right: 0,
-                          bottom: 12,
-                          child: Center(
-                            child: Material(
-                              elevation: 3,
-                              color: theme.colorScheme.primaryContainer,
-                              shape: const CircleBorder(),
-                              child: IconButton(
-                                tooltip: 'Jump to latest',
-                                onPressed: () {
-                                  _pinWindowToLatest();
-                                  _flushRuntimeUi();
-                                  _scrollToEnd(force: true);
-                                },
-                                icon: Icon(
-                                  Icons.keyboard_arrow_down_rounded,
-                                  color: theme.colorScheme.onPrimaryContainer,
-                                ),
-                              ),
+                        child: SizedBox(
+                          height: 32,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                            ),
+                            child: Align(
+                              alignment: Alignment.centerLeft,
+                              child: _buildStreamingActivityLabel(theme, rt),
                             ),
                           ),
-                        );
-                      },
-                    ),
-                    // Activity strip overlays the list so turn status cannot
-                    // resize the scroll viewport (PDF-stable scrollbar).
-                    ListenableBuilder(
-                      listenable: _chromeUiEpoch,
-                      builder: (context, _) {
-                        final rt = _runtime;
-                        if (rt == null || !rt.isWorking) {
-                          return const SizedBox.shrink();
-                        }
-                        return Positioned(
-                          left: 0,
-                          right: 0,
-                          bottom: 0,
-                          child: Material(
-                            color: theme.colorScheme.errorContainer.withValues(
-                              alpha: 0.35,
-                            ),
-                            child: SizedBox(
-                              height: 32,
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 14,
-                                ),
-                                child: Align(
-                                  alignment: Alignment.centerLeft,
-                                  child: _buildStreamingActivityLabel(
-                                    theme,
-                                    rt,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ],
+                        ),
+                      );
+                    },
+                  ),
                 ),
               ),
-              if (_followOutput && queue.isNotEmpty)
+              if (queue.isNotEmpty)
                 _OutboundQueueBar(
                   queue: queue,
                   busy: streaming,
@@ -3859,7 +3238,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     runtime?.removeFromQueue(id) ?? Future<void>.value(),
                   ),
                 ),
-              if (_followOutput && runtime?.pendingPermission != null)
+              if (runtime?.pendingPermission != null)
                 _PermissionPromptBar(
                   request: runtime!.pendingPermission!,
                   onSelect: (optionId) {
@@ -4115,498 +3494,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ),
     );
   }
-}
-
-/// Collapsible agent reasoning — collapsed by default after the turn ends.
-/// Immutable transcript document used while the user scrolls history.
-///
-/// Live tool/thinking/token updates must not change these rows — that is what
-/// made the scrollbar thrash (extent changing under a fixed pixel offset).
-class _FrozenTranscript {
-  _FrozenTranscript({
-    required this.allBlocks,
-    required this.extras,
-    required this.visibleCount,
-  });
-
-  final List<ChatBlock> allBlocks;
-  final List<Widget> extras;
-  int visibleCount;
-
-  int get start {
-    if (allBlocks.isEmpty) return 0;
-    if (visibleCount >= allBlocks.length) return 0;
-    return allBlocks.length - visibleCount;
-  }
-
-  int get hiddenOlder => start;
-
-  List<ChatBlock> get visibleBlocks {
-    if (allBlocks.isEmpty) return allBlocks;
-    return allBlocks.sublist(start);
-  }
-}
-
-class _ThinkingFold extends StatefulWidget {
-  const _ThinkingFold({
-    required this.text,
-    this.streaming = false,
-    this.initiallyExpanded = false,
-  });
-
-  final String text;
-  final bool streaming;
-  final bool initiallyExpanded;
-
-  @override
-  State<_ThinkingFold> createState() => _ThinkingFoldState();
-}
-
-class _ThinkingFoldState extends State<_ThinkingFold> {
-  late bool _expanded = widget.initiallyExpanded;
-
-  @override
-  void didUpdateWidget(covariant _ThinkingFold oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.streaming && !oldWidget.streaming) {
-      _expanded = true;
-    }
-    if (!widget.streaming && oldWidget.streaming) {
-      _expanded = false;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final labelColor = theme.colorScheme.onSurface.withValues(alpha: 0.72);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 4, 4, 2),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: MediaQuery.sizeOf(context).width * 0.88,
-          ),
-          child: Material(
-            color: theme.colorScheme.surfaceContainerHigh.withValues(
-              alpha: 0.55,
-            ),
-            borderRadius: BorderRadius.circular(12),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  InkWell(
-                    borderRadius: BorderRadius.circular(8),
-                    onTap: () => setState(() => _expanded = !_expanded),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.psychology_alt_outlined,
-                          size: 16,
-                          color: labelColor,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Shimmer(
-                            enabled: false,
-                            child: Text(
-                              widget.streaming ? 'Thinking…' : 'Thinking',
-                              style: theme.textTheme.labelMedium?.copyWith(
-                                color: labelColor,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ),
-                        Icon(
-                          _expanded
-                              ? Icons.expand_less_rounded
-                              : Icons.expand_more_rounded,
-                          size: 18,
-                          color: labelColor,
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (_expanded) ...[
-                    const SizedBox(height: 8),
-                    MessageBody(
-                      text: widget.text,
-                      dense: true,
-                      live: widget.streaming,
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        fontStyle: FontStyle.italic,
-                        color: theme.colorScheme.onSurfaceVariant,
-                        height: 1.35,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _Bubble extends StatelessWidget {
-  const _Bubble({
-    required this.role,
-    required this.text,
-    this.streaming = false,
-    this.queued = false,
-    this.at,
-  });
-
-  final MessageRole role;
-  final String text;
-  final bool streaming;
-  final bool queued;
-  final DateTime? at;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final isUser = role == MessageRole.user;
-    final imageRefs = isUser
-        ? ChatImageCodec.listRefs(text)
-        : const <ChatImageRef>[];
-    final stripped = ChatImageCodec.displayText(text);
-    final autoNumber = isUser ? AutoRunTag.parseNumber(stripped) : null;
-    final bodyText = isUser ? AutoRunTag.displayBody(stripped) : stripped;
-
-    if (role == MessageRole.system) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(
-              Icons.psychology_alt,
-              size: 14,
-              color: theme.colorScheme.outline,
-            ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: MessageBody(
-                text: text,
-                dense: true,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  fontStyle: FontStyle.italic,
-                  color: theme.colorScheme.onSurfaceVariant,
-                  height: 1.35,
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    // Cursor-style: user = soft raised pill; agent = bare text on the canvas.
-    final onText = isUser ? AppColors.onBubbleUser : AppColors.chatAgentText;
-    final metaColor = AppColors.chatMeta;
-
-    final bodyStyle = theme.textTheme.bodyMedium?.copyWith(
-      color: onText,
-      height: 1.45,
-      fontSize: 15,
-    );
-
-    final column = Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: useDesktopShell(context)
-          ? MainAxisSize.max
-          : MainAxisSize.min,
-      children: [
-        if (!isUser && streaming)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Shimmer(
-              enabled: false,
-              child: Text(
-                'Thinking',
-                style: theme.textTheme.labelMedium?.copyWith(
-                  color: metaColor,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
-            ),
-          ),
-        if (autoNumber != null)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 6),
-            child: AutoNumberBadge(number: autoNumber, compact: false),
-          ),
-        if (queued)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 6),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.schedule, size: 14, color: metaColor),
-                const SizedBox(width: 6),
-                Text(
-                  'Queued',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: metaColor,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        if (imageRefs.isNotEmpty)
-          Padding(
-            padding: EdgeInsets.only(bottom: bodyText.trim().isEmpty ? 0 : 8),
-            child: _BubbleImages(refs: imageRefs),
-          ),
-        if (streaming && bodyText.isEmpty && imageRefs.isEmpty)
-          MessageBody(text: '…', style: bodyStyle, live: true)
-        else if (bodyText.isNotEmpty || (streaming && bodyText.isEmpty))
-          MessageBody(
-            text: streaming && bodyText.isEmpty ? '…' : bodyText,
-            style: bodyStyle,
-            live: streaming,
-          ),
-        if (!streaming && (at != null || bodyText.trim().isNotEmpty))
-          Padding(
-            padding: const EdgeInsets.only(top: 6),
-            child: Row(
-              // Desktop Cursor-style: meta hugs the trailing edge of a
-              // full-width pill. Phone: keep meta with the text (start) so
-              // it does not look right-justified across the screen.
-              mainAxisAlignment: useDesktopShell(context)
-                  ? MainAxisAlignment.end
-                  : MainAxisAlignment.start,
-              mainAxisSize: useDesktopShell(context)
-                  ? MainAxisSize.max
-                  : MainAxisSize.min,
-              children: [
-                if (!queued && bodyText.trim().isNotEmpty) ...[
-                  IconButton(
-                    tooltip: 'Copy text for Teams',
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(
-                      minWidth: 28,
-                      minHeight: 28,
-                    ),
-                    onPressed: () => copyMessageForTeams(context, bodyText),
-                    icon: Icon(
-                      Icons.copy_rounded,
-                      size: 14,
-                      color: metaColor.withValues(alpha: 0.85),
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Copy HTML for Teams',
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(
-                      minWidth: 28,
-                      minHeight: 28,
-                    ),
-                    onPressed: () => copyMessageHtmlForTeams(context, bodyText),
-                    icon: Icon(
-                      Icons.html,
-                      size: 15,
-                      color: metaColor.withValues(alpha: 0.85),
-                    ),
-                  ),
-                ],
-                if (at != null)
-                  Padding(
-                    padding: const EdgeInsets.only(left: 4),
-                    child: Text(
-                      _formatClock(at!),
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        color: metaColor,
-                        fontWeight: FontWeight.w500,
-                        fontSize: 11,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-      ],
-    );
-
-    if (isUser) {
-      final desktop = useDesktopShell(context);
-      return Align(
-        alignment: Alignment.centerLeft,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth:
-                MediaQuery.sizeOf(context).width * (desktop ? 0.92 : 0.88),
-          ),
-          child: Container(
-            // Full-width pill on desktop; shrink-wrap on phone so short
-            // messages don't stretch timestamps to the screen's right edge.
-            width: desktop ? double.infinity : null,
-            margin: const EdgeInsets.only(top: 10, bottom: 6),
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-            decoration: BoxDecoration(
-              color: AppColors.bubbleUser,
-              borderRadius: BorderRadius.circular(14),
-              border: queued
-                  ? Border.all(
-                      color: theme.colorScheme.primary.withValues(alpha: 0.45),
-                    )
-                  : null,
-            ),
-            child: column,
-          ),
-        ),
-      );
-    }
-
-    return Padding(
-      padding: const EdgeInsets.only(top: 8, bottom: 10, left: 4, right: 4),
-      child: column,
-    );
-  }
-}
-
-class _BubbleImages extends StatefulWidget {
-  const _BubbleImages({required this.refs});
-
-  final List<ChatImageRef> refs;
-
-  @override
-  State<_BubbleImages> createState() => _BubbleImagesState();
-}
-
-class _BubbleImagesState extends State<_BubbleImages> {
-  List<String?> _paths = const [];
-
-  @override
-  void initState() {
-    super.initState();
-    _resolve();
-  }
-
-  @override
-  void didUpdateWidget(covariant _BubbleImages oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (!identical(oldWidget.refs, widget.refs)) _resolve();
-  }
-
-  Future<void> _resolve() async {
-    final docs = await getApplicationDocumentsDirectory();
-    if (!mounted) return;
-    setState(() {
-      _paths = [
-        for (final r in widget.refs)
-          r.absolutePath ?? p.join(docs.path, r.relativePath),
-      ];
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (widget.refs.isEmpty) return const SizedBox.shrink();
-    final paths = _paths.length == widget.refs.length
-        ? _paths
-        : List<String?>.filled(widget.refs.length, null);
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: [
-        for (var i = 0; i < widget.refs.length; i++)
-          ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: paths[i] == null
-                ? Container(
-                    width: 120,
-                    height: 120,
-                    color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                    child: const Icon(Icons.image_outlined),
-                  )
-                : Image.file(
-                    File(paths[i]!),
-                    width: 140,
-                    height: 140,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => Container(
-                      width: 120,
-                      height: 120,
-                      color: Theme.of(context).colorScheme.surfaceContainerHigh,
-                      child: const Icon(Icons.broken_image_outlined),
-                    ),
-                  ),
-          ),
-      ],
-    );
-  }
-}
-
-String _formatClock(DateTime at) {
-  final local = at.toLocal();
-  final h = local.hour.toString().padLeft(2, '0');
-  final m = local.minute.toString().padLeft(2, '0');
-  return '$h:$m';
-}
-
-class _DateChip extends StatelessWidget {
-  const _DateChip(this.day);
-
-  final DateTime day;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final that = DateTime(day.year, day.month, day.day);
-    final label = switch (today.difference(that).inDays) {
-      0 => 'Today',
-      1 => 'Yesterday',
-      _ => '${_month(that.month)} ${that.day}, ${that.year}',
-    };
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-            color: theme.colorScheme.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Text(
-            label,
-            style: theme.textTheme.labelSmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  static const _months = [
-    'Jan',
-    'Feb',
-    'Mar',
-    'Apr',
-    'May',
-    'Jun',
-    'Jul',
-    'Aug',
-    'Sep',
-    'Oct',
-    'Nov',
-    'Dec',
-  ];
-  static String _month(int m) => _months[m - 1];
 }
 
 /// Pending outbound prompts while the agent is still on a turn.

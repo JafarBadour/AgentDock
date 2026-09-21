@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:markdown/markdown.dart' as md;
@@ -7,29 +6,6 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../app/app_theme.dart';
-
-/// While the transcript list is mid-gesture, [MessageBody] skips first-time
-/// GptMarkdown parse (plain text only). Already-frozen bubbles stay put and do
-/// not depend on this, so toggling it does not rebuild the whole list.
-class TranscriptScrollBusy extends InheritedWidget {
-  const TranscriptScrollBusy({
-    super.key,
-    required this.busy,
-    required super.child,
-  });
-
-  final bool busy;
-
-  static bool of(BuildContext context) {
-    final scope =
-        context.dependOnInheritedWidgetOfExactType<TranscriptScrollBusy>();
-    return scope?.busy ?? false;
-  }
-
-  @override
-  bool updateShouldNotify(TranscriptScrollBusy oldWidget) =>
-      busy != oldWidget.busy;
-}
 
 /// A recognised link inside a chat message.
 enum RichLinkKind { githubPr, githubIssue, jira, generic }
@@ -310,10 +286,11 @@ Future<void> openRichLink(String url) async {
 /// Renders a chat message as Markdown (tables, code, lists, …)
 /// with GitHub / Jira chips for recognised links.
 ///
-/// Finished bubbles freeze the parsed [GptMarkdown] tree so parent
-/// [ChatScreen] rebuilds (streaming ticks, sidebar noise) do not re-parse
-/// every visible message. Live/streaming text uses plain [Text] — re-parsing
-/// markdown on every token is what made scrolling feel stuck mid-turn.
+/// Finished text is parsed once and the widget tree frozen, so parent
+/// rebuilds (stream flushes, sidebar noise) never re-parse it. Live text is
+/// split at the last safe blank line: the settled prefix is parsed once and
+/// cached, only the short tail is re-parsed as tokens arrive — so streaming
+/// shows real markdown at a cost proportional to the tail, not the reply.
 class MessageBody extends StatefulWidget {
   const MessageBody({
     super.key,
@@ -327,7 +304,7 @@ class MessageBody extends StatefulWidget {
   final TextStyle? style;
   final bool dense;
 
-  /// When true, skip markdown parsing (streaming / in-progress text).
+  /// True while more text may still arrive.
   final bool live;
 
   @override
@@ -340,21 +317,9 @@ class _MessageBodyState extends State<MessageBody> {
   bool? _frozenDense;
   TextStyle? _frozenStyle;
 
-  /// Cap first-time markdown builds per frame so scroll-end upgrades do not
-  /// hitch the UI isolate when many bubbles become visible at once.
-  static int _upgradesThisFrame = 0;
-  static Duration? _upgradeFrameStamp;
-
-  static bool _claimMarkdownUpgradeSlot() {
-    final stamp = SchedulerBinding.instance.currentFrameTimeStamp;
-    if (_upgradeFrameStamp != stamp) {
-      _upgradeFrameStamp = stamp;
-      _upgradesThisFrame = 0;
-    }
-    if (_upgradesThisFrame >= 2) return false;
-    _upgradesThisFrame++;
-    return true;
-  }
+  /// Settled prefix of a live reply and the widget built from it.
+  String _settledSource = '';
+  Widget? _settledWidget;
 
   static bool _styleEq(TextStyle? a, TextStyle? b) {
     if (identical(a, b)) return true;
@@ -367,19 +332,16 @@ class _MessageBodyState extends State<MessageBody> {
         a.fontFamily == b.fontFamily;
   }
 
-  Widget _plainBody(TextStyle? base) {
-    return Text(
-      widget.text,
-      style: base,
-      textAlign: TextAlign.start,
-      textDirection: TextDirection.ltr,
-    );
-  }
-
-  void _scheduleMarkdownRetry() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) setState(() {});
-    });
+  @override
+  void didUpdateWidget(covariant MessageBody oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.dense != oldWidget.dense ||
+        !_styleEq(widget.style, oldWidget.style) ||
+        !widget.text.startsWith(_settledSource)) {
+      // Style change or the text was replaced (not extended).
+      _settledSource = '';
+      _settledWidget = null;
+    }
   }
 
   @override
@@ -392,32 +354,18 @@ class _MessageBodyState extends State<MessageBody> {
       return Text('…', style: base);
     }
 
-    // Streaming: plain selectable text — no GptMarkdown re-parse per token.
     if (widget.live) {
-      return SelectionArea(
-        child: _plainBody(base),
-      );
+      return _buildLive(context, base);
     }
 
     if (_frozen != null &&
         _frozenText == widget.text &&
         _frozenDense == widget.dense &&
         _styleEq(_frozenStyle, widget.style)) {
-      // Already parsed — do not depend on scroll-busy (avoids list-wide rebuild).
       return _frozen!;
     }
-
-    // Mid-fling: newly entering rows stay plain text. Parsing markdown here is
-    // what made Mac trackpad scrolling hitch at random scroll offsets.
-    if (TranscriptScrollBusy.of(context)) {
-      return _plainBody(base);
-    }
-
-    if (!_claimMarkdownUpgradeSlot()) {
-      _scheduleMarkdownRetry();
-      return _plainBody(base);
-    }
-
+    _settledSource = '';
+    _settledWidget = null;
     _frozenText = widget.text;
     _frozenDense = widget.dense;
     _frozenStyle = widget.style;
@@ -425,13 +373,38 @@ class _MessageBodyState extends State<MessageBody> {
     // pathologically expensive on desktop.
     _frozen = RepaintBoundary(
       child: SelectionArea(
-        child: _buildMarkdown(context, base),
+        child: _buildMarkdown(context, widget.text, base),
       ),
     );
     return _frozen!;
   }
 
-  Widget _buildMarkdown(BuildContext context, TextStyle? base) {
+  Widget _buildLive(BuildContext context, TextStyle? base) {
+    final text = widget.text;
+    final splitAt = settledSplitOffset(text);
+    final tail = _buildMarkdown(context, text.substring(splitAt), base);
+    if (splitAt == 0) return tail;
+
+    final prefix = text.substring(0, splitAt).trimRight();
+    var settled = _settledWidget;
+    if (settled == null || prefix != _settledSource) {
+      settled = RepaintBoundary(
+        child: _buildMarkdown(context, prefix, base),
+      );
+      _settledSource = prefix;
+      _settledWidget = settled;
+    }
+    // One blank line, matching the paragraph gap gpt_markdown paints between
+    // blocks in a single document.
+    final gap = (base?.fontSize ?? 14) * 1.15;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [settled, SizedBox(height: gap), tail],
+    );
+  }
+
+  Widget _buildMarkdown(BuildContext context, String text, TextStyle? base) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
 
@@ -439,7 +412,7 @@ class _MessageBodyState extends State<MessageBody> {
     // wrap every bubble in a new Theme — that forced gpt_markdown to re-parse
     // on every ChatScreen setState.
     return GptMarkdown(
-      widget.text,
+      text,
       style: base,
       textAlign: TextAlign.start,
       textDirection: TextDirection.ltr,

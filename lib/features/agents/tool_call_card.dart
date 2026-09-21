@@ -5,7 +5,8 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../data/models/tool_call_state.dart';
 import 'agent_status_indicators.dart';
 
-/// Count-only row for a run of consecutive tool calls.
+/// One row for a run of consecutive tool calls, labelled by what the run did
+/// ("Read 3 files · Ran 2 commands"; a single tool shows its own preview).
 ///
 /// Details stay out of the transcript until the user expands — then they are
 /// fetched (local DB / live runtime / ADSM) and dropped again on collapse so
@@ -19,7 +20,7 @@ class ToolCallGroupCard extends StatefulWidget {
     this.animate = true,
   });
 
-  /// Lightweight summaries (no raw input/output) used for the count row.
+  /// Lightweight summaries (no raw input/output) used for the header row.
   final List<ToolCallState> tools;
 
   /// Parallel SQLite message ids for [tools], when known.
@@ -49,12 +50,35 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   int get _hardFailCount => widget.tools.where((t) => t.isHardFail).length;
   int get _softFailCount => widget.tools.where((t) => t.isSoftFail).length;
 
-  String get _groupLabel {
-    final count = widget.tools.length;
-    if (_anyActive) {
-      return count == 1 ? '1 tool running' : '$count tools running';
+  /// Collapsed header: what the run did, not just how many calls it made.
+  InlineSpan _groupLabel(ThemeData theme, Color color) {
+    final tools = widget.tools;
+    final base = theme.textTheme.bodySmall?.copyWith(
+      color: color,
+      fontWeight: FontWeight.w500,
+      height: 1.3,
+    );
+    final mono = theme.textTheme.bodySmall?.copyWith(
+      color: theme.colorScheme.outline,
+      fontFamily: 'monospace',
+      fontSize: 11,
+      height: 1.3,
+    );
+    if (tools.length == 1) {
+      final t = tools.first;
+      final preview = t.preview;
+      return TextSpan(
+        style: base,
+        children: [
+          TextSpan(text: t.displayTitle),
+          if (preview != null && preview != t.displayTitle)
+            TextSpan(text: '  $preview', style: mono),
+        ],
+      );
     }
-    return count == 1 ? '1 tool' : '$count tools';
+    final summary = ToolCallState.summarizeActions(tools);
+    final running = _anyActive ? ' · running' : '';
+    return TextSpan(style: base, text: '$summary$running');
   }
 
   Future<void> _toggle() async {
@@ -102,14 +126,17 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   @override
   void didUpdateWidget(covariant ToolCallGroupCard oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // If the group identity changed while expanded, drop stale details.
-    if (_expanded &&
-        (oldWidget.tools.length != widget.tools.length ||
-            oldWidget.tools.first.toolCallId != widget.tools.first.toolCallId)) {
+    if (!_expanded) return;
+    if (oldWidget.tools.first.toolCallId != widget.tools.first.toolCallId) {
+      // Different group under the same element — drop stale details.
       _details = null;
       _expanded = false;
       _loading = false;
       _loadError = null;
+    } else if (oldWidget.tools.length != widget.tools.length && !_loading) {
+      // A running group grew while open: stay open, show the summaries (they
+      // carry previews) until the user re-expands for full payloads.
+      _details = null;
     }
   }
 
@@ -150,7 +177,9 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                       Icon(
                         hard
                             ? Icons.error_outline
-                            : Icons.auto_awesome_outlined,
+                            : widget.tools.length == 1
+                                ? toolKindIcon(widget.tools.first)
+                                : Icons.layers_outlined,
                         size: 14,
                         color: hard
                             ? scheme.error
@@ -163,13 +192,17 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                       child: Shimmer(
                         enabled:
                             widget.animate && _anyActive && !_expanded,
-                        child: Text(
-                          _loading ? 'Loading tools…' : _groupLabel,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: labelColor,
-                            fontWeight: FontWeight.w500,
-                            height: 1.3,
-                          ),
+                        child: Text.rich(
+                          _loading
+                              ? TextSpan(
+                                  text: 'Loading tools…',
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: labelColor,
+                                    fontWeight: FontWeight.w500,
+                                    height: 1.3,
+                                  ),
+                                )
+                              : _groupLabel(theme, labelColor),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
@@ -246,6 +279,18 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   }
 }
 
+/// Icon for a tool's coarse category.
+IconData toolKindIcon(ToolCallState tool) => switch (tool.actionKind) {
+      ToolActionKind.subagent => Icons.hub_outlined,
+      ToolActionKind.web => Icons.language_rounded,
+      ToolActionKind.exec => Icons.terminal_rounded,
+      ToolActionKind.read => Icons.description_outlined,
+      ToolActionKind.edit => Icons.edit_outlined,
+      ToolActionKind.search => Icons.search_rounded,
+      ToolActionKind.mcp => Icons.extension_outlined,
+      ToolActionKind.other => Icons.auto_awesome_outlined,
+    };
+
 /// One line of agent activity, expandable into the raw input/output.
 ///
 /// Only mounted while a [ToolCallGroupCard] is expanded — collapse removes it.
@@ -260,35 +305,6 @@ class ToolCallCard extends StatefulWidget {
 
 class _ToolCallCardState extends State<ToolCallCard> {
   bool _expanded = false;
-
-  IconData get _kindIcon {
-    final k = (widget.tool.kind ?? '').toLowerCase();
-    final title = widget.tool.title.toLowerCase();
-    final blob = '$k $title';
-    if (k.contains('think') ||
-        k.contains('task') ||
-        k.contains('agent') ||
-        blob.contains('subagent')) {
-      return Icons.hub_outlined;
-    }
-    if (blob.contains('web') ||
-        blob.contains('browser') ||
-        k.contains('fetch') ||
-        k.contains('http')) {
-      return Icons.language_rounded;
-    }
-    if (k.contains('exec') || k.contains('shell') || k.contains('terminal')) {
-      return Icons.terminal_rounded;
-    }
-    if (k.contains('read')) return Icons.description_outlined;
-    if (k.contains('edit') || k.contains('write')) return Icons.edit_outlined;
-    if (k.contains('search') || k.contains('grep') || k.contains('glob')) {
-      return Icons.search_rounded;
-    }
-    if (k.contains('delete')) return Icons.delete_outline;
-    if (k.contains('mcp')) return Icons.extension_outlined;
-    return Icons.auto_awesome_outlined;
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -339,7 +355,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                               ? Icons.warning_amber_outlined
                               : (active && tool.isPollingWait)
                                   ? Icons.hourglass_top_rounded
-                                  : _kindIcon,
+                                  : toolKindIcon(tool),
                       size: 14,
                       color: hardFail
                           ? scheme.error

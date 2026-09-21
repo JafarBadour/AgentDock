@@ -3,6 +3,9 @@ import 'dart:convert';
 /// Identity-keyed caches so huge tool JSON is not re-parsed on every rebuild.
 final Expando<String> _toolPreviewCache = Expando<String>('toolPreview');
 
+/// Coarse category of a tool call, for icons and group summaries.
+enum ToolActionKind { read, edit, search, exec, web, subagent, mcp, other }
+
 /// In-memory tool call assembled from ACP tool_call / tool_call_update.
 class ToolCallState {
   const ToolCallState({
@@ -14,6 +17,9 @@ class ToolCallState {
     this.rawInput,
     this.rawOutput,
     this.content,
+    this.previewHint,
+    this.inputHead,
+    this.outputHead,
   });
 
   final String toolCallId;
@@ -27,6 +33,13 @@ class ToolCallState {
   /// ACP `content` blocks (often includes `type: diff` with old/new text).
   final String? content;
 
+  /// Summary-only fields set by [withoutPayloads]: the one-line preview and
+  /// small heads of the raw I/O, computed once from the full payload so the
+  /// transcript row can still say *what* the tool did without carrying blobs.
+  final String? previewHint;
+  final String? inputHead;
+  final String? outputHead;
+
   bool get isActive =>
       status == 'pending' || status == 'in_progress' || status == 'running';
 
@@ -38,7 +51,7 @@ class ToolCallState {
   bool get isSoftFail {
     if (!isFailed) return false;
     // Cap scan — full tool blobs can be 100KB+.
-    final out = rawOutput ?? '';
+    final out = rawOutput ?? outputHead ?? '';
     final cont = content ?? '';
     final blob = '${out.length > 2000 ? out.substring(0, 2000) : out} '
             '${cont.length > 2000 ? cont.substring(0, 2000) : cont}'
@@ -55,6 +68,69 @@ class ToolCallState {
   }
 
   bool get isHardFail => isFailed && !isSoftFail;
+
+  /// Coarse category from ACP `kind` / title (cheap — never scans payloads).
+  ToolActionKind get actionKind {
+    final k = (kind ?? '').toLowerCase();
+    final t = title.toLowerCase();
+    final blob = '$k $t';
+    if (k.contains('think') ||
+        k.contains('task') ||
+        k.contains('agent') ||
+        blob.contains('subagent')) {
+      return ToolActionKind.subagent;
+    }
+    if (k.contains('mcp') || t.startsWith('mcp__')) return ToolActionKind.mcp;
+    if (blob.contains('web') ||
+        blob.contains('browser') ||
+        k.contains('fetch') ||
+        k.contains('http')) {
+      return ToolActionKind.web;
+    }
+    if (k.contains('exec') ||
+        k.contains('shell') ||
+        k.contains('terminal') ||
+        k.contains('bash')) {
+      return ToolActionKind.exec;
+    }
+    if (k.contains('read')) return ToolActionKind.read;
+    if (k.contains('edit') || k.contains('write') || k.contains('delete')) {
+      return ToolActionKind.edit;
+    }
+    if (k.contains('search') || k.contains('grep') || k.contains('glob')) {
+      return ToolActionKind.search;
+    }
+    return ToolActionKind.other;
+  }
+
+  /// "Read 3 files · Ran 2 commands · Edited 1 file" for a run of tools.
+  static String summarizeActions(List<ToolCallState> tools) {
+    if (tools.isEmpty) return '';
+    final counts = <ToolActionKind, int>{};
+    for (final t in tools) {
+      counts.update(t.actionKind, (n) => n + 1, ifAbsent: () => 1);
+    }
+    String noun(String one, String many, int n) => n == 1 ? one : many;
+    final parts = <String>[];
+    for (final kind in ToolActionKind.values) {
+      final n = counts[kind];
+      if (n == null) continue;
+      parts.add(switch (kind) {
+        ToolActionKind.read => 'Read $n ${noun('file', 'files', n)}',
+        ToolActionKind.edit => 'Edited $n ${noun('file', 'files', n)}',
+        ToolActionKind.search =>
+          'Searched $n ${noun('time', 'times', n)}',
+        ToolActionKind.exec =>
+          'Ran $n ${noun('command', 'commands', n)}',
+        ToolActionKind.web => 'Fetched $n ${noun('page', 'pages', n)}',
+        ToolActionKind.subagent =>
+          '$n ${noun('subagent', 'subagents', n)}',
+        ToolActionKind.mcp => '$n MCP ${noun('call', 'calls', n)}',
+        ToolActionKind.other => '$n ${noun('tool', 'tools', n)}',
+      });
+    }
+    return parts.join(' · ');
+  }
 
   bool get isCompleted =>
       status == 'completed' || status == 'success' || status == 'done';
@@ -75,7 +151,7 @@ class ToolCallState {
 
   /// Head of [rawInput] for cheap scans (never the full 100KB blob).
   String get _inputHead {
-    final input = rawInput ?? '';
+    final input = rawInput ?? inputHead ?? '';
     return input.length > 400 ? input.substring(0, 400) : input;
   }
 
@@ -122,8 +198,8 @@ class ToolCallState {
     final k = (kind ?? '').toLowerCase();
     // Never scan full rawInput — Claude tool payloads can be 100KB+ JSON and
     // displayTitle is hit on every list rebuild.
-    final inputHead = _inputHead;
-    final blob = '$k ${title.toLowerCase()} ${inputHead.toLowerCase()}';
+    final head = _inputHead;
+    final blob = '$k ${title.toLowerCase()} ${head.toLowerCase()}';
     if (k.contains('think') ||
         k.contains('task') ||
         k.contains('agent') ||
@@ -185,7 +261,7 @@ class ToolCallState {
   }
 
   String? _commandFromInput() {
-    final input = rawInput?.trim();
+    final input = (rawInput ?? inputHead)?.trim();
     if (input == null || input.isEmpty) return null;
     final fromJson = _previewFromJson(
       input.length > 8000 ? input.substring(0, 8000) : input,
@@ -197,7 +273,7 @@ class ToolCallState {
   }
 
   String? _descriptionFromInput() {
-    final input = rawInput?.trim();
+    final input = (rawInput ?? inputHead)?.trim();
     if (input == null || input.isEmpty) return null;
     final head = input.length > 4000 ? input.substring(0, 4000) : input;
     final match = RegExp(
@@ -249,6 +325,8 @@ class ToolCallState {
 
   /// One-line detail shown next to the title.
   String? get preview {
+    final hint = previewHint;
+    if (hint != null) return hint.isEmpty ? null : hint;
     final cached = _toolPreviewCache[this];
     if (cached != null) return cached.isEmpty ? null : cached;
     final computed = _computePreview();
@@ -324,6 +402,9 @@ class ToolCallState {
         rawInput: rawInput ?? this.rawInput,
         rawOutput: rawOutput ?? this.rawOutput,
         content: content ?? this.content,
+        previewHint: previewHint,
+        inputHead: inputHead,
+        outputHead: outputHead,
       );
 
   /// True when input/output/content payloads are present (heavy for the UI).
@@ -333,13 +414,28 @@ class ToolCallState {
       (content?.isNotEmpty ?? false);
 
   /// Metadata-only copy for the transcript list — no raw I/O blobs.
-  ToolCallState withoutPayloads() => ToolCallState(
-        toolCallId: toolCallId,
-        title: title,
-        kind: kind,
-        status: status,
-        locations: locations.length > 8 ? locations.take(8).toList() : locations,
-      );
+  ///
+  /// Keeps a precomputed [preview] plus short heads of the input/output so
+  /// the row label, exit-code classification and polling detection still
+  /// work on the summary.
+  ToolCallState withoutPayloads() {
+    if (!hasPayloads) return this;
+    return ToolCallState(
+      toolCallId: toolCallId,
+      title: title,
+      kind: kind,
+      status: status,
+      locations: locations.length > 8 ? locations.take(8).toList() : locations,
+      previewHint: preview ?? '',
+      inputHead: _head(rawInput ?? inputHead, 600),
+      outputHead: _head(rawOutput ?? outputHead, 2000),
+    );
+  }
+
+  static String? _head(String? value, int max) {
+    if (value == null || value.isEmpty) return null;
+    return value.length > max ? value.substring(0, max) : value;
+  }
 
   Map<String, dynamic> toJson() => {
         'toolCallId': toolCallId,
