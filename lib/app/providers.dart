@@ -390,7 +390,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
       chatId,
       maxBytes: kTranscriptChunkBytes,
     );
-    runtime.hydrateFromMessages(page.messages);
+    await runtime.hydrateFromMessagesAsync(page.messages);
     runtime.hasMoreOlder =
         page.hasMore ||
         (session is AdsmSession && session.hostTranscriptHasMore);

@@ -316,6 +316,9 @@ class _TranscriptViewState extends State<TranscriptView> {
               // Reversed: `bottom` is the edge nearest the composer.
               padding: EdgeInsets.fromLTRB(sidePad, 12, sidePad, 16),
               cacheExtent: 600,
+              // First frame builds only what is visible; the cache area (and
+              // its markdown parsing) fills in on following frames.
+              delayPopulatingCacheArea: true,
               extentPrecalculationPolicy: _precalculate,
               extentEstimation: (index, crossAxisExtent) =>
                   _estimateExtent(snap, index ?? 0, crossAxisExtent),
