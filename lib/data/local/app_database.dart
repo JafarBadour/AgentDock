@@ -1149,10 +1149,12 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     final db = await database;
     var changed = 0;
     await db.transaction((txn) async {
-      // Never deserialize the entire local transcript to merge a bounded host
-      // tail. Fetch exact ids in SQLite-sized chunks, plus a bounded recent
-      // window for cross-device duplicate-content detection.
-      final byId = <String, Map<String, Object?>>{};
+      // Never deserialize the local transcript to merge a bounded host tail.
+      // Tool rows carry 100 KB+ of JSON, so even a "recent window" of full
+      // bodies is megabytes decoded on the UI isolate per connect. Compare by
+      // a SQL-side fingerprint (role, length, head, tail) and fetch a full
+      // body only when a fingerprint actually collides.
+      final lengthById = <String, int>{};
       final ids = incoming.map((m) => m.id).toSet().toList(growable: false);
       const idChunk = 300;
       for (var i = 0; i < ids.length; i += idChunk) {
@@ -1160,34 +1162,75 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
         final chunk = ids.sublist(i, end);
         final rows = await txn.query(
           'messages',
+          columns: ['id', 'length(content) AS len'],
           where:
               'chat_id = ? AND id IN (${List.filled(chunk.length, '?').join(',')})',
           whereArgs: [chatId, ...chunk],
         );
         for (final row in rows) {
-          byId[row['id']! as String] = row;
+          lengthById[row['id']! as String] = row['len']! as int;
         }
       }
       final duplicateWindow = max(1800, incoming.length * 2);
       final recent = await txn.query(
         'messages',
-        columns: ['id', 'role', 'content'],
+        columns: [
+          'id',
+          'role',
+          'length(content) AS len',
+          'substr(content, 1, $_fingerprintEdge) AS head',
+          'substr(content, -$_fingerprintEdge) AS tail',
+        ],
         where: 'chat_id = ?',
         whereArgs: [chatId],
         orderBy: 'created_at DESC, rowid DESC',
         limit: duplicateWindow,
       );
-      final contentKeys = <(String, String)>{
-        for (final row in recent)
-          (row['role']! as String, row['content']! as String),
-        for (final row in byId.values)
-          (row['role']! as String, row['content']! as String),
-      };
+      // Fingerprint → local ids that share it (same-content candidates).
+      final candidates = <String, List<String>>{};
+      for (final row in recent) {
+        candidates
+            .putIfAbsent(
+              _contentFingerprint(
+                row['role']! as String,
+                row['len']! as int,
+                row['head']! as String,
+                row['tail']! as String,
+              ),
+              () => [],
+            )
+            .add(row['id']! as String);
+      }
+
+      Future<bool> sameBodyExists(ChatMessage m, List<String> ids) async {
+        for (final id in ids) {
+          if (id == m.id) continue;
+          final rows = await txn.query(
+            'messages',
+            columns: ['content'],
+            where: 'id = ?',
+            whereArgs: [id],
+            limit: 1,
+          );
+          if (rows.isNotEmpty && rows.first['content'] == m.content) {
+            return true;
+          }
+        }
+        return false;
+      }
+
       for (final m in incoming) {
-        final prev = byId[m.id];
-        if (prev == null) {
-          final key = (m.role.name, m.content);
-          if (contentKeys.contains(key)) {
+        final runes = m.content.runes.toList(growable: false);
+        final fp = _contentFingerprint(
+          m.role.name,
+          runes.length,
+          _head(runes),
+          _tail(runes),
+        );
+        final prevLen = lengthById[m.id];
+        if (prevLen == null) {
+          final twins = candidates[fp];
+          if (twins != null && await sameBodyExists(m, twins)) {
             // Same bubble already present under another id.
             continue;
           }
@@ -1196,27 +1239,49 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
             m.toMap(),
             conflictAlgorithm: ConflictAlgorithm.ignore,
           );
-          byId[m.id] = m.toMap();
-          contentKeys.add(key);
+          lengthById[m.id] = runes.length;
+          candidates.putIfAbsent(fp, () => []).add(m.id);
           changed++;
           continue;
         }
-        final prevContent = prev['content']! as String;
-        if (m.content.length > prevContent.length) {
+        if (runes.length > prevLen) {
           await txn.update(
             'messages',
             m.toMap(),
             where: 'id = ?',
             whereArgs: [m.id],
           );
-          contentKeys.remove((m.role.name, prevContent));
-          contentKeys.add((m.role.name, m.content));
+          lengthById[m.id] = runes.length;
+          candidates.putIfAbsent(fp, () => []).add(m.id);
           changed++;
         }
       }
     });
     return changed;
   }
+
+  /// Characters of a message body compared at each end before a full read.
+  static const int _fingerprintEdge = 160;
+
+  // SQLite's length()/substr() count Unicode code points, not UTF-16 units,
+  // so the Dart side works in runes to produce identical fingerprints.
+  static String _head(List<int> runes) => String.fromCharCodes(
+        runes.length <= _fingerprintEdge ? runes : runes.sublist(0, _fingerprintEdge),
+      );
+
+  static String _tail(List<int> runes) => String.fromCharCodes(
+        runes.length <= _fingerprintEdge
+            ? runes
+            : runes.sublist(runes.length - _fingerprintEdge),
+      );
+
+  static String _contentFingerprint(
+    String role,
+    int length,
+    String head,
+    String tail,
+  ) =>
+      '$role\u0000$length\u0000$head\u0000$tail';
 
   /// Mark everything in [chatId] up to [at] (default now) as seen.
   ///

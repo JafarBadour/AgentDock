@@ -107,6 +107,7 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
         .read(pendingRemoteDeletedChatIdsProvider.notifier)
         .update((ids) => [...ids, chatId]);
   };
+  unawaited(service.loadPersistedCaches());
   ref.onDispose(service.dispose);
   return service;
 });

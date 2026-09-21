@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math' show max, min;
 
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/agent_provider.dart';
@@ -254,18 +256,75 @@ class AgentDockService {
   /// every debounce was pure UI-isolate work.
   final Map<String, int> _pushedPrefixHash = {};
 
+  /// Stable across launches (unlike `Object.hash`, whose seed is per-run) so
+  /// the persisted watermark still verifies after a restart.
   static int _hashPrefixTail(List<ChatMessage> messages, int prefixLength) {
     const tailSize = 12;
     final end = min(prefixLength, messages.length);
     final start = max(0, end - tailSize);
-    return Object.hashAll([
-      for (var i = start; i < end; i++)
-        Object.hash(
-          messages[i].id,
-          messages[i].content.length,
-          messages[i].content.hashCode,
-        ),
-    ]);
+    var h = 0x811C9DC5;
+    void mix(int v) {
+      h = ((h ^ (v & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF;
+    }
+
+    for (var i = start; i < end; i++) {
+      final m = messages[i];
+      mix(m.id.hashCode);
+      mix(m.content.length);
+      mix(m.content.hashCode);
+    }
+    return h;
+  }
+
+  static const _watermarkPrefsKey = 'agentdock.push_watermarks.v1';
+  Timer? _watermarkSaveTimer;
+
+  /// Restore push watermarks so a relaunch appends instead of rewriting every
+  /// chat's whole transcript on its first push. The `wc -l` and prefix-hash
+  /// checks in [pushChatById] still verify them against the host.
+  Future<void> loadPersistedCaches() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_watermarkPrefsKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      for (final e in decoded.entries) {
+        final v = e.value;
+        if (e.key is String && v is List && v.length == 2) {
+          final lines = v[0];
+          final hash = v[1];
+          if (lines is int && hash is int && lines > 0) {
+            _pushedLines.putIfAbsent(e.key as String, () => lines);
+            _pushedPrefixHash.putIfAbsent(e.key as String, () => hash);
+          }
+        }
+      }
+    } catch (e) {
+      SafeLog.d('load push watermarks failed', e);
+    }
+  }
+
+  void _scheduleWatermarkSave() {
+    _watermarkSaveTimer?.cancel();
+    _watermarkSaveTimer = Timer(const Duration(seconds: 2), () {
+      _watermarkSaveTimer = null;
+      unawaited(_persistWatermarks());
+    });
+  }
+
+  Future<void> _persistWatermarks() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final out = <String, List<int>>{
+        for (final e in _pushedLines.entries)
+          if (_pushedPrefixHash.containsKey(e.key))
+            e.key: [e.value, _pushedPrefixHash[e.key]!],
+      };
+      await prefs.setString(_watermarkPrefsKey, jsonEncode(out));
+    } catch (e) {
+      SafeLog.d('persist push watermarks failed', e);
+    }
   }
 
   static const _marker = '===AGENTDOCK===';
@@ -395,28 +454,33 @@ class AgentDockService {
         finalCount = messages.length;
       }
 
-      final buf = StringBuffer();
-      for (final m in slice) {
-        buf.writeln(jsonEncode(m.toMap()));
-      }
+      // Serialize off the UI isolate — a full rewrite of a tool-heavy chat is
+      // megabytes of JSON. The bytes come back via Isolate.exit (no copy).
+      final payload = slice.isEmpty
+          ? null
+          : await Isolate.run(() => utf8.encode(_encodeAll(slice)));
 
+      // The agent record is small and rides in the command; the transcript
+      // streams over stdin so its size is unbounded (see [SshService.exec]).
       final commands = <String>[
         'mkdir -p ${q('$root/agents')} ${q('$root/messages')}',
         'printf %s ${q(base64Encode(utf8.encode(agentJson)))} | base64 -d > ${q(agentPath)}',
-      ];
-      if (buf.isNotEmpty) {
-        final payload = q(base64Encode(utf8.encode(buf.toString())));
-        commands.add(
+        if (payload != null)
           appendSafely
-              ? 'printf %s $payload | base64 -d >> ${q(messagePath)}'
-              : 'printf %s $payload | base64 -d > ${q(messagePath)}',
-        );
-      }
+              ? 'cat >> ${q(messagePath)}'
+              : 'cat > ${q(messagePath)}',
+      ];
 
-      await _ssh.exec(host, 'sh -c ${q(commands.join('\n'))}');
+      await _ssh.exec(
+        host,
+        'sh -c ${q(commands.join('\n'))}',
+        input: payload ?? const <int>[],
+        timeout: const Duration(seconds: 60),
+      );
       _pushedLines[chatId] = finalCount;
       _pushedPrefixHash[chatId] = _hashPrefixTail(finalTail, finalTail.length);
       _dirtyChats.remove(chatId);
+      _scheduleWatermarkSave();
     } catch (e) {
       SafeLog.d('agentdock pushChat failed', e);
       // Force a full rewrite next time; the remote state is now unknown.
@@ -549,7 +613,17 @@ class AgentDockService {
   Future<List<ChatMessage>> pullMessages(Host host, String chatId) async {
     final root = await _root(host);
     final path = SshService.shellQuote('$root/messages/$chatId.jsonl');
-    final raw = await _ssh.exec(host, 'cat $path 2>/dev/null || true');
+    final raw = await _ssh.exec(
+      host,
+      'cat $path 2>/dev/null || true',
+      timeout: const Duration(seconds: 30),
+    );
+    // A whole archive can be megabytes of JSONL: parse it in a worker isolate.
+    if (raw.length < 16 * 1024) return _decodeJsonl(raw);
+    return Isolate.run(() => _decodeJsonl(raw));
+  }
+
+  static List<ChatMessage> _decodeJsonl(String raw) {
     final messages = <ChatMessage>[];
     for (final line in raw.split('\n')) {
       final t = line.trim();
@@ -559,8 +633,8 @@ class AgentDockService {
         if (decoded is Map) {
           messages.add(ChatMessage.fromMap(Map<String, Object?>.from(decoded)));
         }
-      } catch (e) {
-        SafeLog.d('agentdock message line parse failed', e);
+      } catch (_) {
+        // Skip a corrupt line rather than lose the archive.
       }
     }
     return messages;
@@ -925,10 +999,12 @@ class AgentDockService {
   }
 
   Future<void> _writeFile(Host host, String path, String contents) async {
-    final b64 = base64Encode(utf8.encode(contents));
+    // Body over stdin, never inline: the command-line limit is 128 KiB.
     await _ssh.exec(
       host,
-      'printf %s ${SshService.shellQuote(b64)} | base64 -d > ${SshService.shellQuote(path)}',
+      'cat > ${SshService.shellQuote(path)}',
+      input: utf8.encode(contents),
+      timeout: const Duration(seconds: 60),
     );
   }
 
@@ -938,5 +1014,6 @@ class AgentDockService {
     }
     _pushTimers.clear();
     _dirtyChats.clear();
+    _watermarkSaveTimer?.cancel();
   }
 }
