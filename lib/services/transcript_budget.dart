@@ -18,11 +18,13 @@ int chatMessageBytes(ChatMessage message) =>
     utf8ByteLength(message.content) + kTranscriptRowOverheadBytes;
 
 int toolCallBytes(ToolCallState tool) =>
-    utf8ByteLength(tool.title) +
-    utf8ByteLength(tool.kind ?? '') +
-    utf8ByteLength(tool.content ?? '') +
-    utf8ByteLength(tool.rawInput ?? '') +
-    utf8ByteLength(tool.rawOutput ?? '') +
+    // Length is a good enough budget proxy — utf8.encode on every trim/upsert
+    // was freezing the UI isolate during tool-heavy turns.
+    tool.title.length +
+    (tool.kind?.length ?? 0) +
+    (tool.content?.length ?? 0) +
+    (tool.rawInput?.length ?? 0) +
+    (tool.rawOutput?.length ?? 0) +
     kTranscriptRowOverheadBytes;
 
 /// Newest-first walk until [maxBytes], returned chronological (oldest→newest).

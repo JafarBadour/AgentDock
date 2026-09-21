@@ -266,23 +266,28 @@ fi
     try {
       var processed = 0;
       while (_open || _buffer.isNotEmpty) {
-        var content = _buffer.toString();
+        // Avoid O(n²) full-buffer copies: scan for the next newline in place.
+        final content = _buffer.toString();
         final index = content.indexOf('\n');
         if (index < 0) {
-          _buffer
-            ..clear()
-            ..write(content);
+          if (content != _buffer.toString()) {
+            // Buffer changed while we read — rare; keep latest.
+          }
           break;
         }
         final line = content.substring(0, index).trim();
+        final rest = content.substring(index + 1);
         _buffer
           ..clear()
-          ..write(content.substring(index + 1));
+          ..write(rest);
         if (line.isNotEmpty) _onLine(line);
         processed++;
-        // Yield every batch so frames can paint between JSON decode spikes.
-        if (processed % 24 == 0) {
+        // Yield aggressively: large tool payloads and dense event bursts both
+        // starve Flutter frames (Mac trackpad scroll feels randomly choked).
+        final heavy = line.length > 1024;
+        if (heavy || processed % 4 == 0) {
           await Future<void>.delayed(Duration.zero);
+          processed = 0;
         }
       }
     } finally {

@@ -110,6 +110,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   final ValueNotifier<int> _chromeUiEpoch = ValueNotifier(0);
   final ValueNotifier<int> _transcriptUiEpoch = ValueNotifier(0);
   final ValueNotifier<int> _composerUiEpoch = ValueNotifier(0);
+  /// Pauses shimmer / live-tickers under the ListView without rebuilding rows.
+  /// Cleared while the user owns a trackpad fling or has scrolled away (PDF).
+  final ValueNotifier<bool> _transcriptMotionN = ValueNotifier(true);
+  /// True while a user scroll gesture (including Mac ballistic fling) is active.
+  final ValueNotifier<bool> _scrollBusyN = ValueNotifier(false);
   final ValueNotifier<({bool streaming, bool connected, int queuedCount})>
   _composerRuntimeN = ValueNotifier((
     streaming: false,
@@ -154,6 +159,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// Bumped on every real user scroll so scheduled jumpTo/land callbacks abort
   /// instead of fighting the trackpad (that made the scrollbar thrash).
   int _userScrollGen = 0;
+
+  /// True while the user is actively scrolling / dragging the scrollbar.
+  /// Suppresses transcript rebuilds and auto jump-to-end mid-gesture.
+  bool _userScrollGesture = false;
+  ScrollDirection? _lastUserScrollDirection;
 
   /// Distance-from-end thresholds with hysteresis so trackpad inertia near the
   /// bottom cannot flip follow on/off every frame.
@@ -244,22 +254,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (_showJumpToLatest.value != showJump) {
         _showJumpToLatest.value = showJump;
       }
+      _syncTranscriptMotion();
       return;
     }
     _followOutput = follow;
     _transcriptWindow.pinnedToEnd = follow;
+    _syncTranscriptMotion();
     if (follow) {
       // Resume live document — drop the PDF snapshot and keep only ~1 MiB.
       _frozenTranscript = null;
       _freezeCapturePending = false;
       _runtime?.pinDisplayToLiveChunk();
       _runtimeUiDirty = true;
-      _scheduleRuntimeUi(immediate: true);
+      // Never rebuild mid-gesture — wait until the finger/trackpad settles.
+      if (!_userScrollGesture) {
+        _scheduleRuntimeUi(immediate: true);
+      }
     } else {
-      // Snapshot on the next transcript build; until then keep scrolling on the
-      // last painted rows so we don't rebuild mid-gesture.
+      // Snapshot on the next transcript build *after* scroll ends so we don't
+      // rebuild the ListView under an active fling (that choked Mac scrolling).
       _freezeCapturePending = true;
-      _transcriptUiEpoch.value++;
+      if (!_userScrollGesture) {
+        _transcriptUiEpoch.value++;
+      }
     }
     final showJump = !follow;
     if (_showJumpToLatest.value != showJump) {
@@ -267,27 +284,62 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
+  void _syncTranscriptMotion() {
+    final allow = _followOutput && !_userScrollGesture;
+    if (_transcriptMotionN.value != allow) {
+      _transcriptMotionN.value = allow;
+    }
+    if (_scrollBusyN.value != _userScrollGesture) {
+      _scrollBusyN.value = _userScrollGesture;
+    }
+  }
+
   /// Apply follow hysteresis from a user-driven scroll. Keeps the scrollbar
   /// stable while reading just above the live edge.
   void _onUserScrollIntent(
     ScrollDirection direction,
-    ScrollMetrics metrics,
-  ) {
+    ScrollMetrics metrics, {
+    bool fromScrollbarDrag = false,
+  }) {
     _userScrollGen++;
+    _userScrollGesture = true;
+    _syncTranscriptMotion();
     // Abort initial land-at-bottom pinning if the user already took over.
     if (!_landedAtBottom) {
       _landedAtBottom = true;
       _emptyLandIdleFrames = 99;
     }
+    // Scrollbar thumb fires every pixel — only react on direction changes.
+    if (fromScrollbarDrag &&
+        _lastUserScrollDirection == direction &&
+        !_followOutput) {
+      return;
+    }
+    _lastUserScrollDirection = direction;
+
     final max = metrics.maxScrollExtent;
     final fromEnd = max <= 0 ? 0.0 : max - metrics.pixels;
     if (fromEnd > _unfollowFromEndPx) {
       if (_followOutput) _setFollowOutput(false);
-      return;
     }
-    if (fromEnd <= _refollowFromEndPx &&
-        direction == ScrollDirection.forward) {
-      if (!_followOutput) _setFollowOutput(true);
+    // Do not re-follow mid-scroll — that fights the trackpad. Scroll-end does.
+  }
+
+  void _onUserScrollEnded(ScrollMetrics metrics) {
+    _userScrollGesture = false;
+    _lastUserScrollDirection = null;
+    _syncTranscriptMotion();
+    final max = metrics.maxScrollExtent;
+    final fromEnd = max <= 0 ? 0.0 : max - metrics.pixels;
+    if (!_followOutput && fromEnd <= _refollowFromEndPx) {
+      _setFollowOutput(true);
+    } else if (_freezeCapturePending && !_followOutput) {
+      // One deferred rebuild to freeze the PDF snapshot after the gesture.
+      _transcriptUiEpoch.value++;
+    }
+    // Apply chrome / follow updates that were deferred mid-fling.
+    if (_runtimeUiDirty) {
+      _scheduleRuntimeUi(immediate: true);
     }
   }
 
@@ -613,15 +665,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               !isTransientBridgeErrorText(runtime.lastError!)) ||
           runtime.deliveryError != null;
 
-      // PDF mode: user scrolled up — never mutate the transcript document.
-      // Chrome (status / activity overlay) may still tick.
-      if (!_followOutput) {
-        _runtimeUiDirty = true;
-        _chromeUiEpoch.value++;
-        _scheduleMarkRead();
-        return;
-      }
-
+      // PDF mode and live mode share the coalesced flush — unfollow only
+      // refreshes chrome inside [_flushRuntimeUi], never the transcript.
       _scheduleRuntimeUi(immediate: needsImmediate);
     };
     runtime.addListener(_runtimeListener!);
@@ -650,9 +695,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
     if (_runtimeUiCoalesce?.isActive ?? false) return;
-    // While following live output, refresh chrome a bit more often than the
-    // transcript so scroll stays usable.
-    final ms = _followOutput ? 320 : 200;
+    // Follow: ~3 Hz chrome/transcript. Unfollow / mid-gesture: slower so Mac
+    // trackpad flings aren't fighting ACP-driven rebuilds.
+    final ms = _userScrollGesture
+        ? 500
+        : (_followOutput ? 320 : 400);
     _runtimeUiCoalesce = Timer(Duration(milliseconds: ms), () {
       _runtimeUiCoalesce = null;
       _flushRuntimeUi();
@@ -665,12 +712,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final reconnecting = runtime?.reconnecting ?? false;
     final remoteRunning = runtime?.remoteTurnActive == true;
     final sending = runtime?.sendingToHost == true;
-    final activeToolEntries = runtime == null
-        ? const <ToolCallState>[]
-        : [
-            for (final e in runtime.entries)
-              if (e.tool?.isActive ?? false) e.tool!,
-          ];
+    final activeToolEntries = runtime?.activeToolSummaries ?? const [];
     final activeTools = activeToolEntries.length;
     final pollingTools = [
       for (final t in activeToolEntries)
@@ -725,6 +767,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   void _flushRuntimeUi() {
     if (!mounted || !_runtimeUiDirty) return;
+    // User owns the scroll gesture — stay dirty and touch no notifiers. Even a
+    // chrome-only bump was enough to hitch Mac trackpad frames mid-fling.
+    if (_userScrollGesture) {
+      return;
+    }
     _runtimeUiDirty = false;
     // Still reading history — keep the frozen document; only refresh chrome.
     if (!_followOutput) {
@@ -2167,7 +2214,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _pinWindowToLatest();
       _setFollowOutput(true);
     }
-    if (!force && (!_landedAtBottom || !_followOutput)) return;
+    if (!force && (!_landedAtBottom || !_followOutput || _userScrollGesture)) {
+      return;
+    }
     final gen = _userScrollGen;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients) return;
@@ -2261,6 +2310,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _chromeUiEpoch.dispose();
     _transcriptUiEpoch.dispose();
     _composerUiEpoch.dispose();
+    _transcriptMotionN.dispose();
+    _scrollBusyN.dispose();
     _composerRuntimeN.dispose();
     _connectingN.dispose();
     _connectStatusN.dispose();
@@ -3525,6 +3576,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         }
                         // Trackpad / wheel / touch: UserScrollNotification.
                         // Never auto-fetch history — only the top button does.
+                        //
+                        // Important (macOS): finger-up emits UserScroll idle
+                        // while ballistic inertia is still running. Ending the
+                        // gesture there freezes/rebuilds mid-fling and chokes
+                        // the trackpad — only ScrollEnd means the fling settled.
                         if (notification is UserScrollNotification) {
                           if (notification.direction != ScrollDirection.idle) {
                             _onUserScrollIntent(
@@ -3532,6 +3588,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               notification.metrics,
                             );
                           }
+                          return false;
+                        }
+                        if (notification is ScrollEndNotification) {
+                          _onUserScrollEnded(notification.metrics);
                           return false;
                         }
                         // Scrollbar thumb / drag may only emit ScrollUpdate.
@@ -3545,13 +3605,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           _onUserScrollIntent(
                             direction,
                             notification.metrics,
+                            fromScrollbarDrag: true,
                           );
                         }
                         return false;
                       },
                       child: GptMarkdownTheme(
                         gptThemeData: chatGptMarkdownTheme(theme),
-                        child: ListView.builder(
+                        child: ValueListenableBuilder<bool>(
+                          valueListenable: _scrollBusyN,
+                          builder: (context, busy, child) =>
+                              TranscriptScrollBusy(busy: busy, child: child!),
+                          child: ValueListenableBuilder<bool>(
+                            valueListenable: _transcriptMotionN,
+                            // Preserve the ListView element when motion toggles so
+                            // we only pause tickers (shimmer / live cursors) — no
+                            // mid-fling markdown rebuild.
+                            builder: (context, motion, child) =>
+                                TickerMode(enabled: motion, child: child!),
+                            child: ListView.builder(
                           controller: _scroll,
                           // Desktop: Cursor-like side margins. Phone: tighter inset so
                           // bubbles aren't pushed inward like a desktop column.
@@ -3563,7 +3635,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           ),
                           // Keep scroll physics interactive even while the agent streams.
                           physics: const AlwaysScrollableScrollPhysics(),
-                          cacheExtent: 280,
+                          // Slightly larger than before so Mac trackpad flings
+                          // hitch less when tall bubbles enter the viewport.
+                          cacheExtent: 720,
                           itemCount:
                               (showLoadEarlier ? 1 : 0) +
                               visibleBlocks.length +
@@ -3625,6 +3699,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     for (final e in tools) e.messageId,
                                   ],
                                   resolveDetails: _resolveToolGroupDetails,
+                                  animate: _followOutput,
                                 );
                               } else if (block.entry!.tool != null) {
                                 final entry = block.entry!;
@@ -3632,6 +3707,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                   tools: [entry.tool!.withoutPayloads()],
                                   messageIds: [entry.messageId],
                                   resolveDetails: _resolveToolGroupDetails,
+                                  animate: _followOutput,
                                 );
                               } else {
                                 final m = block.entry!.message!;
@@ -3699,6 +3775,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             cursor -= visibleBlocks.length;
                             return extra[cursor];
                           },
+                        ),
+                        ),
                         ),
                       ),
                     ),
@@ -3809,10 +3887,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       fontWeight: FontWeight.w500,
       fontFeatures: const [FontFeature.tabularFigures()],
     );
-    final active = [
-      for (final e in rt.entries)
-        if (e.tool?.isActive ?? false) e.tool!,
-    ];
+    final active = rt.activeToolSummaries;
     final polling = [
       for (final t in active)
         if (t.isPollingWait) t,

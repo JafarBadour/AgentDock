@@ -112,6 +112,7 @@ class ChatSessionRuntime extends ChangeNotifier {
   final List<TranscriptEntry> entries = [];
   final Map<String, String> _toolMessageIds = {};
   final Map<String, int> _toolEntryIndexes = {};
+  final Set<String> _activeToolIds = {};
   final _random = Random();
 
   /// How many bytes of archive the UI is allowed to keep mounted.
@@ -197,7 +198,19 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// True while a local prompt is in flight, the host is still producing, or
   /// any tool call is still pending/running — so the UI stays on "working"
   /// through long tool chains, not only while text is streaming.
-  bool get hasActiveTools => entries.any((e) => e.tool?.isActive ?? false);
+  bool get hasActiveTools => _activeToolIds.isNotEmpty;
+
+  /// Active tool summaries for chrome labels (no full-list scan).
+  List<ToolCallState> get activeToolSummaries {
+    if (_activeToolIds.isEmpty) return const [];
+    final out = <ToolCallState>[];
+    for (final e in entries) {
+      final tool = e.tool;
+      if (tool == null) continue;
+      if (_activeToolIds.contains(tool.toolCallId)) out.add(tool);
+    }
+    return out;
+  }
 
   bool get isWorking =>
       !reconnecting &&
@@ -215,6 +228,10 @@ class ChatSessionRuntime extends ChangeNotifier {
   int? usageTokensUsed;
   int? usageContextSize;
 
+  /// Cheap explore chip — summaries only (no raw I/O re-scan).
+  ExploreStats get turnExploreStats =>
+      ExploreStats.fromTools(_toolSummariesSinceLastUserMessage());
+
   Iterable<ToolCallState> _toolsSinceStartOfLocalDay() sync* {
     final start = DateTime(
       DateTime.now().year,
@@ -231,8 +248,21 @@ class ChatSessionRuntime extends ChangeNotifier {
   }
 
   /// Reads + searches since the last user message (current turn).
-  ExploreStats get turnExploreStats =>
-      ExploreStats.fromTools(_toolsSinceLastUserMessage());
+  /// Uses UI summaries — enough for explore chips without decoding payloads.
+  Iterable<ToolCallState> _toolSummariesSinceLastUserMessage() sync* {
+    var start = 0;
+    for (var i = entries.length - 1; i >= 0; i--) {
+      final m = entries[i].message;
+      if (m != null && m.role == MessageRole.user) {
+        start = i + 1;
+        break;
+      }
+    }
+    for (var i = start; i < entries.length; i++) {
+      final tool = entries[i].tool;
+      if (tool != null) yield tool;
+    }
+  }
 
   Iterable<ToolCallState> _toolsSinceLastUserMessage() sync* {
     var start = 0;
@@ -332,14 +362,42 @@ class ChatSessionRuntime extends ChangeNotifier {
   final Map<String, ToolCallState> _toolPayloads = {};
 
   void _rememberToolPayload(ToolCallState tool) {
-    if (tool.hasPayloads) {
-      _toolPayloads[tool.toolCallId] = tool;
+    if (!tool.hasPayloads) return;
+    _toolPayloads[tool.toolCallId] = tool;
+    // Cap payload cache — tool-spam turns used to pin tens of MB on the UI
+    // isolate and stall GC on Mac.
+    const maxCached = 40;
+    if (_toolPayloads.length <= maxCached) return;
+    final keep = <String>{
+      ..._activeToolIds,
+      for (final e in entries.reversed)
+        if (e.tool != null) e.tool!.toolCallId,
+    };
+    final drop = <String>[];
+    for (final id in _toolPayloads.keys) {
+      if (!keep.contains(id)) drop.add(id);
+      if (_toolPayloads.length - drop.length <= maxCached) break;
+    }
+    for (final id in drop) {
+      _toolPayloads.remove(id);
+    }
+    while (_toolPayloads.length > maxCached) {
+      _toolPayloads.remove(_toolPayloads.keys.first);
+    }
+  }
+
+  void _trackToolActivity(ToolCallState tool) {
+    if (tool.isActive) {
+      _activeToolIds.add(tool.toolCallId);
+    } else {
+      _activeToolIds.remove(tool.toolCallId);
     }
   }
 
   /// Persist-ready full tool; UI-resident copy has no raw I/O blobs.
   ToolCallState _uiToolSummary(ToolCallState tool) {
     _rememberToolPayload(tool);
+    _trackToolActivity(tool);
     return tool.withoutPayloads();
   }
 
@@ -353,6 +411,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     _toolMessageIds.clear();
     _toolEntryIndexes.clear();
     _toolPayloads.clear();
+    _activeToolIds.clear();
     final queuedIds = {for (final m in outboundQueue) m.id};
     final seenToolIds = <String>{};
     for (final m in messages) {
@@ -537,6 +596,26 @@ class ChatSessionRuntime extends ChangeNotifier {
       ..clear()
       ..addAll(retainedTools);
     _toolPayloads.removeWhere((id, _) => !retainedTools.containsKey(id));
+    _activeToolIds.removeWhere((id) => !retainedTools.containsKey(id));
+  }
+
+  bool _residentNeedsTrim() {
+    if (entries.length > residentTranscriptLimit) return true;
+    // Avoid utf8 + sort on every tool tick; only remeasure when crowded.
+    if (entries.length < 120) return false;
+    var used = 0;
+    for (final entry in entries) {
+      used += _entryBytes(entry);
+      final budget = displayBudgetBytes > 0
+          ? displayBudgetBytes
+          : residentTranscriptBytes;
+      if (used > budget) return true;
+    }
+    return false;
+  }
+
+  void _maybeTrimResident() {
+    if (_residentNeedsTrim()) _trimResidentTranscript();
   }
 
   int _entryBytes(TranscriptEntry entry) {
@@ -621,9 +700,12 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   void _rebuildToolEntryIndexes() {
     _toolEntryIndexes.clear();
+    _activeToolIds.clear();
     for (var i = 0; i < entries.length; i++) {
-      final toolId = entries[i].tool?.toolCallId;
-      if (toolId != null) _toolEntryIndexes[toolId] = i;
+      final tool = entries[i].tool;
+      if (tool == null) continue;
+      _toolEntryIndexes[tool.toolCallId] = i;
+      if (tool.isActive) _activeToolIds.add(tool.toolCallId);
     }
   }
 
@@ -2444,7 +2526,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       // Tool stdout/progress can arrive dozens of times a second. Keep only
       // the newest state for each tool and persist a short batch.
       _pendingToolUpdates[tool.toolCallId] = tool;
-      _toolFlushTimer ??= Timer(const Duration(milliseconds: 250), () {
+      _toolFlushTimer ??= Timer(const Duration(milliseconds: 400), () {
         _toolFlushTimer = null;
         unawaited(_flushPendingToolUpdates());
       });
@@ -2628,7 +2710,7 @@ class ChatSessionRuntime extends ChangeNotifier {
         SafeLog.d('insert tool message failed', e);
       }
     }
-    _trimResidentTranscript();
+    _maybeTrimResident();
     _scheduleCodeDeltaPersist();
     _notifyUi();
   }
@@ -2694,8 +2776,8 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   /// Load full tool payloads for an expanded group (ephemeral UI only).
   ///
-  /// Never returns in-memory payloads — always hits ADSM (when connected)
-  /// then SQLite so the expand spinner is real.
+  /// Prefer targeted SQLite rows (cheap). Only fall back to ADSM for ids still
+  /// missing — never re-scan the whole in-memory payload map on the UI isolate.
   Future<List<ToolCallState>> resolveToolDetails({
     required List<String> toolCallIds,
     List<String?> messageIds = const [],
@@ -2704,32 +2786,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     final wanted = toolCallIds.toSet();
     final byId = <String, ToolCallState>{};
 
-    if (session is AdsmSession) {
-      try {
-        final adsm = session as AdsmSession;
-        final remote = await adsm
-            .pullTranscript(limit: 800, maxBytes: kTranscriptChunkBytes)
-            .timeout(const Duration(seconds: 12));
-        for (final row in remote) {
-          if (row.role != MessageRole.tool) continue;
-          final tool = ToolCallState.tryParseContent(row.content);
-          if (tool == null || !wanted.contains(tool.toolCallId)) continue;
-          byId[tool.toolCallId] = tool;
-        }
-      } catch (e) {
-        SafeLog.d('resolveToolDetails ADSM pull failed', e);
-      }
-    }
-
-    final stillMissing = [
-      for (final id in toolCallIds)
-        if (!(byId[id]?.hasPayloads ?? false)) id,
-    ];
     final missingIds = [
       for (final id in messageIds)
         if (id != null && id.isNotEmpty) id,
     ];
-    if (stillMissing.isNotEmpty && missingIds.isNotEmpty) {
+    if (missingIds.isNotEmpty) {
       try {
         final rows = await _db.getMessagesByIds(missingIds);
         for (final row in rows) {
@@ -2743,7 +2804,28 @@ class ChatSessionRuntime extends ChangeNotifier {
       }
     }
 
-    // Last resort: any remaining ids that only exist as summaries.
+    final stillMissing = [
+      for (final id in toolCallIds)
+        if (!(byId[id]?.hasPayloads ?? false)) id,
+    ];
+    if (stillMissing.isNotEmpty && session is AdsmSession) {
+      try {
+        final adsm = session as AdsmSession;
+        final remote = await adsm
+            .pullTranscript(limit: 400, maxBytes: 512 * 1024)
+            .timeout(const Duration(seconds: 8));
+        for (final row in remote) {
+          if (row.role != MessageRole.tool) continue;
+          final tool = ToolCallState.tryParseContent(row.content);
+          if (tool == null || !wanted.contains(tool.toolCallId)) continue;
+          byId[tool.toolCallId] = tool;
+        }
+      } catch (e) {
+        SafeLog.d('resolveToolDetails ADSM pull failed', e);
+      }
+    }
+
+    // Summaries only if nothing richer is available.
     for (final id in toolCallIds) {
       if (byId.containsKey(id)) continue;
       for (final entry in entries) {

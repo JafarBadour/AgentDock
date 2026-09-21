@@ -16,6 +16,7 @@ class ToolCallGroupCard extends StatefulWidget {
     required this.tools,
     this.messageIds = const [],
     this.resolveDetails,
+    this.animate = true,
   });
 
   /// Lightweight summaries (no raw input/output) used for the count row.
@@ -29,6 +30,9 @@ class ToolCallGroupCard extends StatefulWidget {
     List<ToolCallState> summaries,
     List<String?> messageIds,
   )? resolveDetails;
+
+  /// When false (user scrolled up), skip shimmer tickers so scroll stays smooth.
+  final bool animate;
 
   @override
   State<ToolCallGroupCard> createState() => _ToolCallGroupCardState();
@@ -157,7 +161,8 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Shimmer(
-                        enabled: _anyActive && !_expanded,
+                        enabled:
+                            widget.animate && _anyActive && !_expanded,
                         child: Text(
                           _loading ? 'Loading tools…' : _groupLabel,
                           style: theme.textTheme.bodySmall?.copyWith(

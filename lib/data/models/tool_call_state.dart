@@ -380,11 +380,20 @@ class ToolCallState {
 
   static String? formatOpaque(Object? value) {
     if (value == null) return null;
-    if (value is String) return value;
+    if (value is String) {
+      // Cap huge tool blobs — pretty-print used to freeze the UI isolate.
+      return value.length > 180000 ? value.substring(0, 180000) : value;
+    }
     try {
-      return const JsonEncoder.withIndent('  ').convert(value);
+      // Compact JSON only. Indenting 100KB+ tool payloads on every ADSM event
+      // was a primary cause of Mac/Android hitching mid-turn.
+      final encoded = jsonEncode(value);
+      return encoded.length > 180000
+          ? encoded.substring(0, 180000)
+          : encoded;
     } catch (_) {
-      return value.toString();
+      final s = value.toString();
+      return s.length > 180000 ? s.substring(0, 180000) : s;
     }
   }
 }

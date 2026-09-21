@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:markdown/markdown.dart' as md;
@@ -6,6 +7,29 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../app/app_theme.dart';
+
+/// While the transcript list is mid-gesture, [MessageBody] skips first-time
+/// GptMarkdown parse (plain text only). Already-frozen bubbles stay put and do
+/// not depend on this, so toggling it does not rebuild the whole list.
+class TranscriptScrollBusy extends InheritedWidget {
+  const TranscriptScrollBusy({
+    super.key,
+    required this.busy,
+    required super.child,
+  });
+
+  final bool busy;
+
+  static bool of(BuildContext context) {
+    final scope =
+        context.dependOnInheritedWidgetOfExactType<TranscriptScrollBusy>();
+    return scope?.busy ?? false;
+  }
+
+  @override
+  bool updateShouldNotify(TranscriptScrollBusy oldWidget) =>
+      busy != oldWidget.busy;
+}
 
 /// A recognised link inside a chat message.
 enum RichLinkKind { githubPr, githubIssue, jira, generic }
@@ -316,6 +340,22 @@ class _MessageBodyState extends State<MessageBody> {
   bool? _frozenDense;
   TextStyle? _frozenStyle;
 
+  /// Cap first-time markdown builds per frame so scroll-end upgrades do not
+  /// hitch the UI isolate when many bubbles become visible at once.
+  static int _upgradesThisFrame = 0;
+  static Duration? _upgradeFrameStamp;
+
+  static bool _claimMarkdownUpgradeSlot() {
+    final stamp = SchedulerBinding.instance.currentFrameTimeStamp;
+    if (_upgradeFrameStamp != stamp) {
+      _upgradeFrameStamp = stamp;
+      _upgradesThisFrame = 0;
+    }
+    if (_upgradesThisFrame >= 2) return false;
+    _upgradesThisFrame++;
+    return true;
+  }
+
   static bool _styleEq(TextStyle? a, TextStyle? b) {
     if (identical(a, b)) return true;
     if (a == null || b == null) return false;
@@ -325,6 +365,21 @@ class _MessageBodyState extends State<MessageBody> {
         a.fontWeight == b.fontWeight &&
         a.fontStyle == b.fontStyle &&
         a.fontFamily == b.fontFamily;
+  }
+
+  Widget _plainBody(TextStyle? base) {
+    return Text(
+      widget.text,
+      style: base,
+      textAlign: TextAlign.start,
+      textDirection: TextDirection.ltr,
+    );
+  }
+
+  void _scheduleMarkdownRetry() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -340,12 +395,7 @@ class _MessageBodyState extends State<MessageBody> {
     // Streaming: plain selectable text — no GptMarkdown re-parse per token.
     if (widget.live) {
       return SelectionArea(
-        child: Text(
-          widget.text,
-          style: base,
-          textAlign: TextAlign.start,
-          textDirection: TextDirection.ltr,
-        ),
+        child: _plainBody(base),
       );
     }
 
@@ -353,8 +403,21 @@ class _MessageBodyState extends State<MessageBody> {
         _frozenText == widget.text &&
         _frozenDense == widget.dense &&
         _styleEq(_frozenStyle, widget.style)) {
+      // Already parsed — do not depend on scroll-busy (avoids list-wide rebuild).
       return _frozen!;
     }
+
+    // Mid-fling: newly entering rows stay plain text. Parsing markdown here is
+    // what made Mac trackpad scrolling hitch at random scroll offsets.
+    if (TranscriptScrollBusy.of(context)) {
+      return _plainBody(base);
+    }
+
+    if (!_claimMarkdownUpgradeSlot()) {
+      _scheduleMarkdownRetry();
+      return _plainBody(base);
+    }
+
     _frozenText = widget.text;
     _frozenDense = widget.dense;
     _frozenStyle = widget.style;

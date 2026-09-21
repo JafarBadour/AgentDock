@@ -1,0 +1,30 @@
+---
+description: Keep chat transcript scrolling smooth on macOS (no mid-fling rebuilds/markdown)
+globs: lib/features/agents/chat_screen.dart,lib/features/agents/message_body.dart,lib/features/agents/tool_call_card.dart,lib/services/adsm_client.dart,lib/services/chat_session_runtime.dart
+alwaysApply: false
+---
+
+# Chat scroll performance (macOS)
+
+Random trackpad choke while scrolling a live agent turn is almost always UI-isolate work under the fling — not “scroll physics.” Preserve these invariants; do not “simplify” them away.
+
+## Do not
+
+- Rebuild the transcript `ListView` mid-gesture (`_transcriptUiEpoch`, `setState` on the chat shell, freeze capture).
+- Call `_onUserScrollEnded` / clear `_userScrollGesture` on `UserScrollNotification.idle` — on macOS that fires when the finger lifts while **ballistic inertia still runs**. Only `ScrollEndNotification` means settled.
+- Bump `_chromeUiEpoch` (or any notifier) during `_userScrollGesture`. Stay dirty; flush after scroll end.
+- Parse `GptMarkdown` for rows that newly enter the viewport while scrolling.
+- Fight the trackpad with `jumpTo` / refollow while `_userScrollGesture` or `!_followOutput`.
+- Re-introduce tool-card shimmer / live tickers during unfollow or mid-fling (`animate: _followOutput`, `TickerMode` via `_transcriptMotionN`).
+
+## Do keep
+
+- **`TranscriptScrollBusy` + `MessageBody`**: while busy, first-time markdown is plain `Text`; already-frozen bubbles must **not** `dependOn` the scope (avoids list-wide rebuild). Upgrade markdown after settle, budgeted (~2/frame).
+- **PDF / unfollow**: defer `_frozenTranscript` capture until scroll end (`_freezeCapturePending`); while unfollowed, flushes refresh chrome only.
+- **Split epochs**: `_transcriptUiEpoch` (list) vs `_chromeUiEpoch` (status/activity). Streaming must not rebuild the list every ACP tick.
+- **ADSM `_drainStdout`**: yield often (heavy lines / every few lines) so NDJSON parse cannot starve frames.
+- Tool payloads stay out of the list until expand; collapse drops them.
+
+## If scroll chokes again
+
+Check in order: (1) mid-fling transcript/chrome notifier bumps, (2) markdown build on item insert, (3) ADSM/tool upsert work on the UI isolate, (4) `jumpTo` while following.
