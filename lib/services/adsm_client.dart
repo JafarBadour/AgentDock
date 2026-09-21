@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../data/models/agent_mode.dart';
 import '../data/models/agent_model.dart';
@@ -123,6 +126,20 @@ class AdsmClient {
 
   AdsmClient._local(this._process) : _sshClient = null, _session = null;
 
+  /// Client over raw byte streams, for exercising NDJSON ingestion in tests.
+  @visibleForTesting
+  AdsmClient.overStreams(Stream<List<int>> stdout, Stream<List<int>> stderr)
+      : _sshClient = null,
+        _session = null,
+        _process = null,
+        _testStdout = stdout,
+        _testStderr = stderr {
+    _listen();
+  }
+
+  Stream<List<int>>? _testStdout;
+  Stream<List<int>>? _testStderr;
+
   /// Dedicated SSH connection — not pooled, so periodic pool health checks
   /// cannot tear down a long-lived ADSM bridge mid-turn.
   final SSHClient? _sshClient;
@@ -133,7 +150,11 @@ class AdsmClient {
 
   final _pending = <Object, Completer<Map<String, dynamic>>>{};
   final _events = StreamController<Map<String, dynamic>>.broadcast();
-  final _buffer = StringBuffer();
+  /// Complete NDJSON lines waiting to be handled, plus the partial tail of
+  /// the last chunk. Splitting per chunk keeps ingestion O(n): the old
+  /// StringBuffer scan re-copied the whole backlog for every line.
+  final _lines = Queue<String>();
+  final _partial = StringBuffer();
   StreamSubscription<List<int>>? _sub;
   bool _open = true;
   bool _drainingStdout = false;
@@ -161,12 +182,16 @@ class AdsmClient {
   }
 
   Stream<List<int>> get _stdout {
+    final test = _testStdout;
+    if (test != null) return test;
     final process = _process;
     if (process != null) return process.stdout;
     return _session!.stdout;
   }
 
   Stream<List<int>> get _stderr {
+    final test = _testStderr;
+    if (test != null) return test;
     final process = _process;
     if (process != null) return process.stderr;
     return _session!.stderr;
@@ -236,7 +261,7 @@ fi
   void _listen() {
     _sub = _stdout.listen(
       (data) {
-        _buffer.write(utf8.decode(data, allowMalformed: true));
+        _splitLines(utf8.decode(data, allowMalformed: true));
         unawaited(_drainStdout());
       },
       onError: (Object e) {
@@ -258,50 +283,74 @@ fi
     });
   }
 
-  /// Parse NDJSON off the critical path in batches so a tool-spam burst cannot
-  /// freeze scrolling / panel switches on the UI isolate.
+  void _splitLines(String chunk) {
+    var start = 0;
+    while (true) {
+      final nl = chunk.indexOf('\n', start);
+      if (nl < 0) break;
+      _partial.write(chunk.substring(start, nl));
+      final line = _partial.toString().trim();
+      _partial.clear();
+      if (line.isNotEmpty) _lines.add(line);
+      start = nl + 1;
+    }
+    if (start < chunk.length) _partial.write(chunk.substring(start));
+  }
+
+  /// Lines above this are decoded in a worker isolate: a 150 KB tool payload
+  /// takes milliseconds to parse, which is a dropped frame mid-scroll.
+  static const int _offloadDecodeBytes = 24 * 1024;
+
+  /// Handle queued NDJSON off the critical path in batches so a tool-spam
+  /// burst cannot freeze scrolling / panel switches on the UI isolate.
   Future<void> _drainStdout() async {
     if (_drainingStdout) return;
     _drainingStdout = true;
     try {
       var processed = 0;
-      while (_open || _buffer.isNotEmpty) {
-        // Avoid O(n²) full-buffer copies: scan for the next newline in place.
-        final content = _buffer.toString();
-        final index = content.indexOf('\n');
-        if (index < 0) {
-          if (content != _buffer.toString()) {
-            // Buffer changed while we read — rare; keep latest.
-          }
-          break;
-        }
-        final line = content.substring(0, index).trim();
-        final rest = content.substring(index + 1);
-        _buffer
-          ..clear()
-          ..write(rest);
-        if (line.isNotEmpty) _onLine(line);
+      while (_lines.isNotEmpty) {
+        final line = _lines.removeFirst();
+        await _onLine(line);
         processed++;
-        // Yield aggressively: large tool payloads and dense event bursts both
-        // starve Flutter frames (Mac trackpad scroll feels randomly choked).
-        final heavy = line.length > 1024;
-        if (heavy || processed % 4 == 0) {
+        // Yield between batches so Flutter frames interleave with ingestion.
+        if (line.length > 1024 || processed % 4 == 0) {
           await Future<void>.delayed(Duration.zero);
           processed = 0;
         }
       }
     } finally {
       _drainingStdout = false;
-      // More data may have arrived while we yielded.
-      if (_buffer.toString().contains('\n')) {
-        unawaited(_drainStdout());
-      }
+      if (_lines.isNotEmpty) unawaited(_drainStdout());
     }
   }
 
-  void _onLine(String line) {
+  /// Worker-isolate half of a heavy line: decode, then stringify tool
+  /// payload blobs there too, so the UI isolate's [_toolFrom] only sees
+  /// pass-through strings instead of re-encoding 100 KB of JSON.
+  static Map<String, dynamic> _decodeHeavyLine(String line) {
+    final msg = jsonDecode(line) as Map<String, dynamic>;
+    final params = msg['params'];
+    final tool = params is Map ? params['tool'] : null;
+    if (tool is Map) {
+      for (final key in const ['rawInput', 'rawOutput', 'content']) {
+        final value = tool[key];
+        if (value != null && value is! String) {
+          tool[key] = ToolCallState.formatOpaque(value);
+        }
+      }
+    }
+    return msg;
+  }
+
+  Future<void> _onLine(String line) async {
     try {
-      final msg = jsonDecode(line) as Map<String, dynamic>;
+      final Map<String, dynamic> msg;
+      if (line.length > _offloadDecodeBytes) {
+        // Isolate.run hands the result back via Isolate.exit — no copy.
+        msg = await Isolate.run(() => _decodeHeavyLine(line));
+      } else {
+        msg = jsonDecode(line) as Map<String, dynamic>;
+      }
       if (msg.containsKey('id') &&
           (msg.containsKey('result') || msg.containsKey('error'))) {
         final id = msg['id'];

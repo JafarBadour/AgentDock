@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:super_sliver_list/super_sliver_list.dart';
 
 import '../../app/app_theme.dart';
 import '../../app/platform_layout.dart';
@@ -33,6 +34,16 @@ class TranscriptController {
   void jumpToLatest() => _state?._jumpToLatest();
 
   void dispose() => following.dispose();
+}
+
+/// Measure every row's real height in idle time (3 ms/frame budget) so the
+/// scrollbar and thumb-drag mapping are exact instead of re-estimated from
+/// the average of built rows — with markdown rows varying 10×, that estimate
+/// swung the total extent by ~10 % per scroll step.
+class _PrecalculateAll extends ExtentPrecalculationPolicy {
+  @override
+  bool shouldPrecalculateExtents(ExtentPrecalculationContext context) =>
+      context.numberOfItemsWithEstimatedExtent > 0;
 }
 
 /// The chat transcript: committed blocks plus the live tail.
@@ -94,6 +105,30 @@ class _TranscriptViewState extends State<TranscriptView> {
   static const double _refollowPx = 28;
 
   bool get _following => widget.controller.following.value;
+
+  final _precalculate = _PrecalculateAll();
+
+  /// Rough height for a row that has not been laid out yet: header/meta
+  /// chrome plus wrapped lines. Only used until precalculation reaches it.
+  double _estimateExtent(TranscriptSnapshot snap, int index, double width) {
+    final tail = snap.tailCount;
+    String text;
+    if (index < tail) {
+      text = snap.liveAssistant;
+    } else if (index - tail < snap.blocks.length) {
+      final b = snap.blocks[snap.blocks.length - 1 - (index - tail)];
+      if (b.tools != null || b.entry?.tool != null) return 32;
+      text = b.entry?.message?.content ?? b.thinkingOnly ?? '';
+    } else {
+      return 40;
+    }
+    final charsPerLine = (width / 7.5).clamp(20, 200);
+    var lines = 0;
+    for (final l in text.split('\n')) {
+      lines += 1 + l.length ~/ charsPerLine;
+    }
+    return 56 + lines * 22.0;
+  }
 
   @override
   void initState() {
@@ -274,13 +309,16 @@ class _TranscriptViewState extends State<TranscriptView> {
           onNotification: _onScroll,
           child: GptMarkdownTheme(
             gptThemeData: chatGptMarkdownTheme(theme),
-            child: ListView.custom(
+            child: SuperListView.custom(
               controller: _scroll,
               reverse: true,
               physics: const AlwaysScrollableScrollPhysics(),
               // Reversed: `bottom` is the edge nearest the composer.
               padding: EdgeInsets.fromLTRB(sidePad, 12, sidePad, 16),
               cacheExtent: 600,
+              extentPrecalculationPolicy: _precalculate,
+              extentEstimation: (index, crossAxisExtent) =>
+                  _estimateExtent(snap, index ?? 0, crossAxisExtent),
               childrenDelegate: SliverChildBuilderDelegate(
                 (context, i) => _buildRow(context, snap, i),
                 childCount: _itemCount(snap),
