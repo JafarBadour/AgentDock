@@ -200,7 +200,7 @@ def _run_script(
             "export CLAUDE_ACP_SKIP_PERMISSIONS=true\n" if full_access else ""
         )
     elif provider == "codex":
-        # Zed's codex-acp is a bare ACP binary: model, reasoning effort and
+        # codex-acp is a bare stdio ACP agent: model, reasoning effort and
         # the approval preset are all set per session over RPC.
         agent_args = ""
         skip_perms = ""

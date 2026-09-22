@@ -1217,7 +1217,8 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   . "$HOME/.nvm/nvm.sh"
   nvm install --lts
 fi
-. "$HOME/.nvm/nvm.sh" 2>/dev/null || true
+# `.` of a missing file is fatal under set -e in POSIX sh, even with || true.
+if [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh"; fi
 
 npm install -g @agentclientprotocol/claude-agent-acp \
   || npm install -g @zed-industries/claude-code-acp
@@ -1372,7 +1373,8 @@ if ! node_ok || ! command -v npm >/dev/null 2>&1; then
   . "$HOME/.nvm/nvm.sh"
   nvm install --lts
 fi
-. "$HOME/.nvm/nvm.sh" 2>/dev/null || true
+# `.` of a missing file is fatal under set -e in POSIX sh, even with || true.
+if [ -s "$HOME/.nvm/nvm.sh" ]; then . "$HOME/.nvm/nvm.sh"; fi
 node_ok
 
 npm install -g @agentclientprotocol/codex-acp@latest
@@ -1394,7 +1396,7 @@ done
   printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
   printf '  [ -d "$d" ] && PATH="$d:$PATH"\n'
   printf 'done\n'
-  printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+  printf 'export PATH="$HOME/.local/bin:%s:$PATH"\n' "$NODE_BIN"
   printf 'export NO_BROWSER=1\n'
   printf 'exec %q "$@"\n' "$REAL"
 } > "$HOME/.local/bin/codex-acp"
@@ -1410,6 +1412,7 @@ if ! command -v codex >/dev/null 2>&1 && [ -f "$CODEX_JS" ]; then
     printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
     printf '  [ -d "$d" ] && PATH="$d:$PATH"\n'
     printf 'done\n'
+    printf 'export PATH="%s:$PATH"\n' "$NODE_BIN"
     printf 'exec node %q "$@"\n' "$CODEX_JS"
   } > "$HOME/.local/bin/codex"
   chmod +x "$HOME/.local/bin/codex"

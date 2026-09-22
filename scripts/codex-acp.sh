@@ -100,7 +100,7 @@ fi
   printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
   printf '  [ -d "$d" ] && PATH="$d:$PATH"\n'
   printf 'done\n'
-  printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+  printf 'export PATH="$HOME/.local/bin:%s:$PATH"\n' "$NODE_BIN"
   printf '# Never try to open a browser on a headless host.\n'
   printf 'export NO_BROWSER=1\n'
   printf 'exec %q "$@"\n' "$REAL"
@@ -117,6 +117,7 @@ if ! have codex && [ -f "$CODEX_JS" ]; then
     printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
     printf '  [ -d "$d" ] && PATH="$d:$PATH"\n'
     printf 'done\n'
+    printf 'export PATH="%s:$PATH"\n' "$NODE_BIN"
     printf 'exec node %q "$@"\n' "$CODEX_JS"
   } >"$HOME/.local/bin/codex"
   chmod +x "$HOME/.local/bin/codex"
