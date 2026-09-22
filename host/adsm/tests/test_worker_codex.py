@@ -364,3 +364,50 @@ class AuthHintTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexThreadErrorTest(unittest.TestCase):
+    def test_system_error_after_retries_emits_error_event(self) -> None:
+        emitted: list[dict] = []
+
+        async def _emit(payload: dict) -> None:
+            emitted.append(payload)
+
+        async def _set_status(_cid: str, _st: str, _err: str | None) -> None:
+            return None
+
+        w = Worker("chat-codex-err", emit=_emit, set_status=_set_status)
+        w.provider = "codex"
+
+        async def run() -> None:
+            for i in range(1, 3):
+                await w._handle_update(
+                    {
+                        "update": {
+                            "sessionUpdate": "session_info_update",
+                            "_meta": {
+                                "codex": {
+                                    "error": {
+                                        "message": f"Reconnecting... {i}/5",
+                                        "additionalDetails": "unexpected status 401 Unauthorized: invalid_api_key",
+                                        "willRetry": True,
+                                    }
+                                }
+                            },
+                        }
+                    }
+                )
+            await w._handle_update(
+                {
+                    "update": {
+                        "sessionUpdate": "session_info_update",
+                        "_meta": {"codex": {"threadStatus": {"type": "systemError"}}},
+                    }
+                }
+            )
+
+        asyncio.run(run())
+        errors = [e for e in emitted if e.get("kind") == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("401", errors[0]["text"])
+        self.assertIsNone(w._codex_last_error)

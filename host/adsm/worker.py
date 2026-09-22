@@ -387,6 +387,7 @@ class Worker:
         self.auth_methods: list[str] = []
         self._config_option_ids: set[str] = set()
         self._codex_plan = False
+        self._codex_last_error: Optional[str] = None
         self._term_output: dict[str, str] = {}
         self.binary = ""
         self.full_access = True
@@ -1918,12 +1919,22 @@ class Worker:
             meta = update.get("_meta")
             codex = meta.get("codex") if isinstance(meta, dict) else None
             err = codex.get("error") if isinstance(codex, dict) else None
-            if isinstance(err, dict) and not err.get("willRetry"):
+            if isinstance(err, dict):
                 detail = str(
                     err.get("additionalDetails") or err.get("message") or ""
                 ).strip()
-                if detail:
+                if err.get("willRetry"):
+                    # Remember the cause; the thread flips to systemError
+                    # without repeating it once retries are exhausted.
+                    self._codex_last_error = detail or self._codex_last_error
+                elif detail:
                     await self._emit_event("error", text=detail[:2000])
+                    self._codex_last_error = None
+            thread = codex.get("threadStatus") if isinstance(codex, dict) else None
+            if isinstance(thread, dict) and thread.get("type") == "systemError":
+                detail = self._codex_last_error or "Codex reported a system error"
+                self._codex_last_error = None
+                await self._emit_event("error", text=detail[:2000])
             return
 
         if typ in ("usage_update", "usageUpdate"):
