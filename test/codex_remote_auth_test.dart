@@ -40,4 +40,28 @@ void main() {
       isNull,
     );
   });
+
+  test('device-auth disabled message is recognised', () {
+    const out = 'Enable device code authorization for Codex in ChatGPT '
+        'Security Settings, then run "codex login --device-auth" again.';
+    expect(CodexRemoteAuthSession.isDeviceAuthDisabledOutput(out), isTrue);
+    expect(CodexRemoteAuthSession.isDeviceAuthDisabledOutput(sample), isFalse);
+    expect(CodexRemoteAuthSession.deviceAuthDisabledHint, contains('Security'));
+  });
+
+  test('startup failures are recognised before any URL', () {
+    expect(
+      CodexRemoteAuthSession.isStartupFailureOutput(
+        'bash: codex: command not found',
+      ),
+      isTrue,
+    );
+    expect(
+      CodexRemoteAuthSession.isStartupFailureOutput(
+        "error: unexpected argument '--device-auth' found",
+      ),
+      isTrue,
+    );
+    expect(CodexRemoteAuthSession.isStartupFailureOutput(sample), isFalse);
+  });
 }

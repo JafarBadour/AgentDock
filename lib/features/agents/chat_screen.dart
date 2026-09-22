@@ -1696,7 +1696,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       : null,
                 ),
                 title: Text(m.label),
-                subtitle: Text(m.subtitle),
+                subtitle: Text(
+                  m.subtitleFor(_chat?.provider ?? AgentProvider.cursor),
+                ),
                 onTap: () => Navigator.pop(context, m),
               ),
           ],

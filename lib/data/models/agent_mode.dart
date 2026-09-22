@@ -1,3 +1,5 @@
+import 'agent_provider.dart';
+
 /// Agent session mode (ACP `session/set_mode`).
 enum AgentSessionMode {
   ask,
@@ -17,6 +19,22 @@ enum AgentSessionMode {
         AgentSessionMode.agent => 'Full agent: edit, tools, shell',
         AgentSessionMode.plan => 'Plan first — read-only analysis',
       };
+
+  /// Provider-specific wording where the native mode differs from the
+  /// generic app semantics.
+  String subtitleFor(AgentProvider provider) {
+    if (provider == AgentProvider.codex) {
+      return switch (this) {
+        // codex-acp `read-only` preset: workspace edits/commands still run;
+        // approval is asked for anything outside the workspace or network.
+        AgentSessionMode.ask =>
+          'Ask for approval outside the workspace or network',
+        AgentSessionMode.agent => 'Full agent: edit, tools, shell',
+        AgentSessionMode.plan => 'Plan before making changes',
+      };
+    }
+    return subtitle;
+  }
 
   static AgentSessionMode fromId(String? id) {
     if (id == null || id.isEmpty) return AgentSessionMode.agent;

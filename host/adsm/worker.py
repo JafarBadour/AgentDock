@@ -168,6 +168,39 @@ def codex_models_from_config_options(config_options: Any) -> list[dict[str, Any]
     return out
 
 
+def split_codex_native_model_id(model_id: str) -> tuple[str, Optional[str]]:
+    """codex-acp's legacy `models` ids look like `gpt-6-astra[high]`."""
+    mid = (model_id or "").strip()
+    open_i = mid.find("[")
+    close_i = mid.rfind("]")
+    if open_i < 0 or close_i <= open_i:
+        return mid, None
+    inner = mid[open_i + 1 : close_i].strip()
+    if not inner or "=" in inner:
+        return split_codex_model_id(mid)
+    return mid[:open_i], inner
+
+
+def codex_presets_from_native_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn `gpt-6-astra[high]` / `6 Astra (high)` into app presets
+    `gpt-6-astra[effort=high]` / `6 Astra` (effort becomes a badge)."""
+    out: list[dict[str, Any]] = []
+    for m in models:
+        raw = str(m.get("modelId") or m.get("model_id") or "")
+        if not raw:
+            continue
+        base, eff = split_codex_native_model_id(raw)
+        name = str(m.get("name") or base)
+        if eff:
+            suffix = f" ({eff})"
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+            out.append({"modelId": f"{base}[{_CODEX_EFFORT_ATTR}={eff}]", "name": name})
+        else:
+            out.append({"modelId": base, "name": name})
+    return out
+
+
 def codex_current_model_from_config_options(config_options: Any) -> Optional[str]:
     cur = current_model_from_config_options(config_options)
     if cur is None:
@@ -387,8 +420,12 @@ class Worker:
         self.auth_methods: list[str] = []
         self._config_option_ids: set[str] = set()
         self._codex_plan = False
+        # True once the adapter's own model×effort list was adopted, so a
+        # later configOptions cross product doesn't replace exact combos.
+        self._codex_native_presets = False
         self._codex_last_error: Optional[str] = None
         self._term_output: dict[str, str] = {}
+        self._term_sent: dict[str, int] = {}
         self.binary = ""
         self.full_access = True
         self.acp_session_id: Optional[str] = None
@@ -784,6 +821,9 @@ class Worker:
                 "availableModes": self.available_modes,
                 "mode": self.mode,
                 "loadSession": self.load_session,
+                "configOptionIds": sorted(self._config_option_ids),
+                "codexPlan": self._codex_plan,
+                "codexNativePresets": self._codex_native_presets,
             }
             self._catalog_path().write_text(
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
@@ -815,6 +855,13 @@ class Worker:
             self.mode = str(mode)
         if "loadSession" in data:
             self.load_session = bool(data.get("loadSession"))
+        ids = data.get("configOptionIds")
+        if isinstance(ids, list) and ids:
+            self._config_option_ids = {str(i) for i in ids}
+        if "codexPlan" in data:
+            self._codex_plan = bool(data.get("codexPlan"))
+        if "codexNativePresets" in data:
+            self._codex_native_presets = bool(data.get("codexNativePresets"))
 
     async def _attach_pipes(self) -> None:
         if self._attached and self._fifo_fd is not None:
@@ -1119,8 +1166,24 @@ class Worker:
             for e in avail:
                 if isinstance(e, dict):
                     out.append(dict(e))
-        self.available_models = out
         cur = models.get("currentModelId") or models.get("current_model_id")
+        if self.provider == "codex":
+            presets = codex_presets_from_native_models(out)
+            if presets:
+                # Exact model×effort combos the adapter supports — better
+                # than the configOptions cross product, which can pair a
+                # model with an effort level it doesn't offer.
+                self.available_models = presets
+                self._codex_native_presets = True
+                self._models_via_config_option = True
+                if cur is not None:
+                    base, eff = split_codex_native_model_id(str(cur))
+                    self.model_id = (
+                        f"{base}[{_CODEX_EFFORT_ATTR}={eff}]" if eff else base
+                    )
+                self._persist_catalog()
+                return
+        self.available_models = out
         if cur is not None:
             self.model_id = str(cur)
         self._persist_catalog()
@@ -1137,9 +1200,13 @@ class Worker:
                         cur = entry.get("currentValue") or entry.get("current_value")
                         self._codex_plan = str(cur or "") == "plan"
             if ids:
-                self._config_option_ids = ids
+                self._config_option_ids |= ids
         if self.provider == "codex":
-            out = codex_models_from_config_options(config_options)
+            out = (
+                []
+                if self._codex_native_presets
+                else codex_models_from_config_options(config_options)
+            )
             cur = codex_current_model_from_config_options(config_options)
         else:
             out = models_from_config_options(config_options)
@@ -1209,6 +1276,7 @@ class Worker:
         if self.provider == "codex":
             await self._set_codex_plan(mid_is_plan=mode_id.strip().lower() == "plan")
         self.mode = self._app_mode_id(resolved)
+        self._persist_catalog()
         await self._emit_event("mode", mode=self.mode)
 
     async def _set_codex_plan(self, *, mid_is_plan: bool) -> None:
@@ -1233,6 +1301,7 @@ class Worker:
             self._codex_plan = mid_is_plan
         except Exception as e:  # noqa: BLE001
             self.last_error = f"collaboration_mode: {e}"
+            raise RuntimeError(f"collaboration_mode: {e}") from e
 
     def _app_mode_id(self, native: str) -> str:
         """Map a provider mode id back to the app's ask/agent/plan."""
@@ -1408,16 +1477,22 @@ class Worker:
             timeout=15.0,
         )
         if effort:
-            result = await self._request(
-                "session/set_config_option",
-                {
-                    "sessionId": self.acp_session_id,
-                    "configId": "reasoning_effort",
-                    "type": "id",
-                    "value": effort,
-                },
-                timeout=15.0,
-            )
+            try:
+                result = await self._request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": self.acp_session_id,
+                        "configId": "reasoning_effort",
+                        "type": "id",
+                        "value": effort,
+                    },
+                    timeout=15.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Model switched; effort didn't. Report the model the agent
+                # is actually on (from the first response) rather than the
+                # preset the phone asked for.
+                self.last_error = f"reasoning_effort: {e}"
         return result if isinstance(result, dict) else {}
 
     async def _relaunch_for_model(self, model_id: str) -> None:
@@ -2019,12 +2094,20 @@ class Worker:
             self._term_output[tid] = buf
         elif isinstance(snapshot, dict) and isinstance(snapshot.get("data"), str):
             self._term_output[tid] = snapshot["data"][-64_000:]
-        if tool.get("rawOutput") is None and tid in self._term_output:
-            tool["rawOutput"] = self._term_output[tid]
-        if isinstance(meta.get("terminal_exit"), dict) or str(
+        final = isinstance(meta.get("terminal_exit"), dict) or str(
             tool.get("status") or ""
-        ).lower() in ("completed", "failed", "error", "cancelled"):
+        ).lower() in ("completed", "failed", "error", "cancelled")
+        if tool.get("rawOutput") is None and tid in self._term_output:
+            buf = self._term_output[tid]
+            sent = self._term_sent.get(tid, 0)
+            # Each update carries the whole buffer, so only re-send once it
+            # has grown meaningfully (or at the end) to keep traffic linear.
+            if final or len(buf) - sent >= 2048 or sent == 0:
+                tool["rawOutput"] = buf
+                self._term_sent[tid] = len(buf)
+        if final:
             self._term_output.pop(tid, None)
+            self._term_sent.pop(tid, None)
 
     async def _handle_permission(
         self, req_id: Any, params: dict[str, Any]

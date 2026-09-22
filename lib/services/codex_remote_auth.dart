@@ -65,6 +65,34 @@ class CodexRemoteAuthSession {
     caseSensitive: false,
   );
 
+  /// Device-code login is opt-in per ChatGPT account.
+  static final _deviceAuthDisabledRe = RegExp(
+    r'enable device code authorization',
+    caseSensitive: false,
+  );
+
+  /// User-facing explanation when the account has device auth switched off.
+  static const deviceAuthDisabledHint =
+      'Device-code sign-in is turned off for this ChatGPT account. Enable '
+      '"Device code authorization" under ChatGPT → Settings → Security and '
+      'try again, or save an OpenAI API key in Settings instead.';
+
+  /// The CLI never got as far as printing a code (missing binary, old CLI
+  /// without `--device-auth`, shell choking on the PATH prelude).
+  static final _startupFailureRe = RegExp(
+    r'command not found|no such file or directory|unexpected argument|'
+    r'unrecognized option|not a codex command|error: ',
+    caseSensitive: false,
+  );
+
+  /// Failure text printed before any verification URL appeared.
+  static bool isStartupFailureOutput(String buffer) =>
+      _startupFailureRe.hasMatch(stripAnsi(buffer));
+
+  /// `codex login --device-auth` refuses until the account opts in.
+  static bool isDeviceAuthDisabledOutput(String buffer) =>
+      _deviceAuthDisabledRe.hasMatch(stripAnsi(buffer));
+
   static String stripAnsi(String text) =>
       text.replaceAll(RegExp(r'\x1B\[[0-9;?]*[ -/]*[@-~]'), '');
 
@@ -101,7 +129,24 @@ class CodexRemoteAuthSession {
   void _scan() {
     final plain = stripAnsi(_buffer);
 
+    if (isDeviceAuthDisabledOutput(plain)) {
+      error = deviceAuthDisabledHint;
+      phase = CodexLoginPhase.error;
+      return;
+    }
+
     loginUrl ??= parseLoginUrl(_buffer);
+    if (loginUrl == null && isStartupFailureOutput(plain)) {
+      final line = plain
+          .split('\n')
+          .map((l) => l.trim())
+          .lastWhere(_startupFailureRe.hasMatch, orElse: () => '');
+      error = line.isEmpty
+          ? 'codex login could not start on the host.'
+          : 'codex login could not start: $line';
+      phase = CodexLoginPhase.error;
+      return;
+    }
     if (loginUrl != null) {
       userCode ??= parseUserCode(_buffer);
     }
@@ -219,10 +264,23 @@ codex login status >/dev/null 2>&1
     CodexRemoteAuthSession session, {
     Duration timeout = const Duration(minutes: 15),
     Duration statusPoll = const Duration(seconds: 5),
+    Duration startupTimeout = const Duration(seconds: 90),
   }) async {
-    final deadline = DateTime.now().add(timeout);
-    var nextPoll = DateTime.now().add(statusPoll);
+    final started = DateTime.now();
+    final deadline = started.add(timeout);
+    var nextPoll = started.add(statusPoll);
     while (DateTime.now().isBefore(deadline)) {
+      // The 15-minute budget is for the user approving in the browser; the
+      // CLI itself must print a code within seconds.
+      if (session.phase != CodexLoginPhase.waitingForApproval &&
+          session.phase != CodexLoginPhase.success &&
+          DateTime.now().isAfter(started.add(startupTimeout))) {
+        session.error ??=
+            'codex login did not print a sign-in code on the host.';
+        session.phase = CodexLoginPhase.error;
+        await session.close();
+        return false;
+      }
       if (session.phase == CodexLoginPhase.success) {
         await session.close();
         return true;

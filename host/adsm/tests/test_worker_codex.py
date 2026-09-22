@@ -18,6 +18,7 @@ from adsm.worker import (
     codex_current_model_from_config_options,
     codex_models_from_config_options,
     split_codex_model_id,
+    split_codex_native_model_id,
 )
 
 
@@ -182,21 +183,62 @@ class CodexModelCatalogueTest(unittest.TestCase):
         self.assertEqual(split_codex_model_id("gpt-6-astra"), ("gpt-6-astra", None))
         self.assertEqual(split_codex_model_id("gpt-6-astra[high]"), ("gpt-6-astra", None))
 
-    def test_worker_applies_codex_catalogue_over_native_models(self) -> None:
+    def test_worker_prefers_native_presets_when_adapter_lists_them(self) -> None:
         w = _worker("codex")
-        # codex-acp also returns a legacy `models` block; configOptions win.
+        # codex-acp's `models` block lists exactly the combos it supports;
+        # the configOptions cross product must not replace it.
         w._apply_models(
             {
                 "currentModelId": "gpt-6-astra[medium]",
-                "availableModels": [{"modelId": "gpt-6-astra[medium]", "name": "6 Astra (medium)"}],
+                "availableModels": [
+                    {"modelId": "gpt-6-astra[medium]", "name": "6 Astra (medium)"},
+                    {"modelId": "gpt-6-astra[high]", "name": "6 Astra (high)"},
+                    {"modelId": "gpt-5.6-luna[low]", "name": "5.6 Luna (low)"},
+                ],
             }
         )
         w._apply_config_options(CODEX_CONFIG_OPTIONS)
+        self.assertEqual(
+            [m["modelId"] for m in w.available_models],
+            ["gpt-6-astra[effort=medium]", "gpt-6-astra[effort=high]", "gpt-5.6-luna[effort=low]"],
+        )
+        self.assertEqual(w.available_models[0]["name"], "6 Astra")
         self.assertEqual(w.model_id, "gpt-6-astra[effort=medium]")
-        self.assertEqual(len(w.available_models), 6)
         self.assertTrue(w._models_via_config_option)
+        self.assertTrue(w._codex_native_presets)
         self.assertIn("collaboration_mode", w._config_option_ids)
         self.assertFalse(w._codex_plan)
+
+    def test_worker_falls_back_to_cross_product_without_native_models(self) -> None:
+        w = _worker("codex")
+        w._apply_config_options(CODEX_CONFIG_OPTIONS)
+        self.assertEqual(len(w.available_models), 6)
+        self.assertFalse(w._codex_native_presets)
+
+    def test_native_preset_parsing(self) -> None:
+        self.assertEqual(split_codex_native_model_id("gpt-6-astra[high]"), ("gpt-6-astra", "high"))
+        self.assertEqual(split_codex_native_model_id("gpt-6-astra"), ("gpt-6-astra", None))
+        self.assertEqual(
+            split_codex_native_model_id("gpt-6-astra[effort=high]"), ("gpt-6-astra", "high")
+        )
+
+    def test_plan_state_survives_catalog_round_trip(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from adsm import paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(paths, "agentdock_root", return_value=Path(tmp)):
+                w = _worker("codex")
+                w._apply_config_options(CODEX_CONFIG_OPTIONS)
+                w._codex_plan = True
+                w._persist_catalog()
+                w2 = _worker("codex")
+                w2._restore_catalog()
+                self.assertTrue(w2._codex_plan)
+                self.assertIn("collaboration_mode", w2._config_option_ids)
 
 
 class CodexModeMappingTest(unittest.TestCase):
