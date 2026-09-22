@@ -26,8 +26,8 @@ abstract final class AppColors {
   static const diffAdd = Color(0xFF3FB950);
   static const diffRemove = Color(0xFFF85149);
 
-  /// Chat chrome: user in a soft raised pill; agent bare on the canvas.
-  static const bubbleUser = Color(0xFF2A2A2E);
+  /// Chat chrome: user in a soft raised violet pill; agent bare on the canvas.
+  static const bubbleUser = Color(0xFF2F2742);
   static const onBubbleUser = Color(0xFFF0F0F2);
   static const chatAgentText = Color(0xFFE8E8EA);
   static const chatMeta = Color(0xFF8B8B93);
