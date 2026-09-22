@@ -52,6 +52,11 @@ class _CodexLoginSheetState extends ConsumerState<CodexLoginSheet> {
   }
 
   Future<void> _start() async {
+    // "Try again" — drop the previous PTY session and its UI poll first.
+    _poll?.cancel();
+    await _session?.close();
+    _session = null;
+    if (!mounted) return;
     setState(() {
       _phase = CodexLoginPhase.starting;
       _error = null;
@@ -83,7 +88,7 @@ class _CodexLoginSheetState extends ConsumerState<CodexLoginSheet> {
       // The CLI completes on its own once the code is approved on the web;
       // `waitForSuccess` also polls `codex login status` as a fallback.
       final ok = await auth.waitForSuccess(session);
-      if (!mounted) return;
+      if (!mounted || _finishing) return;
       if (ok) {
         await _finish(success: true);
       } else {

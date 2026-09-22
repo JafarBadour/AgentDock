@@ -44,6 +44,9 @@ class CodexRemoteAuthSession {
   StreamSubscription<List<int>>? _stderrSub;
   bool _closed = false;
 
+  /// True once [close] ran (user cancelled or the flow finished).
+  bool get isClosed => _closed;
+
   static final _urlRe = RegExp(
     r'https://[^\s<>"\)\]\x1b]+',
     multiLine: true,
@@ -228,6 +231,8 @@ codex login status >/dev/null 2>&1
         await session.close();
         return false;
       }
+      // Sheet dismissed — stop polling the host.
+      if (session.isClosed) return false;
       if (session.phase == CodexLoginPhase.waitingForApproval &&
           DateTime.now().isAfter(nextPoll)) {
         nextPoll = DateTime.now().add(statusPoll);
