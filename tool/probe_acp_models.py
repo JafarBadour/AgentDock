@@ -4,6 +4,7 @@
 Usage:
   python3 tool/probe_acp_models.py cursor
   python3 tool/probe_acp_models.py claude
+  python3 tool/probe_acp_models.py codex
 """
 
 from __future__ import annotations
@@ -26,6 +27,13 @@ def _which_agent(kind: str) -> list[str]:
             if path:
                 return [path, "acp"]
         raise SystemExit("agent/cursor-agent not found on PATH")
+    if kind == "codex":
+        bin_path = shutil.which("codex-acp")
+        if not bin_path:
+            raise SystemExit(
+                "codex-acp not found on PATH (npm i -g @agentclientprotocol/codex-acp)"
+            )
+        return [bin_path]
     # Prefer a modern Node for claude-agent-acp.
     bin_path = shutil.which("claude-agent-acp") or shutil.which("claude-code-acp")
     if not bin_path:

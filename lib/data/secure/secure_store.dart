@@ -28,6 +28,7 @@ class SecureStore {
   static const _sshPassphrase = 'ssh_key_passphrase';
   static const _cursorApiKey = 'cursor_api_key';
   static const _anthropicApiKey = 'anthropic_api_key';
+  static const _openAiApiKey = 'openai_api_key';
   static const _gcpSpeechApiKey = 'gcp_speech_api_key';
   static const _gcpSpeechLanguage = 'gcp_speech_language';
   static const _hostPasswordPrefix = 'host_password_';
@@ -126,6 +127,21 @@ class SecureStore {
 
   Future<bool> hasAnthropicApiKey() async {
     final value = await readAnthropicApiKey();
+    return value != null && value.trim().isNotEmpty;
+  }
+
+  Future<void> saveOpenAiApiKey(String? key) async {
+    if (key == null || key.trim().isEmpty) {
+      await _delete(_openAiApiKey);
+      return;
+    }
+    await _write(_openAiApiKey, key.trim());
+  }
+
+  Future<String?> readOpenAiApiKey() => _read(_openAiApiKey);
+
+  Future<bool> hasOpenAiApiKey() async {
+    final value = await readOpenAiApiKey();
     return value != null && value.trim().isNotEmpty;
   }
 

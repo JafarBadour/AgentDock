@@ -42,7 +42,7 @@ else
   trap cleanup EXIT
   # Sparse-ish: pull individual modules.
   mkdir -p "$TMP/adsm"
-  for f in __init__.py __main__.py paths.py protocol.py worker.py daemon.py cli.py scheduler.py transcript.py; do
+  for f in __init__.py __main__.py paths.py protocol.py worker.py daemon.py cli.py scheduler.py transcript.py process_hygiene.py; do
     curl -fsSL "$REPO_URL/host/adsm/$f" -o "$TMP/adsm/$f"
   done
   rm -rf "$DEST_SHARE/host"

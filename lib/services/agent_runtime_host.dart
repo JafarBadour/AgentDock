@@ -273,6 +273,9 @@ class AgentRuntimeHost {
         case AgentProvider.claude:
           lines.add('ANTHROPIC_API_KEY=${SshService.shellQuote(apiKey)}');
           lines.add('export ANTHROPIC_API_KEY');
+        case AgentProvider.codex:
+          lines.add('OPENAI_API_KEY=${SshService.shellQuote(apiKey)}');
+          lines.add('export OPENAI_API_KEY');
       }
     }
     if (provider == AgentProvider.claude &&
@@ -310,6 +313,8 @@ class AgentRuntimeHost {
           : '${modelFlag}acp',
       // Zed's claude-code-acp speaks ACP on stdio with no subcommand.
       AgentProvider.claude => '',
+      // codex-acp likewise; model and approval preset are set over RPC.
+      AgentProvider.codex => '',
     };
     final skipPerms = provider == AgentProvider.claude && fullAccess
         ? 'export CLAUDE_ACP_SKIP_PERMISSIONS=true\n'

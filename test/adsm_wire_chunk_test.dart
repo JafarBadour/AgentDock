@@ -13,9 +13,10 @@ void main() {
       expect(adsmVersionMeets('0.4.14', kRequiredAdsmVersion), isFalse);
       expect(adsmVersionMeets('0.4.15', kRequiredAdsmVersion), isFalse);
       expect(adsmVersionMeets('0.4.18', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.4.20', kRequiredAdsmVersion), isTrue);
+      expect(adsmVersionMeets('0.4.20', kRequiredAdsmVersion), isFalse);
       expect(adsmVersionMeets('0.4.19', kRequiredAdsmVersion), isFalse);
       expect(adsmVersionMeets('0.5.0', kRequiredAdsmVersion), isTrue);
+      expect(adsmVersionMeets('0.5.1', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -26,7 +27,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.4.20');
+      expect(kRequiredAdsmVersion, '0.5.0');
     });
   });
 }

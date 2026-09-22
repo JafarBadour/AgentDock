@@ -19,7 +19,19 @@ curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/
 
 Then: `claude login` **or** save an Anthropic API key in Agent Dock → Settings.
 
-Both scripts are idempotent and install `tmux` when missing, then install/start **ADSM**.
+## Codex
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/codex-acp.sh | bash
+```
+
+Installs `@agentclientprotocol/codex-acp` (bundles the Codex CLI) and a
+`~/.local/bin/codex-acp` wrapper. Then: `codex login --device-auth` on the host
+**or** save an OpenAI API key in Agent Dock → Settings (Codex persists it in
+`~/.codex/auth.json` on the host). Starting a new `codex login` signs out any
+existing Codex session on that host.
+
+All scripts are idempotent and install `tmux` when missing, then install/start **ADSM**.
 
 ## ADSM only
 

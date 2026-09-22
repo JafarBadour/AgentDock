@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
+import 'agent_provider_ui.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
@@ -86,12 +87,7 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
                 ButtonSegment(
                   value: p,
                   label: Text(p.label),
-                  icon: Icon(
-                    p == AgentProvider.cursor
-                        ? Icons.terminal
-                        : Icons.smart_toy_outlined,
-                    size: 16,
-                  ),
+                  icon: Icon(providerPickerIcon(p), size: 16),
                 ),
             ],
             selected: {_provider},

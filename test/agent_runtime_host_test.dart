@@ -244,5 +244,43 @@ void main() {
       expect(script, isNot(contains('CURSOR_API_KEY')));
       expectParses(script, 'ensure-claude.sh');
     });
+
+    test('Codex run script execs the bare adapter with no flags or env', () {
+      final script = AgentRuntimeHost.runScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/codex-acp',
+        provider: AgentProvider.codex,
+        fullAccess: true,
+        preferredModelId: 'gpt-6-astra[effort=high]',
+      );
+      expect(script, contains(RegExp(r"exec '?/home/me/.local/bin/codex-acp'?\n")));
+      expect(script, isNot(contains('--model')));
+      expect(script, isNot(contains('--force')));
+      expect(script, isNot(contains('CLAUDE_ACP_SKIP_PERMISSIONS')));
+      expectParses(script, 'run-codex.sh');
+    });
+
+    test('Codex bootstrap writes OpenAI key env only', () {
+      const secret = 'sk-openai-test';
+      final script = AgentRuntimeHost.ensureScript(
+        dir: '/home/me/.agentdock/sessions/abc',
+        tmuxSession: 'ad-abc',
+        cwd: '/home/me/proj',
+        binary: '/home/me/.local/bin/codex-acp',
+        provider: AgentProvider.codex,
+        apiKey: secret,
+        preferredModelId: 'gpt-6-astra[effort=high]',
+      );
+      expect(script, contains('OPENAI_API_KEY'));
+      expect(script, isNot(contains('ANTHROPIC_API_KEY')));
+      expect(script, isNot(contains('CURSOR_API_KEY')));
+      expect(script, isNot(contains('CLAUDE_ACP_MODEL')));
+      final tmuxLine = script
+          .split('\n')
+          .firstWhere((l) => l.contains('tmux new-session'));
+      expect(tmuxLine, isNot(contains(secret)));
+      expectParses(script, 'ensure-codex.sh');
+    });
   });
 }

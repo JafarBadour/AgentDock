@@ -111,6 +111,9 @@ void main() {
   test('AgentProvider availability', () {
     expect(AgentProvider.cursor.isAvailable, isTrue);
     expect(AgentProvider.claude.isAvailable, isTrue);
+    expect(AgentProvider.codex.isAvailable, isTrue);
+    expect(AgentProviderX.fromId('codex'), AgentProvider.codex);
+    expect(AgentProvider.codex.apiKeyEnvVar, 'OPENAI_API_KEY');
   });
 
   test('SafeLog redacts private keys', () {

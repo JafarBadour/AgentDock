@@ -47,6 +47,7 @@ class ScheduleSyncService {
       binary = switch (chat.provider) {
         AgentProvider.cursor => await _ssh.ensureCursorCli(host),
         AgentProvider.claude => await _ssh.ensureClaudeAcpBinary(host),
+        AgentProvider.codex => await _ssh.ensureCodexAcpBinary(host),
       };
     } catch (e) {
       SafeLog.d('schedule ensure binary failed', e);

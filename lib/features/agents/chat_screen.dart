@@ -25,12 +25,14 @@ import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
 import '../../services/chat_session_runtime.dart';
 import '../../services/claude_remote_auth.dart';
+import '../../services/codex_remote_auth.dart';
 import '../../services/cursor_acp_service.dart';
 import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
 import '../connect/claude_login_sheet.dart';
+import '../connect/codex_login_sheet.dart';
 import 'model_picker_sheet.dart';
 import 'project_files_screen.dart';
 import 'transcript_blocks.dart';
@@ -761,7 +763,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   /// One-line connect failure for the compact banner (full text on tap).
-  static String _compactConnectError(Object error, {required bool isClaude}) {
+  static String _compactConnectError(
+    Object error, {
+    required AgentProvider provider,
+  }) {
     var msg = error.toString().trim();
     const prefixes = ['TimeoutException: ', 'Exception: ', 'StateError: '];
     for (final p in prefixes) {
@@ -769,7 +774,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     // Unwrap "Could not start … ACP: …" if we re-enter.
     final acp = RegExp(
-      r'^Could not start (?:Claude|Cursor)(?: ACP)?:\s*',
+      r'^Could not start (?:Claude|Cursor|Codex)(?: ACP)?:\s*',
       caseSensitive: false,
     ).firstMatch(msg);
     if (acp != null) msg = msg.substring(acp.end).trim();
@@ -803,7 +808,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return 'SSH timed out';
     }
     if (lower.contains('connect timed out')) {
-      return isClaude ? 'Claude connect timed out' : 'Cursor connect timed out';
+      return '${provider.label} connect timed out';
     }
     if (msg.length > 72) return '${msg.substring(0, 69)}…';
     return msg;
@@ -1058,6 +1063,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }
         return;
       }
+      if (chat.provider == AgentProvider.codex) {
+        final ok = await CodexLoginSheet.show(context, host: host);
+        if (!mounted) return;
+        if (ok == true) {
+          await _reconnectAfterReauth();
+        }
+        return;
+      }
 
       final goConnect = await showDialog<bool>(
         context: context,
@@ -1189,16 +1202,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _connectStatus = message;
       }
 
-      status(
-        provider == AgentProvider.claude
-            ? 'Checking Claude…'
-            : 'Checking Cursor…',
-      );
+      status('Checking ${provider.label}…');
 
       final adsmReady = ssh.isAdsmReady(host.id);
       final cachedBinary = switch (provider) {
         AgentProvider.cursor => ssh.cachedCursorCli(host.id),
         AgentProvider.claude => ssh.cachedClaudeAcp(host.id),
+        AgentProvider.codex => ssh.cachedCodexAcp(host.id),
       };
 
       // Skip tmux install probe when we already know the agent binary — cold
@@ -1220,11 +1230,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         // Do not say "ready" here — ADSM attach can still hang, and that
         // label next to the header spinner made chats look connected while
         // the composer stayed locked on [_connecting].
-        status(
-          provider == AgentProvider.claude
-              ? 'Claude ACP found…'
-              : 'Cursor found…',
-        );
+        status(switch (provider) {
+          AgentProvider.cursor => 'Cursor found…',
+          AgentProvider.claude => 'Claude ACP found…',
+          AgentProvider.codex => 'Codex ACP found…',
+        });
       } else {
         binary = switch (provider) {
           AgentProvider.cursor =>
@@ -1244,6 +1254,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   onTimeout: () => throw TimeoutException(
                     'Timed out finding Claude ACP on the remote. '
                     'Open Hosts → terminal and check `claude-code-acp`.',
+                  ),
+                ),
+          AgentProvider.codex =>
+            await ssh
+                .ensureCodexAcpBinary(host, onProgress: status)
+                .timeout(
+                  const Duration(minutes: 8),
+                  onTimeout: () => throw TimeoutException(
+                    'Timed out installing/finding Codex ACP on the remote. '
+                    'Open Hosts → terminal and check `codex-acp`.',
                   ),
                 ),
         };
@@ -1294,9 +1314,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ).timeout(
         const Duration(seconds: 90),
         onTimeout: () => throw TimeoutException(
-          provider == AgentProvider.claude
-              ? 'Claude connect timed out'
-              : 'Cursor connect timed out',
+          '${provider.label} connect timed out',
         ),
       );
     };
@@ -1449,10 +1467,36 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         }
       }
 
+      if (chat.provider == AgentProvider.codex) {
+        final apiKey = await ref.read(secureStoreProvider).readOpenAiApiKey();
+        if (!_connectStillCurrent(epoch)) return;
+        if (apiKey == null || apiKey.isEmpty) {
+          _connectStatus = 'Checking Codex login…';
+          final auth = CodexRemoteAuth(ref.read(sshServiceProvider));
+          if (!await auth
+              .isLoggedIn(host)
+              .timeout(const Duration(seconds: 25), onTimeout: () => false)) {
+            if (!_connectStillCurrent(epoch)) return;
+            _connectStatus = 'Sign in required…';
+            final signedIn = await CodexLoginSheet.show(context, host: host);
+            if (!_connectStillCurrent(epoch)) return;
+            if (signedIn != true) {
+              _connecting = false;
+              _connectStatus = null;
+              if (mounted) {
+                setState(() {
+                  _error =
+                      'Codex sign-in required. Open Settings to continue.';
+                });
+              }
+              return;
+            }
+          }
+        }
+      }
+
       if (!_connectStillCurrent(epoch)) return;
-      _connectStatus = chat.provider == AgentProvider.claude
-          ? 'Starting Claude…'
-          : 'Starting Cursor…';
+      _connectStatus = 'Starting ${chat.provider.label}…';
       final factory = _buildSessionFactory(
         chatId: chat.id,
         cwd: repo.remotePath,
@@ -1504,7 +1548,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } on MissingToolException catch (e) {
       if (!_connectStillCurrent(epoch)) return;
       if (mounted) {
-        final isClaude = chat.provider == AgentProvider.claude;
+        final providerLabel = chat.provider == AgentProvider.cursor
+            ? 'Cursor CLI'
+            : chat.provider.label;
         final isAdsm = e.tool.toUpperCase().contains('ADSM');
         final mismatch = e.installHint.toLowerCase().contains('adsm mismatch');
         setState(() {
@@ -1520,14 +1566,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           'Agent Dock tried automatically — run the setup below on the '
                           'remote, then Connect again.\n\n'
                           '${e.tool} still missing.')
-              : isClaude
-              ? 'Could not install Claude on ${host.displayLabel}.\n'
+              : 'Could not install $providerLabel on ${host.displayLabel}.\n'
                     'Agent Dock tried automatically — run the setup below on the '
                     'remote (or fix network/sudo), then Connect again.\n\n'
-                    '${e.tool} still missing.'
-              : 'Could not install Cursor CLI on ${host.displayLabel}.\n'
-                    'Agent Dock tried automatically — run the setup below on the '
-                    'remote, then Connect again.\n\n'
                     '${e.tool} still missing.';
         });
       }
@@ -1535,11 +1576,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (!_connectStillCurrent(epoch)) return;
       SafeLog.d('ACP connect failed', e);
       final lower = e.toString().toLowerCase();
-      final isClaude = chat.provider == AgentProvider.claude;
       final looksLikeMissingSdk =
           lower.contains('cursor') ||
           lower.contains('claude') ||
           lower.contains('claude-code-acp') ||
+          lower.contains('codex') ||
           lower.contains('agent') ||
           lower.contains('not found') ||
           lower.contains('no such file') ||
@@ -1548,10 +1589,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         setState(() {
           _showSdkInstallGuide = looksLikeMissingSdk;
           _error = looksLikeMissingSdk
-              ? (isClaude
-                    ? 'Could not start Claude — install may have failed on the remote.\n$e'
-                    : 'Could not start Cursor — install may have failed on the remote.\n$e')
-              : _compactConnectError(e, isClaude: isClaude);
+              ? 'Could not start ${chat.provider.label} — install may have '
+                    'failed on the remote.\n$e'
+              : _compactConnectError(e, provider: chat.provider);
         });
       }
       final updated = chat.copyWith(
@@ -2799,9 +2839,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           final err = (displayError ?? '').toLowerCase();
           if (err.contains('tmux')) return kRemoteTmuxSetupGuide;
           if (err.contains('adsm')) return kRemoteAdsmSetupGuide;
-          return _chat!.provider == AgentProvider.claude
-              ? kRemoteClaudeSetupGuide
-              : kRemoteCursorSetupGuide;
+          return switch (_chat!.provider) {
+            AgentProvider.cursor => kRemoteCursorSetupGuide,
+            AgentProvider.claude => kRemoteClaudeSetupGuide,
+            AgentProvider.codex => kRemoteCodexSetupGuide,
+          };
         }();
         final connected = runtime != null && !runtime.closed;
         final reconnecting = runtime?.reconnecting ?? false;
@@ -3131,8 +3173,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             child: Text(
                               _compactConnectError(
                                 displayError,
-                                isClaude:
-                                    _chat?.provider == AgentProvider.claude,
+                                provider:
+                                    _chat?.provider ?? AgentProvider.cursor,
                               ),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,

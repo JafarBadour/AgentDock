@@ -20,10 +20,19 @@ enum AgentSessionMode {
 
   static AgentSessionMode fromId(String? id) {
     if (id == null || id.isEmpty) return AgentSessionMode.agent;
-    return AgentSessionMode.values.firstWhere(
-      (m) => m.id == id || m.name == id,
-      orElse: () => AgentSessionMode.agent,
-    );
+    for (final m in AgentSessionMode.values) {
+      if (m.id == id || m.name == id) return m;
+    }
+    // ADSM normally reports app ids, but native ACP ids can leak through
+    // (Claude `dontAsk`, Codex `read-only` / `agent-full-access`).
+    switch (id.toLowerCase()) {
+      case 'dontask':
+      case 'read-only':
+      case 'readonly':
+        return AgentSessionMode.ask;
+      default:
+        return AgentSessionMode.agent;
+    }
   }
 }
 

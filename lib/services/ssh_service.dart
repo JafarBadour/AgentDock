@@ -152,7 +152,13 @@ bool isAgentAuthFailureText(String text) {
       t.contains('not logged in') ||
       t.contains('please run /login') ||
       t.contains('claude auth login') ||
-      t.contains('agent login');
+      t.contains('agent login') ||
+      // Codex: ACP `authentication required`, expired ChatGPT tokens, or a
+      // rejected OPENAI_API_KEY (`invalid_api_key`).
+      t.contains('authentication required') ||
+      t.contains('invalid_api_key') ||
+      t.contains('incorrect api key') ||
+      t.contains('codex login');
 }
 
 /// ACP session id is gone (common after Stop/cancel on Claude).
@@ -476,9 +482,11 @@ exit 0
 
   String? cachedClaudeAcp(String hostId) => _toolPathCache['claude:$hostId'];
 
+  String? cachedCodexAcp(String hostId) => _toolPathCache['codex:$hostId'];
+
   static const _toolPathPrefsKey = 'ssh_tool_path_cache_v1';
 
-  /// Load Cursor/Claude absolute paths saved from prior connects.
+  /// Load Cursor/Claude/Codex absolute paths saved from prior connects.
   Future<void> loadPersistedCaches() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -1344,6 +1352,161 @@ test -x "$HOME/.local/bin/claude-code-acp"
     return path;
   }
 
+  /// The maintained adapter is TypeScript (`@agentclientprotocol/codex-acp`)
+  /// and bundles the Codex CLI's native binary, so only Node 20+ is needed.
+  static const _codexInlineInstall = r'''
+set -e
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh"
+mkdir -p "$HOME/.local/bin"
+
+node_ok() {
+  command -v node >/dev/null 2>&1 || return 1
+  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [ "${major:-0}" -ge 20 ]
+}
+if ! node_ok || ! command -v npm >/dev/null 2>&1; then
+  if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
+    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+  fi
+  . "$HOME/.nvm/nvm.sh"
+  nvm install --lts
+fi
+. "$HOME/.nvm/nvm.sh" 2>/dev/null || true
+node_ok
+
+npm install -g @agentclientprotocol/codex-acp@latest
+
+NODE_BIN="$(dirname "$(command -v node)")"
+PREFIX_BIN="$(npm prefix -g 2>/dev/null)/bin"
+REAL=
+for dir in "$NODE_BIN" "$PREFIX_BIN"; do
+  [ -d "$dir" ] || continue
+  [ "$(cd "$dir" && pwd -P)" = "$(cd "$HOME/.local/bin" && pwd -P)" ] && continue
+  if [ -x "$dir/codex-acp" ]; then REAL="$dir/codex-acp"; break; fi
+done
+[ -n "$REAL" ]
+
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"\n'
+  printf '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\n'
+  printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
+  printf '  [ -d "$d" ] && PATH="$d:$PATH"\n'
+  printf 'done\n'
+  printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+  printf 'export NO_BROWSER=1\n'
+  printf 'exec %q "$@"\n' "$REAL"
+} > "$HOME/.local/bin/codex-acp"
+chmod +x "$HOME/.local/bin/codex-acp"
+
+# `codex` CLI for `codex login` — the adapter bundles it.
+CODEX_JS="$(npm root -g 2>/dev/null)/@agentclientprotocol/codex-acp/node_modules/@openai/codex/bin/codex.js"
+if ! command -v codex >/dev/null 2>&1 && [ -f "$CODEX_JS" ]; then
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"\n'
+    printf '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\n'
+    printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
+    printf '  [ -d "$d" ] && PATH="$d:$PATH"\n'
+    printf 'done\n'
+    printf 'exec node %q "$@"\n' "$CODEX_JS"
+  } > "$HOME/.local/bin/codex"
+  chmod +x "$HOME/.local/bin/codex"
+fi
+test -x "$HOME/.local/bin/codex-acp"
+''';
+
+  Future<void> _tryCodexInlineInstallOnHost(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    onProgress?.call('Installing Codex ACP adapter (npm)…');
+    if (_preferLocalFs(host)) {
+      await exec(
+        host,
+        _codexInlineInstall,
+        timeout: const Duration(minutes: 12),
+      );
+      return;
+    }
+    final client = await connect(host).timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => throw TimeoutException(
+        'SSH connect timed out while installing Codex ACP',
+      ),
+    );
+    await _runWithInstallProgress(
+      client,
+      _codexInlineInstall,
+      hostId: host.id,
+      timeout: const Duration(minutes: 12),
+      onProgress: onProgress,
+    );
+  }
+
+  /// Resolves the Codex ACP adapter, installing it (with the bundled Codex
+  /// CLI) if needed.
+  Future<String> ensureCodexAcpBinary(
+    Host host, {
+    void Function(String status)? onProgress,
+  }) async {
+    final cached = cachedCodexAcp(host.id);
+    if (cached != null) {
+      onProgress?.call('Codex ACP ready');
+      return cached;
+    }
+
+    onProgress?.call('Looking for Codex ACP…');
+    var path = await _resolveCodexAcpPathOnHost(host);
+    if (path != null) {
+      _cacheToolPath('codex:${host.id}', path);
+      onProgress?.call('Codex ACP ready');
+      return path;
+    }
+
+    onProgress?.call('First Codex setup on this host — usually 2–5 minutes…');
+
+    try {
+      await _tryCodexInlineInstallOnHost(host, onProgress: onProgress);
+      path = await _resolveCodexAcpPathOnHost(host);
+      if (path != null) {
+        _cacheToolPath('codex:${host.id}', path);
+        onProgress?.call('Codex ACP ready');
+        return path;
+      }
+    } catch (e) {
+      SafeLog.d('codex ACP inline install failed', e);
+      onProgress?.call('Inline install failed — trying full setup script…');
+    }
+
+    final installed = await _runAgentDockInstallScriptOnHost(
+      host,
+      scriptName: 'codex-acp.sh',
+      onProgress: onProgress,
+      timeout: const Duration(minutes: 15),
+    );
+    if (!installed) {
+      onProgress?.call('Retrying npm install…');
+      try {
+        await _tryCodexInlineInstallOnHost(host, onProgress: onProgress);
+      } catch (e) {
+        SafeLog.d('codex ACP inline install retry failed', e);
+      }
+    }
+
+    path = await _resolveCodexAcpPathOnHost(host);
+    if (path == null) {
+      throw MissingToolException(
+        'Codex ACP adapter',
+        kRemoteCodexSetupGuide.trim(),
+      );
+    }
+    _cacheToolPath('codex:${host.id}', path);
+    onProgress?.call('Codex ACP ready');
+    return path;
+  }
+
   /// Installs/starts ADSM on the host and verifies it responds at
   /// [kRequiredAdsmVersion] or newer.
   ///
@@ -2206,6 +2369,48 @@ exit 1
       return path.isEmpty ? null : path;
     } catch (e) {
       SafeLog.d('resolve Claude ACP path failed', e);
+      final t = e.toString().toLowerCase();
+      if (t.contains('timed out') ||
+          t.contains('transport') ||
+          t.contains('channel') ||
+          t.contains('connection') ||
+          t.contains('broken pipe') ||
+          t.contains('socket') ||
+          t.contains('gate timed out')) {
+        rethrow;
+      }
+      return null;
+    }
+  }
+
+  Future<String?> _resolveCodexAcpPathOnHost(Host host) async {
+    // Known install locations only — never source nvm here (it can hang).
+    const script = r'''
+set +e
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+for p in \
+  "$HOME/.local/bin/codex-acp" \
+  "$HOME/.npm-global/bin/codex-acp" \
+  /usr/local/bin/codex-acp \
+  /opt/homebrew/bin/codex-acp; do
+  if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
+done
+for p in "$HOME"/.nvm/versions/node/*/bin/codex-acp; do
+  if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
+done
+command -v codex-acp 2>/dev/null && exit 0
+exit 1
+''';
+    try {
+      final out = await exec(
+        host,
+        'sh -c ${shellQuote(script)}',
+        timeout: const Duration(seconds: 12),
+      );
+      final path = out.trim().split('\n').last.trim();
+      return path.isEmpty ? null : path;
+    } catch (e) {
+      SafeLog.d('resolve Codex ACP path failed', e);
       final t = e.toString().toLowerCase();
       if (t.contains('timed out') ||
           t.contains('transport') ||

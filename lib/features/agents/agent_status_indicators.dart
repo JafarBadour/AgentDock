@@ -10,6 +10,7 @@ import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/secure/safe_log.dart';
 import '../../features/connect/claude_login_sheet.dart';
+import '../../features/connect/codex_login_sheet.dart';
 import '../../services/adsm_client.dart';
 import '../../services/ssh_service.dart';
 
@@ -604,10 +605,16 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
     final provider = widget.provider ?? AgentProvider.claude;
     final host = widget.session.host;
 
-    if (provider == AgentProvider.claude) {
+    if (provider == AgentProvider.claude ||
+        provider == AgentProvider.codex) {
       setState(() => _reauthing = true);
       try {
-        final ok = await ClaudeLoginSheet.show(context, host: host);
+        final bool? ok;
+        if (provider == AgentProvider.claude) {
+          ok = await ClaudeLoginSheet.show(context, host: host);
+        } else {
+          ok = await CodexLoginSheet.show(context, host: host);
+        }
         if (!mounted) return;
         if (ok == true) {
           Navigator.pop(context);
@@ -746,9 +753,7 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
                   ),
                 ),
                 IconButton(
-                  tooltip: provider == AgentProvider.cursor
-                      ? 'Re-authenticate Cursor'
-                      : 'Re-authenticate Claude',
+                  tooltip: 'Re-authenticate ${(provider ?? AgentProvider.claude).label}',
                   onPressed: busy ? null : _reauth,
                   icon: _reauthing
                       ? SizedBox(
@@ -872,9 +877,7 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
                 onPressed: busy ? null : _reauth,
                 icon: const Icon(Icons.lock_reset_outlined),
                 label: Text(
-                  provider == AgentProvider.cursor
-                      ? 'Re-authenticate Cursor'
-                      : 'Re-authenticate Claude',
+                  'Re-authenticate ${(provider ?? AgentProvider.claude).label}',
                 ),
               ),
             ],

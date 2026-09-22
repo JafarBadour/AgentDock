@@ -196,6 +196,7 @@ class AcpSession implements AgentSession {
     final apiKey = switch (provider) {
       AgentProvider.cursor => await secureStore.readCursorApiKey(),
       AgentProvider.claude => await secureStore.readAnthropicApiKey(),
+      AgentProvider.codex => await secureStore.readOpenAiApiKey(),
     };
 
     if (durable && runtimeHost != null) {
@@ -376,6 +377,10 @@ class AcpSession implements AgentSession {
           envExports.write(
             'export ANTHROPIC_API_KEY=${SshService.shellQuote(apiKey)}; ',
           );
+        case AgentProvider.codex:
+          envExports.write(
+            'export OPENAI_API_KEY=${SshService.shellQuote(apiKey)}; ',
+          );
       }
     }
     if (provider == AgentProvider.claude && permissionPolicy.fullAccess) {
@@ -388,6 +393,8 @@ class AcpSession implements AgentSession {
             ? '--force --approve-mcps --trust acp'
             : 'acp',
       AgentProvider.claude => '',
+      // codex-acp is a bare stdio ACP agent; mode/model are set over RPC.
+      AgentProvider.codex => '',
     };
     final command = agentArgs.isEmpty
         ? '${envExports}cd ${SshService.shellQuote(cwd)} && '
