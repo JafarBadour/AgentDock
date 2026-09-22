@@ -285,7 +285,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         Text('API keys', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
-          'Cursor, Anthropic, and related agent keys.',
+          'Cursor, Anthropic, OpenAI, and related agent keys.',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 8),
@@ -294,7 +294,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           child: ListTile(
             leading: const Icon(Icons.key_outlined),
             title: const Text('API keys'),
-            subtitle: const Text('View and set Cursor, Anthropic, …'),
+            subtitle: const Text('View and set Cursor, Anthropic, OpenAI, …'),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => openSettingsSubpage(context, ref, '/settings/keys'),
           ),

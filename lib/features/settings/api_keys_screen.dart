@@ -8,11 +8,13 @@ import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import '../../data/secure/safe_log.dart';
 import '../connect/claude_login_sheet.dart';
+import '../connect/codex_login_sheet.dart';
 
 /// Which secret the detail editor is for.
 enum ApiKeyKind {
   cursor,
-  anthropic;
+  anthropic,
+  openai;
 
   String get routeId => name;
 
@@ -27,11 +29,13 @@ enum ApiKeyKind {
   String get title => switch (this) {
         cursor => 'Cursor API key',
         anthropic => 'Anthropic API key',
+        openai => 'OpenAI API key',
       };
 
   String get fieldLabel => switch (this) {
         cursor => 'CURSOR_API_KEY',
         anthropic => 'ANTHROPIC_API_KEY',
+        openai => 'OPENAI_API_KEY',
       };
 
   String get subtitle => switch (this) {
@@ -41,6 +45,9 @@ enum ApiKeyKind {
         anthropic =>
           'Optional if you signed in with Claude on the remote. '
               'If set, the key is injected only into that agent process environment.',
+        openai =>
+          'Optional if you signed in with ChatGPT on the remote. '
+              'Used by Codex agents; note Codex keeps a copy in ~/.codex/auth.json on the host.',
       };
 }
 
@@ -57,6 +64,7 @@ class ApiKeysScreen extends ConsumerStatefulWidget {
 class _ApiKeysScreenState extends ConsumerState<ApiKeysScreen> {
   bool? _hasCursor;
   bool? _hasAnthropic;
+  bool? _hasOpenAi;
 
   @override
   void initState() {
@@ -68,10 +76,12 @@ class _ApiKeysScreenState extends ConsumerState<ApiKeysScreen> {
     final store = ref.read(secureStoreProvider);
     final cursor = await store.hasCursorApiKey();
     final anthropic = await store.hasAnthropicApiKey();
+    final openai = await store.hasOpenAiApiKey();
     if (!mounted) return;
     setState(() {
       _hasCursor = cursor;
       _hasAnthropic = anthropic;
+      _hasOpenAi = openai;
     });
   }
 
@@ -97,6 +107,11 @@ class _ApiKeysScreenState extends ConsumerState<ApiKeysScreen> {
           onTap: () =>
               openSettingsSubpage(context, ref, '/settings/keys/anthropic'),
         ),
+        _ApiKeyTile(
+          kind: ApiKeyKind.openai,
+          stored: _hasOpenAi,
+          onTap: () => openSettingsSubpage(context, ref, '/settings/keys/openai'),
+        ),
         const SizedBox(height: 20),
         Text('Claude sign-in', style: Theme.of(context).textTheme.titleSmall),
         const SizedBox(height: 4),
@@ -106,6 +121,15 @@ class _ApiKeysScreenState extends ConsumerState<ApiKeysScreen> {
         ),
         const SizedBox(height: 8),
         const ClaudeHostLoginPanel(),
+        const SizedBox(height: 20),
+        Text('Codex sign-in', style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 4),
+        Text(
+          'ChatGPT device-code login for Codex agents (alternative to an API key).',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        const CodexHostLoginPanel(),
       ],
     );
 
@@ -206,6 +230,7 @@ class _ApiKeyEditScreenState extends ConsumerState<ApiKeyEditScreen> {
     final has = switch (widget.kind) {
       ApiKeyKind.cursor => await store.hasCursorApiKey(),
       ApiKeyKind.anthropic => await store.hasAnthropicApiKey(),
+      ApiKeyKind.openai => await store.hasOpenAiApiKey(),
     };
     if (!mounted) return;
     setState(() => _hasStored = has);
@@ -224,6 +249,8 @@ class _ApiKeyEditScreenState extends ConsumerState<ApiKeyEditScreen> {
           await store.saveCursorApiKey(raw);
         case ApiKeyKind.anthropic:
           await store.saveAnthropicApiKey(raw);
+        case ApiKeyKind.openai:
+          await store.saveOpenAiApiKey(raw);
       }
       _controller.clear();
       await _load();
@@ -250,6 +277,8 @@ class _ApiKeyEditScreenState extends ConsumerState<ApiKeyEditScreen> {
           await store.saveCursorApiKey(null);
         case ApiKeyKind.anthropic:
           await store.saveAnthropicApiKey(null);
+        case ApiKeyKind.openai:
+          await store.saveOpenAiApiKey(null);
       }
       _controller.clear();
       await _load();

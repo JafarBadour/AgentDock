@@ -33,6 +33,22 @@ command -v claude-code-acp
 tmux -V
 ''';
 
+/// Commands to install the Codex ACP adapter (bundles the Codex CLI).
+const kRemoteCodexSetupGuide = '''
+# Agent Dock · Codex on this host (copy-paste)
+curl -fsSL $kAgentDockScriptsBase/codex-acp.sh | bash
+
+# Then authenticate (pick one):
+codex login --device-auth
+# or save OPENAI_API_KEY in Agent Dock Settings
+# (starting a new login signs out any existing Codex session on this host)
+
+# Smoke:
+codex login status
+command -v codex-acp
+tmux -V
+''';
+
 const kRemoteTmuxSetupGuide = r'''# Install tmux on the remote (required by Agent Dock)
 
 # --- HPC / shared clusters (no sudo) ---

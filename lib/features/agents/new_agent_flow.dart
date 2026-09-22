@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../app/providers.dart';
 import '../../data/models/agent_provider.dart';
+import 'agent_provider_ui.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
@@ -28,16 +29,17 @@ class _NewAgentRequest {
 /// The controller cannot live in the calling function: `showDialog` returns as
 /// soon as the route is popped, but the dialog keeps rebuilding through its
 /// dismissal animation, so disposing there is a use-after-dispose.
-class _NewAgentDialog extends StatefulWidget {
-  const _NewAgentDialog({required this.repoName});
+/// Title + provider picker shown when creating an agent in a repo.
+class NewAgentDialog extends StatefulWidget {
+  const NewAgentDialog({super.key, required this.repoName});
 
   final String repoName;
 
   @override
-  State<_NewAgentDialog> createState() => _NewAgentDialogState();
+  State<NewAgentDialog> createState() => _NewAgentDialogState();
 }
 
-class _NewAgentDialogState extends State<_NewAgentDialog> {
+class _NewAgentDialogState extends State<NewAgentDialog> {
   final _title = TextEditingController(text: 'New agent');
   AgentProvider _provider = AgentProvider.cursor;
 
@@ -78,27 +80,22 @@ class _NewAgentDialogState extends State<_NewAgentDialog> {
             style: Theme.of(context).textTheme.labelLarge,
           ),
           const SizedBox(height: 8),
-          // Segmented control — not a Dropdown — so the menu never paints
-          // through the dialog / wavy background as a broken overlay.
-          SegmentedButton<AgentProvider>(
-            segments: [
+          // Chips — not a Dropdown — so the menu never paints through the
+          // dialog / wavy background as a broken overlay, and three or more
+          // providers still fit a phone-width dialog.
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
               for (final p in AgentProvider.values)
-                ButtonSegment(
-                  value: p,
+                ChoiceChip(
+                  avatar: Icon(providerPickerIcon(p), size: 16),
                   label: Text(p.label),
-                  icon: Icon(
-                    p == AgentProvider.cursor
-                        ? Icons.terminal
-                        : Icons.smart_toy_outlined,
-                    size: 16,
-                  ),
+                  selected: _provider == p,
+                  showCheckmark: false,
+                  onSelected: (_) => setState(() => _provider = p),
                 ),
             ],
-            selected: {_provider},
-            onSelectionChanged: (next) {
-              if (next.isEmpty) return;
-              setState(() => _provider = next.first);
-            },
           ),
         ],
       ),
@@ -203,7 +200,7 @@ Future<void> startNewAgentChat({
 }) async {
   final request = await showDialog<_NewAgentRequest>(
     context: context,
-    builder: (context) => _NewAgentDialog(repoName: repo.name),
+    builder: (context) => NewAgentDialog(repoName: repo.name),
   );
 
   if (request == null || !context.mounted) return;

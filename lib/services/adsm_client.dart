@@ -812,6 +812,7 @@ class AdsmSession implements AgentSession {
     final apiKey = switch (provider) {
       AgentProvider.cursor => await secureStore.readCursorApiKey(),
       AgentProvider.claude => await secureStore.readAnthropicApiKey(),
+      AgentProvider.codex => await secureStore.readOpenAiApiKey(),
     };
 
     final pool = bridgePool;

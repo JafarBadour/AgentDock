@@ -31,7 +31,9 @@ class AgentSetupErrorBanner extends StatelessWidget {
             ? kRemoteTmuxSetupGuide
             : lower.contains('claude')
                 ? kRemoteClaudeSetupGuide
-                : kRemoteCursorSetupGuide;
+                : lower.contains('codex')
+                    ? kRemoteCodexSetupGuide
+                    : kRemoteCursorSetupGuide;
     return AgentSetupErrorBanner(
       key: key,
       message: message,

@@ -101,6 +101,119 @@ def current_model_from_config_options(config_options: Any) -> Optional[str]:
     return None
 
 
+def _uses_config_options(provider: str) -> bool:
+    """Providers whose ACP adapter exposes models via session configOptions."""
+    return (provider or "").lower() in ("claude", "codex")
+
+
+_CODEX_EFFORT_ATTR = "effort"
+
+
+def _config_option(config_options: Any, opt_id: str) -> Optional[dict[str, Any]]:
+    if not isinstance(config_options, list):
+        return None
+    for entry in config_options:
+        if not isinstance(entry, dict):
+            continue
+        eid = entry.get("id") or entry.get("configId") or entry.get("config_id")
+        if eid == opt_id:
+            return entry
+    return None
+
+
+def split_codex_model_id(model_id: str) -> tuple[str, Optional[str]]:
+    """`gpt-5.5[effort=high]` -> (`gpt-5.5`, `high`); plain ids pass through."""
+    mid = (model_id or "").strip()
+    open_i = mid.find("[")
+    close_i = mid.rfind("]")
+    if open_i < 0 or close_i <= open_i:
+        return mid, None
+    base = mid[:open_i]
+    effort: Optional[str] = None
+    for pair in mid[open_i + 1 : close_i].split(","):
+        k, _, v = pair.partition("=")
+        if k.strip() == _CODEX_EFFORT_ATTR and v.strip():
+            effort = v.strip()
+    return base, effort
+
+
+def codex_models_from_config_options(config_options: Any) -> list[dict[str, Any]]:
+    """Codex exposes model and reasoning effort as two independent selects.
+
+    The app treats a model as a single preset string (like Cursor's
+    `model[thinking=true]` ids), so we advertise the cross product as
+    `model[effort=level]` presets. Without an effort option the plain model
+    list is returned unchanged.
+    """
+    base = models_from_config_options(config_options)
+    effort_opt = _config_option(config_options, "reasoning_effort")
+    if not base or effort_opt is None:
+        return base
+    levels = [
+        str(o.get("value"))
+        for o in _flatten_config_select_options(effort_opt.get("options"))
+        if o.get("value") is not None
+    ]
+    if not levels:
+        return base
+    out: list[dict[str, Any]] = []
+    for m in base:
+        for level in levels:
+            out.append(
+                {
+                    "modelId": f"{m['modelId']}[{_CODEX_EFFORT_ATTR}={level}]",
+                    "name": m["name"],
+                }
+            )
+    return out
+
+
+def split_codex_native_model_id(model_id: str) -> tuple[str, Optional[str]]:
+    """codex-acp's legacy `models` ids look like `gpt-6-astra[high]`."""
+    mid = (model_id or "").strip()
+    open_i = mid.find("[")
+    close_i = mid.rfind("]")
+    if open_i < 0 or close_i <= open_i:
+        return mid, None
+    inner = mid[open_i + 1 : close_i].strip()
+    if not inner or "=" in inner:
+        return split_codex_model_id(mid)
+    return mid[:open_i], inner
+
+
+def codex_presets_from_native_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn `gpt-6-astra[high]` / `6 Astra (high)` into app presets
+    `gpt-6-astra[effort=high]` / `6 Astra` (effort becomes a badge)."""
+    out: list[dict[str, Any]] = []
+    for m in models:
+        raw = str(m.get("modelId") or m.get("model_id") or "")
+        if not raw:
+            continue
+        base, eff = split_codex_native_model_id(raw)
+        name = str(m.get("name") or base)
+        if eff:
+            suffix = f" ({eff})"
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+            out.append({"modelId": f"{base}[{_CODEX_EFFORT_ATTR}={eff}]", "name": name})
+        else:
+            out.append({"modelId": base, "name": name})
+    return out
+
+
+def codex_current_model_from_config_options(config_options: Any) -> Optional[str]:
+    cur = current_model_from_config_options(config_options)
+    if cur is None:
+        return None
+    effort_opt = _config_option(config_options, "reasoning_effort")
+    if effort_opt is None:
+        return cur
+    level = effort_opt.get("currentValue") or effort_opt.get("current_value")
+    if level is None:
+        return cur
+    return f"{cur}[{_CODEX_EFFORT_ATTR}={level}]"
+
+
 def _run_script(
     *,
     dir_path: str,
@@ -112,13 +225,18 @@ def _run_script(
 ) -> str:
     q = _shell_quote
     model_flag = ""
-    if provider != "claude" and model_id:
+    if provider == "cursor" and model_id:
         model_flag = f"--model {q(model_id)} "
     if provider == "claude":
         agent_args = ""
         skip_perms = (
             "export CLAUDE_ACP_SKIP_PERMISSIONS=true\n" if full_access else ""
         )
+    elif provider == "codex":
+        # codex-acp is a bare stdio ACP agent: model, reasoning effort and
+        # the approval preset are all set per session over RPC.
+        agent_args = ""
+        skip_perms = ""
     else:
         agent_args = (
             f"{model_flag}--force --approve-mcps --trust acp"
@@ -165,6 +283,9 @@ def _env_file(
         if provider == "claude":
             lines.append(f"ANTHROPIC_API_KEY={_shell_quote(api_key)}")
             lines.append("export ANTHROPIC_API_KEY")
+        elif provider == "codex":
+            lines.append(f"OPENAI_API_KEY={_shell_quote(api_key)}")
+            lines.append("export OPENAI_API_KEY")
         else:
             lines.append(f"CURSOR_API_KEY={_shell_quote(api_key)}")
             lines.append("export CURSOR_API_KEY")
@@ -296,6 +417,15 @@ class Worker:
         self._set_status = set_status
         self.cwd = ""
         self.provider = "cursor"
+        self.auth_methods: list[str] = []
+        self._config_option_ids: set[str] = set()
+        self._codex_plan = False
+        # True once the adapter's own model×effort list was adopted, so a
+        # later configOptions cross product doesn't replace exact combos.
+        self._codex_native_presets = False
+        self._codex_last_error: Optional[str] = None
+        self._term_output: dict[str, str] = {}
+        self._term_sent: dict[str, int] = {}
         self.binary = ""
         self.full_access = True
         self.acp_session_id: Optional[str] = None
@@ -563,7 +693,7 @@ class Worker:
             else:
                 self.acp_session_id = effective
                 self._restore_catalog()
-                if self.provider == "claude" and self.available_models:
+                if _uses_config_options(self.provider) and self.available_models:
                     self._models_via_config_option = True
                 # Re-attach after daemon restart leaves availableModels empty.
                 if not self.available_models and effective:
@@ -691,6 +821,9 @@ class Worker:
                 "availableModes": self.available_modes,
                 "mode": self.mode,
                 "loadSession": self.load_session,
+                "configOptionIds": sorted(self._config_option_ids),
+                "codexPlan": self._codex_plan,
+                "codexNativePresets": self._codex_native_presets,
             }
             self._catalog_path().write_text(
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
@@ -722,6 +855,13 @@ class Worker:
             self.mode = str(mode)
         if "loadSession" in data:
             self.load_session = bool(data.get("loadSession"))
+        ids = data.get("configOptionIds")
+        if isinstance(ids, list) and ids:
+            self._config_option_ids = {str(i) for i in ids}
+        if "codexPlan" in data:
+            self._codex_plan = bool(data.get("codexPlan"))
+        if "codexNativePresets" in data:
+            self._codex_native_presets = bool(data.get("codexNativePresets"))
 
     async def _attach_pipes(self) -> None:
         if self._attached and self._fifo_fd is not None:
@@ -882,7 +1022,36 @@ class Worker:
             self.load_session = bool(
                 caps.get("loadSession") or caps.get("load_session")
             )
+        methods = result.get("authMethods") or result.get("auth_methods") or []
+        self.auth_methods = [
+            str(m.get("id"))
+            for m in methods
+            if isinstance(m, dict) and m.get("id")
+        ]
         await self._notify("initialized", {})
+
+    async def _authenticate_env_key(self) -> bool:
+        """codex-acp only picks up OPENAI_API_KEY after an explicit ACP
+        `authenticate` for that method; `chatgpt` must never be requested
+        headless (it blocks on a browser)."""
+        for method_id in ("api-key", "openai-api-key", "codex-api-key"):
+            if method_id not in self.auth_methods:
+                continue
+            try:
+                await self._request(
+                    "authenticate", {"methodId": method_id}, timeout=20.0
+                )
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    @staticmethod
+    def _is_auth_required(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return "authentication required" in text or (
+            "-32000" in text and "auth" in text
+        )
 
     async def _open_session(
         self,
@@ -899,11 +1068,20 @@ class Worker:
         await self._new_session(mcp_servers)
 
     async def _new_session(self, mcp_servers: list[Any]) -> None:
-        result = await self._request(
-            "session/new",
-            {"cwd": self.cwd, "mcpServers": mcp_servers},
-            timeout=25.0,
-        )
+        params = {"cwd": self.cwd, "mcpServers": mcp_servers}
+        # codex-acp refreshes its model catalogue on first start.
+        timeout = 45.0 if self.provider == "codex" else 25.0
+        try:
+            result = await self._request("session/new", params, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            if not self._is_auth_required(e):
+                raise
+            if self.provider == "codex" and await self._authenticate_env_key():
+                result = await self._request(
+                    "session/new", params, timeout=timeout
+                )
+            else:
+                raise RuntimeError(self._auth_required_hint()) from e
         self.acp_session_id = (
             result.get("sessionId") or result.get("session_id")
         )
@@ -916,6 +1094,19 @@ class Worker:
         # Fresh ACP sessions have no memory — inject durable chat on next prompt.
         self._needs_history_bootstrap = True
         self._reap_stale_claude_children()
+
+    def _auth_required_hint(self) -> str:
+        if self.provider == "codex":
+            return (
+                "Codex is not logged in on this host — run `codex login` "
+                "there or save an OpenAI API key in Agent Dock Settings"
+            )
+        if self.provider == "claude":
+            return (
+                "Claude is not logged in on this host — run `claude login` "
+                "there or save an Anthropic API key in Agent Dock Settings"
+            )
+        return "Agent authentication required — run `agent login` on this host"
 
     async def _load_session(
         self, session_id: str, mcp_servers: list[Any]
@@ -975,18 +1166,54 @@ class Worker:
             for e in avail:
                 if isinstance(e, dict):
                     out.append(dict(e))
-        self.available_models = out
         cur = models.get("currentModelId") or models.get("current_model_id")
+        if self.provider == "codex":
+            presets = codex_presets_from_native_models(out)
+            if presets:
+                # Exact model×effort combos the adapter supports — better
+                # than the configOptions cross product, which can pair a
+                # model with an effort level it doesn't offer.
+                self.available_models = presets
+                self._codex_native_presets = True
+                self._models_via_config_option = True
+                if cur is not None:
+                    base, eff = split_codex_native_model_id(str(cur))
+                    self.model_id = (
+                        f"{base}[{_CODEX_EFFORT_ATTR}={eff}]" if eff else base
+                    )
+                self._persist_catalog()
+                return
+        self.available_models = out
         if cur is not None:
             self.model_id = str(cur)
         self._persist_catalog()
 
     def _apply_config_options(self, config_options: Any) -> None:
-        out = models_from_config_options(config_options)
+        if isinstance(config_options, list):
+            ids = set()
+            for entry in config_options:
+                if isinstance(entry, dict):
+                    eid = entry.get("id") or entry.get("configId")
+                    if eid:
+                        ids.add(str(eid))
+                    if eid == "collaboration_mode":
+                        cur = entry.get("currentValue") or entry.get("current_value")
+                        self._codex_plan = str(cur or "") == "plan"
+            if ids:
+                self._config_option_ids |= ids
+        if self.provider == "codex":
+            out = (
+                []
+                if self._codex_native_presets
+                else codex_models_from_config_options(config_options)
+            )
+            cur = codex_current_model_from_config_options(config_options)
+        else:
+            out = models_from_config_options(config_options)
+            cur = current_model_from_config_options(config_options)
         if out:
             self.available_models = out
             self._models_via_config_option = True
-        cur = current_model_from_config_options(config_options)
         if cur is not None:
             self.model_id = cur
         if out or cur is not None:
@@ -1009,7 +1236,7 @@ class Worker:
                 self.available_modes = ids
         cur = modes.get("currentModeId") or modes.get("current_mode_id")
         if cur is not None:
-            self.mode = str(cur)
+            self.mode = self._app_mode_id(str(cur))
 
     async def set_mode(self, mode_id: str) -> None:
         if not self.acp_session_id:
@@ -1046,8 +1273,59 @@ class Worker:
                 },
                 timeout=15.0,
             )
-        self.mode = resolved
-        await self._emit_event("mode", mode=resolved)
+        if self.provider == "codex":
+            await self._set_codex_plan(mid_is_plan=mode_id.strip().lower() == "plan")
+        self.mode = self._app_mode_id(resolved)
+        self._persist_catalog()
+        await self._emit_event("mode", mode=self.mode)
+
+    async def _set_codex_plan(self, *, mid_is_plan: bool) -> None:
+        """Codex plan mode is `collaboration_mode=plan` on top of read-only."""
+        if "collaboration_mode" not in self._config_option_ids:
+            self._codex_plan = False
+            return
+        value = "plan" if mid_is_plan else "default"
+        if self._codex_plan == mid_is_plan:
+            return
+        try:
+            await self._request(
+                "session/set_config_option",
+                {
+                    "sessionId": self.acp_session_id,
+                    "configId": "collaboration_mode",
+                    "type": "id",
+                    "value": value,
+                },
+                timeout=15.0,
+            )
+            self._codex_plan = mid_is_plan
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"collaboration_mode: {e}"
+            raise RuntimeError(f"collaboration_mode: {e}") from e
+
+    def _app_mode_id(self, native: str) -> str:
+        """Map a provider mode id back to the app's ask/agent/plan."""
+        n = (native or "").strip()
+        low = n.lower()
+        if self.provider == "codex":
+            if self._codex_plan:
+                return "plan"
+            if low in ("ask", "agent"):
+                return low
+            if low == "read-only":
+                return "ask"
+            if low in ("agent-full-access", "full-access", "auto"):
+                return "agent"
+            return n
+        if low in ("ask", "agent", "plan"):
+            return low
+        if self.provider == "claude":
+            if low == "dontask":
+                return "ask"
+            if low in ("default", "acceptedits", "bypasspermissions", "auto"):
+                return "agent"
+            return n
+        return n
 
     def _resolve_mode_id(self, mode_id: str) -> str:
         """Map app modes (ask/agent/plan) onto provider ACP mode ids."""
@@ -1056,8 +1334,30 @@ class Worker:
             return mid
         available = list(self.available_modes or [])
         by_lower = {m.lower(): m for m in available}
-        if mid.lower() in by_lower:
+        # Codex advertises an `agent` id too, but the app's "agent" must
+        # become full access when the chat runs with the allow-all policy,
+        # so map before the exact-match shortcut.
+        if mid.lower() in by_lower and self.provider != "codex":
             return by_lower[mid.lower()]
+        if self.provider == "codex":
+            # codex-acp approval presets: read-only ("ask for approval"),
+            # agent ("approve for me"), agent-full-access. Plan is a separate
+            # `collaboration_mode` config option layered on read-only (see
+            # set_mode), so it maps to read-only here.
+            if mid.lower() == "agent":
+                candidates = (
+                    ["agent-full-access", "full-access", "agent", "auto"]
+                    if self.full_access
+                    else ["agent", "auto"]
+                )
+            elif mid.lower() in ("ask", "plan"):
+                candidates = ["read-only"]
+            else:
+                candidates = [mid]
+            for c in candidates:
+                if c.lower() in by_lower:
+                    return by_lower[c.lower()]
+            return candidates[0]
         if self.provider == "claude":
             # Claude ACP: auto/default/acceptEdits/plan/dontAsk/bypassPermissions
             if mid.lower() == "agent":
@@ -1092,23 +1392,15 @@ class Worker:
             raise RuntimeError("ACP session not ready")
 
         async def via_config_option() -> None:
-            result = await self._request(
-                "session/set_config_option",
-                {
-                    "sessionId": self.acp_session_id,
-                    "configId": "model",
-                    "type": "id",
-                    "value": model_id,
-                },
-                timeout=15.0,
-            )
+            result = await self._set_model_config_options(model_id)
             # Response carries the authoritative currentValue (may be a
             # canonical id rather than the alias we sent).
-            self._apply_config_options(
-                result.get("configOptions") or result.get("config_options")
-            )
-            confirmed = current_model_from_config_options(
-                result.get("configOptions") or result.get("config_options")
+            opts = result.get("configOptions") or result.get("config_options")
+            self._apply_config_options(opts)
+            confirmed = (
+                codex_current_model_from_config_options(opts)
+                if self.provider == "codex"
+                else current_model_from_config_options(opts)
             )
             self.model_id = confirmed or model_id
             self._models_via_config_option = True
@@ -1123,7 +1415,7 @@ class Worker:
             self._models_via_config_option = False
 
         prefer_config = (
-            self.provider == "claude" or self._models_via_config_option
+            _uses_config_options(self.provider) or self._models_via_config_option
         )
         switched = False
         if prefer_config:
@@ -1167,6 +1459,42 @@ class Worker:
             loadSession=self.load_session,
         )
 
+    async def _set_model_config_options(self, model_id: str) -> dict[str, Any]:
+        """`session/set_config_option` for the model; Codex presets also
+        carry a reasoning effort that is a second option."""
+        value = model_id
+        effort: Optional[str] = None
+        if self.provider == "codex":
+            value, effort = split_codex_model_id(model_id)
+        result = await self._request(
+            "session/set_config_option",
+            {
+                "sessionId": self.acp_session_id,
+                "configId": "model",
+                "type": "id",
+                "value": value,
+            },
+            timeout=15.0,
+        )
+        if effort:
+            try:
+                result = await self._request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": self.acp_session_id,
+                        "configId": "reasoning_effort",
+                        "type": "id",
+                        "value": effort,
+                    },
+                    timeout=15.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Model switched; effort didn't. Report the model the agent
+                # is actually on (from the first response) rather than the
+                # preset the phone asked for.
+                self.last_error = f"reasoning_effort: {e}"
+        return result if isinstance(result, dict) else {}
+
     async def _relaunch_for_model(self, model_id: str) -> None:
         """Old ACP adapters lack model RPCs — restart with startup model flags."""
         self.model_id = model_id
@@ -1198,22 +1526,14 @@ class Worker:
             self.model_id = model_id
         # One more RPC attempt in case the restarted binary is newer.
         try:
-            if self.provider == "claude" or self._models_via_config_option:
-                result = await self._request(
-                    "session/set_config_option",
-                    {
-                        "sessionId": self.acp_session_id,
-                        "configId": "model",
-                        "type": "id",
-                        "value": model_id,
-                    },
-                    timeout=15.0,
-                )
-                self._apply_config_options(
-                    result.get("configOptions") or result.get("config_options")
-                )
-                confirmed = current_model_from_config_options(
-                    result.get("configOptions") or result.get("config_options")
+            if _uses_config_options(self.provider) or self._models_via_config_option:
+                result = await self._set_model_config_options(model_id)
+                opts = result.get("configOptions") or result.get("config_options")
+                self._apply_config_options(opts)
+                confirmed = (
+                    codex_current_model_from_config_options(opts)
+                    if self.provider == "codex"
+                    else current_model_from_config_options(opts)
                 )
                 self.model_id = confirmed or model_id
         except Exception:  # noqa: BLE001
@@ -1617,8 +1937,8 @@ class Worker:
         if typ in ("current_mode_update", "currentModeUpdate"):
             mid = str(update.get("modeId") or update.get("currentModeId") or "")
             if mid:
-                self.mode = mid
-                await self._emit_event("mode", mode=mid)
+                self.mode = self._app_mode_id(mid)
+                await self._emit_event("mode", mode=self.mode)
             return
 
         if typ in ("state_update", "stateUpdate"):
@@ -1643,10 +1963,53 @@ class Worker:
             await self._emit_event("turn_complete", reason=str(bare))
             return
 
+        if typ == "plan":
+            # Codex/Claude TODO lists: surface the active step as activity
+            # and forward the entries for clients that render them.
+            entries = update.get("entries")
+            if isinstance(entries, list):
+                active = next(
+                    (
+                        e
+                        for e in entries
+                        if isinstance(e, dict)
+                        and str(e.get("status") or "") == "in_progress"
+                    ),
+                    None,
+                )
+                if active and active.get("content"):
+                    label = str(active["content"])
+                    if len(label) > 48:
+                        label = label[:47] + "…"
+                    await self._emit_event("activity", label=label)
+                await self._emit_event("plan", entries=entries)
+            return
+
         if typ in ("session_info_update", "sessionInfoUpdate"):
             title = update.get("title")
             if title:
                 await self._emit_event("status", title=str(title))
+            # codex-acp reports transport/auth failures here while it retries;
+            # surface the final one so the phone can offer re-auth.
+            meta = update.get("_meta")
+            codex = meta.get("codex") if isinstance(meta, dict) else None
+            err = codex.get("error") if isinstance(codex, dict) else None
+            if isinstance(err, dict):
+                detail = str(
+                    err.get("additionalDetails") or err.get("message") or ""
+                ).strip()
+                if err.get("willRetry"):
+                    # Remember the cause; the thread flips to systemError
+                    # without repeating it once retries are exhausted.
+                    self._codex_last_error = detail or self._codex_last_error
+                elif detail:
+                    await self._emit_event("error", text=detail[:2000])
+                    self._codex_last_error = None
+            thread = codex.get("threadStatus") if isinstance(codex, dict) else None
+            if isinstance(thread, dict) and thread.get("type") == "systemError":
+                detail = self._codex_last_error or "Codex reported a system error"
+                self._codex_last_error = None
+                await self._emit_event("error", text=detail[:2000])
             return
 
         if typ in ("usage_update", "usageUpdate"):
@@ -1691,6 +2054,7 @@ class Worker:
         if "tool" in typ.lower():
             tool = _parse_tool(update)
             if tool:
+                self._merge_terminal_output(update, tool)
                 kind = (
                     "tool_start"
                     if typ in ("tool_call", "toolCall")
@@ -1708,6 +2072,42 @@ class Worker:
         text = _extract_text(update)
         if text:
             await self._emit_event("text", text=text)
+
+    def _merge_terminal_output(
+        self, update: dict[str, Any], tool: dict[str, Any]
+    ) -> None:
+        """codex-acp streams shell output as `_meta.terminal_output_delta`
+        rather than through a client terminal; fold it into rawOutput so the
+        phone's tool card shows live output."""
+        meta = update.get("_meta")
+        if not isinstance(meta, dict):
+            return
+        tid = str(tool.get("toolCallId") or "")
+        if not tid:
+            return
+        delta = meta.get("terminal_output_delta")
+        snapshot = meta.get("terminal_output")
+        if isinstance(delta, dict) and isinstance(delta.get("data"), str):
+            buf = self._term_output.get(tid, "") + delta["data"]
+            if len(buf) > 64_000:
+                buf = buf[-48_000:]
+            self._term_output[tid] = buf
+        elif isinstance(snapshot, dict) and isinstance(snapshot.get("data"), str):
+            self._term_output[tid] = snapshot["data"][-64_000:]
+        final = isinstance(meta.get("terminal_exit"), dict) or str(
+            tool.get("status") or ""
+        ).lower() in ("completed", "failed", "error", "cancelled")
+        if tool.get("rawOutput") is None and tid in self._term_output:
+            buf = self._term_output[tid]
+            sent = self._term_sent.get(tid, 0)
+            # Each update carries the whole buffer, so only re-send once it
+            # has grown meaningfully (or at the end) to keep traffic linear.
+            if final or len(buf) - sent >= 2048 or sent == 0:
+                tool["rawOutput"] = buf
+                self._term_sent[tid] = len(buf)
+        if final:
+            self._term_output.pop(tid, None)
+            self._term_sent.pop(tid, None)
 
     async def _handle_permission(
         self, req_id: Any, params: dict[str, Any]
@@ -1738,12 +2138,22 @@ class Worker:
         if not self._permission_policy_ask:
             # Auto-allow: always pick an id that exists on the prompt.
             pick = None
-            for o in options:
-                oid = str(o.get("optionId") or "")
-                low = oid.lower()
-                if "always" in low:
-                    pick = oid
+            # ACP `kind` is authoritative; codex-acp's ids (`approved`,
+            # `abort`) don't contain allow/always.
+            for want in ("allow_always", "allow_once"):
+                for o in options:
+                    if str(o.get("kind") or "") == want and o.get("optionId"):
+                        pick = str(o["optionId"])
+                        break
+                if pick is not None:
                     break
+            if pick is None:
+                for o in options:
+                    oid = str(o.get("optionId") or "")
+                    low = oid.lower()
+                    if "always" in low:
+                        pick = oid
+                        break
             if pick is None:
                 for o in options:
                     oid = str(o.get("optionId") or "")

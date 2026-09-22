@@ -281,11 +281,13 @@ enum SkillHostInstallStatus {
 /// Where a skill was found / should be written on a host.
 enum SkillClientTarget {
   cursor,
-  claude;
+  claude,
+  codex;
 
   String get label => switch (this) {
         cursor => 'Cursor',
         claude => 'Claude',
+        codex => 'Codex',
       };
 
   static SkillClientTarget? tryParse(String raw) {

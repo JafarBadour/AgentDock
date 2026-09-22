@@ -7,7 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../../app/app_theme.dart';
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
-import '../../data/models/agent_provider.dart';
+import 'agent_provider_ui.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
@@ -799,9 +799,7 @@ class _NestedAgentRow extends StatelessWidget {
                         size: 4,
                       )
                     : Icon(
-                        chat.provider == AgentProvider.cursor
-                            ? Icons.auto_awesome
-                            : Icons.psychology_alt_outlined,
+                        providerIcon(chat.provider),
                         size: 15,
                         color: selected || live
                             ? AppColors.accent
@@ -1073,9 +1071,7 @@ class _PhoneChatCard extends StatelessWidget {
                             color: AppColors.accent,
                           )
                         : Icon(
-                            chat.provider == AgentProvider.cursor
-                                ? Icons.auto_awesome
-                                : Icons.psychology_alt_outlined,
+                            providerIcon(chat.provider),
                             size: 18,
                             color: selected || live
                                 ? AppColors.accent

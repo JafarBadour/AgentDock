@@ -13,10 +13,11 @@ import 'ssh_service.dart';
 
 /// Installs / removes Agent Skills (`SKILL.md`) on remotes via SSH.
 ///
-/// Writes the same skill into Cursor and Claude user skill roots so ACP
+/// Writes the same skill into Cursor, Claude and Codex user skill roots so ACP
 /// sessions on either stack pick them up:
 /// - `~/.cursor/skills/<name>/SKILL.md`
 /// - `~/.claude/skills/<name>/SKILL.md`
+/// - `~/.codex/skills/<name>/SKILL.md`
 class SkillDeployService {
   SkillDeployService(this._ssh, this._db);
 
@@ -35,7 +36,11 @@ class SkillDeployService {
       enabled: true,
       installStatus: SkillHostInstallStatus.installing,
       installDetail: 'Writing skill folder…',
-      targets: const [SkillClientTarget.cursor, SkillClientTarget.claude],
+      targets: const [
+        SkillClientTarget.cursor,
+        SkillClientTarget.claude,
+        SkillClientTarget.codex,
+      ],
     );
     await _db.upsertSkillHostLink(link);
 
@@ -51,6 +56,7 @@ class SkillDeployService {
       for (final root in [
         '$home/.cursor/skills',
         '$home/.claude/skills',
+        '$home/.codex/skills',
       ]) {
         final dir = '$root/$slug';
         // Replace the whole skill tree so removed supporting files don't linger.
@@ -83,7 +89,11 @@ class SkillDeployService {
       link = link.copyWith(
         installStatus: SkillHostInstallStatus.installed,
         installDetail: details.join('\n'),
-        targets: const [SkillClientTarget.cursor, SkillClientTarget.claude],
+        targets: const [
+        SkillClientTarget.cursor,
+        SkillClientTarget.claude,
+        SkillClientTarget.codex,
+      ],
       );
       await _db.upsertSkillHostLink(link);
       return link;
@@ -122,6 +132,7 @@ class SkillDeployService {
       for (final root in [
         '$home/.cursor/skills',
         '$home/.claude/skills',
+        '$home/.codex/skills',
       ]) {
         final dir = '$root/$slug';
         await _run(
@@ -179,7 +190,7 @@ class SkillDeployService {
 python3 - <<'PY'
 import json, pathlib, os, re
 home = pathlib.Path(os.path.expanduser("~"))
-# name -> {cursor, claude, description}
+# name -> {cursor, claude, codex, description}
 found = {}
 
 def read_desc(skill_md: pathlib.Path) -> str:
@@ -220,6 +231,7 @@ def read_desc(skill_md: pathlib.Path) -> str:
 for label, root in (
     ("cursor", home / ".cursor" / "skills"),
     ("claude", home / ".claude" / "skills"),
+    ("codex", home / ".codex" / "skills"),
 ):
     if not root.is_dir():
         continue
@@ -236,7 +248,7 @@ for label, root in (
             continue
         entry = found.setdefault(
             name,
-            {"name": name, "cursor": False, "claude": False, "description": ""},
+            {"name": name, "cursor": False, "claude": False, "codex": False, "description": ""},
         )
         entry[label] = True
         if not entry["description"]:
@@ -261,6 +273,7 @@ PY
               'name': '$item'.trim(),
               'cursor': true,
               'claude': true,
+              'codex': true,
               'description': '',
             });
           }
@@ -329,10 +342,15 @@ PY
         final targets = <SkillClientTarget>[
           if (remoteEntry['cursor'] == true) SkillClientTarget.cursor,
           if (remoteEntry['claude'] == true) SkillClientTarget.claude,
+          if (remoteEntry['codex'] == true) SkillClientTarget.codex,
         ];
         // If probe lacked root flags, assume both (legacy).
         final effective = targets.isEmpty
-            ? const [SkillClientTarget.cursor, SkillClientTarget.claude]
+            ? const [
+        SkillClientTarget.cursor,
+        SkillClientTarget.claude,
+        SkillClientTarget.codex,
+      ]
             : targets;
         final detail = effective.map((t) => t.label).join(' · ');
         await _db.upsertSkillHostLink(
@@ -357,7 +375,7 @@ PY
             enabled: false,
             installStatus: SkillHostInstallStatus.removed,
             installDetail: 'Not on ${host.displayLabel} '
-                '(~/.cursor/skills / ~/.claude/skills)',
+                '(~/.cursor/skills / ~/.claude/skills / ~/.codex/skills)',
             targets: const [],
           ),
         );
