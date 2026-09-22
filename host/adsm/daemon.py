@@ -684,15 +684,35 @@ async def run_serve() -> None:
 
     serve_task = asyncio.create_task(daemon.start())
     await stop.wait()
-    await daemon.scheduler.stop()
-    serve_task.cancel()
+
+    async def _shutdown() -> None:
+        await daemon.scheduler.stop()
+        serve_task.cancel()
+        try:
+            await serve_task
+        except asyncio.CancelledError:
+            pass
+
+    # Python 3.12's Server.wait_closed() blocks until every client hangs up,
+    # so a phone bridge that stays attached would keep an old daemon alive
+    # forever after an upgrade. Give the graceful path a few seconds, then go.
     try:
-        await serve_task
-    except asyncio.CancelledError:
+        await asyncio.wait_for(_shutdown(), timeout=5.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
-    sock = paths.socket_path()
-    if sock.exists():
-        sock.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Only clean up files that belong to *this* process — a replacement
+    # daemon may already own the socket and pid file.
     pid = paths.pid_path()
-    if pid.exists():
+    mine = False
+    try:
+        mine = pid.read_text(encoding="utf-8").strip() == str(os.getpid())
+    except OSError:
+        pass
+    if mine:
+        sock = paths.socket_path()
+        if sock.exists():
+            sock.unlink(missing_ok=True)
         pid.unlink(missing_ok=True)

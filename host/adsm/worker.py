@@ -10,13 +10,13 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from . import paths, protocol
 from . import process_hygiene
 from . import transcript as transcript_store
 
-EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
+EmitFn = Callable[[Dict[str, Any]], Awaitable[None]]
 StatusFn = Callable[[str, str, Optional[str]], Awaitable[None]]
 
 

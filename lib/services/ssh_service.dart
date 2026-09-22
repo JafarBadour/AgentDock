@@ -344,8 +344,7 @@ export PATH="$HOME/.local/bin:$PATH"
 if command -v agentdock-adsm >/dev/null 2>&1; then
   agentdock-adsm stop 2>/dev/null || true
 fi
-pkill -f 'python3 -m adsm serve' 2>/dev/null || true
-pkill -f 'python -m adsm serve' 2>/dev/null || true
+pkill -f '[p]ython[0-9.]* -m adsm serve' 2>/dev/null || true
 rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
 rm -f "$HOME/.agentdock/adsm.pid" 2>/dev/null || true
 exit 0
@@ -2024,21 +2023,36 @@ exit 0
     return payloads;
   }
 
-  static const _adsmWrapper = '''
+  static const _adsmWrapper = r'''
 #!/usr/bin/env bash
-export PYTHONPATH="\$HOME/.local/share/agentdock/host\${PYTHONPATH:+:\$PYTHONPATH}"
-exec python3 -m adsm "\$@"
+export PYTHONPATH="$HOME/.local/share/agentdock/host${PYTHONPATH:+:$PYTHONPATH}"
+export PATH="$HOME/.local/bin:$PATH"
+# Prefer the newest Python 3 on PATH (uv/pyenv installs live in ~/.local/bin);
+# the system python3 on older distros can be 3.8.
+for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    exec "$py" -m adsm "$@"
+  fi
+done
+exec python3 -m adsm "$@"
 ''';
 
   static const _adsmRestartScript = r'''
 set -e
 chmod +x "$HOME/.local/bin/agentdock-adsm"
 export PATH="$HOME/.local/bin:$PATH"
-pkill -f 'python3 -m adsm serve' 2>/dev/null || true
-pkill -f 'python -m adsm serve' 2>/dev/null || true
-sleep 0.3
+pkill -f '[p]ython[0-9.]* -m adsm serve' 2>/dev/null || true
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  pgrep -f '[p]ython[0-9.]* -m adsm serve' >/dev/null 2>&1 || break
+  sleep 0.5
+done
+pkill -KILL -f '[p]ython[0-9.]* -m adsm serve' 2>/dev/null || true
 rm -f "$HOME/.agentdock/adsm.sock" 2>/dev/null || true
-agentdock-adsm ensure-running
+if ! agentdock-adsm ensure-running; then
+  echo "ADSM_START_FAILED" >&2
+  tail -n 25 "$HOME/.agentdock/adsm.log" >&2 2>/dev/null || true
+  exit 1
+fi
 ''';
 
   /// Install bundled ADSM onto This Mac/PC via local filesystem (no SSH).

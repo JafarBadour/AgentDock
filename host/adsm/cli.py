@@ -152,15 +152,21 @@ async def _status() -> int:
 def _force_kill() -> None:
     import subprocess
 
+    # Matches python3 / python3.12 / python; bracketed so no shell whose
+    # command line quotes this pattern can match itself.
+    import time
+
+    pattern = "[p]ython[0-9.]* -m adsm serve"
+    subprocess.run(["pkill", "-f", pattern], check=False, capture_output=True)
+    for _ in range(10):
+        alive = subprocess.run(
+            ["pgrep", "-f", pattern], check=False, capture_output=True
+        )
+        if alive.returncode != 0:
+            break
+        time.sleep(0.5)
     subprocess.run(
-        ["pkill", "-f", "python3 -m adsm serve"],
-        check=False,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["pkill", "-f", "python -m adsm serve"],
-        check=False,
-        capture_output=True,
+        ["pkill", "-KILL", "-f", pattern], check=False, capture_output=True
     )
     sock = paths.socket_path()
     if sock.exists():
