@@ -161,14 +161,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   static const _voiceLockThreshold = -56.0;
 
   void _syncComposerDraft([String? text]) {
-    ref
-        .read(chatComposerDraftsProvider.notifier)
-        .setDraft(widget.chatId, text ?? _composer.text);
+    _composerDrafts.setDraft(widget.chatId, text ?? _composer.text);
   }
+
+  // Riverpod refuses `ref` once the element is unmounted, and on current
+  // Flutter `StatefulElement.unmount` runs before `State.dispose`, so
+  // everything dispose() touches through a provider is captured here.
+  late final ChatComposerDrafts _composerDrafts;
+  late final StateController<String?> _focusedChatId;
+  late final GcpSpeechService _speech;
 
   @override
   void initState() {
     super.initState();
+    _composerDrafts = ref.read(chatComposerDraftsProvider.notifier);
+    _focusedChatId = ref.read(focusedChatIdProvider.notifier);
+    _speech = ref.read(gcpSpeechServiceProvider);
     _voicePulse = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 700),
@@ -184,7 +192,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           !saved.contains(' ');
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(focusedChatIdProvider.notifier).state = widget.chatId;
+      if (mounted) _focusedChatId.state = widget.chatId;
     });
     _bootstrap();
   }
@@ -819,10 +827,48 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _ensureAcp() {
-    _ensureAcpInFlight ??= _ensureAcpBody().whenComplete(() {
-      _ensureAcpInFlight = null;
+    final inflight = _ensureAcpInFlight;
+    if (inflight != null) return inflight;
+    late final Future<void> created;
+    created = _ensureAcpBody().whenComplete(() {
+      // A force reconnect may have replaced us — never clear its future.
+      if (identical(_ensureAcpInFlight, created)) _ensureAcpInFlight = null;
     });
-    return _ensureAcpInFlight!;
+    _ensureAcpInFlight = created;
+    return created;
+  }
+
+  /// Tear down everything on this device for the chat — the in-flight
+  /// connect, the runtime, and the shared SSH bridge to the host — then
+  /// connect again from scratch. The worker keeps running on the host, so
+  /// this is safe to hit whenever "Connecting…" never settles.
+  Future<void> _forceReconnect() async {
+    final chat = _chat;
+    final host = _host;
+    if (chat == null || host == null) return;
+
+    _cancelConnect();
+    // Abandon a wedged connect instead of joining it.
+    _ensureAcpInFlight = null;
+    _runtime?.lastError = null;
+    _runtime?.deliveryError = null;
+    try {
+      await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
+    } catch (e) {
+      SafeLog.d('force reconnect: closing runtime failed', e);
+    }
+    await ref.read(adsmBridgePoolProvider).drop(host.id);
+    if (!mounted) return;
+    _syncComposerRuntime(null);
+    setState(() {
+      _dropRuntime();
+      _error = null;
+      _showSdkInstallGuide = false;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Reconnecting to ${host.displayLabel}…')),
+    );
+    await _ensureAcp();
   }
 
   void _cancelConnect() {
@@ -887,6 +933,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   onTap: () => Navigator.pop(ctx, 'disconnect'),
                 ),
               ListTile(
+                leading: const Icon(Icons.restart_alt),
+                title: const Text('Force reconnect'),
+                subtitle: const Text(
+                  'Drops the SSH bridge and attaches again — the agent '
+                  'keeps running on the host',
+                ),
+                onTap: () => Navigator.pop(ctx, 'force_reconnect'),
+              ),
+              ListTile(
                 leading: const Icon(Icons.refresh),
                 title: const Text('Start a new session'),
                 subtitle: const Text(
@@ -915,6 +970,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _cancelConnect();
       case 'connect':
         unawaited(_ensureAcp());
+      case 'force_reconnect':
+        unawaited(_forceReconnect());
       case 'disconnect':
         _cancelConnect();
         await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
@@ -2025,9 +2082,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_runtimeListener != null && _runtime != null) {
       _runtime!.removeListener(_runtimeListener!);
     }
-    if (ref.read(focusedChatIdProvider) == widget.chatId) {
-      ref.read(focusedChatIdProvider.notifier).state = null;
-    }
+    // Providers must not change mid-frame (unmount runs inside finalizeTree),
+    // so clear focus once this frame is done; the guard keeps a chat that
+    // took focus in the meantime untouched.
+    final focus = _focusedChatId;
+    final chatId = widget.chatId;
+    Future<void>(() {
+      if (focus.state == chatId) focus.state = null;
+    });
     _markReadTimer?.cancel();
     _runtimeUiCoalesce?.cancel();
     _chromeUiEpoch.dispose();
@@ -2043,7 +2105,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _composer.removeListener(_onComposerChanged);
     _syncComposerDraft();
     if (_recordingVoice) {
-      unawaited(ref.read(gcpSpeechServiceProvider).cancel());
+      unawaited(_speech.cancel());
     }
     _composer.dispose();
     super.dispose();
@@ -2862,6 +2924,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 onReconnect: connected || connecting
                                     ? null
                                     : _ensureAcp,
+                                onForceReconnect: () {
+                                  unawaited(_forceReconnect());
+                                },
                                 onNewSession: () {
                                   unawaited(_startFreshSession());
                                 },

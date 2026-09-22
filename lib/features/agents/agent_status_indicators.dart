@@ -481,6 +481,7 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
     required this.bridgeOpen,
     this.provider,
     this.onReconnect,
+    this.onForceReconnect,
     this.onNewSession,
     this.onReauthed,
     this.onStopped,
@@ -490,6 +491,10 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
   final bool bridgeOpen;
   final AgentProvider? provider;
   final VoidCallback? onReconnect;
+
+  /// Drop the SSH bridge + runtime for this chat and attach again from
+  /// scratch — the escape hatch for a connect that never settles.
+  final VoidCallback? onForceReconnect;
 
   /// Mint a fresh ACP session so newly deployed MCPs attach.
   final VoidCallback? onNewSession;
@@ -504,6 +509,7 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
     required bool bridgeOpen,
     AgentProvider? provider,
     VoidCallback? onReconnect,
+    VoidCallback? onForceReconnect,
     VoidCallback? onNewSession,
     VoidCallback? onReauthed,
     VoidCallback? onStopped,
@@ -517,6 +523,7 @@ class AdsmHealthSheet extends ConsumerStatefulWidget {
         bridgeOpen: bridgeOpen,
         provider: provider,
         onReconnect: onReconnect,
+        onForceReconnect: onForceReconnect,
         onNewSession: onNewSession,
         onReauthed: onReauthed,
         onStopped: onStopped,
@@ -882,6 +889,29 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
                       },
                 icon: const Icon(Icons.link),
                 label: const Text('Reconnect'),
+              ),
+            ],
+            if (widget.onForceReconnect != null) ...[
+              const SizedBox(height: 12),
+              FilledButton.tonalIcon(
+                onPressed: busy
+                    ? null
+                    : () {
+                        Navigator.pop(context);
+                        widget.onForceReconnect!();
+                      },
+                icon: const Icon(Icons.restart_alt),
+                label: const Text('Force reconnect'),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  'Drops the SSH bridge and attaches again. '
+                  'The agent keeps running on the host.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
               ),
             ],
             if (widget.onNewSession != null) ...[

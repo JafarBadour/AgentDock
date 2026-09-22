@@ -252,6 +252,16 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
   Timer? _adsmStatusPollSoon;
   bool _adsmStatusPollInFlight = false;
 
+  /// Consecutive unanswered `agents.list` polls per bridge. dartssh2's
+  /// keepalive stops after its first unanswered ping, so a half-dead TCP
+  /// path (VPN handover, sleeping laptop) otherwise stays "open" until the
+  /// OS gives up — a quarter hour of a chat that neither works nor reconnects.
+  final Map<AdsmClient, int> _bridgePollMisses = {};
+
+  /// Misses before the bridge is declared dead and closed, which surfaces a
+  /// `closed` event to its chats so their normal auto-reconnect takes over.
+  static const _deadBridgeMisses = 2;
+
   /// How often to ask ADSM for authoritative worker status across all live
   /// bridges. One `agents.list` per shared bridge — not per chat.
   static const _adsmStatusPollInterval = Duration(seconds: 30);
@@ -296,6 +306,7 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
         final session = runtime.session as AdsmSession;
         byBridge.putIfAbsent(session.bridgeClient, () => []).add(session);
       }
+      _bridgePollMisses.removeWhere((c, _) => !c.isOpen);
       await Future.wait(
         byBridge.entries.map((entry) async {
           final client = entry.key;
@@ -307,9 +318,30 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
               {},
               timeout: const Duration(seconds: 8),
             );
+            _bridgePollMisses.remove(client);
             for (final session in sessions) {
               session.applyAgentsList(list, forceEmit: false);
             }
+          } on TimeoutException catch (e) {
+            final misses = (_bridgePollMisses[client] ?? 0) + 1;
+            _bridgePollMisses[client] = misses;
+            SafeLog.d('ADSM status poll for bridge timed out ($misses)', e);
+            if (misses < _deadBridgeMisses) {
+              // Confirm quickly instead of waiting a full poll interval.
+              _adsmStatusPollSoon ??= Timer(const Duration(seconds: 5), () {
+                _adsmStatusPollSoon = null;
+                unawaited(_pollAllAdsmStatuses());
+              });
+              return;
+            }
+            _bridgePollMisses.remove(client);
+            SafeLog.d(
+              'ADSM bridge unresponsive after $misses polls — closing it so '
+              '${sessions.length} chat(s) reconnect',
+            );
+            try {
+              await client.close();
+            } catch (_) {}
           } catch (e) {
             SafeLog.d('ADSM status poll for bridge failed', e);
           }
