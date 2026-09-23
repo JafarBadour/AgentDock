@@ -2269,7 +2269,11 @@ class ChatSessionRuntime extends ChangeNotifier {
           deliveryError = null;
         }
         if (tool.isActive) {
-          activityLabel = tool.displayTitle;
+          // Name the delegate, so the header says who is working, not just what.
+          final agent = tool.isSubagent ? tool.subagentTypeLabel : null;
+          activityLabel = agent == null
+              ? tool.displayTitle
+              : '$agent subagent · ${tool.subagentTask ?? tool.displayTitle}';
         }
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());

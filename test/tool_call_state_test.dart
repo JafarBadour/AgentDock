@@ -163,6 +163,78 @@ void main() {
       );
     });
 
+    test('Task input is recognised as a sub-agent run', () {
+      final task = _tool(
+        title: 'Task',
+        kind: 'other',
+        input: '{"description":"Map the pruning code","prompt":"Find …",'
+            '"subagent_type":"Explore"}',
+        status: 'in_progress',
+      );
+      expect(task.isSubagent, isTrue);
+      expect(task.subagentType, 'Explore');
+      expect(task.subagentTypeLabel, 'Explore');
+      expect(task.subagentTask, 'Map the pruning code');
+      expect(task.subagentPrompt, 'Find …');
+    });
+
+    test('ordinary tools are not sub-agents', () {
+      expect(_tool(kind: 'execute', input: '{"command":"ls"}').isSubagent,
+          isFalse);
+      expect(_tool(kind: 'read', input: '{"file_path":"a.dart"}').isSubagent,
+          isFalse);
+      expect(
+        _tool(
+          title: 'Bash',
+          kind: 'execute',
+          input: '{"command":"until curl -s x; do sleep 5; done"}',
+        ).isSubagent,
+        isFalse,
+      );
+    });
+
+    test('lower-case agent types get a capitalised chip label', () {
+      expect(
+        _tool(
+          title: 'Task',
+          input: '{"description":"d","prompt":"p",'
+              '"subagent_type":"general-purpose"}',
+        ).subagentTypeLabel,
+        'General-purpose',
+      );
+    });
+
+    test('report unwraps ACP content blocks into text', () {
+      final done = _tool(
+        title: 'Task',
+        kind: 'task',
+        status: 'completed',
+        output: '[{"type":"text","text":"Found it in lib/a.dart"}]',
+      );
+      expect(done.subagentReport, 'Found it in lib/a.dart');
+    });
+
+    test('plain-text report passes through unchanged', () {
+      expect(
+        _tool(title: 'Task', kind: 'task', output: '  Done: 3 files  ')
+            .subagentReport,
+        'Done: 3 files',
+      );
+    });
+
+    test('summary rows keep the agent type once payloads are dropped', () {
+      final summary = _tool(
+        title: 'Task',
+        kind: 'other',
+        input: '{"description":"Map the code","prompt":"${'x' * 4000}",'
+            '"subagent_type":"Explore"}',
+        output: 'report',
+      ).withoutPayloads();
+      expect(summary.rawInput, isNull);
+      expect(summary.isSubagent, isTrue);
+      expect(summary.subagentType, 'Explore');
+    });
+
     test('shell-dump titles collapse to Ran a command', () {
       expect(
         _tool(

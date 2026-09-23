@@ -2,6 +2,10 @@ import 'dart:convert';
 
 /// Identity-keyed caches so huge tool JSON is not re-parsed on every rebuild.
 final Expando<String> _toolPreviewCache = Expando<String>('toolPreview');
+final Expando<Object> _toolInputJsonCache = Expando<Object>('toolInputJson');
+
+/// Cache marker for "input is not JSON" — an Expando cannot hold null.
+final Object _notJson = Object();
 
 /// Coarse category of a tool call, for icons and group summaries.
 enum ToolActionKind { read, edit, search, exec, web, subagent, mcp, other }
@@ -20,6 +24,7 @@ class ToolCallState {
     this.previewHint,
     this.inputHead,
     this.outputHead,
+    this.subagentTypeHint,
   });
 
   final String toolCallId;
@@ -39,6 +44,11 @@ class ToolCallState {
   final String? previewHint;
   final String? inputHead;
   final String? outputHead;
+
+  /// Sub-agent type (`Explore`, `general-purpose`, …) pulled out of the full
+  /// Task input by [withoutPayloads], since the summary row it produces no
+  /// longer carries the payload the type lives in.
+  final String? subagentTypeHint;
 
   bool get isActive =>
       status == 'pending' || status == 'in_progress' || status == 'running';
@@ -68,6 +78,152 @@ class ToolCallState {
   }
 
   bool get isHardFail => isFailed && !isSoftFail;
+
+  /// True when this call delegates work to a sub-agent (the Task tool) rather
+  /// than doing something itself.
+  ///
+  /// A sub-agent runs a conversation of its own and comes back with a report
+  /// worth reading, so the transcript gives it its own card instead of one
+  /// line inside a run of tool calls. Kept cheap — head scans only.
+  bool get isSubagent {
+    if (isPollingWait) return false;
+    if (subagentTypeHint != null) return true;
+    final k = (kind ?? '').toLowerCase();
+    if (k.contains('subagent') || k.contains('task') || k.contains('agent')) {
+      return true;
+    }
+    final t = title.trim().toLowerCase();
+    if (t == 'task' || t == 'agent' || t.contains('subagent')) return true;
+    final head = _inputHead.toLowerCase();
+    return head.contains('"subagent_type"') ||
+        head.contains('"subagenttype"') ||
+        (head.contains('"prompt"') && head.contains('"description"'));
+  }
+
+  /// Agent type the Task named (`Explore`, `general-purpose`, …).
+  String? get subagentType {
+    final hint = subagentTypeHint;
+    if (hint != null) return hint.isEmpty ? null : hint;
+    final value = _stringFromInput('subagent_type') ??
+        _stringFromInput('subagentType') ??
+        _stringFromInput('agent_type');
+    return (value == null || value.isEmpty) ? null : value;
+  }
+
+  /// `general-purpose` → `General-purpose`, for the chip next to the title.
+  String? get subagentTypeLabel {
+    final type = subagentType;
+    if (type == null || type.isEmpty) return null;
+    return type[0].toUpperCase() + type.substring(1);
+  }
+
+  /// One-line task the sub-agent was given.
+  String? get subagentTask {
+    final desc = _descriptionFromInput();
+    if (desc != null && desc.isNotEmpty) return desc;
+    final given = title.trim();
+    final low = given.toLowerCase();
+    if (given.isEmpty || low == 'tool' || low == 'task' || low == 'agent') {
+      return null;
+    }
+    return _looksLikeShellDump(given) ? null : given;
+  }
+
+  /// Full instructions handed to the sub-agent (needs loaded payloads).
+  String? get subagentPrompt {
+    final value = _stringFromInput('prompt')?.trim();
+    return (value == null || value.isEmpty) ? null : value;
+  }
+
+  /// The report the sub-agent came back with, unwrapped from ACP content
+  /// blocks into plain text the transcript can render as markdown.
+  String? get subagentReport {
+    final text =
+        _textFromPayload(rawOutput ?? outputHead) ?? _textFromPayload(content);
+    final trimmed = text?.trim();
+    return (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+  }
+
+  /// Decoded tool input, parsed at most once per instance.
+  Map<String, dynamic>? get _decodedInput {
+    final cached = _toolInputJsonCache[this];
+    if (cached != null) {
+      return identical(cached, _notJson)
+          ? null
+          : cached as Map<String, dynamic>;
+    }
+    final input = (rawInput ?? inputHead)?.trim();
+    Map<String, dynamic>? parsed;
+    if (input != null && input.startsWith('{')) {
+      try {
+        final decoded = jsonDecode(input);
+        if (decoded is Map) parsed = Map<String, dynamic>.from(decoded);
+      } catch (_) {
+        // A truncated summary head never parses — the regex below still works.
+      }
+    }
+    _toolInputJsonCache[this] = parsed ?? _notJson;
+    return parsed;
+  }
+
+  /// String value of [key] in the tool input, whole payload or truncated head.
+  String? _stringFromInput(String key) {
+    final decoded = _decodedInput;
+    if (decoded != null) {
+      final value = decoded[key];
+      return value is String ? value : null;
+    }
+    final input = rawInput ?? inputHead;
+    if (input == null || input.isEmpty) return null;
+    final match = RegExp(
+      '"$key"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"',
+    ).firstMatch(input);
+    final raw = match?.group(1);
+    return raw == null ? null : _unescapeJson(raw);
+  }
+
+  static String _unescapeJson(String raw) {
+    try {
+      final decoded = jsonDecode('"$raw"');
+      if (decoded is String) return decoded;
+    } catch (_) {}
+    return raw.replaceAll(r'\"', '"').replaceAll(r'\n', '\n');
+  }
+
+  /// Readable text out of an ACP payload: plain strings pass through, content
+  /// blocks (`[{type: text, text: …}]`) are flattened.
+  static String? _textFromPayload(String? raw) {
+    final value = raw?.trim();
+    if (value == null || value.isEmpty) return null;
+    if (!value.startsWith('{') && !value.startsWith('[')) return value;
+    Object? decoded;
+    try {
+      decoded = jsonDecode(value);
+    } catch (_) {
+      return value;
+    }
+    final text = _collectText(decoded).trim();
+    return text.isEmpty ? value : text;
+  }
+
+  static String _collectText(Object? node) {
+    if (node is String) return node;
+    if (node is List) {
+      return node
+          .map(_collectText)
+          .where((s) => s.trim().isNotEmpty)
+          .join('\n\n');
+    }
+    if (node is Map) {
+      for (final key in const ['text', 'content', 'output', 'result']) {
+        final value = node[key];
+        if (value == null) continue;
+        final text = _collectText(value);
+        if (text.trim().isNotEmpty) return text;
+      }
+    }
+    return '';
+  }
 
   /// Coarse category from ACP `kind` / title (cheap — never scans payloads).
   ToolActionKind get actionKind {
@@ -124,7 +280,7 @@ class ToolCallState {
           'Ran $n ${noun('command', 'commands', n)}',
         ToolActionKind.web => 'Fetched $n ${noun('page', 'pages', n)}',
         ToolActionKind.subagent =>
-          '$n ${noun('subagent', 'subagents', n)}',
+          'Delegated $n ${noun('subagent', 'subagents', n)}',
         ToolActionKind.mcp => '$n MCP ${noun('call', 'calls', n)}',
         ToolActionKind.other => '$n ${noun('tool', 'tools', n)}',
       });
@@ -405,6 +561,7 @@ class ToolCallState {
         previewHint: previewHint,
         inputHead: inputHead,
         outputHead: outputHead,
+        subagentTypeHint: subagentTypeHint,
       );
 
   /// True when input/output/content payloads are present (heavy for the UI).
@@ -429,6 +586,7 @@ class ToolCallState {
       previewHint: preview ?? '',
       inputHead: _head(rawInput ?? inputHead, 600),
       outputHead: _head(rawOutput ?? outputHead, 2000),
+      subagentTypeHint: isSubagent ? (subagentType ?? '') : null,
     );
   }
 

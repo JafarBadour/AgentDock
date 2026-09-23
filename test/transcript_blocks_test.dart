@@ -64,6 +64,25 @@ TranscriptEntry _tool(
       createdAt: DateTime(2026, 9, 7, 12),
     );
 
+TranscriptEntry _subagent(
+  String id, {
+  String status = 'completed',
+  String type = 'Explore',
+}) =>
+    TranscriptEntry.tool(
+      ToolCallState(
+        toolCallId: id,
+        title: 'Task',
+        kind: 'other',
+        status: status,
+        rawInput: '{"description":"Map the code","prompt":"Find …",'
+            '"subagent_type":"$type"}',
+        rawOutput: 'It lives in lib/a.dart',
+      ),
+      messageId: 'm-$id',
+      createdAt: DateTime(2026, 9, 7, 12),
+    );
+
 void main() {
   group('entriesByTime', () {
     test('empty / single unchanged', () {
@@ -154,6 +173,35 @@ void main() {
   });
 
   group('buildTranscriptBlocks', () {
+    test('a sub-agent breaks the tool run into its own block', () {
+      final blocks = buildTranscriptBlocks([
+        _user('u1'),
+        _tool('t1'),
+        _subagent('s1'),
+        _tool('t2'),
+        _tool('t3'),
+      ]);
+      // user + [t1] + [s1] + [t2, t3]
+      expect(blocks, hasLength(4));
+      expect(blocks[1].tools?.map((e) => e.tool!.toolCallId), ['t1']);
+      expect(blocks[2].tools, hasLength(1));
+      expect(blocks[2].tools!.single.tool!.isSubagent, isTrue);
+      expect(blocks[2].tools!.single.tool!.subagentType, 'Explore');
+      expect(blocks[3].tools?.map((e) => e.tool!.toolCallId), ['t2', 't3']);
+    });
+
+    test('parallel sub-agents each get their own block', () {
+      final blocks = buildTranscriptBlocks([
+        _user('u1'),
+        _subagent('s1'),
+        _subagent('s2'),
+      ]);
+      expect(blocks, hasLength(3));
+      expect(blocks[1].tools!.single.tool!.toolCallId, 's1');
+      expect(blocks[2].tools!.single.tool!.toolCallId, 's2');
+      expect(blocks[1].key, isNot(blocks[2].key));
+    });
+
     test('empty → empty', () {
       expect(buildTranscriptBlocks(const []), isEmpty);
     });

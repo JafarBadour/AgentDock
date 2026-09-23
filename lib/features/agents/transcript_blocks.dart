@@ -209,17 +209,30 @@ List<ChatBlock> buildTranscriptBlocks(
 
     void flushToolRun() {
       if (toolRun.isEmpty) return;
-      // Always one count-only group — details load on expand, not in the list.
-      segmentBlocks.add(
-        ChatBlock.tools([
-          for (final e in toolRun)
-            TranscriptEntry.tool(
-              e.tool!.withoutPayloads(),
-              messageId: e.messageId,
-              createdAt: e.createdAt,
-            ),
-        ]),
-      );
+      // Always count-only groups — details load on expand, not in the list.
+      // Sub-agents break the run: a delegated run is its own card, so it never
+      // disappears into a "Read 3 files · 1 subagent" summary.
+      final pending = <TranscriptEntry>[];
+      void emitGroup() {
+        if (pending.isEmpty) return;
+        segmentBlocks.add(ChatBlock.tools(List.of(pending)));
+        pending.clear();
+      }
+
+      for (final e in toolRun) {
+        final summary = TranscriptEntry.tool(
+          e.tool!.withoutPayloads(),
+          messageId: e.messageId,
+          createdAt: e.createdAt,
+        );
+        if (summary.tool!.isSubagent) {
+          emitGroup();
+          segmentBlocks.add(ChatBlock.tools([summary]));
+          continue;
+        }
+        pending.add(summary);
+      }
+      emitGroup();
       toolRun.clear();
     }
 

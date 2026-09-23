@@ -3412,7 +3412,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } else if (active.length == 1) {
       label = active.first.displayTitle;
     } else if (active.length > 1) {
-      label = 'Working · ${active.length} tools';
+      final agents = active.where((t) => t.isSubagent).length;
+      label = agents == active.length
+          ? '$agents subagents working'
+          : 'Working · ${active.length} tools';
     } else {
       label = 'Thinking';
     }

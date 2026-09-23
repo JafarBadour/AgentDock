@@ -4,6 +4,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../data/models/tool_call_state.dart';
 import 'agent_status_indicators.dart';
+import 'subagent_card.dart';
 
 /// One row for a run of consecutive tool calls, labelled by what the run did
 /// ("Read 3 files · Ran 2 commands"; a single tool shows its own preview).
@@ -142,6 +143,15 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
 
   @override
   Widget build(BuildContext context) {
+    // A lone sub-agent is a delegated run, not a tool line — give it its card.
+    if (widget.tools.length == 1 && widget.tools.first.isSubagent) {
+      return SubagentCard(
+        tool: widget.tools.first,
+        messageId: widget.messageIds.isEmpty ? null : widget.messageIds.first,
+        resolveDetails: widget.resolveDetails,
+        animate: widget.animate,
+      );
+    }
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final hard = _hardFails;
@@ -266,7 +276,10 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
                   child: Column(
                     children: [
                       for (final tool in _details ?? widget.tools)
-                        ToolCallCard(tool: tool),
+                        if (tool.isSubagent)
+                          SubagentCard(tool: tool, animate: widget.animate)
+                        else
+                          ToolCallCard(tool: tool),
                     ],
                   ),
                 ),
