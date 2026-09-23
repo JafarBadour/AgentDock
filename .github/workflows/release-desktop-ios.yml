@@ -28,6 +28,14 @@ jobs:
           channel: stable
           cache: true
       - run: flutter pub get
+      # Release builds sign with the debug config; restore the shared debug
+      # keystore so CI APKs install over locally built ones.
+      - name: Restore debug keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android
+          echo "$KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
       - run: flutter build apk --release
       - name: Rename APK
         run: cp build/app/outputs/flutter-apk/app-release.apk AgentDock-android.apk
