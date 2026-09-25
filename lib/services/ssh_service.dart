@@ -2521,6 +2521,50 @@ exit 1
         : home;
   }
 
+  /// Stat one remote path, or null when it does not exist.
+  ///
+  /// Used before offering to view or download a file the agent mentioned, so
+  /// the sheet can show a size (and say "not found") without listing a whole
+  /// directory.
+  Future<RemoteFileEntry?> statRemoteFile(Host host, String path) async {
+    final remote = normalizeRemotePath(path);
+    final name = _localBasename(remote);
+    if (_preferLocalFs(host)) {
+      try {
+        final type = await FileSystemEntity.type(remote, followLinks: true);
+        if (type == FileSystemEntityType.notFound) return null;
+        final isDir = type == FileSystemEntityType.directory;
+        final stat = await FileStat.stat(remote);
+        return RemoteFileEntry(
+          name: name,
+          isDirectory: isDir,
+          size: isDir ? null : stat.size,
+          modifiedAt: stat.modified,
+        );
+      } catch (e) {
+        SafeLog.d('local stat failed $remote', e);
+        return null;
+      }
+    }
+    try {
+      final client = await connect(host);
+      final sftp = await client.sftp();
+      final attrs = await sftp.stat(remote);
+      return RemoteFileEntry(
+        name: name,
+        isDirectory: attrs.isDirectory,
+        isSymlink: attrs.isSymbolicLink,
+        size: attrs.isDirectory ? null : attrs.size,
+        modifiedAt: attrs.modifyTime != null
+            ? DateTime.fromMillisecondsSinceEpoch(attrs.modifyTime! * 1000)
+            : null,
+      );
+    } catch (e) {
+      SafeLog.d('stat failed $remote', e);
+      return null;
+    }
+  }
+
   /// List directories (and symlink-to-dir) under [path] via SFTP.
   Future<RemoteListing> listRemoteDirectories(Host host, String path) async {
     final full = await listRemoteEntries(host, path);

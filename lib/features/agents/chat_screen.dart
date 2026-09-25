@@ -23,14 +23,14 @@ import '../../data/models/tool_call_state.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
+import '../../services/chat_connect_coordinator.dart';
 import '../../services/chat_session_runtime.dart';
-import '../../services/claude_remote_auth.dart';
-import '../../services/codex_remote_auth.dart';
 import '../../services/cursor_acp_service.dart';
 import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
+import 'file_mention.dart';
 import '../connect/claude_login_sheet.dart';
 import '../connect/codex_login_sheet.dart';
 import 'model_picker_sheet.dart';
@@ -51,7 +51,8 @@ class ChatScreen extends ConsumerStatefulWidget {
 }
 
 class _ChatScreenState extends ConsumerState<ChatScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin
+    implements ConnectUiDelegate {
   final _composer = TextEditingController();
 
   /// Offline / pre-connect transcript from DB.
@@ -94,8 +95,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   ChatSessionRuntime? _runtime;
   VoidCallback? _runtimeListener;
-  Future<void>? _ensureAcpInFlight;
-  int _connectEpoch = 0;
   Timer? _markReadTimer;
   Timer? _runtimeUiCoalesce;
   bool _runtimeUiDirty = false;
@@ -196,6 +195,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _focusedChatId.state = widget.chatId;
     });
+    // The coordinator owns bring-up; this screen only reflects it and lends
+    // it a `context` for the sign-in sheets while mounted.
+    ref
+        .read(chatConnectCoordinatorProvider.notifier)
+        .attachUi(widget.chatId, this);
+    ref.listenManual(
+      chatConnectCoordinatorProvider.select((m) => m[widget.chatId]),
+      (_, next) => _applyConnectProgress(next),
+      fireImmediately: true,
+    );
     _bootstrap();
   }
 
@@ -766,53 +775,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   static String _compactConnectError(
     Object error, {
     required AgentProvider provider,
-  }) {
-    var msg = error.toString().trim();
-    const prefixes = ['TimeoutException: ', 'Exception: ', 'StateError: '];
-    for (final p in prefixes) {
-      if (msg.startsWith(p)) msg = msg.substring(p.length).trim();
-    }
-    // Unwrap "Could not start … ACP: …" if we re-enter.
-    final acp = RegExp(
-      r'^Could not start (?:Claude|Cursor|Codex)(?: ACP)?:\s*',
-      caseSensitive: false,
-    ).firstMatch(msg);
-    if (acp != null) msg = msg.substring(acp.end).trim();
-    for (final p in prefixes) {
-      if (msg.startsWith(p)) msg = msg.substring(p.length).trim();
-    }
-
-    final lower = msg.toLowerCase();
-    if (lower.contains('can\'t reach') ||
-        lower.contains('timed out reaching') ||
-        lower.contains('timed out opening ssh') ||
-        lower.contains('socketexception') ||
-        lower.contains('connection refused') ||
-        lower.contains('network is unreachable') ||
-        lower.contains('no route to host')) {
-      return 'Can\'t reach host — check VPN/network';
-    }
-    if (lower.contains('timed out connecting to adsm')) {
-      final host = RegExp(
-        r'on ([^\s.]+)',
-        caseSensitive: false,
-      ).firstMatch(msg)?.group(1);
-      return host != null
-          ? 'ADSM timed out on $host'
-          : 'ADSM connect timed out';
-    }
-    if (lower.contains('timed out installing/starting adsm')) {
-      return 'ADSM install timed out';
-    }
-    if (lower.contains('timed out opening ssh')) {
-      return 'SSH timed out';
-    }
-    if (lower.contains('connect timed out')) {
-      return '${provider.label} connect timed out';
-    }
-    if (msg.length > 72) return '${msg.substring(0, 69)}…';
-    return msg;
-  }
+  }) => compactConnectError(error, provider: provider);
 
   Future<void> _showFullConnectError(String full) async {
     if (!mounted) return;
@@ -831,16 +794,134 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Future<void> _ensureAcp() {
-    final inflight = _ensureAcpInFlight;
-    if (inflight != null) return inflight;
-    late final Future<void> created;
-    created = _ensureAcpBody().whenComplete(() {
-      // A force reconnect may have replaced us — never clear its future.
-      if (identical(_ensureAcpInFlight, created)) _ensureAcpInFlight = null;
-    });
-    _ensureAcpInFlight = created;
-    return created;
+  /// Start (or join) this chat's bring-up.
+  ///
+  /// The handshake itself runs in [ChatConnectCoordinator], outside the widget
+  /// tree, so switching chats/agents or backgrounding the app no longer
+  /// cancels a connect the user just asked for. This method only does the
+  /// parts that need the screen: the credential check and adopting a runtime
+  /// that is already live.
+  Future<void> _ensureAcp() async {
+    final repo = _repo;
+    final host = _host;
+    final chat = _chat;
+    if (chat == null || repo == null || host == null) return;
+
+    final canAuth = await ref
+        .read(secureStoreProvider)
+        .canAuthenticateToHost(host.id);
+    if (!canAuth) {
+      if (mounted) {
+        setState(() {
+          _error =
+              'No SSH credentials for this host. Add a password on the host, '
+              'or an SSH key in Settings.';
+          _showSdkInstallGuide = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Add a host password or an SSH key in Settings first.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
+    if (existing != null && !existing.closed) {
+      existing.sessionFactory = _buildSessionFactory(
+        chatId: chat.id,
+        cwd: repo.remotePath,
+      );
+      _bindRuntime(existing);
+      // Re-open of an already-attached chat: clear sticky "working" from a
+      // previous dead turn, then ask ADSM whether anything is still live.
+      unawaited(existing.resyncBusyFromHost());
+      if (existing.permissionPolicy != _permission) {
+        try {
+          await existing.applyPermissionPolicy(_permission);
+        } catch (e) {
+          SafeLog.d('applyPermissionPolicy on existing session failed', e);
+        }
+      }
+      if (existing.mode != _mode) {
+        try {
+          await existing.setMode(_mode);
+        } catch (e) {
+          SafeLog.d('setMode on existing session failed', e);
+        }
+      }
+      return;
+    }
+
+    // Consumed here so a background retry does not re-mint another session.
+    final forceFresh = _forceFreshSession;
+    if (forceFresh) _forceFreshSession = false;
+
+    await ref
+        .read(chatConnectCoordinatorProvider.notifier)
+        .ensure(
+          chat: chat,
+          repo: repo,
+          host: host,
+          mode: _mode,
+          permission: _permission,
+          forceFreshSession: forceFresh,
+        );
+  }
+
+  /// Mirror coordinator progress onto the screen's notifiers.
+  ///
+  /// Status/spinner go through [_connectingN]/[_connectStatusN] so streaming
+  /// progress never setStates the transcript; only the banner fields do.
+  void _applyConnectProgress(ConnectProgress? progress) {
+    if (progress == null) return;
+    _connecting = progress.connecting;
+    _connectStatus = progress.status;
+    final changed =
+        progress.error != _error ||
+        progress.showSdkInstallGuide != _showSdkInstallGuide ||
+        progress.resumedInPlace != _resumedInPlace;
+    if (changed && mounted) {
+      setState(() {
+        _error = progress.error;
+        _showSdkInstallGuide = progress.showSdkInstallGuide;
+        _resumedInPlace = progress.resumedInPlace;
+      });
+    }
+    if (progress.phase == ConnectPhase.connected) {
+      unawaited(_adoptConnectedSession());
+    }
+  }
+
+  /// Bind the runtime a coordinator connect just attached, and deliver
+  /// anything typed while it was still coming up.
+  Future<void> _adoptConnectedSession() async {
+    final runtime = ref
+        .read(activeAcpSessionsProvider.notifier)
+        .get(widget.chatId);
+    if (runtime != null && _runtime != runtime) _bindRuntime(runtime);
+    final refreshed = await ref
+        .read(appDatabaseProvider)
+        .getChat(widget.chatId);
+    if (!mounted) return;
+    if (refreshed != null) setState(() => _chat = refreshed);
+    unawaited(_flushDeferredSend());
+  }
+
+  @override
+  Future<bool> requestLogin(AgentProvider provider, Host host) async {
+    if (!mounted) return false;
+    // Pick the sheet before awaiting so `context` is never used across the
+    // async gap.
+    final sheet = switch (provider) {
+      AgentProvider.claude => ClaudeLoginSheet.show(context, host: host),
+      AgentProvider.codex => CodexLoginSheet.show(context, host: host),
+      AgentProvider.cursor => Future<bool?>.value(false),
+    };
+    return await sheet == true;
   }
 
   /// Tear down everything on this device for the chat — the in-flight
@@ -852,9 +933,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final host = _host;
     if (chat == null || host == null) return;
 
+    // Abandon a wedged connect instead of joining it; [cancel] bumps the
+    // coordinator's epoch so the old run tears itself down.
     _cancelConnect();
-    // Abandon a wedged connect instead of joining it.
-    _ensureAcpInFlight = null;
     _runtime?.lastError = null;
     _runtime?.deliveryError = null;
     try {
@@ -877,17 +958,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   void _cancelConnect() {
-    _connectEpoch++;
-    final host = _host;
-    if (host != null) {
-      ref.read(sshServiceProvider).abandonAdsmEnsure(host.id);
-      ref.read(sshServiceProvider).clearAdsmReady(host.id);
-    }
+    ref
+        .read(chatConnectCoordinatorProvider.notifier)
+        .cancel(widget.chatId, host: _host);
     _connecting = false;
     _connectStatus = null;
   }
-
-  bool _connectStillCurrent(int epoch) => mounted && epoch == _connectEpoch;
 
   Future<void> _showConnectionControls({
     required bool connecting,
@@ -1169,445 +1245,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   /// A closure that can open a transport for this chat at any later time.
   ///
-  /// It captures the services directly instead of `ref`, because the runtime
-  /// keeps reconnecting in the background after this screen is disposed.
+  /// Delegates to [buildSessionFactory], which captures services instead of
+  /// `ref` because the runtime keeps reconnecting in the background after
+  /// this screen is disposed.
   Future<AgentSession> Function() _buildSessionFactory({
     required String chatId,
     required String cwd,
   }) {
-    final ssh = ref.read(sshServiceProvider);
-    final secureStore = ref.read(secureStoreProvider);
-    final db = ref.read(appDatabaseProvider);
-    final sessions = ref.read(activeAcpSessionsProvider.notifier);
-    final bridgePool = ref.read(adsmBridgePoolProvider);
-    final host = _host!;
-    final provider = _chat?.provider ?? AgentProvider.cursor;
-    // Fallbacks for the first connect, before a runtime exists.
-    final fallbackMode = _mode;
-    final fallbackPermission = _permission;
     // Consume once — background reconnects must resume the new session id.
-    var forceNewOnce = _forceFreshSession;
-    if (forceNewOnce) _forceFreshSession = false;
-
-    return () async {
-      final forceNew = forceNewOnce;
-      forceNewOnce = false;
-      final live = sessions.get(chatId);
-      final mode = live?.preferredMode ?? fallbackMode;
-      final permission = live?.preferredPermissionPolicy ?? fallbackPermission;
-
-      void status(String message) {
+    final forceNew = _forceFreshSession;
+    if (forceNew) _forceFreshSession = false;
+    return buildSessionFactory(
+      ssh: ref.read(sshServiceProvider),
+      secureStore: ref.read(secureStoreProvider),
+      db: ref.read(appDatabaseProvider),
+      sessions: ref.read(activeAcpSessionsProvider.notifier),
+      bridgePool: ref.read(adsmBridgePoolProvider),
+      chatId: chatId,
+      cwd: cwd,
+      host: _host!,
+      provider: _chat?.provider ?? AgentProvider.cursor,
+      fallbackMode: _mode,
+      fallbackPermission: _permission,
+      forceFreshSession: forceNew,
+      onProgress: (message) {
         // Never setState the chat for SSH progress — only the toolbar listens.
         if (!mounted || !_connecting) return;
         _connectStatus = message;
-      }
-
-      status('Checking ${provider.label}…');
-
-      final adsmReady = ssh.isAdsmReady(host.id);
-      final cachedBinary = switch (provider) {
-        AgentProvider.cursor => ssh.cachedCursorCli(host.id),
-        AgentProvider.claude => ssh.cachedClaudeAcp(host.id),
-        AgentProvider.codex => ssh.cachedCodexAcp(host.id),
-      };
-
-      // Skip tmux install probe when we already know the agent binary — cold
-      // reconnects used to hang here forever on ProxyJump SSH.
-      if (!adsmReady && cachedBinary == null) {
-        await ssh
-            .ensureTmux(host, onProgress: status)
-            .timeout(
-              const Duration(seconds: 45),
-              onTimeout: () => throw TimeoutException(
-                'Timed out checking tmux on the remote.',
-              ),
-            );
-      }
-
-      final String binary;
-      if (cachedBinary != null) {
-        binary = cachedBinary;
-        // Do not say "ready" here — ADSM attach can still hang, and that
-        // label next to the header spinner made chats look connected while
-        // the composer stayed locked on [_connecting].
-        status(switch (provider) {
-          AgentProvider.cursor => 'Cursor found…',
-          AgentProvider.claude => 'Claude ACP found…',
-          AgentProvider.codex => 'Codex ACP found…',
-        });
-      } else {
-        binary = switch (provider) {
-          AgentProvider.cursor =>
-            await ssh
-                .ensureCursorCli(host, onProgress: status)
-                .timeout(
-                  const Duration(minutes: 8),
-                  onTimeout: () => throw TimeoutException(
-                    'Timed out installing/finding Cursor CLI on the remote.',
-                  ),
-                ),
-          AgentProvider.claude =>
-            await ssh
-                .ensureClaudeAcpBinary(host, onProgress: status)
-                .timeout(
-                  const Duration(seconds: 90),
-                  onTimeout: () => throw TimeoutException(
-                    'Timed out finding Claude ACP on the remote. '
-                    'Open Hosts → terminal and check `claude-code-acp`.',
-                  ),
-                ),
-          AgentProvider.codex =>
-            await ssh
-                .ensureCodexAcpBinary(host, onProgress: status)
-                .timeout(
-                  const Duration(minutes: 8),
-                  onTimeout: () => throw TimeoutException(
-                    'Timed out installing/finding Codex ACP on the remote. '
-                    'Open Hosts → terminal and check `codex-acp`.',
-                  ),
-                ),
-        };
-      }
-
-      status(adsmReady ? 'Connecting to ADSM…' : 'Starting ADSM…');
-      try {
-        await ssh
-            .ensureAdsm(host, onProgress: status, allowUpgrade: !adsmReady)
-            .timeout(
-              adsmReady
-                  ? const Duration(seconds: 60)
-                  : const Duration(seconds: 90),
-              onTimeout: () => throw TimeoutException(
-                adsmReady
-                    ? 'Timed out connecting to ADSM on ${host.displayLabel}. '
-                          'Check VPN/SSH, tap Cancel, then reconnect.'
-                    : 'Timed out installing/starting ADSM on ${host.displayLabel}. '
-                          'Check VPN/SSH, tap Cancel, then reconnect.',
-              ),
-            );
-      } on TimeoutException {
-        ssh.clearAdsmReady(host.id);
-        ssh.abandonAdsmEnsure(host.id);
-        rethrow;
-      }
-
-      final mcps = await db.listEnabledMcpsForHost(host.id);
-      final latest = await db.getChat(chatId);
-
-      status('Starting agent…');
-
-      return AdsmSession.start(
-        ssh: ssh,
-        secureStore: secureStore,
-        bridgePool: bridgePool,
-        host: host,
-        cwd: cwd,
-        binary: binary,
-        chatId: chatId,
-        provider: provider,
-        mcpServers: mcps.map((m) => m.toAcpConfig()).toList(),
-        initialMode: mode,
-        permissionPolicy: permission,
-        resumeSessionId: forceNew ? null : latest?.acpSessionId,
-        forceNewSession: forceNew,
-        preferredModelId: latest?.modelId,
-      ).timeout(
-        const Duration(seconds: 90),
-        onTimeout: () => throw TimeoutException(
-          '${provider.label} connect timed out',
-        ),
-      );
-    };
-  }
-
-  Future<void> _ensureAcpBody() async {
-    final repo = _repo;
-    final host = _host;
-    if (_chat == null || repo == null || host == null) return;
-    var chat = _chat!;
-
-    final canAuth = await ref
-        .read(secureStoreProvider)
-        .canAuthenticateToHost(host.id);
-    if (!canAuth) {
-      if (mounted) {
-        setState(() {
-          _error =
-              'No SSH credentials for this host. Add a password on the host, '
-              'or an SSH key in Settings.';
-          _showSdkInstallGuide = false;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Add a host password or an SSH key in Settings first.',
-            ),
-          ),
-        );
-      }
-      return;
-    }
-
-    final existing = ref.read(activeAcpSessionsProvider.notifier).get(chat.id);
-    if (existing != null && !existing.closed) {
-      existing.sessionFactory = _buildSessionFactory(
-        chatId: chat.id,
-        cwd: repo.remotePath,
-      );
-      _bindRuntime(existing);
-      // Re-open of an already-attached chat: clear sticky "working" from a
-      // previous dead turn, then ask ADSM whether anything is still live.
-      unawaited(existing.resyncBusyFromHost());
-      if (existing.permissionPolicy != _permission) {
-        try {
-          await existing.applyPermissionPolicy(_permission);
-        } catch (e) {
-          SafeLog.d('applyPermissionPolicy on existing session failed', e);
-        }
-      }
-      if (existing.mode != _mode) {
-        try {
-          await existing.setMode(_mode);
-        } catch (e) {
-          SafeLog.d('setMode on existing session failed', e);
-        }
-      }
-      return;
-    }
-
-    _connecting = true;
-    // Never say "Preparing Claude" before we can reach the host — that
-    // hid offline/VPN failures behind a misleading agent label.
-    _connectStatus = 'Reaching ${host.displayLabel}…';
-    if (mounted) {
-      setState(() {
-        _error = null;
-        _showSdkInstallGuide = false;
-      });
-    }
-    final epoch = ++_connectEpoch;
-
-    try {
-      try {
-        await ref
-            .read(sshServiceProvider)
-            .connect(host)
-            .timeout(
-              const Duration(seconds: 20),
-              onTimeout: () => throw TimeoutException(
-                'Timed out reaching ${host.displayLabel}',
-              ),
-            );
-      } catch (e) {
-        if (!_connectStillCurrent(epoch)) return;
-        SafeLog.d('host unreachable before ACP connect', e);
-        _connecting = false;
-        _connectStatus = null;
-        if (mounted) {
-          setState(() {
-            _error =
-                'Can\'t reach ${host.displayLabel} — check VPN or network, then Retry.';
-            _showSdkInstallGuide = false;
-          });
-        }
-        return;
-      }
-      if (!_connectStillCurrent(epoch)) return;
-
-      // Pull the live session id Mac wrote before we attach — without it the
-      // agent starts over and only sees messages sent on this device.
-      try {
-        _connectStatus = 'Syncing chat…';
-        final changed = await ref
-            .read(agentDockServiceProvider)
-            .syncChatRecord(host: host, chatId: chat.id)
-            .timeout(const Duration(seconds: 12));
-        if (!_connectStillCurrent(epoch)) return;
-        if (changed) {
-          final refreshed = await ref
-              .read(appDatabaseProvider)
-              .getChat(chat.id);
-          if (!_connectStillCurrent(epoch)) return;
-          if (refreshed != null) {
-            chat = refreshed;
-            if (mounted) setState(() => _chat = refreshed);
-          }
-        }
-      } catch (e) {
-        SafeLog.d('sync chat record before connect failed', e);
-      }
-
-      if (chat.provider == AgentProvider.claude) {
-        final apiKey = await ref
-            .read(secureStoreProvider)
-            .readAnthropicApiKey();
-        if (!_connectStillCurrent(epoch)) return;
-        if (apiKey == null || apiKey.isEmpty) {
-          _connectStatus = 'Checking Claude login…';
-          final auth = ClaudeRemoteAuth(ref.read(sshServiceProvider));
-          if (!await auth
-              .isLoggedIn(host)
-              .timeout(const Duration(seconds: 25), onTimeout: () => false)) {
-            if (!_connectStillCurrent(epoch)) return;
-            _connectStatus = 'Sign in required…';
-            final signedIn = await ClaudeLoginSheet.show(context, host: host);
-            if (!_connectStillCurrent(epoch)) return;
-            if (signedIn != true) {
-              _connecting = false;
-              _connectStatus = null;
-              if (mounted) {
-                setState(() {
-                  _error =
-                      'Claude sign-in required. Open Settings to continue.';
-                });
-              }
-              return;
-            }
-          }
-        }
-      }
-
-      if (chat.provider == AgentProvider.codex) {
-        final apiKey = await ref.read(secureStoreProvider).readOpenAiApiKey();
-        if (!_connectStillCurrent(epoch)) return;
-        if (apiKey == null || apiKey.isEmpty) {
-          _connectStatus = 'Checking Codex login…';
-          final auth = CodexRemoteAuth(ref.read(sshServiceProvider));
-          if (!await auth
-              .isLoggedIn(host)
-              .timeout(const Duration(seconds: 25), onTimeout: () => false)) {
-            if (!_connectStillCurrent(epoch)) return;
-            _connectStatus = 'Sign in required…';
-            final signedIn = await CodexLoginSheet.show(context, host: host);
-            if (!_connectStillCurrent(epoch)) return;
-            if (signedIn != true) {
-              _connecting = false;
-              _connectStatus = null;
-              if (mounted) {
-                setState(() {
-                  _error =
-                      'Codex sign-in required. Open Settings to continue.';
-                });
-              }
-              return;
-            }
-          }
-        }
-      }
-
-      if (!_connectStillCurrent(epoch)) return;
-      _connectStatus = 'Starting ${chat.provider.label}…';
-      final factory = _buildSessionFactory(
-        chatId: chat.id,
-        cwd: repo.remotePath,
-      );
-
-      final session = await factory();
-      if (!_connectStillCurrent(epoch)) {
-        try {
-          await session.close();
-        } catch (_) {}
-        return;
-      }
-
-      final runtime = await ref
-          .read(activeAcpSessionsProvider.notifier)
-          .attach(chatId: chat.id, session: session, sessionFactory: factory);
-      if (!_connectStillCurrent(epoch)) {
-        await ref.read(activeAcpSessionsProvider.notifier).close(chat.id);
-        return;
-      }
-      runtime.chatMeta = chat;
-      _bindRuntime(runtime);
-
-      final sessionId = session.sessionId;
-      if (sessionId != null) {
-        unawaited(
-          ref
-              .read(agentRuntimeHostProvider)
-              .writeSessionId(host, chat.id, sessionId),
-        );
-      }
-
-      final updated = chat.copyWith(
-        status: ChatStatus.running,
-        acpSessionId: session.sessionId,
-        updatedAt: DateTime.now(),
-      );
-      runtime.chatMeta = updated;
-      await ref.read(appDatabaseProvider).upsertChat(updated);
-      ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
-      if (mounted) {
-        setState(() {
-          _chat = updated;
-          _showSdkInstallGuide = false;
-          _error = null;
-          _resumedInPlace = session.resumedInPlace;
-        });
-      }
-    } on MissingToolException catch (e) {
-      if (!_connectStillCurrent(epoch)) return;
-      if (mounted) {
-        final providerLabel = chat.provider == AgentProvider.cursor
-            ? 'Cursor CLI'
-            : chat.provider.label;
-        final isAdsm = e.tool.toUpperCase().contains('ADSM');
-        final mismatch = e.installHint.toLowerCase().contains('adsm mismatch');
-        setState(() {
-          _showSdkInstallGuide = true;
-          _error = isAdsm
-              ? (mismatch
-                    ? 'ADSM mismatch — cannot run until the host matches this app '
-                          '(needs v$kRequiredAdsmVersion).\n'
-                          'Agent Dock tried to update automatically. Leave this chat '
-                          'and open it again to retry, or update ADSM on the remote.\n\n'
-                          '${e.installHint}'
-                    : 'Could not install ADSM on ${host.displayLabel}.\n'
-                          'Agent Dock tried automatically — run the setup below on the '
-                          'remote, then Connect again.\n\n'
-                          '${e.tool} still missing.')
-              : 'Could not install $providerLabel on ${host.displayLabel}.\n'
-                    'Agent Dock tried automatically — run the setup below on the '
-                    'remote (or fix network/sudo), then Connect again.\n\n'
-                    '${e.tool} still missing.';
-        });
-      }
-    } catch (e) {
-      if (!_connectStillCurrent(epoch)) return;
-      SafeLog.d('ACP connect failed', e);
-      final lower = e.toString().toLowerCase();
-      final looksLikeMissingSdk =
-          lower.contains('cursor') ||
-          lower.contains('claude') ||
-          lower.contains('claude-code-acp') ||
-          lower.contains('codex') ||
-          lower.contains('agent') ||
-          lower.contains('not found') ||
-          lower.contains('no such file') ||
-          lower.contains('install');
-      if (mounted) {
-        setState(() {
-          _showSdkInstallGuide = looksLikeMissingSdk;
-          _error = looksLikeMissingSdk
-              ? 'Could not start ${chat.provider.label} — install may have '
-                    'failed on the remote.\n$e'
-              : _compactConnectError(e, provider: chat.provider);
-        });
-      }
-      final updated = chat.copyWith(
-        status: ChatStatus.error,
-        updatedAt: DateTime.now(),
-      );
-      await ref.read(appDatabaseProvider).upsertChat(updated);
-      ref.read(agentDockServiceProvider).schedulePushChat(updated.id);
-      if (mounted) setState(() => _chat = updated);
-    } finally {
-      if (_connectStillCurrent(epoch)) {
-        _connecting = false;
-        _connectStatus = null;
-        unawaited(_flushDeferredSend());
-      }
-    }
+      },
+    );
   }
 
   Future<void> _flushDeferredSend() async {
@@ -2124,6 +1790,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_runtimeListener != null && _runtime != null) {
       _runtime!.removeListener(_runtimeListener!);
     }
+    // Hand back the login-sheet delegate without disturbing an in-flight
+    // connect; the coordinator keeps going without a screen.
+    ref
+        .read(chatConnectCoordinatorProvider.notifier)
+        .detachUi(widget.chatId, this);
     // Providers must not change mid-frame (unmount runs inside finalizeTree),
     // so clear focus once this frame is done; the guard keeps a chat that
     // took focus in the meantime untouched.
@@ -2813,7 +2484,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // Scaffold chrome rebuilds on [_transcriptUiEpoch] (content changes,
     // ≤3 Hz); status labels on [_chromeUiEpoch]. The transcript list is a
     // [TranscriptView] fed by [_transcriptN] and never rebuilt from here.
-    return ListenableBuilder(
+    final Widget shell = ListenableBuilder(
       listenable: _transcriptUiEpoch,
       child: _buildIsolatedComposer(),
       builder: (context, composerChild) {
@@ -3365,6 +3036,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           ),
         );
       },
+    );
+
+    // Paths the agent mentions resolve against this chat's project, so they can
+    // be viewed or downloaded straight from the transcript.
+    final mentionHost = _host;
+    final mentionRoot = _repo?.remotePath;
+    if (mentionHost == null || mentionRoot == null) return shell;
+    return FileMentionScope(
+      host: mentionHost,
+      rootPath: mentionRoot,
+      child: shell,
     );
   }
 

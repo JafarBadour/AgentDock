@@ -16,6 +16,7 @@ import '../services/config_backup_service.dart';
 import '../services/gcp_speech_service.dart';
 import '../services/local_notification_service.dart';
 import '../services/mcp_deploy_service.dart';
+import '../services/chat_connect_coordinator.dart';
 import '../services/skill_deploy_service.dart';
 import '../services/schedule_runner.dart';
 import '../services/schedule_sync_service.dart';
@@ -185,6 +186,13 @@ final remoteDeletedChatsPrunerProvider = Provider<void>((ref) {
 final configBackupServiceProvider = Provider<ConfigBackupService>(
   (ref) => ConfigBackupService(ref.watch(appDatabaseProvider)),
 );
+
+/// Chat bring-up that outlives the chat screen, so switching agents or
+/// backgrounding the app cannot cancel a connect the user just started.
+final chatConnectCoordinatorProvider =
+    StateNotifierProvider<ChatConnectCoordinator, Map<String, ConnectProgress>>(
+      (ref) => ChatConnectCoordinator(ref),
+    );
 
 /// Long-lived ACP runtimes keyed by chat id — survive leaving the chat screen.
 final activeAcpSessionsProvider =

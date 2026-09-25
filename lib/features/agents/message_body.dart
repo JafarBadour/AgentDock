@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
@@ -6,6 +7,8 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../app/app_theme.dart';
+import '../../services/file_kind.dart';
+import 'file_mention.dart';
 
 /// A recognised link inside a chat message.
 enum RichLinkKind { githubPr, githubIssue, jira, generic }
@@ -317,6 +320,20 @@ class _MessageBodyState extends State<MessageBody> {
   bool? _frozenDense;
   TextStyle? _frozenStyle;
 
+  /// Tap recognizers handed to file-mention spans. Spans cannot own their
+  /// lifetime, so the bubble does: they live as long as the tree that uses
+  /// them, and go when it does.
+  final List<TapGestureRecognizer> _mentionTaps = [];
+
+  @override
+  void dispose() {
+    for (final tap in _mentionTaps) {
+      tap.dispose();
+    }
+    _mentionTaps.clear();
+    super.dispose();
+  }
+
   /// Settled prefix of a live reply and the widget built from it.
   String _settledSource = '';
   Widget? _settledWidget;
@@ -382,7 +399,15 @@ class _MessageBodyState extends State<MessageBody> {
   Widget _buildLive(BuildContext context, TextStyle? base) {
     final text = widget.text;
     final splitAt = settledSplitOffset(text);
-    final tail = _buildMarkdown(context, text.substring(splitAt), base);
+    // No mention chips in the streaming tail: it is rebuilt on every token, and
+    // each chip would leave a tap recognizer behind. The tail gets them once it
+    // settles into the prefix.
+    final tail = _buildMarkdown(
+      context,
+      text.substring(splitAt),
+      base,
+      mentions: false,
+    );
     if (splitAt == 0) return tail;
 
     final prefix = text.substring(0, splitAt).trimRight();
@@ -404,7 +429,27 @@ class _MessageBodyState extends State<MessageBody> {
     );
   }
 
-  Widget _buildMarkdown(BuildContext context, String text, TextStyle? base) {
+  /// A tap handler for a path the agent mentioned, or null when this bubble is
+  /// not inside a [FileMentionScope] (so there is no host to fetch it from).
+  VoidCallback? _mentionTap(BuildContext context, String raw) {
+    final scope = FileMentionScope.maybeOf(context);
+    if (scope == null) return null;
+    final mention = parseFileMention(raw);
+    if (mention == null) return null;
+    return () => showFileMentionSheet(
+          context,
+          host: scope.host,
+          rootPath: scope.rootPath,
+          mention: mention,
+        );
+  }
+
+  Widget _buildMarkdown(
+    BuildContext context,
+    String text,
+    TextStyle? base, {
+    bool mentions = true,
+  }) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
 
@@ -417,11 +462,44 @@ class _MessageBodyState extends State<MessageBody> {
       textAlign: TextAlign.start,
       textDirection: TextDirection.ltr,
       onLinkTap: (url, _) => openRichLink(url),
+      inlineCodeBuilder: !mentions
+          ? null
+          : (context, code, style, codeStyle) {
+              final onTap = _mentionTap(context, code);
+              if (onTap == null) {
+                return CodeTextSpan(
+                  text: code,
+                  codeStyle: codeStyle,
+                  style: style,
+                );
+              }
+              final tap = TapGestureRecognizer()..onTap = onTap;
+              _mentionTaps.add(tap);
+              return CodeTextSpan(
+                text: code,
+                codeStyle: codeStyle.copyWith(color: scheme.primary),
+                style: style.copyWith(color: scheme.primary),
+                recognizer: tap,
+                mouseCursor: SystemMouseCursors.click,
+                semanticsLabel: 'File $code',
+              );
+            },
       onCodeCopy: (code) {
         Clipboard.setData(ClipboardData(text: code));
       },
       linkBuilder: (context, span, url, _) {
         final label = span is TextSpan ? span.toPlainText() : '';
+        // `[the plan](docs/plan.md)` — a link into the project, not the web.
+        if (mentions && !url.contains('://')) {
+          final onTap = _mentionTap(context, url);
+          if (onTap != null) {
+            return _FileMentionChip(
+              label: label.trim().isEmpty ? url : label.trim(),
+              dense: widget.dense,
+              onTap: onTap,
+            );
+          }
+        }
         final link = classifyLink(
           url,
           label.trim().isEmpty ? null : label.trim(),
@@ -496,6 +574,63 @@ GptMarkdownThemeData chatGptMarkdownTheme(ThemeData theme) {
     linkHoverColor: scheme.primary,
     hrLineColor: scheme.outlineVariant,
   );
+}
+
+/// A markdown link whose target is a file in the project, not a URL.
+class _FileMentionChip extends StatelessWidget {
+  const _FileMentionChip({
+    required this.label,
+    required this.onTap,
+    this.dense = false,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final bool dense;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final fg = theme.colorScheme.primary;
+    return Material(
+      color: fg.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: dense ? 6 : 8,
+            vertical: dense ? 2 : 4,
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.description_outlined,
+                size: dense ? 12 : 14,
+                color: fg,
+              ),
+              const SizedBox(width: 5),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 220),
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: fg,
+                    fontWeight: FontWeight.w600,
+                    fontSize: dense ? 11 : 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _LinkChip extends StatelessWidget {
