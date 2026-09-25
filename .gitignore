@@ -49,3 +49,9 @@ app.*.map.json
 .env
 .env.*
 binaries/
+
+# Local build outputs and signing material — never commit (repo is public)
+/dist/
+keystore.b64
+*.keystore
+*.jks
