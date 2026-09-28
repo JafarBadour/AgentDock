@@ -62,4 +62,17 @@ void main() {
     });
     expect(user.content, png);
   });
+
+  test('handles real-size blobs without a backtracking regex', () {
+    // A RegExp `{2000,}` run threw StackOverflowError on 60 KB+ blobs in
+    // AOT (release) builds and crashed the v21 cleanup at startup. JIT tests
+    // did not reproduce it, so pin the size and the linear-time behavior.
+    final big = 'iVBORw0KGgo${'Ab+/' * 500000}=';
+    final row = '{"rawOutput":"$big","content":"$big"}';
+    final sw = Stopwatch()..start();
+    final out = stripInlineImages(row);
+    expect(sw.elapsedMilliseconds, lessThan(2000));
+    expect(out, '{"rawOutput":"[image omitted, 1464 KB]",'
+        '"content":"[image omitted, 1464 KB]"}');
+  });
 }
