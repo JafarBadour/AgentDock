@@ -11,6 +11,7 @@ import '../services/agent_runtime_host.dart';
 import '../services/agent_session.dart';
 import '../services/agentdock_service.dart';
 import '../services/background_keep_alive.dart';
+import '../services/chat_fork.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
 import '../services/gcp_speech_service.dart';
@@ -112,6 +113,16 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
   unawaited(service.loadPersistedCaches());
   ref.onDispose(service.dispose);
   return service;
+});
+
+/// Branches a chat into a second agent carrying the same context — see
+/// [ChatForkService].
+final chatForkServiceProvider = Provider<ChatForkService>((ref) {
+  return ChatForkService(
+    pool: ref.watch(adsmBridgePoolProvider),
+    db: ref.watch(appDatabaseProvider),
+    dock: ref.watch(agentDockServiceProvider),
+  );
 });
 
 /// Live, messenger-style sync of every chat on every host (see
