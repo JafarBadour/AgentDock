@@ -23,6 +23,18 @@ class McpDeployService {
     required McpServer mcp,
     required Host host,
   }) async {
+    if (mcp.isStub) {
+      // Writing this would leave an empty entry in every client config.
+      final failed = McpHostLink(
+        mcpId: mcp.id,
+        hostId: host.id,
+        enabled: false,
+        installStatus: McpHostInstallStatus.failed,
+        installDetail: 'No URL or command — edit the MCP first',
+      );
+      await _db.upsertMcpHostLink(failed);
+      return failed;
+    }
     var link = McpHostLink(
       mcpId: mcp.id,
       hostId: host.id,
@@ -179,14 +191,9 @@ class McpDeployService {
     final path = '$home/.codex/config.toml';
     await _run(client, 'mkdir -p ${SshService.shellQuote('$home/.codex')}');
     final fragment = mcp.toCodexTomlFragment();
-    final payload = jsonEncode({
-      'name': mcp.name,
-      'fragment': fragment,
-    });
+    final payload = jsonEncode({'name': mcp.name, 'fragment': fragment});
     final b64 = base64Encode(utf8.encode(payload));
-    await _run(
-      client,
-      '''
+    await _run(client, '''
 python3 - <<'PY'
 import base64, json, pathlib, re, sys
 raw = base64.b64decode(${SshService.shellQuote(b64)}).decode("utf-8")
@@ -207,9 +214,7 @@ else:
 path.write_text(text if text.endswith("\\n") else text + "\\n", encoding="utf-8")
 print(path)
 PY
-''',
-      timeout: const Duration(seconds: 30),
-    );
+''', timeout: const Duration(seconds: 30));
     return path;
   }
 
@@ -220,9 +225,7 @@ PY
   }) async {
     final path = '$home/.codex/config.toml';
     try {
-      final out = await _run(
-        client,
-        '''
+      final out = await _run(client, '''
 python3 - <<'PY'
 import pathlib, re, sys
 name = ${jsonEncode(mcp.name)}
@@ -239,9 +242,7 @@ if new == text:
 path.write_text(new if not new or new.endswith("\\n") else new + "\\n", encoding="utf-8")
 print(path)
 PY
-''',
-        timeout: const Duration(seconds: 30),
-      );
+''', timeout: const Duration(seconds: 30));
       final t = out.trim();
       return t.isEmpty ? null : t;
     } catch (e) {
@@ -375,47 +376,81 @@ PY
     } catch (_) {}
 
     final client = await _ssh.connect(host);
-    final raw = await _run(
-      client,
-      r'''
+    final raw = await _run(client, r'''
 python3 - <<'PY'
 import json, pathlib, re, os
 home = pathlib.Path(os.path.expanduser("~"))
-out = {"cursor": [], "claude": [], "codex": []}
+# Full entries per client ({name: entry}), so servers found on a host can be
+# copied to other hosts — not just listed by name.
+out = {"cursor": {}, "claude": {}, "codex": {}}
 
-def keys_from_json(path):
+def entries_from_json(path):
     try:
         if not path.is_file():
-            return []
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
         servers = data.get("mcpServers") or data.get("mcp_servers") or {}
         if isinstance(servers, dict):
-            return [str(k) for k in servers.keys()]
+            return {
+                str(k): (v if isinstance(v, dict) else {})
+                for k, v in servers.items()
+            }
     except Exception:
         pass
-    return []
+    return {}
 
-out["cursor"] = keys_from_json(home / ".cursor" / "mcp.json")
-out["claude"] = keys_from_json(home / ".claude.json")
+def toml_value(raw):
+    raw = raw.strip()
+    try:
+        return json.loads(raw)  # "strings", [arrays], numbers, true/false
+    except Exception:
+        pass
+    if raw.startswith("'") and raw.endswith("'"):
+        return raw[1:-1]
+    return raw
+
+def codex_entries(text):
+    try:
+        try:
+            import tomllib as toml
+        except ImportError:
+            import tomli as toml  # type: ignore
+        servers = toml.loads(text).get("mcp_servers") or {}
+        return {str(k): v for k, v in servers.items() if isinstance(v, dict)}
+    except Exception:
+        pass
+    # Python < 3.11 without tomli: flat keys plus env / http_headers tables.
+    found = {}
+    current = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r'^\[mcp_servers\.(?:"([^"]+)"|([^\].]+))(?:\.([A-Za-z_]+))?\]$', line)
+        if m:
+            name = m.group(1) or m.group(2)
+            entry = found.setdefault(name, {})
+            current = entry.setdefault(m.group(3), {}) if m.group(3) else entry
+            continue
+        if line.startswith("["):
+            current = None
+            continue
+        if current is not None and "=" in line:
+            key, _, value = line.partition("=")
+            current[key.strip().strip('"')] = toml_value(value)
+    return found
+
+out["cursor"] = entries_from_json(home / ".cursor" / "mcp.json")
+out["claude"] = entries_from_json(home / ".claude.json")
 codex = home / ".codex" / "config.toml"
 if codex.is_file():
     try:
-        text = codex.read_text(encoding="utf-8")
-        # [mcp_servers.name] or [mcp_servers."name"]
-        for m in re.finditer(
-            r'(?m)^\[mcp_servers\.(?:"([^"]+)"|([^\].]+))\]',
-            text,
-        ):
-            name = m.group(1) or m.group(2)
-            if name:
-                out["codex"].append(name)
+        out["codex"] = codex_entries(codex.read_text(encoding="utf-8"))
     except Exception:
         pass
-print(json.dumps(out))
+print(json.dumps(out, default=str))
 PY
-''',
-      timeout: const Duration(seconds: 20),
-    );
+''', timeout: const Duration(seconds: 20));
 
     Map<String, dynamic> decoded = {};
     try {
@@ -426,15 +461,31 @@ PY
       return;
     }
 
-    Set<String> namesFor(String key) {
+    /// {name: entry} per client. Older probes sent a bare list of names.
+    Map<String, Map<String, dynamic>> entriesFor(String key) {
       final v = decoded[key];
-      if (v is! List) return {};
-      return {for (final n in v) '$n'.trim()}.where((s) => s.isNotEmpty).toSet();
+      final out = <String, Map<String, dynamic>>{};
+      if (v is Map) {
+        v.forEach((k, e) {
+          final name = '$k'.trim();
+          if (name.isEmpty) return;
+          out[name] = e is Map ? Map<String, dynamic>.from(e) : {};
+        });
+      } else if (v is List) {
+        for (final n in v) {
+          final name = '$n'.trim();
+          if (name.isNotEmpty) out[name] = {};
+        }
+      }
+      return out;
     }
 
-    final cursor = namesFor('cursor');
-    final claude = namesFor('claude');
-    final codex = namesFor('codex');
+    final cursorEntries = entriesFor('cursor');
+    final claudeEntries = entriesFor('claude');
+    final codexEntries = entriesFor('codex');
+    final cursor = cursorEntries.keys.toSet();
+    final claude = claudeEntries.keys.toSet();
+    final codex = codexEntries.keys.toSet();
     final allNames = {...cursor, ...claude, ...codex};
 
     final locals = await _db.listMcpServers();
@@ -444,20 +495,58 @@ PY
 
     String norm(String n) => n.trim().toLowerCase();
 
-    // Create local stubs for remotes we have never seen.
+    /// The host's definition of [name], trying Claude, Cursor, then Codex.
+    McpServer? hostDefinition(
+      String name, {
+      required String id,
+      required String displayName,
+      required DateTime createdAt,
+    }) {
+      for (final entries in [claudeEntries, cursorEntries, codexEntries]) {
+        final entry = entries[name];
+        if (entry == null) continue;
+        final parsed = McpServer.fromHostConfig(
+          id: id,
+          name: displayName,
+          entry: entry,
+          createdAt: createdAt,
+        );
+        if (parsed != null) return parsed;
+      }
+      return null;
+    }
+
+    // Import remotes we have never seen, and fill in name-only stubs left by
+    // older probes. Never overwrite a definition that already has a URL or
+    // command — that one came from the user.
     for (final name in allNames) {
       final key = norm(name);
-      if (byName.containsKey(key)) continue;
-      final stub = McpServer(
-        id: const Uuid().v4(),
-        name: name.trim(),
-        transport: McpTransport.http,
-        url: null,
-        createdAt: DateTime.now(),
+      final local = byName[key];
+      if (local != null && !local.isStub) continue;
+      final imported = hostDefinition(
+        name,
+        id: local?.id ?? const Uuid().v4(),
+        displayName: local?.name ?? name.trim(),
+        createdAt: local?.createdAt ?? DateTime.now(),
       );
+      if (local != null) {
+        if (imported == null) continue;
+        await _db.upsertMcpServer(imported);
+        byName[key] = imported;
+        continue;
+      }
+      final row =
+          imported ??
+          McpServer(
+            id: const Uuid().v4(),
+            name: name.trim(),
+            transport: McpTransport.http,
+            url: null,
+            createdAt: DateTime.now(),
+          );
       try {
-        await _db.upsertMcpServer(stub);
-        byName[key] = stub;
+        await _db.upsertMcpServer(row);
+        byName[key] = row;
       } catch (e) {
         // Unique name index: another probe won the race — reuse that row.
         SafeLog.d('mcp stub insert raced for $name', e);
@@ -478,10 +567,7 @@ PY
         if (claudeKeys.contains(key)) McpClientTarget.claude,
         if (codexKeys.contains(key)) McpClientTarget.codex,
       ];
-      final links = await _db.listMcpHostLinks(
-        mcpId: mcp.id,
-        hostId: host.id,
-      );
+      final links = await _db.listMcpHostLinks(mcpId: mcp.id, hostId: host.id);
       final existing = links.isEmpty ? null : links.first;
 
       if (targets.isEmpty) {

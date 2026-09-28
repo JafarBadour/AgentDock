@@ -1,9 +1,6 @@
 import 'dart:convert';
 
-enum McpTransport {
-  stdio,
-  http,
-}
+enum McpTransport { stdio, http }
 
 enum McpClientTarget {
   cursor,
@@ -11,10 +8,10 @@ enum McpClientTarget {
   codex;
 
   String get label => switch (this) {
-        cursor => 'Cursor',
-        claude => 'Claude',
-        codex => 'Codex',
-      };
+    cursor => 'Cursor',
+    claude => 'Claude',
+    codex => 'Codex',
+  };
 
   static McpClientTarget? tryParse(String raw) {
     final t = raw.trim().toLowerCase();
@@ -62,15 +59,15 @@ class McpServer {
   final DateTime createdAt;
 
   Map<String, Object?> toMap() => {
-        'id': id,
-        'name': name,
-        'transport': transport.name,
-        'command': command,
-        'args_json': jsonEncode(args),
-        'url': url,
-        'env_json': jsonEncode(env),
-        'created_at': createdAt.toIso8601String(),
-      };
+    'id': id,
+    'name': name,
+    'transport': transport.name,
+    'command': command,
+    'args_json': jsonEncode(args),
+    'url': url,
+    'env_json': jsonEncode(env),
+    'created_at': createdAt.toIso8601String(),
+  };
 
   factory McpServer.fromMap(Map<String, Object?> map) {
     List<String> args = const [];
@@ -93,12 +90,61 @@ class McpServer {
     return McpServer(
       id: map['id']! as String,
       name: map['name']! as String,
-      transport: transportName == 'http' ? McpTransport.http : McpTransport.stdio,
+      transport: transportName == 'http'
+          ? McpTransport.http
+          : McpTransport.stdio,
       command: map['command'] as String?,
       args: args,
       url: map['url'] as String?,
       env: env,
       createdAt: DateTime.parse(map['created_at']! as String),
+    );
+  }
+
+  /// Name-only placeholder: seen on a host but nothing to connect with.
+  bool get isStub =>
+      (url ?? '').trim().isEmpty && (command ?? '').trim().isEmpty;
+
+  /// Parse one `mcpServers[name]` entry as found on a host — Cursor / Claude
+  /// JSON, or a Codex TOML table the host probe converted to the same shape.
+  /// Returns null when the entry has neither a URL nor a command.
+  static McpServer? fromHostConfig({
+    required String id,
+    required String name,
+    required Map<String, dynamic> entry,
+    required DateTime createdAt,
+  }) {
+    String? str(Object? v) {
+      final s = v?.toString().trim();
+      return s == null || s.isEmpty ? null : s;
+    }
+
+    Map<String, String> strMap(Object? v) => v is Map
+        ? {for (final e in v.entries) '${e.key}': '${e.value}'}
+        : const {};
+
+    final url = str(entry['url']) ?? str(entry['serverUrl']);
+    if (url != null) {
+      return McpServer(
+        id: id,
+        name: name,
+        transport: McpTransport.http,
+        url: url,
+        env: {...strMap(entry['http_headers']), ...strMap(entry['headers'])},
+        createdAt: createdAt,
+      );
+    }
+    final command = str(entry['command']);
+    if (command == null) return null;
+    final args = entry['args'];
+    return McpServer(
+      id: id,
+      name: name,
+      transport: McpTransport.stdio,
+      command: command,
+      args: args is List ? [for (final a in args) '$a'] : const [],
+      env: strMap(entry['env']),
+      createdAt: createdAt,
     );
   }
 
@@ -124,16 +170,14 @@ class McpServer {
     };
   }
 
-  static List<Map<String, String>> _nameValuePairs(Map<String, String> map) =>
-      [for (final e in map.entries) {'name': e.key, 'value': e.value}];
+  static List<Map<String, String>> _nameValuePairs(Map<String, String> map) => [
+    for (final e in map.entries) {'name': e.key, 'value': e.value},
+  ];
 
   /// Entry under mcpServers[name] for ~/.cursor/mcp.json.
   Map<String, dynamic> toMcpJsonEntry() {
     if (transport == McpTransport.http) {
-      return {
-        'url': url ?? '',
-        if (env.isNotEmpty) 'headers': env,
-      };
+      return {'url': url ?? '', if (env.isNotEmpty) 'headers': env};
     }
     return {
       'command': command ?? '',
@@ -171,22 +215,24 @@ class McpServer {
         buf.writeln();
         buf.writeln('[mcp_servers.$key.http_headers]');
         for (final e in env.entries) {
-          buf.writeln('${_tomlBareOrQuotedKey(e.key)} = ${_tomlString(e.value)}');
+          buf.writeln(
+            '${_tomlBareOrQuotedKey(e.key)} = ${_tomlString(e.value)}',
+          );
         }
       }
     } else {
       buf.writeln('command = ${_tomlString(command ?? '')}');
       if (args.isNotEmpty) {
-        buf.writeln(
-          'args = [${args.map(_tomlString).join(', ')}]',
-        );
+        buf.writeln('args = [${args.map(_tomlString).join(', ')}]');
       }
       buf.writeln('enabled = true');
       if (env.isNotEmpty) {
         buf.writeln();
         buf.writeln('[mcp_servers.$key.env]');
         for (final e in env.entries) {
-          buf.writeln('${_tomlBareOrQuotedKey(e.key)} = ${_tomlString(e.value)}');
+          buf.writeln(
+            '${_tomlBareOrQuotedKey(e.key)} = ${_tomlString(e.value)}',
+          );
         }
       }
     }
@@ -234,17 +280,16 @@ class McpHostLink {
   /// Which client configs on the host list this MCP (cursor / claude / codex).
   final List<McpClientTarget> targets;
 
-  String get targetsLabel =>
-      targets.map((t) => t.label).join(' · ');
+  String get targetsLabel => targets.map((t) => t.label).join(' · ');
 
   Map<String, Object?> toMap() => {
-        'mcp_id': mcpId,
-        'host_id': hostId,
-        'enabled': enabled ? 1 : 0,
-        'install_status': installStatus.name,
-        'install_detail': installDetail,
-        'targets_json': jsonEncode(targets.map((t) => t.name).toList()),
-      };
+    'mcp_id': mcpId,
+    'host_id': hostId,
+    'enabled': enabled ? 1 : 0,
+    'install_status': installStatus.name,
+    'install_detail': installDetail,
+    'targets_json': jsonEncode(targets.map((t) => t.name).toList()),
+  };
 
   factory McpHostLink.fromMap(Map<String, Object?> map) {
     final targets = <McpClientTarget>[];
@@ -278,14 +323,12 @@ class McpHostLink {
     String? installDetail,
     List<McpClientTarget>? targets,
     bool clearDetail = false,
-  }) =>
-      McpHostLink(
-        mcpId: mcpId,
-        hostId: hostId,
-        enabled: enabled ?? this.enabled,
-        installStatus: installStatus ?? this.installStatus,
-        installDetail:
-            clearDetail ? null : (installDetail ?? this.installDetail),
-        targets: targets ?? this.targets,
-      );
+  }) => McpHostLink(
+    mcpId: mcpId,
+    hostId: hostId,
+    enabled: enabled ?? this.enabled,
+    installStatus: installStatus ?? this.installStatus,
+    installDetail: clearDetail ? null : (installDetail ?? this.installDetail),
+    targets: targets ?? this.targets,
+  );
 }
