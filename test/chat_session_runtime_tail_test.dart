@@ -10,6 +10,7 @@ import 'package:agent_dock/data/models/host.dart';
 import 'package:agent_dock/data/models/prompt_image.dart';
 import 'package:agent_dock/data/models/repo.dart';
 import 'package:agent_dock/data/models/tool_call_state.dart';
+import 'package:agent_dock/services/adsm_client.dart';
 import 'package:agent_dock/services/agent_session.dart';
 import 'package:agent_dock/services/chat_session_runtime.dart';
 import 'package:agent_dock/services/cursor_acp_service.dart';
@@ -213,5 +214,98 @@ void main() {
     expect(runtime.entries.single.tool?.outputHead, 'done');
 
     await runtime.disposeRuntime();
+  });
+
+  group('multi-device', () {
+    Future<(AppDatabase, _FakeSession, ChatSessionRuntime)> open() async {
+      final db = AppDatabase(overridePath: inMemoryDatabasePath);
+      final now = DateTime.utc(2026);
+      await db.upsertHost(
+        Host(
+          id: 'host',
+          alias: 'host',
+          hostname: 'example.com',
+          username: 'test',
+          createdAt: now,
+        ),
+      );
+      await db.upsertRepo(
+        Repo(
+          id: 'repo',
+          hostId: 'host',
+          name: 'repo',
+          remotePath: '/repo',
+          createdAt: now,
+        ),
+      );
+      await db.upsertChat(
+        Chat(
+          id: 'chat',
+          repoId: 'repo',
+          title: 'chat',
+          provider: AgentProvider.claude,
+          createdAt: now,
+          updatedAt: now,
+        ),
+      );
+      final session = _FakeSession();
+      final runtime = ChatSessionRuntime(
+        chatId: 'chat',
+        session: session,
+        db: db,
+      )..startListening();
+      return (db, session, runtime);
+    }
+
+    ChatMessage fromPhone(String id, String text) => ChatMessage(
+      id: id,
+      chatId: 'chat',
+      role: MessageRole.user,
+      content: text,
+      createdAt: DateTime.utc(2026, 1, 2),
+    );
+
+    test('a message sent from another device shows up once', () async {
+      final (db, session, runtime) = await open();
+      session.emit(AcpUpdate.userMessage(fromPhone('m1', 'from the phone')));
+      session.emit(AcpUpdate.userMessage(fromPhone('m1', 'from the phone')));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final users = runtime.entries.where((e) => e.messageId == 'm1');
+      expect(users, hasLength(1));
+      expect((await db.getMessage('m1'))?.content, 'from the phone');
+      await runtime.disposeRuntime();
+    });
+
+    test('our own send echoed back by the host is ignored', () async {
+      final (db, session, runtime) = await open();
+      // As sent from this device: stored with image markers under its id.
+      final sent = fromPhone('m1', '<!--agentdock-img:a.png|image/png-->\nhi');
+      await db.upsertMessage(sent);
+      runtime.absorbMessages([sent]);
+      session.emit(AcpUpdate.userMessage(fromPhone('m1', '🖼 Image\n\nhi')));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(runtime.entries.where((e) => e.messageId == 'm1'), hasLength(1));
+      expect((await db.getMessage('m1'))?.content, sent.content);
+      await runtime.disposeRuntime();
+    });
+
+    test('streamed reply and thought take host-derived ids', () async {
+      final (db, session, runtime) = await open();
+      session.emit(const AcpUpdate.thought('hmm', streamId: 't1:3'));
+      session.emit(const AcpUpdate.delta('Hello', streamId: 't1:5'));
+      session.emit(const AcpUpdate.delta(' there', streamId: 't1:6'));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await runtime.flushAssistantBuffer();
+      await runtime.commitThought();
+      final thought = await db.getMessage(
+        streamSegmentMessageId('chat', 't1:3')!,
+      );
+      final reply = await db.getMessage(
+        streamSegmentMessageId('chat', 't1:5')!,
+      );
+      expect(thought?.role, MessageRole.system);
+      expect(reply?.content, 'Hello there');
+      await runtime.disposeRuntime();
+    });
   });
 }

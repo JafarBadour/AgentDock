@@ -14,6 +14,7 @@ import '../services/background_keep_alive.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
 import '../services/gcp_speech_service.dart';
+import '../services/host_live_sync.dart';
 import '../services/local_notification_service.dart';
 import '../services/mcp_deploy_service.dart';
 import '../services/chat_connect_coordinator.dart';
@@ -111,6 +112,65 @@ final agentDockServiceProvider = Provider<AgentDockService>((ref) {
   unawaited(service.loadPersistedCaches());
   ref.onDispose(service.dispose);
   return service;
+});
+
+/// Live, messenger-style sync of every chat on every host (see
+/// [HostLiveSync]). Driven by [hostLiveSyncLifecycleProvider].
+final hostLiveSyncProvider = Provider<HostLiveSync>((ref) {
+  final dock = ref.watch(agentDockServiceProvider);
+  Timer? tick;
+  void bumpLists() {
+    tick?.cancel();
+    tick = Timer(const Duration(milliseconds: 400), () {
+      tick = null;
+      ref.read(chatActivityTickProvider.notifier).state++;
+      ref.read(agentsCatalogEpochProvider.notifier).state++;
+    });
+  }
+
+  final sync = HostLiveSync(
+    pool: ref.watch(adsmBridgePoolProvider),
+    db: ref.watch(appDatabaseProvider),
+    dock: dock,
+    isChatLive: (chatId) {
+      final runtime = ref.read(activeAcpSessionsProvider)[chatId];
+      return runtime != null && !runtime.closed;
+    },
+    onMessages: (_) => bumpLists(),
+    onCatalogChanged: bumpLists,
+  );
+  dock.onChatMetaPushed = (host, chatId) {
+    unawaited(sync.notifyChatChanged(host, chatId));
+  };
+  ref.onDispose(() {
+    tick?.cancel();
+    dock.onChatMetaPushed = null;
+    unawaited(sync.stop());
+  });
+  return sync;
+});
+
+/// Runs [hostLiveSyncProvider] while the app is in the foreground, and picks
+/// up hosts that gain their first chat.
+final hostLiveSyncLifecycleProvider = Provider<void>((ref) {
+  final sync = ref.watch(hostLiveSyncProvider);
+  Timer? start;
+  void apply(bool foreground) {
+    start?.cancel();
+    if (foreground) {
+      // Let the first frames after launch / resume land before SSH work.
+      start = Timer(const Duration(seconds: 2), () => unawaited(sync.start()));
+    } else {
+      unawaited(sync.stop());
+    }
+  }
+
+  ref.listen<bool>(appInForegroundProvider, (_, fg) => apply(fg));
+  ref.listen<int>(agentsCatalogEpochProvider, (_, _) {
+    if (sync.running) unawaited(sync.refreshHosts());
+  });
+  apply(ref.read(appInForegroundProvider));
+  ref.onDispose(() => start?.cancel());
 });
 
 /// Bumped when the host catalog removes chats (cross-device delete).

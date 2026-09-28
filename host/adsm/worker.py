@@ -17,7 +17,8 @@ from . import process_hygiene
 from . import images as images_util
 from . import transcript as transcript_store
 
-EmitFn = Callable[[Dict[str, Any]], Awaitable[None]]
+# Returns the event seq (daemon) or None (tests).
+EmitFn = Callable[[Dict[str, Any]], Awaitable[Optional[int]]]
 StatusFn = Callable[[str, str, Optional[str]], Awaitable[None]]
 
 
@@ -403,6 +404,12 @@ def ensure_tmux_worker(
     return state, size
 
 
+def segment_message_id(chat_id: str, turn_id: str, seq: int) -> str:
+    """Message id of the reply segment that starts with event [seq] of turn
+    [turn_id]. Must match `_streamMessageId` in chat_session_runtime.dart."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentdock:{chat_id}:{turn_id}:{seq}"))
+
+
 class Worker:
     """Owns ACP JSON-RPC for one chatId."""
 
@@ -440,9 +447,13 @@ class Worker:
         self.status = protocol.STATUS_DEAD
         self.last_error: Optional[str] = None
         self.last_turn_text = ""
-        self._assistant_persisted = False
         self._turn_user_id: Optional[str] = None
         self._turn_assistant_id: Optional[str] = None
+        # The reply text streaming right now, persisted as its own row when a
+        # thought / tool call interrupts it or the turn ends — the same cuts
+        # the app makes, under the same id (see [segment_message_id]).
+        self._seg_id: Optional[str] = None
+        self._seg_text = ""
 
         self._fifo_write: Optional[asyncio.StreamWriter] = None
         self._fifo_fd: Optional[int] = None
@@ -1661,8 +1672,8 @@ class Worker:
             blocks.append({"type": "text", "text": text})
         if not blocks:
             raise ValueError("empty prompt")
+        self._close_segment()
         self.last_turn_text = ""
-        self._assistant_persisted = False
         self._turn_assistant_id = str(uuid.uuid4())
         self._turn_user_id = user_message_id or str(uuid.uuid4())
         # Persist the user turn on the host so reconnects see it even if the
@@ -1685,6 +1696,15 @@ class Worker:
             "prompt_accepted",
             userMessageId=self._turn_user_id,
             status=protocol.STATUS_RUNNING,
+        )
+        # Every device on this chat sees the message, not just the sender
+        # (which already has it under the same id and ignores the echo).
+        await self._emit_event(
+            "user_message",
+            messageId=self._turn_user_id,
+            text=text,
+            imageCount=len([b for b in blocks if b.get("type") == "image"]),
+            createdAt=user_created_at or transcript_store.now_iso(),
         )
         await self._emit_event("status", status=protocol.STATUS_RUNNING)
         await self._emit_event("activity", label="Thinking")
@@ -1763,21 +1783,7 @@ class Worker:
             return await _send(blocks)
 
     def _persist_assistant_turn(self) -> None:
-        if self._assistant_persisted:
-            return
-        text = (self.last_turn_text or "").strip()
-        if not text:
-            return
-        try:
-            transcript_store.append_message(
-                self.chat_id,
-                role="assistant",
-                content=text,
-                message_id=self._turn_assistant_id or str(uuid.uuid4()),
-            )
-            self._assistant_persisted = True
-        except Exception:  # noqa: BLE001
-            pass
+        self._close_segment()
 
     async def cancel(self) -> None:
         if not self.acp_session_id:
@@ -1849,7 +1855,35 @@ class Worker:
     async def _emit_event(self, kind: str, **payload: Any) -> None:
         if kind not in ("text", "thought", "activity"):
             self.touch_activity()
-        await self._emit({"chatId": self.chat_id, "kind": kind, **payload})
+        turn = self._turn_assistant_id
+        if kind in ("text", "thought") and turn:
+            # Devices derive message ids from (turnId, seq) so every one of
+            # them stores a streamed segment under the same id.
+            payload.setdefault("turnId", turn)
+        seq = await self._emit({"chatId": self.chat_id, "kind": kind, **payload})
+        if kind == "text":
+            if self._seg_id is None:
+                self._seg_id = (
+                    segment_message_id(self.chat_id, turn, seq)
+                    if turn and isinstance(seq, int)
+                    else str(uuid.uuid4())
+                )
+            self._seg_text += str(payload.get("text") or "")
+        elif kind in ("thought", "tool_start", "tool_update"):
+            self._close_segment()
+
+    def _close_segment(self) -> None:
+        """Persist the reply text streamed since the last cut, if any."""
+        seg_id, text = self._seg_id, self._seg_text.strip()
+        self._seg_id, self._seg_text = None, ""
+        if not seg_id or not text:
+            return
+        try:
+            transcript_store.append_message(
+                self.chat_id, role="assistant", content=text, message_id=seg_id
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _handle_acp_line(self, line: str) -> None:
         try:

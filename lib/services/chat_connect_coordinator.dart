@@ -417,11 +417,15 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
       _patch(chat.id, (p) => p.copyWith(status: message));
     }
 
-    await ssh.connect(host).timeout(
-      const Duration(seconds: 20),
-      onTimeout: () =>
-          throw TimeoutException('Timed out reaching ${host.displayLabel}'),
-    );
+    // This Mac/PC runs everything through a local shell; an SSH handshake
+    // here failed whenever Remote Login was off or had no authorized key.
+    if (!ssh.runsLocally(host)) {
+      await ssh.connect(host).timeout(
+        const Duration(seconds: 20),
+        onTimeout: () =>
+            throw TimeoutException('Timed out reaching ${host.displayLabel}'),
+      );
+    }
     if (!_current(chat.id, epoch)) return _AttemptOutcome.superseded;
 
     // Pull the live session id the desktop wrote before attaching — without

@@ -1,9 +1,12 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
+
+import 'image_fit.dart';
 
 /// Base64 image payload for ACP `session/prompt` content blocks.
 class PromptImage {
@@ -59,8 +62,9 @@ abstract final class ChatImageCodec {
 
   static const maxImagesPerPrompt = 5;
 
-  /// Transfer cap per image. Not the agent's limit — the host (ADSM
-  /// `images.py`) shrinks / converts anything the agent API would reject.
+  /// Transfer cap for an image the device could not decode (HEIC on some
+  /// platforms, TIFF, …). Those go as-is and ADSM `images.py` converts them;
+  /// everything decodable is shrunk on the device first ([ImageFit]).
   static const maxBytesPerImage = 15 * 1024 * 1024;
 
   /// Build ACP `prompt` content blocks (images first, then text).
@@ -77,38 +81,40 @@ abstract final class ChatImageCodec {
     return blocks;
   }
 
-  /// Persist a picked image under `chat_images/<chatId>/` and return a ref.
+  /// Persist a picked / dropped image file under `chat_images/<chatId>/`.
   static Future<ChatImageRef> storePickedFile({
     required String chatId,
     required String sourcePath,
     required String fileName,
-    int? byteLength,
   }) async {
-    _checkSize(byteLength ?? await File(sourcePath).length());
-    final (ref, dest) = await _newRef(chatId, fileName);
-    await File(sourcePath).copy(dest.path);
-    return ref;
+    final bytes = await File(sourcePath).readAsBytes();
+    return storeBytes(chatId: chatId, bytes: bytes, fileName: fileName);
   }
 
-  /// Persist pasted / keyboard-inserted image bytes; see [storePickedFile].
+  /// Persist pasted / dropped / keyboard-inserted image bytes, shrunk to
+  /// what the agent accepts whatever their original size.
   static Future<ChatImageRef> storeBytes({
     required String chatId,
     required List<int> bytes,
     required String fileName,
   }) async {
-    _checkSize(bytes.length);
-    final (ref, dest) = await _newRef(chatId, fileName);
-    await dest.writeAsBytes(bytes, flush: true);
-    return ref;
-  }
-
-  static void _checkSize(int len) {
-    if (len > maxBytesPerImage) {
+    final raw = bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+    final fitted = await ImageFit.fit(raw);
+    var out = raw;
+    var name = fileName;
+    if (fitted != null) {
+      out = fitted.bytes;
+      name = '${p.basenameWithoutExtension(fileName)}.${fitted.ext}';
+    } else if (raw.length > maxBytesPerImage) {
       throw StateError(
-        'Image too large (${(len / (1024 * 1024)).toStringAsFixed(1)} MB). '
-        'Max is ${maxBytesPerImage ~/ (1024 * 1024)} MB.',
+        'Could not read this image to shrink it '
+        '(${(raw.length / (1024 * 1024)).toStringAsFixed(1)} MB). '
+        'Try PNG or JPEG.',
       );
     }
+    final (ref, dest) = await _newRef(chatId, name);
+    await dest.writeAsBytes(out, flush: true);
+    return ref;
   }
 
   static Future<(ChatImageRef, File)> _newRef(

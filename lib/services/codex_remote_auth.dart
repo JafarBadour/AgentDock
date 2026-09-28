@@ -1,11 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-
-import 'package:dartssh2/dartssh2.dart';
 
 import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
+import 'login_shell.dart';
 import 'ssh_service.dart';
 
 enum CodexLoginPhase {
@@ -19,7 +17,8 @@ enum CodexLoginPhase {
   error,
 }
 
-/// Drives `codex login --device-auth` on a remote host over an SSH PTY.
+/// Drives `codex login --device-auth` in a PTY on a host (SSH, or local on
+/// This Mac/PC).
 ///
 /// Unlike Claude's flow (paste a code *back* into the CLI), Codex's device
 /// flow goes the other way: the CLI prints a verification URL plus a one-time
@@ -28,7 +27,7 @@ enum CodexLoginPhase {
 class CodexRemoteAuthSession {
   CodexRemoteAuthSession._({
     required this.host,
-    required SSHSession session,
+    required LoginShell session,
   })  : _session = session,
         phase = CodexLoginPhase.starting;
 
@@ -39,9 +38,8 @@ class CodexRemoteAuthSession {
   String? error;
   String _buffer = '';
 
-  final SSHSession _session;
-  StreamSubscription<List<int>>? _stdoutSub;
-  StreamSubscription<List<int>>? _stderrSub;
+  final LoginShell _session;
+  StreamSubscription<List<int>>? _outputSub;
   bool _closed = false;
 
   /// True once [close] ran (user cancelled or the flow finished).
@@ -177,7 +175,7 @@ class CodexRemoteAuthSession {
   void _write(String text) {
     if (_closed) return;
     try {
-      _session.stdin.add(utf8.encode(text));
+      _session.write(utf8.encode(text));
     } catch (e) {
       SafeLog.d('codex login stdin write failed', e);
     }
@@ -186,11 +184,10 @@ class CodexRemoteAuthSession {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
-    await _stdoutSub?.cancel();
-    await _stderrSub?.cancel();
+    await _outputSub?.cancel();
     try {
       // Ctrl-C the CLI so an abandoned login doesn't keep polling.
-      _session.stdin.add(Uint8List.fromList(const [3]));
+      _session.write(const [3]);
     } catch (_) {}
     try {
       _session.close();
@@ -201,18 +198,10 @@ class CodexRemoteAuthSession {
     required SshService ssh,
     required Host host,
   }) async {
-    final client = await ssh.connect(host);
-    final session = await client.shell(
-      pty: const SSHPtyConfig(
-        type: 'xterm-256color',
-        width: 120,
-        height: 40,
-      ),
-    );
+    final session = await LoginShell.open(ssh, host);
 
     final auth = CodexRemoteAuthSession._(host: host, session: session);
-    auth._stdoutSub = session.stdout.listen(auth._appendBytes);
-    auth._stderrSub = session.stderr.listen(auth._appendBytes);
+    auth._outputSub = session.output.listen(auth._appendBytes);
 
     auth._write('${CodexRemoteAuth.pathPrefix}\n');
     auth._write('codex login --device-auth\n');

@@ -1424,7 +1424,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               chatId: _chat!.id,
               sourcePath: path,
               fileName: f.name,
-              byteLength: f.size > 0 ? f.size : null,
             ),
           );
         } catch (e) {
@@ -3155,11 +3154,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     // be viewed or downloaded straight from the transcript.
     final mentionHost = _host;
     final mentionRoot = _repo?.remotePath;
-    if (mentionHost == null || mentionRoot == null) return shell;
+    final droppable = ImageDropRegion(
+      max: ChatImageCodec.maxImagesPerPrompt,
+      onImages: _attachPastedImages,
+      child: shell,
+    );
+    if (mentionHost == null || mentionRoot == null) return droppable;
     return FileMentionScope(
       host: mentionHost,
       rootPath: mentionRoot,
-      child: shell,
+      child: droppable,
     );
   }
 

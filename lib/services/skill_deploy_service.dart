@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
-import 'package:dartssh2/dartssh2.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/local/app_database.dart';
@@ -45,8 +43,7 @@ class SkillDeployService {
     await _db.upsertSkillHostLink(link);
 
     try {
-      final client = await _ssh.connect(host);
-      final homeOut = await _run(client, r'printf %s "$HOME"');
+      final homeOut = await _run(host, r'printf %s "$HOME"');
       final home = homeOut.trim().isEmpty ? '.' : homeOut.trim();
       final details = <String>[];
       final md = skill.toSkillMd();
@@ -60,10 +57,10 @@ class SkillDeployService {
       ]) {
         final dir = '$root/$slug';
         // Replace the whole skill tree so removed supporting files don't linger.
-        await _run(client, 'rm -rf ${SshService.shellQuote(dir)}');
-        await _run(client, 'mkdir -p ${SshService.shellQuote(dir)}');
+        await _run(host, 'rm -rf ${SshService.shellQuote(dir)}');
+        await _run(host, 'mkdir -p ${SshService.shellQuote(dir)}');
         await _writeBytes(
-          client,
+          host,
           path: '$dir/SKILL.md',
           bytes: utf8.encode(md),
         );
@@ -80,8 +77,8 @@ class SkillDeployService {
           final parent = remotePath.contains('/')
               ? remotePath.substring(0, remotePath.lastIndexOf('/'))
               : dir;
-          await _run(client, 'mkdir -p ${SshService.shellQuote(parent)}');
-          await _writeBytes(client, path: remotePath, bytes: file.bytes);
+          await _run(host, 'mkdir -p ${SshService.shellQuote(parent)}');
+          await _writeBytes(host, path: remotePath, bytes: file.bytes);
           details.add('Updated $remotePath');
         }
       }
@@ -123,8 +120,7 @@ class SkillDeployService {
     await _db.upsertSkillHostLink(link);
 
     try {
-      final client = await _ssh.connect(host);
-      final homeOut = await _run(client, r'printf %s "$HOME"');
+      final homeOut = await _run(host, r'printf %s "$HOME"');
       final home = homeOut.trim().isEmpty ? '.' : homeOut.trim();
       final details = <String>[];
       final slug = skill.name;
@@ -136,7 +132,7 @@ class SkillDeployService {
       ]) {
         final dir = '$root/$slug';
         await _run(
-          client,
+          host,
           'rm -rf ${SshService.shellQuote(dir)}',
         );
         details.add('Removed $dir');
@@ -183,9 +179,8 @@ class SkillDeployService {
   }
 
   Future<void> _syncRemoteSkillStateUnlocked(Host host) async {
-    final client = await _ssh.connect(host);
     final raw = await _run(
-      client,
+      host,
       r'''
 python3 - <<'PY'
 import json, pathlib, os, re
@@ -384,42 +379,22 @@ PY
   }
 
   Future<void> _writeBytes(
-    SSHClient client, {
+    Host host, {
     required String path,
     required List<int> bytes,
   }) async {
     final b64 = base64Encode(bytes);
     await _run(
-      client,
+      host,
       'printf %s ${SshService.shellQuote(b64)} | base64 -d > ${SshService.shellQuote(path)}',
       timeout: const Duration(seconds: 60),
     );
   }
 
   Future<String> _run(
-    SSHClient client,
+    Host host,
     String command, {
     Duration timeout = const Duration(seconds: 20),
-  }) async {
-    final session = await client.execute(command);
-    final chunks = await Future.wait<Uint8List>([
-      _readAll(session.stdout),
-      _readAll(session.stderr),
-    ]).timeout(timeout);
-    await session.done.timeout(const Duration(seconds: 5));
-    final code = session.exitCode ?? 0;
-    if (code != 0) {
-      final err = utf8.decode(chunks[1]).trim();
-      throw Exception(err.isEmpty ? 'Remote command failed (exit $code)' : err);
-    }
-    return utf8.decode(chunks[0]);
-  }
-
-  Future<Uint8List> _readAll(Stream<Uint8List> stream) async {
-    final builder = BytesBuilder(copy: false);
-    await for (final chunk in stream) {
-      builder.add(chunk);
-    }
-    return builder.takeBytes();
-  }
+  }) =>
+      _ssh.exec(host, command, timeout: timeout);
 }

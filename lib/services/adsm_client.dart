@@ -7,6 +7,7 @@ import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:uuid/uuid.dart';
 
 import '../data/models/agent_mode.dart';
 import '../data/models/agent_model.dart';
@@ -100,6 +101,14 @@ class AdsmBridgePool {
     } catch (_) {}
   }
 
+  /// [release], but only while [client] is still the host's bridge — a
+  /// borrower whose bridge already died must not drop a newer one.
+  Future<void> releaseClient(String hostId, AdsmClient client) async {
+    final entry = _entries[hostId];
+    if (entry == null || !identical(entry.client, client)) return;
+    await release(hostId);
+  }
+
   /// Drop one borrower. Closes the SSH bridge when the last chat releases.
   Future<void> release(String hostId) async {
     final entry = _entries[hostId];
@@ -120,6 +129,48 @@ class _AdsmBridgeEntry {
   int refs = 0;
 }
 
+/// `turnId:seq` for a streamed ADSM chunk, or null from hosts before 0.6.0.
+String? adsmStreamId(Map<String, dynamic> params) {
+  final turn = params['turnId']?.toString() ?? '';
+  final seq = params['seq'];
+  if (turn.isEmpty || seq == null) return null;
+  return '$turn:$seq';
+}
+
+/// Message id of the streamed segment that starts with chunk [streamId]
+/// (from [adsmStreamId]). Every device — and the host, which persists the
+/// same segments (`segment_message_id` in worker.py) — derives the same id,
+/// so a reply is one row everywhere instead of one per device.
+String? streamSegmentMessageId(String chatId, String? streamId) {
+  if (streamId == null || streamId.isEmpty) return null;
+  return const Uuid().v5(Namespace.url.value, 'agentdock:$chatId:$streamId');
+}
+
+/// The message in an ADSM `user_message` event (sent from any device).
+ChatMessage? adsmUserMessage(Map<String, dynamic> params) {
+  final id = params['messageId']?.toString() ?? '';
+  final chatId = params['chatId']?.toString() ?? '';
+  if (id.isEmpty || chatId.isEmpty) return null;
+  var text = params['text']?.toString() ?? '';
+  final images = params['imageCount'];
+  if (images is int && images > 0) {
+    // The pixels stay on the sending device; say they were there.
+    final note = images == 1 ? '🖼 Image' : '🖼 $images images';
+    text = text.trim().isEmpty ? note : '$note\n\n$text';
+  }
+  if (text.trim().isEmpty) return null;
+  final created =
+      DateTime.tryParse(params['createdAt']?.toString() ?? '')?.toLocal() ??
+      DateTime.now();
+  return ChatMessage(
+    id: id,
+    chatId: chatId,
+    role: MessageRole.user,
+    content: text,
+    createdAt: created,
+  );
+}
+
 /// NDJSON control client for the host ADSM daemon (`agentdock-adsm client`).
 class AdsmClient {
   AdsmClient._ssh(this._sshClient, this._session) : _process = null;
@@ -129,11 +180,11 @@ class AdsmClient {
   /// Client over raw byte streams, for exercising NDJSON ingestion in tests.
   @visibleForTesting
   AdsmClient.overStreams(Stream<List<int>> stdout, Stream<List<int>> stderr)
-      : _sshClient = null,
-        _session = null,
-        _process = null,
-        _testStdout = stdout,
-        _testStderr = stderr {
+    : _sshClient = null,
+      _session = null,
+      _process = null,
+      _testStdout = stdout,
+      _testStderr = stderr {
     _listen();
   }
 
@@ -150,6 +201,7 @@ class AdsmClient {
 
   final _pending = <Object, Completer<Map<String, dynamic>>>{};
   final _events = StreamController<Map<String, dynamic>>.broadcast();
+
   /// Complete NDJSON lines waiting to be handled, plus the partial tail of
   /// the last chunk. Splitting per chunk keeps ingestion O(n): the old
   /// StringBuffer scan re-copied the whole backlog for every line.
@@ -242,13 +294,22 @@ fi
       if (Platform.isMacOS) '/opt/homebrew/bin',
       '/usr/local/bin',
       Platform.environment['PATH'] ?? '',
-    ].where((s) => s.isNotEmpty).join(Platform.isWindows ? ';' : ':');
-    final process = await Process.start(
-      Platform.isWindows ? 'bash' : '/bin/bash',
-      ['-lc', _clientLaunch],
-      workingDirectory: home.isEmpty ? null : home,
-      environment: {...Platform.environment, 'PATH': path},
-    );
+    ].where((s) => s.isNotEmpty).join(':');
+    final (shell, args) = localShellInvocation(_clientLaunch);
+    final Process process;
+    try {
+      process = await Process.start(
+        shell,
+        args,
+        workingDirectory: home.isEmpty ? null : home,
+        // WSL (Windows) keeps its own PATH.
+        environment: Platform.isWindows
+            ? null
+            : {...Platform.environment, 'PATH': path},
+      );
+    } on ProcessException catch (e) {
+      throw StateError(localShellMissingHint(e));
+    }
     final adsm = AdsmClient._local(process);
     adsm._listen();
     final pong = await adsm
@@ -916,11 +977,7 @@ class AdsmSession implements AgentSession {
   }
 
   Future<({List<ChatMessage> messages, bool hasMore, int bytes})>
-  pullTranscriptPage({
-    int limit = 300,
-    int? maxBytes,
-    String? beforeId,
-  }) async {
+  pullTranscriptPage({int limit = 300, int? maxBytes, String? beforeId}) async {
     final params = <String, dynamic>{
       'chatId': chatId,
       'limit': limit,
@@ -1005,10 +1062,17 @@ class AdsmSession implements AgentSession {
     switch (kind) {
       case 'text':
         final t = params['text']?.toString() ?? '';
-        if (t.isNotEmpty) _updates.add(AcpUpdate.delta(t));
+        if (t.isNotEmpty) {
+          _updates.add(AcpUpdate.delta(t, streamId: adsmStreamId(params)));
+        }
       case 'thought':
         final t = params['text']?.toString() ?? '';
-        if (t.isNotEmpty) _updates.add(AcpUpdate.thought(t));
+        if (t.isNotEmpty) {
+          _updates.add(AcpUpdate.thought(t, streamId: adsmStreamId(params)));
+        }
+      case 'user_message':
+        final m = adsmUserMessage(params);
+        if (m != null) _updates.add(AcpUpdate.userMessage(m));
       case 'tool_start':
       case 'tool_update':
         final tool = _toolFrom(params['tool']);
