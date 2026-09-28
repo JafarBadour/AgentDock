@@ -26,6 +26,56 @@ bool isLocalThisComputerHost(Host host) {
   return loopback && host.port == 22;
 }
 
+/// Whether [path] is an absolute folder path of this OS's shape: a drive path
+/// (`C:/…`) on Windows, a POSIX path (`/…`) elsewhere.
+bool isLocalFolderPathForThisOs(String path, {bool? windows}) {
+  final isDrivePath = RegExp(r'^/?[A-Za-z]:([\\/]|$)').hasMatch(path.trim());
+  return (windows ?? Platform.isWindows)
+      ? isDrivePath
+      : !isDrivePath && path.trim().startsWith('/');
+}
+
+/// Shell used for local commands on This Mac/PC.
+///
+/// On Windows a bare `bash` resolves through System32 before PATH, which is
+/// WSL's launcher — a different filesystem that cannot see `C:\` as `C:\`.
+/// Prefer Git Bash, and fall back to `bash` only when it is not found.
+String localBashExecutable() {
+  if (!Platform.isWindows) return '/bin/bash';
+  final env = Platform.environment;
+  final candidates = [
+    for (final root in [
+      env['ProgramFiles'],
+      env['ProgramW6432'],
+      env['ProgramFiles(x86)'],
+      if (env['LOCALAPPDATA'] != null) p.join(env['LOCALAPPDATA']!, 'Programs'),
+    ])
+      if (root != null && root.isNotEmpty)
+        p.join(root, 'Git', 'bin', 'bash.exe'),
+    // `git.exe` on PATH lives in `<Git>\cmd`; bash is in the sibling `bin`.
+    for (final dir in (env['PATH'] ?? '').split(';'))
+      if (dir.trim().isNotEmpty &&
+          File(p.join(dir.trim(), 'git.exe')).existsSync())
+        p.join(p.dirname(dir.trim()), 'bin', 'bash.exe'),
+  ];
+  for (final candidate in candidates) {
+    if (File(candidate).existsSync()) return candidate;
+  }
+  return 'bash';
+}
+
+/// `PATH` for local commands: ~/.local/bin and common tool dirs first.
+String localShellPathEnv() {
+  final home =
+      Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
+  return [
+    if (home != null && home.isNotEmpty) p.join(home, '.local', 'bin'),
+    if (Platform.isMacOS) '/opt/homebrew/bin',
+    if (!Platform.isWindows) '/usr/local/bin',
+    Platform.environment['PATH'] ?? '',
+  ].where((s) => s.isNotEmpty).join(Platform.isWindows ? ';' : ':');
+}
+
 String localOsUsername() {
   if (Platform.isWindows) {
     return Platform.environment['USERNAME'] ??
@@ -68,12 +118,22 @@ Future<Host?> ensureLocalThisComputerHost(AppDatabase db) async {
   if (!isDesktopLocalHostPlatform) return null;
 
   final existing = await db.getHost(kLocalThisComputerHostId);
-  if (existing != null) return existing;
+  if (existing != null) {
+    // A `.ag` import from another OS used to carry that machine's row across
+    // (e.g. "This Mac · MacBook Pro" on a Windows PC). Re-label it here.
+    final foreignPrefix = Platform.isMacOS ? 'This PC' : 'This Mac';
+    if (!existing.alias.startsWith(foreignPrefix)) return existing;
+    final healed = existing.copyWith(
+      alias: await _localHostAlias(),
+      username: localOsUsername(),
+    );
+    await db.upsertHost(healed);
+    SafeLog.d('Re-labelled imported local host as ${healed.alias}');
+    return healed;
+  }
 
   final username = localOsUsername();
-  final computer = await localComputerDisplayName();
-  final alias =
-      Platform.isMacOS ? 'This Mac · $computer' : 'This PC · $computer';
+  final alias = await _localHostAlias();
 
   // Put this machine at the top of the list.
   final hosts = await db.listHosts();
@@ -96,6 +156,11 @@ Future<Host?> ensureLocalThisComputerHost(AppDatabase db) async {
   await db.upsertHost(host);
   SafeLog.d('Auto-added local host $alias ($username@127.0.0.1)');
   return host;
+}
+
+Future<String> _localHostAlias() async {
+  final computer = await localComputerDisplayName();
+  return Platform.isMacOS ? 'This Mac · $computer' : 'This PC · $computer';
 }
 
 /// Default identity files under `~/.ssh` (no passphrase prompt).

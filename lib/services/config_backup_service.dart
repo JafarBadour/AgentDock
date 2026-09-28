@@ -7,6 +7,7 @@ import '../data/models/mcp_server.dart';
 import '../data/models/repo.dart';
 import '../data/models/skill.dart';
 import '../data/secure/safe_log.dart';
+import 'local_host_bootstrap.dart';
 
 /// Portable config backup (`.ag` = JSON). Never includes SSH keys or API keys.
 class ConfigBackupService {
@@ -120,6 +121,9 @@ class ConfigBackupService {
         return aj.compareTo(bj);
       });
       for (final host in parsed) {
+        // "This Mac/PC" describes the exporting machine, not this one; the
+        // local row is created by [ensureLocalThisComputerHost].
+        if (host.id == kLocalThisComputerHostId) continue;
         await _db.upsertHost(host);
         hostsN++;
       }
@@ -130,6 +134,12 @@ class ConfigBackupService {
       for (final item in reposRaw) {
         if (item is! Map) continue;
         final repo = Repo.fromMap(Map<String, Object?>.from(item));
+        // A Mac's `/Users/…` folder cannot exist on a Windows PC (and a
+        // Windows `C:/…` folder cannot exist on a Mac).
+        if (repo.hostId == kLocalThisComputerHostId &&
+            !isLocalFolderPathForThisOs(repo.remotePath)) {
+          continue;
+        }
         await _db.upsertRepo(repo);
         reposN++;
       }

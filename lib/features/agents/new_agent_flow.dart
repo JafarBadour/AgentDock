@@ -10,6 +10,7 @@ import '../../data/models/agent_provider.dart';
 import 'agent_provider_ui.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
+import '../../data/models/remote_path.dart';
 import '../../data/models/repo.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/agent_runtime_host.dart';
@@ -156,9 +157,7 @@ Future<void> startNewAgentWizard({
   final path = await RemoteBrowserScreen.open(context, host: host);
   if (path == null || !context.mounted) return;
 
-  final folderName = path == '/'
-      ? 'root'
-      : path.split('/').where((s) => s.isNotEmpty).last;
+  final folderName = remoteBasename(path);
 
   try {
     final exists =

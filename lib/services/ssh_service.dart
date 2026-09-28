@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/host.dart';
+import '../data/models/remote_path.dart' as remote_path;
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'adsm_version.dart';
@@ -843,18 +844,16 @@ exit 0
   }) async {
     final home =
         Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
-    final pathPrefix = [
-      if (home != null && home.isNotEmpty) '$home/.local/bin',
-      if (Platform.isMacOS) '/opt/homebrew/bin',
-      '/usr/local/bin',
-      Platform.environment['PATH'] ?? '',
-    ].where((s) => s.isNotEmpty).join(':');
-    final env = <String, String>{...Platform.environment, 'PATH': pathPrefix};
+    final env = <String, String>{
+      ...Platform.environment,
+      'PATH': localShellPathEnv(),
+    };
+    final bash = localBashExecutable();
     late final ProcessResult result;
     try {
       if (input == null) {
         result = await Process.run(
-          Platform.isWindows ? 'bash' : '/bin/bash',
+          bash,
           ['-lc', command],
           workingDirectory: home != null && home.isNotEmpty ? home : null,
           environment: env,
@@ -864,7 +863,7 @@ exit 0
       } else {
         result = await () async {
           final proc = await Process.start(
-            Platform.isWindows ? 'bash' : '/bin/bash',
+            bash,
             ['-lc', command],
             workingDirectory: home != null && home.isNotEmpty ? home : null,
             environment: env,
@@ -2957,36 +2956,17 @@ exit 1
   }
 
   /// True if [path] is [root] or a child of [root].
-  static bool isUnderRoot(String root, String path) {
-    final r = normalizeRemotePath(root);
-    final p = normalizeRemotePath(path);
-    if (r == '/') return true;
-    return p == r || p.startsWith('$r/');
-  }
+  static bool isUnderRoot(String root, String path) =>
+      remote_path.isUnderRemoteRoot(root, path);
 
-  static String normalizeRemotePath(String path) {
-    var p = path.trim();
-    if (p.isEmpty) return '/';
-    if (!p.startsWith('/')) p = '/$p';
-    while (p.length > 1 && p.endsWith('/')) {
-      p = p.substring(0, p.length - 1);
-    }
-    return p;
-  }
+  static String normalizeRemotePath(String path) =>
+      remote_path.normalizeRemotePath(path);
 
-  static String joinRemotePath(String parent, String child) {
-    final base = normalizeRemotePath(parent);
-    if (base == '/') return '/$child';
-    return '$base/$child';
-  }
+  static String joinRemotePath(String parent, String child) =>
+      remote_path.joinRemotePath(parent, child);
 
-  static String? parentRemotePath(String path) {
-    final normalized = normalizeRemotePath(path);
-    if (normalized == '/') return null;
-    final index = normalized.lastIndexOf('/');
-    if (index <= 0) return '/';
-    return normalized.substring(0, index);
-  }
+  static String? parentRemotePath(String path) =>
+      remote_path.parentRemotePath(path);
 
   /// `command -v` with an extended PATH (non-login; avoids hanging .bashrc).
   // ignore: unused_element

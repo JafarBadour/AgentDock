@@ -237,17 +237,11 @@ fi
         Platform.environment['HOME'] ??
         Platform.environment['USERPROFILE'] ??
         '';
-    final path = [
-      if (home.isNotEmpty) '$home/.local/bin',
-      if (Platform.isMacOS) '/opt/homebrew/bin',
-      '/usr/local/bin',
-      Platform.environment['PATH'] ?? '',
-    ].where((s) => s.isNotEmpty).join(Platform.isWindows ? ';' : ':');
     final process = await Process.start(
-      Platform.isWindows ? 'bash' : '/bin/bash',
+      localBashExecutable(),
       ['-lc', _clientLaunch],
       workingDirectory: home.isEmpty ? null : home,
-      environment: {...Platform.environment, 'PATH': path},
+      environment: {...Platform.environment, 'PATH': localShellPathEnv()},
     );
     final adsm = AdsmClient._local(process);
     adsm._listen();

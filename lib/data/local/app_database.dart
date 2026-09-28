@@ -13,6 +13,7 @@ import '../models/code_change_stats.dart';
 import '../models/host.dart';
 import '../models/inline_images.dart';
 import '../models/mcp_server.dart';
+import '../models/remote_path.dart';
 import '../models/repo.dart';
 import '../models/scheduled_job.dart';
 import '../models/skill.dart';
@@ -787,9 +788,7 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     final path = _normalizePath(remotePath);
     final existing = await findRepoByHostAndPath(hostId, path);
     if (existing != null) return existing;
-    final base = path == '/'
-        ? 'root'
-        : path.split('/').where((s) => s.isNotEmpty).last;
+    final base = remoteBasename(path);
     final repo = Repo(
       id: const Uuid().v4(),
       hostId: hostId,
@@ -802,15 +801,7 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     return repo;
   }
 
-  static String _normalizePath(String path) {
-    var p = path.trim();
-    if (p.isEmpty) return '/';
-    if (!p.startsWith('/')) p = '/$p';
-    while (p.length > 1 && p.endsWith('/')) {
-      p = p.substring(0, p.length - 1);
-    }
-    return p;
-  }
+  static String _normalizePath(String path) => normalizeRemotePath(path);
 
   Future<void> upsertRepo(Repo repo) async {
     final db = await database;
