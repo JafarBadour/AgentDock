@@ -1,8 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:super_sliver_list/super_sliver_list.dart';
@@ -14,8 +14,10 @@ import '../../data/models/prompt_image.dart';
 import '../../data/models/scheduled_job.dart';
 import '../../data/models/tool_call_state.dart';
 import 'agent_status_indicators.dart';
+import 'chat_markdown.dart';
 import 'message_body.dart';
 import 'tool_call_card.dart';
+import 'transcript_blocks.dart';
 import 'transcript_snapshot.dart';
 
 typedef ToolDetailsResolver = Future<List<ToolCallState>> Function(
@@ -34,16 +36,6 @@ class TranscriptController {
   void jumpToLatest() => _state?._jumpToLatest();
 
   void dispose() => following.dispose();
-}
-
-/// Measure every row's real height in idle time (3 ms/frame budget) so the
-/// scrollbar and thumb-drag mapping are exact instead of re-estimated from
-/// the average of built rows — with markdown rows varying 10×, that estimate
-/// swung the total extent by ~10 % per scroll step.
-class _PrecalculateAll extends ExtentPrecalculationPolicy {
-  @override
-  bool shouldPrecalculateExtents(ExtentPrecalculationContext context) =>
-      context.numberOfItemsWithEstimatedExtent > 0;
 }
 
 /// The chat transcript: committed blocks plus the live tail.
@@ -106,10 +98,50 @@ class _TranscriptViewState extends State<TranscriptView> {
 
   bool get _following => widget.controller.following.value;
 
-  final _precalculate = _PrecalculateAll();
+  static const double _baseCacheExtent = 600;
+
+  /// Grows while idle so every row gets built and laid out ahead of the
+  /// user (rows are kept alive, so they stay laid out), then drops back.
+  /// Scrolling into history then only paints: on a 950-message chat, first
+  /// time text layout of rows entering the viewport was the last source of
+  /// 15-20 ms frames.
+  double _cacheExtent = _baseCacheExtent;
+  bool _warmStepPending = false;
+  Timer? _warmRetry;
+  DateTime _lastUserScroll = DateTime.fromMillisecondsSinceEpoch(0);
+  int _warmedRowCount = 0;
+
+  /// Step one screen-half of rows per idle frame; restart for new rows.
+  void _scheduleLayoutWarmup() {
+    if (_warmStepPending || !mounted) return;
+    _warmStepPending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _warmStepPending = false;
+      if (!mounted || !_scroll.hasClients) return;
+      final idleFor = DateTime.now().difference(_lastUserScroll);
+      const settle = Duration(milliseconds: 300);
+      if (idleFor < settle) {
+        // Never add layout work to a frame the user is scrolling through.
+        _warmRetry?.cancel();
+        _warmRetry = Timer(settle - idleFor, _scheduleLayoutWarmup);
+        return;
+      }
+      final pos = _scroll.position;
+      final covered = pos.pixels + pos.viewportDimension + _cacheExtent;
+      if (covered >= pos.maxScrollExtent + pos.viewportDimension) {
+        if (_cacheExtent != _baseCacheExtent) {
+          setState(() => _cacheExtent = _baseCacheExtent);
+        }
+        return;
+      }
+      setState(() => _cacheExtent += pos.viewportDimension * 0.5);
+      _scheduleLayoutWarmup();
+    });
+  }
 
   /// Rough height for a row that has not been laid out yet: header/meta
-  /// chrome plus wrapped lines. Only used until precalculation reaches it.
+  /// chrome plus wrapped lines. Only used until the idle warm-up (or the user)
+  /// reaches it.
   double _estimateExtent(TranscriptSnapshot snap, int index, double width) {
     final tail = snap.tailCount;
     String text;
@@ -135,6 +167,22 @@ class _TranscriptViewState extends State<TranscriptView> {
     super.initState();
     widget.controller._state = this;
     widget.snapshot.addListener(_onSnapshot);
+    _warmMarkdown(widget.snapshot.value);
+  }
+
+  /// Committed block list last handed to [warmChatMarkdown].
+  List<ChatBlock>? _warmedBlocks;
+
+  /// Parse every committed message on a background isolate, so rows only
+  /// pay for text layout when they scroll in.
+  void _warmMarkdown(TranscriptSnapshot snap) {
+    if (identical(_warmedBlocks, snap.blocks)) return;
+    _warmedBlocks = snap.blocks;
+    final texts = <String>[
+      for (final b in snap.blocks)
+        if (b.entry?.message case final m?) ChatBubble.bodyTextFor(m.role, m.content),
+    ];
+    unawaited(warmChatMarkdown(texts));
   }
 
   @override
@@ -153,6 +201,7 @@ class _TranscriptViewState extends State<TranscriptView> {
   @override
   void dispose() {
     widget.snapshot.removeListener(_onSnapshot);
+    _warmRetry?.cancel();
     if (widget.controller._state == this) widget.controller._state = null;
     _newWhileFrozen.dispose();
     _scroll.dispose();
@@ -161,6 +210,7 @@ class _TranscriptViewState extends State<TranscriptView> {
 
   void _onSnapshot() {
     if (!mounted) return;
+    _warmMarkdown(widget.snapshot.value);
     final frozen = _frozen;
     if (frozen == null) {
       setState(() {});
@@ -230,6 +280,10 @@ class _TranscriptViewState extends State<TranscriptView> {
 
   bool _onScroll(ScrollNotification n) {
     if (n.depth != 0) return false;
+    if (n is ScrollUpdateNotification && n.dragDetails != null ||
+        n is UserScrollNotification) {
+      _lastUserScroll = DateTime.now();
+    }
     if (n is! ScrollUpdateNotification &&
         n is! ScrollEndNotification &&
         n is! UserScrollNotification) {
@@ -297,9 +351,13 @@ class _TranscriptViewState extends State<TranscriptView> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final snap = _frozen ?? widget.snapshot.value;
     final index = _indexFor(snap);
+    final rows = _itemCount(snap);
+    if (rows > _warmedRowCount) {
+      _warmedRowCount = rows;
+      _scheduleLayoutWarmup();
+    }
     final desktop = useDesktopShell(context);
     final sidePad = desktop ? 40.0 : 16.0;
 
@@ -307,30 +365,28 @@ class _TranscriptViewState extends State<TranscriptView> {
       children: [
         NotificationListener<ScrollNotification>(
           onNotification: _onScroll,
-          child: GptMarkdownTheme(
-            gptThemeData: chatGptMarkdownTheme(theme),
-            child: SuperListView.custom(
+          child: SuperListView.custom(
               controller: _scroll,
               reverse: true,
               physics: const AlwaysScrollableScrollPhysics(),
               // Reversed: `bottom` is the edge nearest the composer.
               padding: EdgeInsets.fromLTRB(sidePad, 12, sidePad, 16),
-              cacheExtent: 600,
+              cacheExtent: _cacheExtent,
               // First frame builds only what is visible; the cache area (and
               // its markdown parsing) fills in on following frames.
               delayPopulatingCacheArea: true,
-              extentPrecalculationPolicy: _precalculate,
               extentEstimation: (index, crossAxisExtent) =>
                   _estimateExtent(snap, index ?? 0, crossAxisExtent),
               childrenDelegate: SliverChildBuilderDelegate(
                 (context, i) => _buildRow(context, snap, i),
                 childCount: _itemCount(snap),
                 findChildIndexCallback: (key) => index[key],
-                addAutomaticKeepAlives: false,
+                // Rows keep their built/laid-out subtree once seen (see
+                // [_KeepAliveRow]), so scrolling back never rebuilds them.
+                addAutomaticKeepAlives: true,
                 addRepaintBoundaries: false,
                 addSemanticIndexes: false,
               ),
-            ),
           ),
         ),
         ValueListenableBuilder<bool>(
@@ -371,7 +427,7 @@ class _TranscriptViewState extends State<TranscriptView> {
         onTap: widget.onLoadOlder,
       );
     }
-    return KeyedSubtree(key: key, child: RepaintBoundary(child: body));
+    return _KeepAliveRow(key: key, child: RepaintBoundary(child: body));
   }
 
   Widget _buildTailRow(TranscriptSnapshot snap, int chrono) {
@@ -683,6 +739,16 @@ class ChatBubble extends StatelessWidget {
   final bool queued;
   final DateTime? at;
 
+  /// Exactly the markdown this bubble renders for [text] — also what
+  /// [TranscriptView] pre-parses in the background.
+  static String bodyTextFor(MessageRole role, String text) {
+    if (role == MessageRole.system) return text;
+    final stripped = ChatImageCodec.displayText(text);
+    return role == MessageRole.user
+        ? AutoRunTag.displayBody(stripped)
+        : stripped;
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -691,7 +757,7 @@ class ChatBubble extends StatelessWidget {
         isUser ? ChatImageCodec.listRefs(text) : const <ChatImageRef>[];
     final stripped = ChatImageCodec.displayText(text);
     final autoNumber = isUser ? AutoRunTag.parseNumber(stripped) : null;
-    final bodyText = isUser ? AutoRunTag.displayBody(stripped) : stripped;
+    final bodyText = bodyTextFor(role, text);
 
     if (role == MessageRole.system) {
       return Padding(
@@ -1033,4 +1099,29 @@ class DateChip extends StatelessWidget {
     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
   ];
   static String _month(int m) => _months[m - 1];
+}
+
+/// Keeps a transcript row's element (parsed markdown, text layout, expanded
+/// tool groups) alive after it scrolls out. Profiling a 950-message chat on
+/// real data showed first-build markdown and text layout as the whole cost
+/// of scroll jank; kept-alive rows re-enter for the price of a paint.
+class _KeepAliveRow extends StatefulWidget {
+  const _KeepAliveRow({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<_KeepAliveRow> createState() => _KeepAliveRowState();
+}
+
+class _KeepAliveRowState extends State<_KeepAliveRow>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return widget.child;
+  }
 }

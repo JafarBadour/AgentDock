@@ -1,4 +1,3 @@
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
@@ -6,8 +5,8 @@ import 'package:markdown/markdown.dart' as md;
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import '../../app/app_theme.dart';
 import '../../services/file_kind.dart';
+import 'chat_markdown.dart';
 import 'file_mention.dart';
 
 /// A recognised link inside a chat message.
@@ -320,20 +319,6 @@ class _MessageBodyState extends State<MessageBody> {
   bool? _frozenDense;
   TextStyle? _frozenStyle;
 
-  /// Tap recognizers handed to file-mention spans. Spans cannot own their
-  /// lifetime, so the bubble does: they live as long as the tree that uses
-  /// them, and go when it does.
-  final List<TapGestureRecognizer> _mentionTaps = [];
-
-  @override
-  void dispose() {
-    for (final tap in _mentionTaps) {
-      tap.dispose();
-    }
-    _mentionTaps.clear();
-    super.dispose();
-  }
-
   /// Settled prefix of a live reply and the widget built from it.
   String _settledSource = '';
   Widget? _settledWidget;
@@ -450,100 +435,11 @@ class _MessageBodyState extends State<MessageBody> {
     TextStyle? base, {
     bool mentions = true,
   }) {
-    final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
-
-    // Prefer an ancestor [GptMarkdownTheme] (hoisted at the list) so we do not
-    // wrap every bubble in a new Theme — that forced gpt_markdown to re-parse
-    // on every ChatScreen setState.
-    return GptMarkdown(
-      text,
+    return ChatMarkdown(
+      text: text,
       style: base,
-      textAlign: TextAlign.start,
-      textDirection: TextDirection.ltr,
-      onLinkTap: (url, _) => openRichLink(url),
-      inlineCodeBuilder: !mentions
-          ? null
-          : (context, code, style, codeStyle) {
-              final onTap = _mentionTap(context, code);
-              if (onTap == null) {
-                return CodeTextSpan(
-                  text: code,
-                  codeStyle: codeStyle,
-                  style: style,
-                );
-              }
-              final tap = TapGestureRecognizer()..onTap = onTap;
-              _mentionTaps.add(tap);
-              return CodeTextSpan(
-                text: code,
-                codeStyle: codeStyle.copyWith(color: scheme.primary),
-                style: style.copyWith(color: scheme.primary),
-                recognizer: tap,
-                mouseCursor: SystemMouseCursors.click,
-                semanticsLabel: 'File $code',
-              );
-            },
-      onCodeCopy: (code) {
-        Clipboard.setData(ClipboardData(text: code));
-      },
-      linkBuilder: (context, span, url, _) {
-        final label = span is TextSpan ? span.toPlainText() : '';
-        // `[the plan](docs/plan.md)` — a link into the project, not the web.
-        if (mentions && !url.contains('://')) {
-          final onTap = _mentionTap(context, url);
-          if (onTap != null) {
-            return _FileMentionChip(
-              label: label.trim().isEmpty ? url : label.trim(),
-              dense: widget.dense,
-              onTap: onTap,
-            );
-          }
-        }
-        final link = classifyLink(
-          url,
-          label.trim().isEmpty ? null : label.trim(),
-        );
-        if (link.kind == RichLinkKind.generic) {
-          return Text.rich(span);
-        }
-        return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 2),
-          child: _LinkChip(link: link, dense: widget.dense),
-        );
-      },
-      styleSheet: GptMarkdownStyleSheet(
-        table: TableStyle(
-          borderColor: scheme.outlineVariant,
-          borderWidth: 0.5,
-          borderRadius: const Radius.circular(8),
-          headerBackground: scheme.surfaceContainerHigh,
-          headerTextStyle: theme.textTheme.labelLarge?.copyWith(
-            fontWeight: FontWeight.w600,
-          ),
-          rowStripeColor: scheme.onSurface.withValues(alpha: 0.04),
-          cellPadding: EdgeInsets.symmetric(
-            horizontal: widget.dense ? 8 : 10,
-            vertical: widget.dense ? 4 : 6,
-          ),
-        ),
-        codeBlock: CodeBlockStyle(
-          backgroundColor: AppColors.chatInlineCodeBg,
-          borderColor: scheme.outlineVariant.withValues(alpha: 0.35),
-          borderWidth: 0.5,
-          borderRadius: const Radius.circular(8),
-          padding: EdgeInsets.all(widget.dense ? 10 : 12),
-          fontSize: widget.dense ? 12 : 13,
-        ),
-        heading: const HeadingStyle(
-          showDivider: false,
-          padding: EdgeInsets.only(top: 4, bottom: 2),
-        ),
-        blockQuote: BlockQuoteStyle(
-          barColor: scheme.primary.withValues(alpha: 0.45),
-          barWidth: 3,
-        ),
-      ),
+      dense: widget.dense,
+      mentionTap: mentions ? (raw) => _mentionTap(context, raw) : null,
     );
   }
 }
@@ -586,8 +482,9 @@ GptMarkdownThemeData _buildChatGptMarkdownTheme(ThemeData theme) {
 }
 
 /// A markdown link whose target is a file in the project, not a URL.
-class _FileMentionChip extends StatelessWidget {
-  const _FileMentionChip({
+class FileMentionChip extends StatelessWidget {
+  const FileMentionChip({
+    super.key,
     required this.label,
     required this.onTap,
     this.dense = false,
@@ -642,8 +539,8 @@ class _FileMentionChip extends StatelessWidget {
   }
 }
 
-class _LinkChip extends StatelessWidget {
-  const _LinkChip({required this.link, this.dense = false});
+class LinkChip extends StatelessWidget {
+  const LinkChip({super.key, required this.link, this.dense = false});
 
   final RichLink link;
   final bool dense;
