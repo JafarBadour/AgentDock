@@ -401,6 +401,8 @@ class Daemon:
                 result = await self._transcript_sync(params)
             elif method == "chats.notify":
                 result = await self._chats_notify(params)
+            elif method == "chats.fork":
+                result = await self._chats_fork(params)
             else:
                 writer.write(
                     protocol.encode(
@@ -525,6 +527,60 @@ class Daemon:
         change = str(params.get("change") or "updated")
         await self._broadcast_chat_changed(chat_id, change)
         return {"ok": True}
+
+    async def _chats_fork(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Start a new chat carrying another one's conversation.
+
+        The fork gets its own copy of the durable transcript but deliberately
+        no ACP session id: it opens a fresh session and rebuilds context from
+        that transcript on its first prompt (see Worker's history bootstrap).
+        Forking therefore costs nothing until the fork is actually used, and
+        the source chat keeps running untouched.
+        """
+        src = str(params.get("fromChatId") or "")
+        dst = str(params.get("chatId") or "")
+        if not src or not dst:
+            raise ValueError("fromChatId and chatId required")
+        if src == dst:
+            raise ValueError("cannot fork a chat onto itself")
+        if paths.agent_record_path(dst).exists():
+            raise ValueError(f"chat already exists: {dst}")
+
+        rows = await asyncio.to_thread(
+            transcript_store.fork_messages,
+            src,
+            dst,
+            through_id=str(params.get("throughMessageId") or "") or None,
+        )
+
+        # Land the fork in the same repo, on the same agent and model.
+        source: dict[str, Any] = {}
+        src_path = paths.agent_record_path(src)
+        if src_path.exists():
+            try:
+                source = json.loads(src_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                source = {}
+        await self._patch_agent_record(
+            dst,
+            status=protocol.STATUS_IDLE,
+            cwd=source.get("cwd"),
+            binary=source.get("binary"),
+            provider=source.get("provider"),
+            model_id=source.get("model_id"),
+        )
+
+        # Tells the worker to introduce the replayed history as a fork rather
+        # than as a dropped session. Consumed once, on the first prompt.
+        session_dir = paths.session_dir(dst)
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (session_dir / "forked_from").write_text(src, encoding="utf-8")
+        except OSError:
+            pass
+
+        await self._broadcast_chat_changed(dst, "created")
+        return {"chatId": dst, "fromChatId": src, "messages": len(rows)}
 
     async def _stop(
         self, params: dict[str, Any], *, delete: bool

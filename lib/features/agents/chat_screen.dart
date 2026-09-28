@@ -28,8 +28,10 @@ import '../../services/chat_session_runtime.dart';
 import '../../services/cursor_acp_service.dart';
 import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
+import 'agent_activity_strip.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
+import 'composer_model_footer.dart';
 import 'file_mention.dart';
 import 'image_paste.dart';
 import '../connect/claude_login_sheet.dart';
@@ -64,6 +66,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Host? _host;
   bool _loading = true;
   bool _sending = false;
+  bool _forking = false;
 
   /// SSH/ADSM bring-up — ValueNotifiers so progress never setStates the
   /// whole transcript (that was freezing scroll/typing on the UI isolate).
@@ -1399,6 +1402,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }());
   }
 
+  /// Branch this conversation into a second agent and open it. The agent here
+  /// keeps running — the fork inherits the history and goes its own way.
+  Future<void> _forkChat() async {
+    final chat = _chat;
+    final repo = _repo;
+    final host = _host;
+    if (chat == null || repo == null || host == null || _forking) return;
+
+    setState(() => _forking = true);
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final fork = await ref
+          .read(chatForkServiceProvider)
+          .fork(host: host, repo: repo, source: chat);
+      // Rebuilds the agents list wherever it is mounted.
+      ref.read(agentsCatalogEpochProvider.notifier).state++;
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text('Forked into "${fork.title}"')),
+      );
+      if (useDesktopShell(context)) {
+        context.go('/agents/chat/${fork.id}');
+      } else {
+        await context.push('/agents/chat/${fork.id}');
+      }
+    } catch (e) {
+      SafeLog.d('fork chat failed', e);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('Could not fork — $e')));
+    } finally {
+      if (mounted) setState(() => _forking = false);
+    }
+  }
+
   Future<void> _pickImages() async {
     if (_chat == null || _pickingImages) return;
     final room = ChatImageCodec.maxImagesPerPrompt - _pendingImages.length;
@@ -2710,6 +2747,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   },
                   icon: const Icon(Icons.terminal),
                 ),
+              if (_repo != null && _host != null && _chat != null)
+                IconButton(
+                  tooltip: 'Fork agent — new agent, same context',
+                  onPressed: _forking ? null : () => unawaited(_forkChat()),
+                  icon: _forking
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.call_split),
+                ),
               ListenableBuilder(
                 listenable: Listenable.merge([_connectingN, _connectStatusN]),
                 builder: (context, _) {
@@ -3104,20 +3153,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       if (rt == null || !rt.isWorking) {
                         return const SizedBox.shrink();
                       }
-                      return Material(
-                        color: theme.colorScheme.errorContainer.withValues(
-                          alpha: 0.35,
-                        ),
-                        child: SizedBox(
-                          height: 32,
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 14),
-                            child: Align(
-                              alignment: Alignment.centerLeft,
-                              child: _buildStreamingActivityLabel(theme, rt),
-                            ),
-                          ),
-                        ),
+                      return AgentActivityStrip(
+                        label: _buildStreamingActivityLabel(theme, rt),
                       );
                     },
                   ),
@@ -3311,36 +3348,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       Row(
                         crossAxisAlignment: CrossAxisAlignment.center,
                         children: [
-                          Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                tooltip: 'Attach image',
-                                visualDensity: VisualDensity.compact,
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(
-                                  minWidth: 40,
-                                  minHeight: 36,
-                                ),
-                                onPressed:
-                                    _pickingImages ||
-                                        !_chat!.provider.isAvailable
-                                    ? null
-                                    : () => unawaited(_pickImages()),
-                                icon: _pickingImages
-                                    ? const SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                        ),
-                                      )
-                                    : const Icon(
-                                        Icons.add_photo_alternate_outlined,
-                                      ),
-                              ),
-                              _buildComposerModelHint(theme),
-                            ],
+                          IconButton(
+                            tooltip: 'Attach image',
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(
+                              minWidth: 40,
+                              minHeight: 36,
+                            ),
+                            onPressed:
+                                _pickingImages || !_chat!.provider.isAvailable
+                                ? null
+                                : () => unawaited(_pickImages()),
+                            icon: _pickingImages
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(
+                                    Icons.add_photo_alternate_outlined,
+                                  ),
                           ),
                           Expanded(
                             child: Column(
@@ -3358,6 +3388,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           ),
                         ],
                       ),
+                      _buildComposerModelHint(theme),
                     ],
                   ),
                 ),
@@ -3369,7 +3400,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  /// Model chip under the attach button, beside the composer.
+  /// Model + context footer under the composer.
+  ///
+  /// Full width and strictly one line: model names arrive from the agent's own
+  /// catalog and run long ("Default (recommended)"), so a narrow two-line box
+  /// used to break them mid-word and clip the second line. The model name
+  /// gives up space first; the context reading stays whole.
   Widget _buildComposerModelHint(ThemeData theme) {
     final model = _selectedModel;
     final label =
@@ -3384,32 +3420,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _runtime?.usageTokensUsed,
       _runtime?.usageContextSize,
     );
-    final line = usage == null ? label : '$label\n$usage';
-    return Tooltip(
-      message: usage == null
-          ? 'Model: $label'
-          : 'Model: $label\nContext: $usage',
-      child: InkWell(
-        borderRadius: BorderRadius.circular(6),
-        onTap: _pickModel,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 72),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(2, 0, 2, 4),
-            child: Text(
-              line,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: theme.textTheme.labelSmall?.copyWith(
-                color: theme.colorScheme.primary.withValues(alpha: 0.9),
-                fontWeight: FontWeight.w500,
-                height: 1.15,
-              ),
-            ),
-          ),
-        ),
-      ),
+    return ComposerModelFooter(
+      label: label,
+      usage: usage,
+      onTap: _pickModel,
     );
   }
 }

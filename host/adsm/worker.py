@@ -1601,15 +1601,41 @@ class Worker:
             label = "User" if row["role"] == "user" else "Assistant"
             lines.append(f"{label}:\n{row['content']}")
         body = "\n\n".join(lines)
+        if self._take_fork_marker():
+            preamble = (
+                "[Agent Dock] This agent was forked from another chat and "
+                "starts with that chat's history below, so you keep full "
+                "context. You are now a separate agent: the original is still "
+                "running on its own, so treat the work below as done and do "
+                "not redo or re-explore it unless the user asks."
+            )
+        else:
+            preamble = (
+                "[Agent Dock] The previous ACP session ended (stop/cancel or "
+                "restart). Here is the recent chat history from this agent so "
+                "you keep full context. Do not re-explore work already covered "
+                "below unless the user asks."
+            )
         return (
-            "[Agent Dock] The previous ACP session ended (stop/cancel or "
-            "restart). Here is the recent chat history from this agent so you "
-            "keep full context. Do not re-explore work already covered below "
-            "unless the user asks.\n\n"
+            f"{preamble}\n\n"
             f"{body}\n\n"
             "---\n"
             "Continue from this history. The user's latest message follows."
         )
+
+    def _take_fork_marker(self) -> bool:
+        """True once, for a chat the daemon created via `chats.fork`."""
+        marker = self.dir / "forked_from"
+        try:
+            if not marker.read_text(encoding="utf-8").strip():
+                return False
+        except OSError:
+            return False
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return True
 
     async def _ensure_acp_session(self) -> None:
         """Mint a session when cancel/crash left us without a usable id."""
