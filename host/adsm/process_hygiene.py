@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -118,6 +119,10 @@ def list_claude_sdk_pids(acp_pid: int) -> list[tuple[int, float]]:
 
 def reap_extra_claude_children(acp_pid: int) -> int:
     """Keep the newest Claude SDK child; SIGTERM the rest. Returns killed count."""
+    # POSIX only: on Windows `os.kill(pid, 0)` terminates instead of probing,
+    # and there is no /proc to find the children with.
+    if sys.platform == "win32":
+        return 0
     rows = list_claude_sdk_pids(acp_pid)
     if len(rows) <= 1:
         return 0

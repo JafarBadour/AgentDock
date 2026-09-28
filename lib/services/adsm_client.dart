@@ -23,6 +23,7 @@ import 'cursor_acp_service.dart';
 import 'local_host_bootstrap.dart';
 import 'ssh_service.dart';
 import 'transcript_budget.dart';
+import 'windows_local_agent.dart';
 
 export 'adsm_version.dart';
 
@@ -237,6 +238,16 @@ fi
         Platform.environment['HOME'] ??
         Platform.environment['USERPROFILE'] ??
         '';
+    if (Platform.isWindows) {
+      // No bash wrapper on Windows: run the bridge with Python directly.
+      final adsm = AdsmClient._local(await WindowsLocalAgent.startClient());
+      adsm._listen();
+      final pong = await adsm
+          .request('ping', {})
+          .timeout(const Duration(seconds: 15));
+      adsm.protocolVersion = pong['version']?.toString();
+      return adsm;
+    }
     final process = await Process.start(
       localBashExecutable(),
       ['-lc', _clientLaunch],
