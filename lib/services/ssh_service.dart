@@ -1605,9 +1605,11 @@ test -x "$HOME/.local/bin/codex-acp"
     onProgress?.call('Looking for $label…');
     var path = await WindowsLocalAgent.findNpmAgent(shimNames);
     if (path == null) {
-      onProgress?.call('Installing $label (npm)…');
       try {
-        await WindowsLocalAgent.npmInstallGlobal(package);
+        await WindowsLocalAgent.npmInstallGlobal(
+          package,
+          onProgress: onProgress,
+        );
       } on StateError catch (e) {
         throw MissingToolException(label, e.message);
       }

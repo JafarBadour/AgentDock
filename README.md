@@ -39,6 +39,12 @@ curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/
 curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash
 ```
 
+Agents on **This PC** (Windows) run natively; to preinstall what they need, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/windows-setup.ps1 | iex
+```
+
 Details: [`scripts/README.md`](scripts/README.md).
 
 ## Security
@@ -69,6 +75,6 @@ Use JDK 17+ for Android Gradle if your machine requires it.
 ```
 lib/          Flutter app
 host/adsm/    Python ADSM daemon (installed on host by install-adsm.sh)
-scripts/      Remote installers (cursor-acp, claude-acp, codex-acp, install-adsm)
+scripts/      Remote installers (cursor-acp, claude-acp, codex-acp, install-adsm) + windows-setup.ps1
 test/         Dart tests
 ```

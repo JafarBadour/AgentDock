@@ -36,14 +36,36 @@ class WindowsLocalAgent {
     };
   }
 
-  /// Command (and leading args) of a Python ≥ 3.9 on PATH.
+  /// Command (and leading args) of a Python ≥ 3.9, installing it with winget
+  /// when there is none.
   static Future<List<String>> python() async {
     final cached = _python;
     if (cached != null) return cached;
-    const candidates = [
+    final found = await _findPython();
+    if (found != null) return _python = found;
+    await _wingetInstall('Python.Python.3.12', 'Python');
+    final installed = await _findPython();
+    if (installed != null) return _python = installed;
+    throw StateError(
+      'Python 3.9+ was not found on This PC. Install it from python.org '
+      '(or `winget install Python.Python.3.12`), then reconnect.',
+    );
+  }
+
+  static Future<List<String>?> _findPython() async {
+    final local = Platform.environment['LOCALAPPDATA'];
+    final programFiles = Platform.environment['ProgramFiles'];
+    final candidates = [
       ['python'],
       ['py', '-3'],
       ['python3'],
+      // Fresh winget installs are not on this process's PATH yet.
+      for (final v in ['313', '312', '311', '310'])
+        if (local != null)
+          [p.join(local, 'Programs', 'Python', 'Python$v', 'python.exe')],
+      for (final v in ['313', '312', '311', '310'])
+        if (programFiles != null)
+          [p.join(programFiles, 'Python$v', 'python.exe')],
     ];
     for (final c in candidates) {
       try {
@@ -53,16 +75,53 @@ class WindowsLocalAgent {
           'import sys; print(sys.version_info >= (3, 9))',
         ]).timeout(const Duration(seconds: 15));
         if (r.exitCode == 0 && (r.stdout as String).trim() == 'True') {
-          return _python = c;
+          return c;
         }
       } catch (_) {
         // Not on PATH (or the Microsoft Store stub) — try the next one.
       }
     }
-    throw StateError(
-      'Python 3.9+ was not found on This PC. Install it from python.org '
-      '(or `winget install Python.Python.3.12`), then reconnect.',
-    );
+    return null;
+  }
+
+  /// `winget install <id>` (may show an administrator prompt).
+  static Future<void> _wingetInstall(String id, String label) async {
+    ProcessResult r;
+    try {
+      r = await Process.run('winget', [
+        'install',
+        '--id',
+        id,
+        '-e',
+        '--silent',
+        '--accept-source-agreements',
+        '--accept-package-agreements',
+      ]).timeout(const Duration(minutes: 15));
+    } catch (e) {
+      SafeLog.d('winget install $id failed', e);
+      return;
+    }
+    // -1978335189 (0x8A15002B): already installed / nothing to upgrade.
+    if (r.exitCode != 0 && r.exitCode != -1978335189) {
+      SafeLog.d('winget install $id exit ${r.exitCode}: ${r.stdout}');
+    }
+  }
+
+  /// `npm.cmd`, from PATH or Node's default install dir.
+  static Future<String?> _findNpm() async {
+    try {
+      final r = await Process.run('where', ['npm.cmd']);
+      if (r.exitCode == 0) {
+        final first = (r.stdout as String).split('\n').first.trim();
+        if (first.isNotEmpty) return first;
+      }
+    } catch (_) {}
+    final programFiles = Platform.environment['ProgramFiles'];
+    if (programFiles != null) {
+      final npm = File(p.join(programFiles, 'nodejs', 'npm.cmd'));
+      if (await npm.exists()) return npm.path;
+    }
+    return null;
   }
 
   /// Run `python -m adsm <args>`.
@@ -161,25 +220,39 @@ class WindowsLocalAgent {
     return null;
   }
 
-  /// `npm install -g <package>`. Throws with guidance when Node is missing.
-  static Future<void> npmInstallGlobal(String package) async {
-    ProcessResult r;
+  /// `npm install -g <package>`, installing Node.js with winget first when
+  /// it is missing. Throws with guidance when that is not possible.
+  static Future<void> npmInstallGlobal(
+    String package, {
+    void Function(String status)? onProgress,
+  }) async {
+    var npm = await _findNpm();
+    if (npm == null) {
+      onProgress?.call('Installing Node.js (winget)…');
+      await _wingetInstall('OpenJS.NodeJS.LTS', 'Node.js');
+      npm = await _findNpm();
+    }
+    if (npm == null) throw StateError(_nodeHint(package));
+    onProgress?.call('Installing $package (npm)…');
+    final ProcessResult r;
     try {
-      // npm is `npm.cmd`; runInShell lets Windows resolve it.
-      r = await Process.run('npm', [
-        'install',
-        '-g',
-        package,
-      ], runInShell: true).timeout(const Duration(minutes: 8));
+      // `.cmd` files run through cmd.exe.
+      r = await Process.run(
+        npm,
+        ['install', '-g', package],
+        runInShell: true,
+        environment: {
+          // npm.cmd needs node.exe, which may not be on PATH yet.
+          'PATH': '${p.dirname(npm)};${Platform.environment['PATH'] ?? ''}',
+        },
+      ).timeout(const Duration(minutes: 8));
     } catch (e) {
-      throw StateError(_nodeHint(package));
+      throw StateError('npm install -g $package failed: $e');
     }
     if (r.exitCode != 0) {
-      final err = '${r.stderr}'.trim();
-      if (err.contains('is not recognized')) {
-        throw StateError(_nodeHint(package));
-      }
-      throw StateError('npm install -g $package failed: $err');
+      throw StateError(
+        'npm install -g $package failed: ${'${r.stderr}'.trim()}',
+      );
     }
   }
 
