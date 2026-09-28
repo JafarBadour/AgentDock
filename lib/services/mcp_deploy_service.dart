@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
-import 'package:dartssh2/dartssh2.dart';
 import 'package:uuid/uuid.dart';
 
 import '../data/local/app_database.dart';
@@ -45,17 +43,16 @@ class McpDeployService {
     await _db.upsertMcpHostLink(link);
 
     try {
-      final client = await _ssh.connect(host);
-      final homeOut = await _run(client, r'printf %s "$HOME"');
+      final homeOut = await _run(host, r'printf %s "$HOME"');
       final home = homeOut.trim().isEmpty ? '.' : homeOut.trim();
       final details = <String>[];
 
       // Always write all three — HPC non-interactive shells often hide `claude`
       // / `codex` from PATH, so "detect then skip" left only Cursor updated.
       final cursorPath = '$home/.cursor/mcp.json';
-      await _run(client, 'mkdir -p ${SshService.shellQuote('$home/.cursor')}');
+      await _run(host, 'mkdir -p ${SshService.shellQuote('$home/.cursor')}');
       await _upsertMcpEntry(
-        client,
+        host,
         path: cursorPath,
         name: mcp.name,
         entry: mcp.toMcpJsonEntry(),
@@ -65,7 +62,7 @@ class McpDeployService {
 
       try {
         final enableOut = await _run(
-          client,
+          host,
           'export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:\$PATH"; '
           '(command -v agent >/dev/null && agent mcp enable ${SshService.shellQuote(mcp.name)}) || '
           '(command -v cursor-agent >/dev/null && cursor-agent mcp enable ${SshService.shellQuote(mcp.name)}) || '
@@ -81,7 +78,7 @@ class McpDeployService {
 
       final claudePath = '$home/.claude.json';
       await _upsertMcpEntry(
-        client,
+        host,
         path: claudePath,
         name: mcp.name,
         entry: mcp.toClaudeMcpJsonEntry(),
@@ -89,7 +86,7 @@ class McpDeployService {
       );
       details.add('Updated $claudePath');
 
-      final codexPath = await _upsertCodexMcp(client, mcp: mcp, home: home);
+      final codexPath = await _upsertCodexMcp(host, mcp: mcp, home: home);
       details.add('Updated $codexPath');
 
       link = link.copyWith(
@@ -128,14 +125,13 @@ class McpDeployService {
     await _db.upsertMcpHostLink(link);
 
     try {
-      final client = await _ssh.connect(host);
-      final homeOut = await _run(client, r'printf %s "$HOME"');
+      final homeOut = await _run(host, r'printf %s "$HOME"');
       final home = homeOut.trim().isEmpty ? '.' : homeOut.trim();
       final details = <String>[];
 
       final cursorPath = '$home/.cursor/mcp.json';
       final cursorRemoved = await _removeMcpEntry(
-        client,
+        host,
         path: cursorPath,
         name: mcp.name,
       );
@@ -143,7 +139,7 @@ class McpDeployService {
 
       try {
         await _run(
-          client,
+          host,
           'export PATH="\$HOME/.local/bin:\$HOME/.cursor/bin:\$PATH"; '
           '(command -v agent >/dev/null && agent mcp disable ${SshService.shellQuote(mcp.name)}) || true',
           timeout: const Duration(seconds: 30),
@@ -152,13 +148,13 @@ class McpDeployService {
 
       final claudePath = '$home/.claude.json';
       final claudeRemoved = await _removeMcpEntry(
-        client,
+        host,
         path: claudePath,
         name: mcp.name,
       );
       if (claudeRemoved) details.add('Removed from $claudePath');
 
-      final codexPath = await _removeCodexMcp(client, mcp: mcp, home: home);
+      final codexPath = await _removeCodexMcp(host, mcp: mcp, home: home);
       if (codexPath != null) details.add('Removed from $codexPath');
 
       link = link.copyWith(
@@ -184,16 +180,16 @@ class McpDeployService {
 
   /// Merge [mcp] into `~/.codex/config.toml` (TOML), preserving other keys.
   Future<String> _upsertCodexMcp(
-    SSHClient client, {
+    Host host, {
     required McpServer mcp,
     required String home,
   }) async {
     final path = '$home/.codex/config.toml';
-    await _run(client, 'mkdir -p ${SshService.shellQuote('$home/.codex')}');
+    await _run(host, 'mkdir -p ${SshService.shellQuote('$home/.codex')}');
     final fragment = mcp.toCodexTomlFragment();
     final payload = jsonEncode({'name': mcp.name, 'fragment': fragment});
     final b64 = base64Encode(utf8.encode(payload));
-    await _run(client, '''
+    await _run(host, '''
 python3 - <<'PY'
 import base64, json, pathlib, re, sys
 raw = base64.b64decode(${SshService.shellQuote(b64)}).decode("utf-8")
@@ -219,13 +215,13 @@ PY
   }
 
   Future<String?> _removeCodexMcp(
-    SSHClient client, {
+    Host host, {
     required McpServer mcp,
     required String home,
   }) async {
     final path = '$home/.codex/config.toml';
     try {
-      final out = await _run(client, '''
+      final out = await _run(host, '''
 python3 - <<'PY'
 import pathlib, re, sys
 name = ${jsonEncode(mcp.name)}
@@ -252,7 +248,7 @@ PY
   }
 
   Future<void> _upsertMcpEntry(
-    SSHClient client, {
+    Host host, {
     required String path,
     required String name,
     required Map<String, dynamic> entry,
@@ -262,7 +258,7 @@ PY
     var hadFile = false;
     try {
       final existing = await _run(
-        client,
+        host,
         'test -f ${SshService.shellQuote(path)} && cat ${SshService.shellQuote(path)} || true',
       );
       final trimmed = existing.trim();
@@ -298,19 +294,19 @@ PY
     final payload = const JsonEncoder.withIndent('  ').convert(root);
     final b64 = base64Encode(utf8.encode(payload));
     await _run(
-      client,
+      host,
       'printf %s ${SshService.shellQuote(b64)} | base64 -d > ${SshService.shellQuote(path)}',
     );
   }
 
   Future<bool> _removeMcpEntry(
-    SSHClient client, {
+    Host host, {
     required String path,
     required String name,
   }) async {
     try {
       final existing = await _run(
-        client,
+        host,
         'test -f ${SshService.shellQuote(path)} && cat ${SshService.shellQuote(path)} || true',
       );
       final trimmed = existing.trim();
@@ -335,7 +331,7 @@ PY
       final payload = const JsonEncoder.withIndent('  ').convert(root);
       final b64 = base64Encode(utf8.encode(payload));
       await _run(
-        client,
+        host,
         'printf %s ${SshService.shellQuote(b64)} | base64 -d > ${SshService.shellQuote(path)}',
       );
       return true;
@@ -374,9 +370,7 @@ PY
     try {
       await _db.ensureMcpServersDeduped();
     } catch (_) {}
-
-    final client = await _ssh.connect(host);
-    final raw = await _run(client, r'''
+    final raw = await _run(host, r'''
 python3 - <<'PY'
 import json, pathlib, re, os
 home = pathlib.Path(os.path.expanduser("~"))
@@ -606,29 +600,8 @@ PY
   }
 
   Future<String> _run(
-    SSHClient client,
+    Host host,
     String command, {
     Duration timeout = const Duration(seconds: 20),
-  }) async {
-    final session = await client.execute(command);
-    final chunks = await Future.wait<Uint8List>([
-      _readAll(session.stdout),
-      _readAll(session.stderr),
-    ]).timeout(timeout);
-    await session.done.timeout(const Duration(seconds: 5));
-    final code = session.exitCode ?? 0;
-    if (code != 0) {
-      final err = utf8.decode(chunks[1]).trim();
-      throw Exception(err.isEmpty ? 'Remote command failed (exit $code)' : err);
-    }
-    return utf8.decode(chunks[0]);
-  }
-
-  Future<Uint8List> _readAll(Stream<Uint8List> stream) async {
-    final builder = BytesBuilder(copy: false);
-    await for (final chunk in stream) {
-      builder.add(chunk);
-    }
-    return builder.takeBytes();
-  }
+  }) => _ssh.exec(host, command, timeout: timeout);
 }

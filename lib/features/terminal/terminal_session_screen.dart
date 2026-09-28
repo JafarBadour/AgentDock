@@ -163,10 +163,14 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
     final cwd = widget.initialDirectory?.trim();
     final workingDirectory = (cwd != null && cwd.isNotEmpty) ? cwd : null;
 
+    // Windows: the terminal opens in WSL, where This PC's agents and paths
+    // live (see localShellInvocation).
     final pty = Pty.start(
       shell,
-      arguments: Platform.isWindows ? const <String>[] : const ['-l'],
-      workingDirectory: workingDirectory,
+      arguments: Platform.isWindows
+          ? ['--cd', workingDirectory ?? '~']
+          : const ['-l'],
+      workingDirectory: Platform.isWindows ? null : workingDirectory,
       environment: {
         ...Platform.environment,
         'TERM': 'xterm-256color',
@@ -313,9 +317,7 @@ class _TerminalSessionScreenState extends ConsumerState<TerminalSessionScreen> {
   }
 
   static String _localShellExecutable() {
-    if (Platform.isWindows) {
-      return Platform.environment['COMSPEC'] ?? 'powershell.exe';
-    }
+    if (Platform.isWindows) return 'wsl.exe';
     final shell = Platform.environment['SHELL']?.trim();
     if (shell != null && shell.isNotEmpty) return shell;
     return '/bin/zsh';

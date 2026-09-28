@@ -8,6 +8,7 @@ import 'package:dartssh2/dartssh2.dart';
 import '../data/models/agent_mode.dart';
 import '../data/models/agent_model.dart';
 import '../data/models/agent_provider.dart';
+import '../data/models/chat_message.dart';
 import '../data/models/host.dart';
 import '../data/models/prompt_image.dart';
 import '../data/models/tool_call_state.dart';
@@ -1463,10 +1464,21 @@ class AcpUpdate {
     this.permissionRequest,
     this.tokensUsed,
     this.contextSize,
+    this.streamId,
+    this.message,
   });
 
-  const AcpUpdate.delta(String text) : this._(AcpUpdateKind.delta, text);
-  const AcpUpdate.thought(String text) : this._(AcpUpdateKind.thought, text);
+  /// [streamId]: host-assigned identity of this chunk (ADSM turn id + event
+  /// seq). Every device sees the same value, so a segment that starts with
+  /// this chunk gets the same message id everywhere.
+  const AcpUpdate.delta(String text, {String? streamId})
+    : this._(AcpUpdateKind.delta, text, streamId: streamId);
+  const AcpUpdate.thought(String text, {String? streamId})
+    : this._(AcpUpdateKind.thought, text, streamId: streamId);
+
+  /// A user message the host accepted — possibly sent from another device.
+  const AcpUpdate.userMessage(ChatMessage message)
+    : this._(AcpUpdateKind.userMessage, '', message: message);
   const AcpUpdate.permission(String text, {PendingPermissionRequest? request})
     : this._(AcpUpdateKind.permission, text, permissionRequest: request);
   const AcpUpdate.error(String text) : this._(AcpUpdateKind.error, text);
@@ -1723,9 +1735,12 @@ class AcpUpdate {
   final PendingPermissionRequest? permissionRequest;
   final int? tokensUsed;
   final int? contextSize;
+  final String? streamId;
+  final ChatMessage? message;
 }
 
 enum AcpUpdateKind {
+  userMessage,
   delta,
   tool,
   thought,

@@ -23,8 +23,11 @@ def ensure_messages_dir() -> None:
     messages_dir().mkdir(parents=True, exist_ok=True)
 
 
-def _now_iso() -> str:
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_now_iso = now_iso
 
 
 def _normalize(row: dict[str, Any], chat_id: str) -> Optional[dict[str, Any]]:

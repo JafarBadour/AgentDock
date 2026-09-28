@@ -21,8 +21,14 @@ from .worker import Worker
 _IDLE_STOP_SECONDS = 15 * 60
 _MAINTENANCE_EVERY = 60
 # Stream chunks are fanned out live but must not accumulate in RAM.
-_EVENT_LOG_SKIP_KINDS = frozenset({"text", "thought", "activity"})
+_EVENT_LOG_SKIP_KINDS = frozenset({"text", "thought", "activity", "chat_changed"})
 _EVENT_LOG_MAX = 200
+# What a `digest` subscriber (a device keeping its chat list live) receives
+# for chats it has not opened: new messages, turn ends, status and catalog
+# changes — not the token stream.
+_DIGEST_KINDS = frozenset(
+    {"user_message", "prompt_accepted", "turn_complete", "status", "chat_changed"}
+)
 
 
 class Daemon:
@@ -31,6 +37,7 @@ class Daemon:
         self._seq = 0
         self._subscribers: dict[str, set[asyncio.StreamWriter]] = {}
         self._global_subscribers: set[asyncio.StreamWriter] = set()
+        self._digest_subscribers: set[asyncio.StreamWriter] = set()
         self._event_log: dict[str, list[dict[str, Any]]] = {}
         # In-flight `rpc.chunk` transfers: (writer_id, req_id) → buffer.
         self._chunk_bufs: dict[tuple[int, Any], dict[str, Any]] = {}
@@ -224,7 +231,7 @@ class Daemon:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    async def _worker_emit(self, payload: dict[str, Any]) -> None:
+    async def _worker_emit(self, payload: dict[str, Any]) -> int:
         chat_id = str(payload.get("chatId") or "")
         kind = str(payload.get("kind") or "status")
         self._seq += 1
@@ -242,6 +249,8 @@ class Daemon:
         dead: list[asyncio.StreamWriter] = []
         targets = set(self._global_subscribers)
         targets |= self._subscribers.get(chat_id, set())
+        if kind in _DIGEST_KINDS:
+            targets |= self._digest_subscribers
         raw = protocol.encode(event)
         for w in targets:
             try:
@@ -259,9 +268,11 @@ class Daemon:
                 await self._patch_agent_record(
                     chat_id, acp_session_id=str(sid)
                 )
+        return seq
 
     def _drop_writer(self, writer: asyncio.StreamWriter) -> None:
         self._global_subscribers.discard(writer)
+        self._digest_subscribers.discard(writer)
         for s in self._subscribers.values():
             s.discard(writer)
         wid = id(writer)
@@ -388,6 +399,8 @@ class Daemon:
                 result = await self._transcript_pull(params)
             elif method == "transcript.sync":
                 result = await self._transcript_sync(params)
+            elif method == "chats.notify":
+                result = await self._chats_notify(params)
             else:
                 writer.write(
                     protocol.encode(
@@ -463,6 +476,10 @@ class Daemon:
         chat_id = str(params.get("chatId") or "")
         if not chat_id:
             raise ValueError("chatId required")
+        is_new = (
+            chat_id not in self.workers
+            and not paths.agent_record_path(chat_id).exists()
+        )
         w = self._worker(chat_id)
         cwd = str(params.get("cwd") or "")
         binary = str(params.get("binary") or "")
@@ -489,7 +506,25 @@ class Daemon:
             binary=binary or None,
             provider=provider or None,
         )
+        if is_new:
+            await self._broadcast_chat_changed(chat_id, "created")
         return snap
+
+    async def _broadcast_chat_changed(self, chat_id: str, change: str) -> None:
+        """Tell every connected device a chat's catalog entry changed."""
+        await self._worker_emit(
+            {"chatId": chat_id, "kind": "chat_changed", "change": change}
+        )
+
+    async def _chats_notify(self, params: dict[str, Any]) -> dict[str, Any]:
+        """A device changed a chat record (rename, read marker, new chat,
+        delete) through the files; fan that out so other devices re-sync."""
+        chat_id = str(params.get("chatId") or "")
+        if not chat_id:
+            raise ValueError("chatId required")
+        change = str(params.get("change") or "updated")
+        await self._broadcast_chat_changed(chat_id, change)
+        return {"ok": True}
 
     async def _stop(
         self, params: dict[str, Any], *, delete: bool
@@ -504,6 +539,8 @@ class Daemon:
                 if rec.exists():
                     rec.unlink(missing_ok=True)
                 transcript_store.clear_messages(chat_id)
+        if delete and chat_id:
+            await self._broadcast_chat_changed(chat_id, "deleted")
         return {"ok": True}
 
     async def _subscribe(
@@ -519,6 +556,8 @@ class Daemon:
                 if seq > after:
                     writer.write(protocol.encode(ev))
             await writer.drain()
+        elif params.get("digest"):
+            self._digest_subscribers.add(writer)
         else:
             self._global_subscribers.add(writer)
         w = self.workers.get(chat_id) if chat_id else None
