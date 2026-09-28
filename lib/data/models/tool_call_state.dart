@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'inline_images.dart';
+
 /// Identity-keyed caches so huge tool JSON is not re-parsed on every rebuild.
 final Expando<String> _toolPreviewCache = Expando<String>('toolPreview');
 final Expando<Object> _toolInputJsonCache = Expando<Object>('toolInputJson');
@@ -614,8 +616,8 @@ class ToolCallState {
         locations: (json['locations'] is List)
             ? (json['locations'] as List).map((e) => e.toString()).toList()
             : const [],
-        rawInput: json['rawInput']?.toString(),
-        rawOutput: json['rawOutput']?.toString(),
+        rawInput: _stripped(json['rawInput']?.toString()),
+        rawOutput: _stripped(json['rawOutput']?.toString()),
         content: ToolCallState.formatOpaque(json['content']),
       );
 
@@ -632,22 +634,25 @@ class ToolCallState {
     return null;
   }
 
+  static String? _stripped(String? value) =>
+      value == null ? null : stripInlineImages(value);
+
   static String? formatOpaque(Object? value) {
     if (value == null) return null;
-    if (value is String) {
-      // Cap huge tool blobs — pretty-print used to freeze the UI isolate.
-      return value.length > 180000 ? value.substring(0, 180000) : value;
+    String cap(String s) {
+      // Drop inline images first, then cap what is left — pretty-print and
+      // huge blobs used to freeze the UI isolate.
+      s = stripInlineImages(s);
+      return s.length > 180000 ? s.substring(0, 180000) : s;
     }
+
+    if (value is String) return cap(value);
     try {
       // Compact JSON only. Indenting 100KB+ tool payloads on every ADSM event
       // was a primary cause of Mac/Android hitching mid-turn.
-      final encoded = jsonEncode(value);
-      return encoded.length > 180000
-          ? encoded.substring(0, 180000)
-          : encoded;
+      return cap(jsonEncode(value));
     } catch (_) {
-      final s = value.toString();
-      return s.length > 180000 ? s.substring(0, 180000) : s;
+      return cap(value.toString());
     }
   }
 }

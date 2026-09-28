@@ -3270,8 +3270,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                                   .surfaceContainerHighest,
                                               child: const Icon(Icons.image),
                                             )
-                                          : Image.file(
-                                              File(path),
+                                          : Image(
+                                              image: thumbnailImage(
+                                                File(path),
+                                                logicalSize: 72,
+                                                devicePixelRatio:
+                                                    MediaQuery.devicePixelRatioOf(
+                                                      context,
+                                                    ),
+                                              ),
                                               width: 72,
                                               height: 72,
                                               fit: BoxFit.cover,

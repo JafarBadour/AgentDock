@@ -239,6 +239,13 @@ class AgentDockService {
   /// Called when a local chat is removed because the host says it was deleted.
   void Function(String chatId)? onChatRemoved;
 
+  /// True while [chatId] has a live ADSM runtime. The daemon then owns
+  /// `messages/<chatId>.jsonl` (it persists turns itself and takes the phone's
+  /// rows via `transcript.sync`), so pushes send only the agent record. Two
+  /// writers on that file kept the line-count check failing, sending every
+  /// push down the pull-whole-file / rewrite-whole-file path.
+  bool Function(String chatId)? hostOwnsTranscript;
+
   final Map<String, Timer> _pushTimers = {};
   final Set<String> _dirtyChats = {};
   Future<String?>? _catalogSyncInFlight;
@@ -394,6 +401,20 @@ class AgentDockService {
       final messagePath = '$root/messages/$chatId.jsonl';
       final q = SshService.shellQuote;
 
+      if (hostOwnsTranscript?.call(chatId) ?? false) {
+        await _ssh.exec(
+          host,
+          'mkdir -p ${q('$root/agents')} && '
+          'printf %s ${q(base64Encode(utf8.encode(agentJson)))} | base64 -d > ${q(agentPath)}',
+          timeout: const Duration(seconds: 60),
+        );
+        // The file moves under us now; re-verify from scratch next time.
+        _pushedLines.remove(chatId);
+        _pushedPrefixHash.remove(chatId);
+        _dirtyChats.remove(chatId);
+        return;
+      }
+
       final pushed = _pushedLines[chatId] ?? 0;
       // A streaming turn is checkpointed in place, so a message we already
       // pushed can change without the count moving. Appending would leave the
@@ -466,9 +487,7 @@ class AgentDockService {
         'mkdir -p ${q('$root/agents')} ${q('$root/messages')}',
         'printf %s ${q(base64Encode(utf8.encode(agentJson)))} | base64 -d > ${q(agentPath)}',
         if (payload != null)
-          appendSafely
-              ? 'cat >> ${q(messagePath)}'
-              : 'cat > ${q(messagePath)}',
+          appendSafely ? 'cat >> ${q(messagePath)}' : 'cat > ${q(messagePath)}',
       ];
 
       await _ssh.exec(

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math' show max, min;
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
@@ -10,6 +11,7 @@ import '../models/chat.dart';
 import '../models/chat_message.dart';
 import '../models/code_change_stats.dart';
 import '../models/host.dart';
+import '../models/inline_images.dart';
 import '../models/mcp_server.dart';
 import '../models/repo.dart';
 import '../models/scheduled_job.dart';
@@ -54,7 +56,7 @@ class AppDatabase {
         );
     return openDatabase(
       path,
-      version: 20,
+      version: 21,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -286,6 +288,9 @@ AND (
             sql: 'ALTER TABLE skill_host_links ADD COLUMN targets_json TEXT',
           );
         }
+        if (oldVersion < 21) {
+          await stripInlineToolImages(db);
+        }
       },
     );
   }
@@ -398,7 +403,9 @@ AND (
         await upsertMcpHostLink(
           keep.copyWith(
             enabled: keep.enabled || link.enabled,
-            installStatus: preferLoser ? link.installStatus : keep.installStatus,
+            installStatus: preferLoser
+                ? link.installStatus
+                : keep.installStatus,
             installDetail: preferLoser
                 ? link.installDetail
                 : (keep.installDetail ?? link.installDetail),
@@ -430,7 +437,10 @@ AND (
     try {
       // Use the open DB without going through listMcpServers (avoids recursion).
       final db = await database;
-      final rows = await db.query('mcp_servers', orderBy: 'name COLLATE NOCASE');
+      final rows = await db.query(
+        'mcp_servers',
+        orderBy: 'name COLLATE NOCASE',
+      );
       final all = rows.map(McpServer.fromMap).toList();
       if (all.length >= 2) {
         final groups = <String, List<McpServer>>{};
@@ -965,6 +975,29 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
 
   /// Chronological messages for a chat (full local archive). Prefer
   /// [listRecentMessagesByBytes] for UI opens.
+  /// One-off: drop base64 image blobs from stored tool rows (see
+  /// [stripInlineImages]). A handful of image `Read`s made chats tens of MB.
+  @visibleForTesting
+  static Future<void> stripInlineToolImages(DatabaseExecutor db) async {
+    final rows = await db.rawQuery(
+      "SELECT id, content FROM messages WHERE role = 'tool' "
+      'AND length(content) > 2048 AND ('
+      "content LIKE '%iVBORw0KGgo%' OR content LIKE '%/9j/%' OR "
+      "content LIKE '%R0lGOD%' OR content LIKE '%UklGR%')",
+    );
+    for (final row in rows) {
+      final content = row['content']! as String;
+      final stripped = stripInlineImages(content);
+      if (stripped.length == content.length) continue;
+      await db.update(
+        'messages',
+        {'content': stripped},
+        where: 'id = ?',
+        whereArgs: [row['id']],
+      );
+    }
+  }
+
   Future<List<ChatMessage>> listMessagesChronological(String chatId) async {
     final db = await database;
     final rows = await db.query(
@@ -977,10 +1010,8 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
   }
 
   /// Last ~[maxBytes] of local message content (UTF-8), chronological.
-  Future<({List<ChatMessage> messages, bool hasMore})> listRecentMessagesByBytes(
-    String chatId, {
-    required int maxBytes,
-  }) async {
+  Future<({List<ChatMessage> messages, bool hasMore})>
+  listRecentMessagesByBytes(String chatId, {required int maxBytes}) async {
     final all = await listMessagesChronological(chatId);
     final slice = takeRecentMessagesByBytes(all, maxBytes: maxBytes);
     return (messages: slice, hasMore: slice.length < all.length);
@@ -1072,14 +1103,23 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     final byId = {
       for (final row in rows) row['id']! as String: ChatMessage.fromMap(row),
     };
-    return [for (final id in ids) if (byId[id] != null) byId[id]!];
+    return [
+      for (final id in ids)
+        if (byId[id] != null) byId[id]!,
+    ];
   }
 
+  /// Rewrite an existing row's content in place.
+  ///
+  /// Keeps the row's original `created_at`: tool updates used to stamp
+  /// `now()`, which moved finished tools to the end of the chat on disk and
+  /// knocked every host push off the cheap append path onto a full
+  /// pull-merge-rewrite of the whole transcript.
   Future<void> updateMessage(ChatMessage message) async {
     final db = await database;
     await db.update(
       'messages',
-      message.toMap(),
+      message.toMap()..remove('created_at'),
       where: 'id = ?',
       whereArgs: [message.id],
     );
@@ -1272,22 +1312,23 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
   // SQLite's length()/substr() count Unicode code points, not UTF-16 units,
   // so the Dart side works in runes to produce identical fingerprints.
   static String _head(List<int> runes) => String.fromCharCodes(
-        runes.length <= _fingerprintEdge ? runes : runes.sublist(0, _fingerprintEdge),
-      );
+    runes.length <= _fingerprintEdge
+        ? runes
+        : runes.sublist(0, _fingerprintEdge),
+  );
 
   static String _tail(List<int> runes) => String.fromCharCodes(
-        runes.length <= _fingerprintEdge
-            ? runes
-            : runes.sublist(runes.length - _fingerprintEdge),
-      );
+    runes.length <= _fingerprintEdge
+        ? runes
+        : runes.sublist(runes.length - _fingerprintEdge),
+  );
 
   static String _contentFingerprint(
     String role,
     int length,
     String head,
     String tail,
-  ) =>
-      '$role\u0000$length\u0000$head\u0000$tail';
+  ) => '$role\u0000$length\u0000$head\u0000$tail';
 
   /// Mark everything in [chatId] up to [at] (default now) as seen.
   ///

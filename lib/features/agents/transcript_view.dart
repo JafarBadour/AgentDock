@@ -878,6 +878,22 @@ class _MetaIconButton extends StatelessWidget {
   }
 }
 
+/// [file] decoded to fit a [logicalSize] square at 2× headroom, so
+/// `BoxFit.cover` stays sharp for aspect ratios up to 2:1.
+ImageProvider thumbnailImage(
+  File file, {
+  required double logicalSize,
+  required double devicePixelRatio,
+}) {
+  final px = (logicalSize * devicePixelRatio * 2).round();
+  return ResizeImage(
+    FileImage(file),
+    width: px,
+    height: px,
+    policy: ResizeImagePolicy.fit,
+  );
+}
+
 class _BubbleImages extends StatefulWidget {
   const _BubbleImages({required this.refs});
 
@@ -899,7 +915,17 @@ class _BubbleImagesState extends State<_BubbleImages> {
   @override
   void didUpdateWidget(covariant _BubbleImages oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (!identical(oldWidget.refs, widget.refs)) _resolve();
+    // [ChatImageCodec.listRefs] returns a new list on every bubble build, so
+    // compare by value — identity re-resolved (platform call + setState) on
+    // every rebuild.
+    final old = oldWidget.refs;
+    final now = widget.refs;
+    final same = old.length == now.length &&
+        [
+          for (var i = 0; i < now.length; i++)
+            old[i].relativePath == now[i].relativePath,
+        ].every((e) => e);
+    if (!same) _resolve();
   }
 
   Future<void> _resolve() async {
@@ -933,8 +959,14 @@ class _BubbleImagesState extends State<_BubbleImages> {
                     color: Theme.of(context).colorScheme.surfaceContainerHigh,
                     child: const Icon(Icons.image_outlined),
                   )
-                : Image.file(
-                    File(paths[i]!),
+                : Image(
+                    // Decode near display size, not the full photo (a 12 MP
+                    // image is ~48 MB decoded and thrashed the image cache).
+                    image: thumbnailImage(
+                      File(paths[i]!),
+                      logicalSize: 140,
+                      devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
+                    ),
                     width: 140,
                     height: 140,
                     fit: BoxFit.cover,

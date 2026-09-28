@@ -207,7 +207,14 @@ final activeAcpSessionsProvider =
         tick?.cancel();
         orderTick?.cancel();
       });
-      return ActiveAcpSessions(
+      late final ActiveAcpSessions sessions;
+      final dock = ref.read(agentDockServiceProvider);
+      dock.hostOwnsTranscript = (chatId) {
+        final runtime = sessions.get(chatId);
+        return runtime != null && !runtime.closed;
+      };
+      ref.onDispose(() => dock.hostOwnsTranscript = null);
+      return sessions = ActiveAcpSessions(
         ref.watch(appDatabaseProvider),
         keepAlive: ref.watch(backgroundKeepAliveProvider),
         notifications: ref.watch(localNotificationServiceProvider),

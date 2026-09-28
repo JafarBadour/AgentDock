@@ -27,7 +27,7 @@ void main() {
 
     final reopened = await AppDatabase(overridePath: path).database;
     final version = await reopened.rawQuery('PRAGMA user_version');
-    expect(version.single.values.single, 20);
+    expect(version.single.values.single, 21);
 
     final cols = await reopened.rawQuery('PRAGMA table_info(mcp_host_links)');
     expect(cols.where((c) => c['name'] == 'targets_json'), hasLength(1));

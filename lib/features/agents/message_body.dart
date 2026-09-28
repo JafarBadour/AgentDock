@@ -548,9 +548,18 @@ class _MessageBodyState extends State<MessageBody> {
   }
 }
 
+final _chatGptMarkdownThemes = Expando<GptMarkdownThemeData>();
+
 /// Shared markdown theme for the chat list — hoist once so bubbles do not
 /// each install a Theme extension (which re-parses markdown).
-GptMarkdownThemeData chatGptMarkdownTheme(ThemeData theme) {
+///
+/// Memoized per [ThemeData]: GptMarkdownThemeData has no `==`, so a fresh
+/// instance on every TranscriptView build made GptMarkdownTheme notify and
+/// every mounted bubble re-parse its markdown (~3×/s while streaming).
+GptMarkdownThemeData chatGptMarkdownTheme(ThemeData theme) =>
+    _chatGptMarkdownThemes[theme] ??= _buildChatGptMarkdownTheme(theme);
+
+GptMarkdownThemeData _buildChatGptMarkdownTheme(ThemeData theme) {
   final scheme = theme.colorScheme;
   return GptMarkdownThemeData(
     brightness: theme.brightness,
