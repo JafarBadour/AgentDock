@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -8,6 +9,7 @@ import '../../app/app_theme.dart';
 import '../../app/platform_layout.dart';
 import '../../app/providers.dart';
 import 'agent_provider_ui.dart';
+import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
@@ -74,6 +76,30 @@ class _FlatChat {
   final Repo repo;
 }
 
+/// True when every whitespace-separated term in [query] appears somewhere in
+/// the agent's title, folder, host or provider (case-insensitive).
+bool agentMatchesSearch({
+  required String query,
+  required Chat chat,
+  required Repo repo,
+  required Host host,
+}) {
+  final terms = query
+      .toLowerCase()
+      .split(RegExp(r'\s+'))
+      .where((t) => t.isNotEmpty);
+  if (terms.isEmpty) return true;
+  final haystack = [
+    chat.title,
+    repo.name,
+    repo.remotePath,
+    host.alias,
+    host.hostname,
+    chat.provider.label,
+  ].join('\n').toLowerCase();
+  return terms.every(haystack.contains);
+}
+
 class AgentsScreen extends ConsumerStatefulWidget {
   const AgentsScreen({super.key, this.embedded = false, this.selectedChatId});
 
@@ -97,6 +123,14 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
   /// Expanded host ids in Hosts view (hosts start collapsed).
   final Set<String> _expandedHosts = {};
 
+  /// Current [agentsSearchQueryProvider] value, trimmed; set in [build].
+  String _query = '';
+
+  bool get _searching => _query.isNotEmpty;
+
+  bool _matches(Chat chat, Repo repo, Host host) =>
+      agentMatchesSearch(query: _query, chat: chat, repo: repo, host: host);
+
   List<_FlatChat> _flatChats(AgentsTree tree) {
     final hostsById = {for (final h in tree.hosts) h.id: h};
     final reposById = {for (final r in tree.repos) r.id: r};
@@ -108,6 +142,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       if (host == null) continue;
       for (final chat in entry.value) {
         if (_dismissedChats.contains(chat.id)) continue;
+        if (!_matches(chat, repo, host)) continue;
         out.add(_FlatChat(chat: chat, host: host, repo: repo));
       }
     }
@@ -123,8 +158,9 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       if (host == null) continue;
       final chats = [
         for (final c in tree.chatsByRepo[repo.id] ?? const <Chat>[])
-          if (!_dismissedChats.contains(c.id)) c,
+          if (!_dismissedChats.contains(c.id) && _matches(c, repo, host)) c,
       ]..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      if (_searching && chats.isEmpty) continue;
       sections.add(_DirSection(repo: repo, host: host, chats: chats));
     }
     sections.sort((a, b) {
@@ -145,6 +181,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     final sections = <_HostSection>[];
     for (final host in tree.hosts) {
       final agents = [...(byHost[host.id] ?? const <_FlatChat>[])];
+      if (_searching && agents.isEmpty) continue;
       // Under a host: group/sort by directory name, then recency within dir.
       agents.sort((a, b) {
         final byDir = a.repo.name.toLowerCase().compareTo(
@@ -301,6 +338,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
   @override
   Widget build(BuildContext context) {
     final treeAsync = ref.watch(agentsTreeProvider);
+    _query = ref.watch(agentsSearchQueryProvider).trim();
     final sync = ref.watch(catalogSyncProvider);
     final syncNote = sync.when(
       data: (note) => note,
@@ -344,6 +382,13 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Agents'),
+        bottom: const PreferredSize(
+          preferredSize: Size.fromHeight(56),
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: AgentsSearchField(),
+          ),
+        ),
         actions: [
           IconButton(
             tooltip: 'New agent',
@@ -398,6 +443,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     String? syncNote,
   ) {
     final sections = _directorySections(tree);
+    if (sections.isEmpty && _searching) return _NoMatches(query: _query);
     if (sections.isEmpty) {
       return _EmptyState(
         hasHosts: tree.hosts.isNotEmpty,
@@ -427,7 +473,8 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
             index -= 1;
           }
           final section = sections[index];
-          final collapsed = _collapsedDirs.contains(section.repo.id);
+          final collapsed =
+              !_searching && _collapsedDirs.contains(section.repo.id);
           return _CollapsibleSection(
             key: ValueKey('dir-${section.repo.id}'),
             title: section.repo.name,
@@ -459,6 +506,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     String? syncNote,
   ) {
     final sections = _hostSections(tree);
+    if (sections.isEmpty && _searching) return _NoMatches(query: _query);
     if (sections.isEmpty) {
       return _EmptyState(
         hasHosts: false,
@@ -488,7 +536,8 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
             index -= 1;
           }
           final section = sections[index];
-          final collapsed = !_expandedHosts.contains(section.host.id);
+          final collapsed =
+              !_searching && !_expandedHosts.contains(section.host.id);
           final n = section.agents.length;
           return _CollapsibleSection(
             key: ValueKey('host-${section.host.id}'),
@@ -519,6 +568,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     String? syncNote,
   ) {
     final flat = _flatChats(tree);
+    if (flat.isEmpty && _searching) return _NoMatches(query: _query);
     if (flat.isEmpty) {
       return _EmptyState(
         hasHosts: tree.hosts.isNotEmpty,
@@ -837,6 +887,108 @@ class _NestedAgentRow extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Search box bound to [agentsSearchQueryProvider].
+class AgentsSearchField extends ConsumerStatefulWidget {
+  const AgentsSearchField({super.key, this.compact = false});
+
+  /// Denser sizing for the desktop sidebar header.
+  final bool compact;
+
+  @override
+  ConsumerState<AgentsSearchField> createState() => _AgentsSearchFieldState();
+}
+
+class _AgentsSearchFieldState extends ConsumerState<AgentsSearchField> {
+  late final TextEditingController _controller = TextEditingController(
+    text: ref.read(agentsSearchQueryProvider),
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _set(String value) =>
+      ref.read(agentsSearchQueryProvider.notifier).state = value;
+
+  void _clear() {
+    _controller.clear();
+    _set('');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return CallbackShortcuts(
+      bindings: {const SingleActivator(LogicalKeyboardKey.escape): _clear},
+      child: ValueListenableBuilder<TextEditingValue>(
+        valueListenable: _controller,
+        builder: (context, value, _) => TextField(
+          controller: _controller,
+          onChanged: _set,
+          textInputAction: TextInputAction.search,
+          style: widget.compact ? Theme.of(context).textTheme.bodySmall : null,
+          decoration: InputDecoration(
+            hintText: 'Search agents, folders, hosts',
+            isDense: true,
+            filled: true,
+            fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.6),
+            contentPadding: EdgeInsets.symmetric(
+              horizontal: 10,
+              vertical: widget.compact ? 8 : 10,
+            ),
+            prefixIcon: Icon(Icons.search, size: widget.compact ? 16 : 20),
+            prefixIconConstraints: BoxConstraints(
+              minWidth: widget.compact ? 32 : 40,
+            ),
+            suffixIcon: value.text.isEmpty
+                ? null
+                : IconButton(
+                    tooltip: 'Clear search',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: _clear,
+                    icon: Icon(Icons.close, size: widget.compact ? 16 : 18),
+                  ),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: BorderSide.none,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NoMatches extends StatelessWidget {
+  const _NoMatches({required this.query});
+
+  final String query;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.search_off, size: 36, color: theme.colorScheme.outline),
+            const SizedBox(height: 10),
+            Text(
+              'No agents match “$query”.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium,
+            ),
+          ],
         ),
       ),
     );

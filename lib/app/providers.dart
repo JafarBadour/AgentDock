@@ -651,6 +651,9 @@ final agentsSidebarModeProvider = StateProvider<AgentsSidebarMode>(
   (ref) => AgentsSidebarMode.agents,
 );
 
+/// Free-text filter for the Agents list (phone app bar + desktop sidebar).
+final agentsSearchQueryProvider = StateProvider<String>((ref) => '');
+
 /// Host + path for [DesktopRightPanel.files]; cleared when the panel closes.
 final desktopProjectFilesProvider = StateProvider<DesktopProjectFilesArgs?>(
   (ref) => null,

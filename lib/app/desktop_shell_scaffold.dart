@@ -291,6 +291,8 @@ class _DesktopSidebarHeader extends ConsumerWidget {
           ),
           const SizedBox(height: 8),
           const _AgentsModeSwitcher(),
+          const SizedBox(height: 8),
+          const AgentsSearchField(compact: true),
         ],
       ),
     );
