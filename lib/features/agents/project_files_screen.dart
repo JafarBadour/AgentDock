@@ -45,22 +45,15 @@ class ProjectFilesScreen extends ConsumerStatefulWidget {
     if (useDesktopShell(context)) {
       final container = ProviderScope.containerOf(context);
       container.read(desktopProjectFilesProvider.notifier).state =
-          DesktopProjectFilesArgs(
-        host: host,
-        rootPath: rootPath,
-        title: title,
-      );
+          DesktopProjectFilesArgs(host: host, rootPath: rootPath, title: title);
       container.read(desktopRightPanelProvider.notifier).state =
           DesktopRightPanel.files;
       return Future.value();
     }
     return Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => ProjectFilesScreen(
-          host: host,
-          rootPath: rootPath,
-          title: title,
-        ),
+        builder: (_) =>
+            ProjectFilesScreen(host: host, rootPath: rootPath, title: title),
       ),
     );
   }
@@ -108,10 +101,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
       _error = null;
     });
     try {
-      final listing = await ref.read(sshServiceProvider).listRemoteEntries(
-            widget.host,
-            target,
-          );
+      final listing = await ref
+          .read(sshServiceProvider)
+          .listRemoteEntries(widget.host, target);
       if (!mounted) return;
       setState(() {
         _path = listing.path;
@@ -140,16 +132,12 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     await _load(next);
   }
 
-  Future<void> _download(
-    RemoteFileEntry entry, {
-    bool askWhere = false,
-  }) async {
+  Future<void> _download(RemoteFileEntry entry, {bool askWhere = false}) async {
     if (entry.isDirectory) return;
     final remote = SshService.joinRemotePath(_path ?? _root, entry.name);
     final total = entry.size;
     // Unknown size or ≥1 MiB / explicit Save as → location picker + progress.
-    final large =
-        total == null || total >= kLargeDownloadBytes || askWhere;
+    final large = total == null || total >= kLargeDownloadBytes || askWhere;
 
     // Large downloads (or explicit Save as): pick location + progress dialog.
     if (large) {
@@ -177,7 +165,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
       if (!await parent.exists()) {
         await parent.create(recursive: true);
       }
-      final bytes = await ref.read(sshServiceProvider).downloadRemoteFile(
+      final bytes = await ref
+          .read(sshServiceProvider)
+          .downloadRemoteFile(
             widget.host,
             remote,
             localPath,
@@ -190,7 +180,7 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                 final t = _downloadTotal;
                 _status = t != null && t > 0
                     ? 'Downloading ${entry.name}… '
-                        '${formatBytes(received)} / ${formatBytes(t)}'
+                          '${formatBytes(received)} / ${formatBytes(t)}'
                     : 'Downloading ${entry.name}… ${formatBytes(received)}';
               });
             },
@@ -246,7 +236,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         totalBytes: total,
         initialPath: suggested,
         onStartDownload: (localPath, onProgress, isCancelled) {
-          return ref.read(sshServiceProvider).downloadRemoteFile(
+          return ref
+              .read(sshServiceProvider)
+              .downloadRemoteFile(
                 widget.host,
                 remote,
                 localPath,
@@ -289,9 +281,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
       } catch (e) {
         SafeLog.d('save local copy failed', e);
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Save failed: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Save failed: $e')));
       } finally {
         if (mounted) setState(() => _busy = false);
       }
@@ -337,9 +329,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         return;
       }
       setState(() => _status = 'Save failed: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Save failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Save failed: $e')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -355,11 +347,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     try {
       final cache = await getTemporaryDirectory();
       final localPath = await uniquePathIn(cache, entry.name);
-      await ref.read(sshServiceProvider).downloadRemoteFile(
-            widget.host,
-            remote,
-            localPath,
-          );
+      await ref
+          .read(sshServiceProvider)
+          .downloadRemoteFile(widget.host, remote, localPath);
       if (!mounted) return;
       setState(() => _status = 'Sharing ${entry.name}…');
       await SharePlus.instance.share(
@@ -374,9 +364,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
       SafeLog.d('share failed', e);
       if (!mounted) return;
       setState(() => _status = 'Share failed: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Share failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Share failed: $e')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -407,8 +397,18 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
       allowMultiple: true,
       withData: false,
     );
-    if (result == null || result.files.isEmpty) return;
+    if (result == null || result.files.isEmpty || !mounted) return;
     final dir = _path ?? _root;
+    final existing = {
+      for (final e in _entries)
+        if (!e.isDirectory) e.name,
+    };
+    final clashes = [
+      for (final f in result.files)
+        if (existing.contains(f.name)) f.name,
+    ];
+    if (clashes.isNotEmpty && !await _confirmOverwrite(clashes)) return;
+    if (!mounted) return;
     setState(() {
       _busy = true;
       _status = 'Uploading…';
@@ -420,27 +420,81 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         final local = f.path;
         if (local == null) continue;
         final name = f.name;
+        final total = f.size > 0 ? f.size : null;
         final remote = SshService.joinRemotePath(dir, name);
-        setState(() => _status = 'Uploading $name…');
-        await ssh.uploadRemoteFile(widget.host, local, remote);
+        setState(() {
+          _status = 'Uploading $name…';
+          _downloadReceived = 0;
+          _downloadTotal = total;
+        });
+        await ssh.uploadRemoteFile(
+          widget.host,
+          local,
+          remote,
+          onProgress: (sent) {
+            if (!mounted) return;
+            setState(() {
+              _downloadReceived = sent;
+              _status = total == null
+                  ? 'Uploading $name… ${formatBytes(sent)}'
+                  : 'Uploading $name… '
+                        '${formatBytes(sent)} / ${formatBytes(total)}';
+            });
+          },
+        );
         ok++;
       }
       if (!mounted) return;
       setState(() => _status = 'Uploaded $ok file(s)');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Uploaded $ok file(s)')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Uploaded $ok file(s)')));
       await _load(dir);
     } catch (e) {
       SafeLog.d('upload failed', e);
       if (!mounted) return;
       setState(() => _status = 'Upload failed: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Upload failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Upload failed: $e')));
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloadReceived = null;
+          _downloadTotal = null;
+        });
+      }
     }
+  }
+
+  Future<bool> _confirmOverwrite(List<String> names) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          names.length == 1
+              ? 'Replace file?'
+              : 'Replace ${names.length} files?',
+        ),
+        content: Text(
+          names.length == 1
+              ? '“${names.single}” already exists in this folder.'
+              : 'These already exist in this folder:\n${names.join('\n')}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Replace'),
+          ),
+        ],
+      ),
+    );
+    return ok == true;
   }
 
   Future<void> _mkdir() async {
@@ -459,7 +513,10 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
           onSubmitted: (v) => Navigator.pop(context, v.trim()),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             onPressed: () => Navigator.pop(context, controller.text.trim()),
             child: const Text('Create'),
@@ -476,15 +533,15 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     try {
       await ref.read(sshServiceProvider).mkdirRemote(widget.host, remote);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Created $name')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Created $name')));
       await _load(_path ?? _root);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed: $e')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -503,7 +560,10 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
         title: const Text('Delete file?'),
         content: Text('Delete ${entry.name} on the remote?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             onPressed: () => Navigator.pop(context, true),
             child: const Text('Delete'),
@@ -520,15 +580,15 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     try {
       await ref.read(sshServiceProvider).removeRemoteFile(widget.host, remote);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Deleted ${entry.name}')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Deleted ${entry.name}')));
       await _load(_path ?? _root);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Delete failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Delete failed: $e')));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -556,7 +616,9 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     try {
       final cache = await getTemporaryDirectory();
       final localPath = await uniquePathIn(cache, entry.name);
-      await ref.read(sshServiceProvider).downloadRemoteFile(
+      await ref
+          .read(sshServiceProvider)
+          .downloadRemoteFile(
             widget.host,
             remote,
             localPath,
@@ -570,7 +632,7 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
                 final t = _downloadTotal;
                 _status = t != null && t > 0
                     ? 'Opening ${entry.name}… '
-                        '${formatBytes(received)} / ${formatBytes(t)}'
+                          '${formatBytes(received)} / ${formatBytes(t)}'
                     : 'Opening ${entry.name}… ${formatBytes(received)}';
               });
             },
@@ -635,12 +697,12 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
 
   /// "View PDF" / "View Markdown" / "View" — matches what the viewer shows.
   static String _viewLabel(FileKind kind) => switch (kind) {
-        FileKind.pdf => 'View PDF',
-        FileKind.markdown => 'View Markdown',
-        FileKind.image => 'View image',
-        FileKind.text => 'View',
-        FileKind.binary => 'View',
-      };
+    FileKind.pdf => 'View PDF',
+    FileKind.markdown => 'View Markdown',
+    FileKind.image => 'View image',
+    FileKind.text => 'View',
+    FileKind.binary => 'View',
+  };
 
   void _showEntryMenu(RemoteFileEntry entry) {
     showModalBottomSheet<void>(
@@ -770,10 +832,10 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
     final relative = _path == null
         ? ''
         : (_path == _root
-            ? '/'
-            : _path!.substring(_root.length).isEmpty
-                ? '/'
-                : _path!.substring(_root.length));
+              ? '/'
+              : _path!.substring(_root.length).isEmpty
+              ? '/'
+              : _path!.substring(_root.length));
 
     final pathBar = Material(
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
@@ -883,58 +945,56 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
           child: _loading
               ? const Center(child: CircularProgressIndicator())
               : _entries.isEmpty
-                  ? const Center(child: Text('Empty folder'))
-                  : ListView.separated(
-                      itemCount: _entries.length,
-                      separatorBuilder: (_, _) => const Divider(height: 1),
-                      itemBuilder: (context, index) {
-                        final entry = _entries[index];
-                        return ListTile(
-                          leading: Icon(_iconFor(entry)),
-                          title: Text(entry.name),
-                          subtitle: entry.sizeLabel.isEmpty
-                              ? null
-                              : Text(entry.sizeLabel),
-                          trailing: entry.isDirectory
-                              ? const Icon(Icons.chevron_right)
-                              : _kindOf(entry).isViewable
-                                  ? Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        IconButton(
-                                          tooltip: 'Download to Downloads',
-                                          icon: const Icon(Icons.download),
-                                          onPressed: _busy
-                                              ? null
-                                              : () => _download(entry),
-                                        ),
-                                        IconButton(
-                                          tooltip: _viewLabel(_kindOf(entry)),
-                                          icon: const Icon(
-                                            Icons.visibility_outlined,
-                                          ),
-                                          onPressed: _busy
-                                              ? null
-                                              : () => _viewFile(entry),
-                                        ),
-                                      ],
-                                    )
-                                  : IconButton(
-                                      tooltip: 'Download to Downloads',
-                                      icon: const Icon(Icons.download),
-                                      onPressed: _busy
-                                          ? null
-                                          : () => _download(entry),
-                                    ),
-                          onTap: entry.isDirectory
-                              ? () => _openDir(entry.name)
-                              : _kindOf(entry).isViewable
-                                  ? () => _viewFile(entry)
-                                  : () => _showEntryMenu(entry),
-                          onLongPress: () => _showEntryMenu(entry),
-                        );
-                      },
-                    ),
+              ? const Center(child: Text('Empty folder'))
+              : ListView.separated(
+                  // Keep the last row clear of the phone Upload button.
+                  padding: EdgeInsets.only(bottom: widget.embedded ? 0 : 88),
+                  itemCount: _entries.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final entry = _entries[index];
+                    return ListTile(
+                      leading: Icon(_iconFor(entry)),
+                      title: Text(entry.name),
+                      subtitle: entry.sizeLabel.isEmpty
+                          ? null
+                          : Text(entry.sizeLabel),
+                      trailing: entry.isDirectory
+                          ? const Icon(Icons.chevron_right)
+                          : _kindOf(entry).isViewable
+                          ? Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  tooltip: 'Download to Downloads',
+                                  icon: const Icon(Icons.download),
+                                  onPressed: _busy
+                                      ? null
+                                      : () => _download(entry),
+                                ),
+                                IconButton(
+                                  tooltip: _viewLabel(_kindOf(entry)),
+                                  icon: const Icon(Icons.visibility_outlined),
+                                  onPressed: _busy
+                                      ? null
+                                      : () => _viewFile(entry),
+                                ),
+                              ],
+                            )
+                          : IconButton(
+                              tooltip: 'Download to Downloads',
+                              icon: const Icon(Icons.download),
+                              onPressed: _busy ? null : () => _download(entry),
+                            ),
+                      onTap: entry.isDirectory
+                          ? () => _openDir(entry.name)
+                          : _kindOf(entry).isViewable
+                          ? () => _viewFile(entry)
+                          : () => _showEntryMenu(entry),
+                      onLongPress: () => _showEntryMenu(entry),
+                    );
+                  },
+                ),
         ),
       ],
     );
@@ -959,12 +1019,13 @@ class _ProjectFilesScreenState extends ConsumerState<ProjectFilesScreen> {
             onPressed: _busy || _loading ? null : _mkdir,
             icon: const Icon(Icons.create_new_folder_outlined),
           ),
-          IconButton(
-            tooltip: 'Upload',
-            onPressed: _busy || _loading ? null : _upload,
-            icon: const Icon(Icons.upload_file),
-          ),
         ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        tooltip: 'Upload files to this folder',
+        onPressed: _busy || _loading ? null : _upload,
+        icon: const Icon(Icons.upload_file),
+        label: const Text('Upload'),
       ),
       body: body,
     );

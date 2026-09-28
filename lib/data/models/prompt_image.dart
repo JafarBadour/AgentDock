@@ -7,10 +7,7 @@ import 'package:uuid/uuid.dart';
 
 /// Base64 image payload for ACP `session/prompt` content blocks.
 class PromptImage {
-  const PromptImage({
-    required this.mimeType,
-    required this.data,
-  });
+  const PromptImage({required this.mimeType, required this.data});
 
   final String mimeType;
 
@@ -18,15 +15,12 @@ class PromptImage {
   final String data;
 
   Map<String, dynamic> toAcpBlock() => {
-        'type': 'image',
-        'mimeType': mimeType,
-        'data': data,
-      };
+    'type': 'image',
+    'mimeType': mimeType,
+    'data': data,
+  };
 
-  Map<String, dynamic> toWire() => {
-        'mimeType': mimeType,
-        'data': data,
-      };
+  Map<String, dynamic> toWire() => {'mimeType': mimeType, 'data': data};
 }
 
 /// A chat-local image file referenced from a persisted user message.
@@ -50,6 +44,7 @@ class ChatImageRef {
       '.webp' => 'image/webp',
       '.heic' => 'image/heic',
       '.heif' => 'image/heif',
+      '.tif' || '.tiff' => 'image/tiff',
       '.jpg' || '.jpeg' => 'image/jpeg',
       _ => 'image/jpeg',
     };
@@ -63,7 +58,10 @@ abstract final class ChatImageCodec {
   );
 
   static const maxImagesPerPrompt = 5;
-  static const maxBytesPerImage = 1536 * 1024; // ~1.5 MB — keeps SSH/ADSM snappy
+
+  /// Transfer cap per image. Not the agent's limit — the host (ADSM
+  /// `images.py`) shrinks / converts anything the agent API would reject.
+  static const maxBytesPerImage = 15 * 1024 * 1024;
 
   /// Build ACP `prompt` content blocks (images first, then text).
   static List<Map<String, dynamic>> buildAcpBlocks({
@@ -86,41 +84,61 @@ abstract final class ChatImageCodec {
     required String fileName,
     int? byteLength,
   }) async {
-    final len = byteLength ?? await File(sourcePath).length();
+    _checkSize(byteLength ?? await File(sourcePath).length());
+    final (ref, dest) = await _newRef(chatId, fileName);
+    await File(sourcePath).copy(dest.path);
+    return ref;
+  }
+
+  /// Persist pasted / keyboard-inserted image bytes; see [storePickedFile].
+  static Future<ChatImageRef> storeBytes({
+    required String chatId,
+    required List<int> bytes,
+    required String fileName,
+  }) async {
+    _checkSize(bytes.length);
+    final (ref, dest) = await _newRef(chatId, fileName);
+    await dest.writeAsBytes(bytes, flush: true);
+    return ref;
+  }
+
+  static void _checkSize(int len) {
     if (len > maxBytesPerImage) {
       throw StateError(
         'Image too large (${(len / (1024 * 1024)).toStringAsFixed(1)} MB). '
         'Max is ${maxBytesPerImage ~/ (1024 * 1024)} MB.',
       );
     }
+  }
+
+  static Future<(ChatImageRef, File)> _newRef(
+    String chatId,
+    String fileName,
+  ) async {
     final docs = await getApplicationDocumentsDirectory();
     final mime = ChatImageRef.mimeForName(fileName);
     final ext = p.extension(fileName).isEmpty
         ? _extForMime(mime)
         : p.extension(fileName).toLowerCase();
-    final relative = p.join(
-      'chat_images',
-      chatId,
-      '${const Uuid().v4()}$ext',
-    );
+    final relative = p.join('chat_images', chatId, '${const Uuid().v4()}$ext');
     final dest = File(p.join(docs.path, relative));
     await dest.parent.create(recursive: true);
-    await File(sourcePath).copy(dest.path);
-    return ChatImageRef(
+    final ref = ChatImageRef(
       relativePath: relative.replaceAll('\\', '/'),
       mimeType: mime,
       absolutePath: dest.path,
     );
+    return (ref, dest);
   }
 
   static String _extForMime(String mime) => switch (mime) {
-        'image/png' => '.png',
-        'image/gif' => '.gif',
-        'image/webp' => '.webp',
-        'image/heic' => '.heic',
-        'image/heif' => '.heif',
-        _ => '.jpg',
-      };
+    'image/png' => '.png',
+    'image/gif' => '.gif',
+    'image/webp' => '.webp',
+    'image/heic' => '.heic',
+    'image/heif' => '.heif',
+    _ => '.jpg',
+  };
 
   /// Prefix content with markers so images survive SQLite + the outbound queue.
   static String encodeMessage({
@@ -130,9 +148,7 @@ abstract final class ChatImageCodec {
     if (images.isEmpty) return text;
     final buf = StringBuffer();
     for (final img in images) {
-      buf.writeln(
-        '<!--agentdock-img:${img.relativePath}|${img.mimeType}-->',
-      );
+      buf.writeln('<!--agentdock-img:${img.relativePath}|${img.mimeType}-->');
     }
     if (text.isNotEmpty) buf.write(text);
     return buf.toString();
@@ -196,14 +212,11 @@ abstract final class ChatImageCodec {
       if (!await file.exists()) continue;
       final bytes = await file.readAsBytes();
       if (bytes.length > maxBytesPerImage) {
-        throw StateError('Stored image exceeds size limit: ${ref.relativePath}');
+        throw StateError(
+          'Stored image exceeds size limit: ${ref.relativePath}',
+        );
       }
-      out.add(
-        PromptImage(
-          mimeType: ref.mimeType,
-          data: base64Encode(bytes),
-        ),
-      );
+      out.add(PromptImage(mimeType: ref.mimeType, data: base64Encode(bytes)));
     }
     return out;
   }

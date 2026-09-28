@@ -873,7 +873,12 @@ exit 0
           final err = utf8.decodeStream(proc.stderr);
           proc.stdin.add(input);
           await proc.stdin.close();
-          return ProcessResult(proc.pid, await proc.exitCode, await out, await err);
+          return ProcessResult(
+            proc.pid,
+            await proc.exitCode,
+            await out,
+            await err,
+          );
         }().timeout(timeout);
       }
     } on TimeoutException {
@@ -2009,6 +2014,7 @@ exit 0
     'scheduler.py',
     'transcript.py',
     'process_hygiene.py',
+    'images.py',
   ];
 
   Future<Map<String, Uint8List>> _loadBundledAdsmPayloads() async {
@@ -2897,21 +2903,29 @@ exit 1
       onProgress?.call(await File(remote).length());
       return;
     }
-    final bytes = await File(localPath).readAsBytes();
     final client = await connect(host);
     final sftp = await client.sftp();
-    final remoteFile = await sftp.open(
-      remote,
-      mode:
-          SftpFileOpenMode.create |
-          SftpFileOpenMode.truncate |
-          SftpFileOpenMode.write,
-    );
     try {
-      await remoteFile.writeBytes(bytes);
-      onProgress?.call(bytes.length);
+      final remoteFile = await sftp.open(
+        remote,
+        mode:
+            SftpFileOpenMode.create |
+            SftpFileOpenMode.truncate |
+            SftpFileOpenMode.write,
+      );
+      try {
+        // Stream from disk so large files never sit in memory whole.
+        await remoteFile
+            .write(
+              File(localPath).openRead().cast<Uint8List>(),
+              onProgress: onProgress,
+            )
+            .done;
+      } finally {
+        await remoteFile.close();
+      }
     } finally {
-      await remoteFile.close();
+      sftp.close();
     }
   }
 

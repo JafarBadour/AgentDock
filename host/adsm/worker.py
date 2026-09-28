@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from . import paths, protocol
 from . import process_hygiene
+from . import images as images_util
 from . import transcript as transcript_store
 
 EmitFn = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -1643,6 +1644,12 @@ class Worker:
             mime = img.get("mimeType") or img.get("mime_type") or "image/jpeg"
             if not data:
                 continue
+            try:
+                data, mime = await asyncio.to_thread(
+                    images_util.fit_image, str(data), str(mime)
+                )
+            except Exception:  # noqa: BLE001 — send as-is; the agent decides
+                pass
             blocks.append(
                 {
                     "type": "image",

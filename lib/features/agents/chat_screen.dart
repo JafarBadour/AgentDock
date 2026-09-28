@@ -31,6 +31,7 @@ import '../../services/ssh_service.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
 import 'file_mention.dart';
+import 'image_paste.dart';
 import '../connect/claude_login_sheet.dart';
 import '../connect/codex_login_sheet.dart';
 import 'model_picker_sheet.dart';
@@ -109,8 +110,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   /// What the transcript list paints. Only [TranscriptView] listens, so a
   /// stream flush never rebuilds the chrome around it.
-  final ValueNotifier<TranscriptSnapshot> _transcriptN =
-      ValueNotifier(TranscriptSnapshot.empty);
+  final ValueNotifier<TranscriptSnapshot> _transcriptN = ValueNotifier(
+    TranscriptSnapshot.empty,
+  );
   final TranscriptController _transcriptCtl = TranscriptController();
   final ValueNotifier<({bool streaming, bool connected, int queuedCount})>
   _composerRuntimeN = ValueNotifier((
@@ -228,8 +230,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   /// When true, SQLite still has messages older than [_dbEntries] (offline).
   bool _localHasMoreOlder = false;
 
-  bool get _hasMoreOlderArchive =>
-      _runtime?.hasMoreOlder ?? _localHasMoreOlder;
+  bool get _hasMoreOlderArchive => _runtime?.hasMoreOlder ?? _localHasMoreOlder;
 
   bool _loadingOlderHistory = false;
 
@@ -532,8 +533,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         ' · $activityLabel',
       _ when streaming && activeTools == 1 =>
         ' · working · ${activeToolEntries.first.displayTitle}',
-      _ when streaming && activeTools > 1 =>
-        ' · working · $activeTools tools',
+      _ when streaming && activeTools > 1 => ' · working · $activeTools tools',
       _ when streaming => ' · Thinking',
       _ when connected && _resumedInPlace => ' · live · resumed',
       _ when connected => ' · live',
@@ -1225,9 +1225,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text(
-              'Starting a new session so MCP tools can attach…',
-            ),
+            content: Text('Starting a new session so MCP tools can attach…'),
           ),
         );
       }
@@ -1405,13 +1403,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_chat == null || _pickingImages) return;
     final room = ChatImageCodec.maxImagesPerPrompt - _pendingImages.length;
     if (room <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            'You can attach up to ${ChatImageCodec.maxImagesPerPrompt} images.',
-          ),
-        ),
-      );
+      _showImageLimitSnack();
       return;
     }
     setState(() => _pickingImages = true);
@@ -1458,6 +1450,106 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
+  void _showImageLimitSnack() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'You can attach up to ${ChatImageCodec.maxImagesPerPrompt} images.',
+        ),
+      ),
+    );
+  }
+
+  /// Attach pasted / keyboard-inserted images as pending composer images.
+  Future<void> _attachPastedImages(List<PastedImage> images) async {
+    if (_chat == null || images.isEmpty) return;
+    final room = ChatImageCodec.maxImagesPerPrompt - _pendingImages.length;
+    if (room <= 0) {
+      _showImageLimitSnack();
+      return;
+    }
+    final added = <ChatImageRef>[];
+    for (final img in images.take(room)) {
+      try {
+        added.add(
+          await ChatImageCodec.storeBytes(
+            chatId: _chat!.id,
+            bytes: img.bytes,
+            fileName: img.name,
+          ),
+        );
+      } catch (e) {
+        SafeLog.d('store pasted image failed', e);
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('$e')));
+        }
+      }
+    }
+    if (!mounted || added.isEmpty) return;
+    setState(() => _pendingImages.addAll(added));
+    if (images.length > room) _showImageLimitSnack();
+  }
+
+  /// Cmd/Ctrl+V and "Paste image": attach clipboard images when there are
+  /// any, otherwise paste text as usual (unless [imagesOnly]).
+  Future<void> _pasteIntoComposer({bool imagesOnly = false}) async {
+    final images = await readClipboardImages(
+      max: ChatImageCodec.maxImagesPerPrompt,
+    );
+    if (!mounted) return;
+    if (images.isNotEmpty) {
+      await _attachPastedImages(images);
+      return;
+    }
+    if (imagesOnly) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No image on the clipboard')),
+      );
+      return;
+    }
+    final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+    if (!mounted || text == null || text.isEmpty) return;
+    final value = _composer.value;
+    final sel = value.selection.isValid
+        ? value.selection
+        : TextSelection.collapsed(offset: value.text.length);
+    _composer.value = TextEditingValue(
+      text: value.text.replaceRange(sel.start, sel.end, text),
+      selection: TextSelection.collapsed(offset: sel.start + text.length),
+    );
+  }
+
+  void _onKeyboardInsertedContent(KeyboardInsertedContent content) {
+    final bytes = content.data;
+    if (bytes == null || bytes.isEmpty) return;
+    unawaited(
+      _attachPastedImages([
+        (bytes: bytes, name: 'inserted.${extForImageMime(content.mimeType)}'),
+      ]),
+    );
+  }
+
+  Widget _composerContextMenu(
+    BuildContext context,
+    EditableTextState editableTextState,
+  ) {
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: editableTextState.contextMenuAnchors,
+      buttonItems: [
+        ...editableTextState.contextMenuButtonItems,
+        ContextMenuButtonItem(
+          label: 'Paste image',
+          onPressed: () {
+            ContextMenuController.removeAny();
+            unawaited(_pasteIntoComposer(imagesOnly: true));
+          },
+        ),
+      ],
+    );
+  }
+
   void _removePendingImage(int index) {
     if (index < 0 || index >= _pendingImages.length) return;
     setState(() => _pendingImages.removeAt(index));
@@ -1469,8 +1561,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     List<String?> messageIds,
   ) async {
     final ids = [for (final t in summaries) t.toolCallId];
-    final runtime =
-        ref.read(activeAcpSessionsProvider.notifier).get(widget.chatId);
+    final runtime = ref
+        .read(activeAcpSessionsProvider.notifier)
+        .get(widget.chatId);
     if (runtime != null) {
       return runtime.resolveToolDetails(
         toolCallIds: ids,
@@ -1487,8 +1580,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     ];
     if (mids.isNotEmpty) {
       try {
-        final rows =
-            await ref.read(appDatabaseProvider).getMessagesByIds(mids);
+        final rows = await ref.read(appDatabaseProvider).getMessagesByIds(mids);
         for (final row in rows) {
           if (row.role != MessageRole.tool) continue;
           final tool = ToolCallState.tryParseContent(row.content);
@@ -2174,8 +2266,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   /// Desktop: Enter sends, Shift+Enter inserts a newline.
-  KeyEventResult _composerDesktopEnterKey(FocusNode node, KeyEvent event) {
+  /// Cmd/Ctrl+V on any hardware keyboard; Enter-to-send on desktop only.
+  KeyEventResult _composerKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey == LogicalKeyboardKey.keyV) {
+      final keyboard = HardwareKeyboard.instance;
+      final apple = Platform.isMacOS || Platform.isIOS;
+      final primary = apple
+          ? keyboard.isMetaPressed
+          : keyboard.isControlPressed;
+      final other = apple ? keyboard.isControlPressed : keyboard.isMetaPressed;
+      if (primary &&
+          !other &&
+          !keyboard.isShiftPressed &&
+          !keyboard.isAltPressed) {
+        unawaited(_pasteIntoComposer());
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    if (!useDesktopShell()) return KeyEventResult.ignored;
     if (event.logicalKey != LogicalKeyboardKey.enter &&
         event.logicalKey != LogicalKeyboardKey.numpadEnter) {
       return KeyEventResult.ignored;
@@ -2237,9 +2347,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           children: [
             Expanded(
               child: Focus(
-                onKeyEvent: useDesktopShell() ? _composerDesktopEnterKey : null,
+                onKeyEvent: _composerKey,
                 child: TextField(
                   controller: _composer,
+                  contextMenuBuilder: _composerContextMenu,
+                  contentInsertionConfiguration: ContentInsertionConfiguration(
+                    allowedMimeTypes: kInsertableImageMimeTypes,
+                    onContentInserted: _onKeyboardInsertedContent,
+                  ),
                   minLines: 1,
                   maxLines: 5,
                   textInputAction: useDesktopShell()
@@ -2997,9 +3112,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         child: SizedBox(
                           height: 32,
                           child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                            ),
+                            padding: const EdgeInsets.symmetric(horizontal: 14),
                             child: Align(
                               alignment: Alignment.centerLeft,
                               child: _buildStreamingActivityLabel(theme, rt),
@@ -3050,10 +3163,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Widget _buildStreamingActivityLabel(
-    ThemeData theme,
-    ChatSessionRuntime rt,
-  ) {
+  Widget _buildStreamingActivityLabel(ThemeData theme, ChatSessionRuntime rt) {
     final explore = rt.turnExploreStats;
     final style = theme.textTheme.bodyMedium?.copyWith(
       color: theme.colorScheme.onSurfaceVariant,
