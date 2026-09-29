@@ -751,6 +751,20 @@ async def run_serve() -> None:
             pass
 
     serve_task = asyncio.create_task(daemon.start())
+
+    def _served(task: asyncio.Task) -> None:
+        # start() serves forever, so finishing means it failed. Without this
+        # a daemon whose server never came up (e.g. no Unix sockets on
+        # Windows) waited on [stop] forever as an orphan with no endpoint.
+        if not task.cancelled() and task.exception() is not None:
+            print(
+                f"ADSM serve failed: {task.exception()!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+        stop.set()
+
+    serve_task.add_done_callback(_served)
     await stop.wait()
 
     async def _shutdown() -> None:
