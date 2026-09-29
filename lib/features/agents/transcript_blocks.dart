@@ -202,6 +202,11 @@ List<ChatBlock> buildTranscriptBlocks(
     final turnStats =
         (persistedStats ?? const TurnStats()).mergeComputed(computed);
 
+    // Only the final segment can still be running, and only while the turn is
+    // open. Every tool before that finished — or died with the session — so it
+    // is history, however `pending` the durable row still reads.
+    final segmentIsOpen = openTurnActive && i >= compact.length;
+
     final segmentBlocks = <ChatBlock>[];
     // Keep tools interleaved with assistant text. Collapse only consecutive
     // tool runs (not every tool in the whole turn into one end clump).
@@ -220,8 +225,9 @@ List<ChatBlock> buildTranscriptBlocks(
       }
 
       for (final e in toolRun) {
+        final tool = e.tool!.withoutPayloads();
         final summary = TranscriptEntry.tool(
-          e.tool!.withoutPayloads(),
+          segmentIsOpen ? tool : tool.settled(),
           messageId: e.messageId,
           createdAt: e.createdAt,
         );

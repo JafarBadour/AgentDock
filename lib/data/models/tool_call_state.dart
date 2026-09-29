@@ -52,8 +52,41 @@ class ToolCallState {
   /// longer carries the payload the type lives in.
   final String? subagentTypeHint;
 
+  /// A call the app never saw finish: the session ended, the host dropped, or
+  /// the app quit mid-tool, so the durable transcript kept `pending` forever.
+  ///
+  /// It is *not* running — nothing is driving it any more — and that
+  /// distinction is not cosmetic. An "active" row shimmers, and transcript
+  /// rows are kept alive, so every abandoned call left in history would run a
+  /// ticker for as long as the chat stayed open. A real database here had 33
+  /// of them in one chat, between them holding the whole app at a frame every
+  /// vsync while it sat idle.
+  static const String abandonedStatus = 'abandoned';
+
+  bool get isAbandoned => status == abandonedStatus;
+
   bool get isActive =>
       status == 'pending' || status == 'in_progress' || status == 'running';
+
+  /// This call as history: if it never finished, say so instead of pretending
+  /// it is still going. Terminal states are returned unchanged.
+  ToolCallState settled() {
+    if (!isActive) return this;
+    return ToolCallState(
+      toolCallId: toolCallId,
+      title: title,
+      kind: kind,
+      status: abandonedStatus,
+      locations: locations,
+      rawInput: rawInput,
+      rawOutput: rawOutput,
+      content: content,
+      previewHint: previewHint,
+      inputHead: inputHead,
+      outputHead: outputHead,
+      subagentTypeHint: subagentTypeHint,
+    );
+  }
 
   bool get isFailed => status == 'failed' || status == 'error';
 

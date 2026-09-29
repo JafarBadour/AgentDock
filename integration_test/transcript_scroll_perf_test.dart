@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:agent_dock/app/app_theme.dart';
 import 'package:agent_dock/data/local/app_database.dart';
@@ -69,6 +70,13 @@ void main() {
     final snapshot = ValueNotifier(TranscriptSnapshot(blocks: blocks));
     final controller = TranscriptController();
 
+    // Retained memory matters as much as frame time: rows are kept alive, so
+    // whatever the list builds it holds until the chat closes. A heap that
+    // grows with the transcript is what puts the concurrent marker on a
+    // permanent 30% of a core.
+    double rssMb() => ProcessInfo.currentRss / (1024 * 1024);
+    final rssBefore = rssMb();
+
     await tester.pumpWidget(
       MaterialApp(
         debugShowCheckedModeBanner: false,
@@ -86,10 +94,13 @@ void main() {
     }
 
     final list = find.byType(Scrollable).first;
+    final rssWarm = rssMb();
     binding.reportData = {
       'chat': _chatTitle,
       'messages': messages.length,
       'blocks': blocks.length,
+      'rss_mb_before': rssBefore.round(),
+      'rss_mb_after_warmup': rssWarm.round(),
     };
     Future<void> scroll() async {
       // Reversed list: dragging down scrolls up into history.
@@ -118,6 +129,9 @@ void main() {
       debugProfileLayoutsEnabled = false;
     } else {
       await binding.watchPerformance(scroll, reportKey: 'scroll');
+      binding.reportData!['rss_mb_after_scroll'] = rssMb().round();
+      binding.reportData!['live_rows'] =
+          tester.widgetList(find.byType(ChatBubble)).length;
       // Back at the live end: stream an answer the way ChatScreen publishes
       // flushes, to catch whole-list rebuilds on every snapshot.
       await tester.pumpAndSettle(const Duration(milliseconds: 16));
