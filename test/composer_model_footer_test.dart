@@ -18,8 +18,14 @@ Widget _host(Widget child, {double width = 360}) => MaterialApp(
 
 void main() {
   setUpAll(() async {
-    final font = File('/System/Library/Fonts/SFNS.ttf');
-    if (font.existsSync()) {
+    // The test font draws every glyph a full em wide, so widths only mean
+    // something with a real system font.
+    final font = [
+      '/System/Library/Fonts/SFNS.ttf',
+      r'C:\Windows\Fonts\segoeui.ttf',
+      '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ].map(File.new).where((f) => f.existsSync()).firstOrNull;
+    if (font != null) {
       final loader = FontLoader('Roboto')
         ..addFont(Future.value(font.readAsBytesSync().buffer.asByteData()));
       await loader.load();

@@ -24,7 +24,11 @@ void main() {
     final dir = await Directory.systemTemp.createTemp('agentdock-window');
     addTearDown(() => dir.delete(recursive: true));
     db = AppDatabase(overridePath: p.join(dir.path, 'w.db'));
-    await (await db.database).execute('PRAGMA foreign_keys = OFF');
+    final handle = await db.database;
+    // Tear-downs run last-first: close before the directory goes, or
+    // Windows refuses to delete the still-open file.
+    addTearDown(handle.close);
+    await handle.execute('PRAGMA foreign_keys = OFF');
     all = [
       for (var i = 0; i < count; i++)
         ChatMessage(
