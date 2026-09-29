@@ -3145,7 +3145,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   onLoadOlder: _loadOlderHistoryChunk,
                   onJumpToLatest: () => _runtime?.pinDisplayToLiveChunk(),
                   // Activity strip overlays the list so turn status cannot
-                  // resize the scroll viewport.
+                  // resize the scroll viewport; its height is reserved below
+                  // so the newest line never hides behind it.
+                  overlayHeight: AgentActivityStrip.height,
                   overlay: ListenableBuilder(
                     listenable: _chromeUiEpoch,
                     builder: (context, _) {
