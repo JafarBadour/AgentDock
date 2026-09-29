@@ -1,4 +1,4 @@
-name: Release builds
+﻿name: Release builds
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  FLUTTER_VERSION: '3.41.8'
+  FLUTTER_VERSION: '3.47.5'
 
 jobs:
   android:
@@ -157,7 +157,7 @@ jobs:
             - **Android**: install `AgentDock-android.apk` (sideload)
             - **Windows**: unzip `AgentDock-windows-x64.zip` and run `agent_dock.exe`
             - **Linux (Ubuntu)**: `tar -xzf AgentDock-linux-x64.tar.gz` then run `./agent_dock`
-            - **iOS**: `AgentDock-ios-unsigned.zip` contains unsigned `Agent Dock.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
+            - **iOS**: `AgentDock-ios-unsigned.zip` contains unsigned `Agent Dock.app` â€” sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
           files: |
             artifacts/AgentDock-macos/AgentDock-macos.zip
             artifacts/AgentDock-android/AgentDock-android.apk
