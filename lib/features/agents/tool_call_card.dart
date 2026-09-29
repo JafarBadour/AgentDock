@@ -47,6 +47,7 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
   List<ToolCallState>? _details;
 
   bool get _anyActive => widget.tools.any((t) => t.isActive);
+  bool get _anyAbandoned => widget.tools.any((t) => t.isAbandoned);
   bool get _hardFails => widget.tools.where((t) => t.isHardFail).isNotEmpty;
   int get _hardFailCount => widget.tools.where((t) => t.isHardFail).length;
   int get _softFailCount => widget.tools.where((t) => t.isSoftFail).length;
@@ -74,12 +75,19 @@ class _ToolCallGroupCardState extends State<ToolCallGroupCard> {
           TextSpan(text: t.displayTitle),
           if (preview != null && preview != t.displayTitle)
             TextSpan(text: '  $preview', style: mono),
+          // Without this an interrupted call is indistinguishable from a
+          // finished one, since it no longer animates.
+          if (t.isAbandoned) TextSpan(text: '  · interrupted', style: mono),
         ],
       );
     }
     final summary = ToolCallState.summarizeActions(tools);
-    final running = _anyActive ? ' · running' : '';
-    return TextSpan(style: base, text: '$summary$running');
+    final suffix = _anyActive
+        ? ' · running'
+        : _anyAbandoned
+            ? ' · interrupted'
+            : '';
+    return TextSpan(style: base, text: '$summary$suffix');
   }
 
   Future<void> _toggle() async {
