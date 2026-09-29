@@ -1,4 +1,7 @@
-"""Per-chat ACP worker: tmux + FIFO/journal owned exclusively by ADSM."""
+"""Per-chat ACP worker: tmux + FIFO/journal owned exclusively by ADSM.
+
+On Windows the agent is a daemon-owned child process instead (see winproc).
+"""
 
 from __future__ import annotations
 
@@ -7,6 +10,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -16,6 +20,9 @@ from . import paths, protocol
 from . import process_hygiene
 from . import images as images_util
 from . import transcript as transcript_store
+from . import winproc
+
+IS_WINDOWS = sys.platform == "win32"
 
 # Returns the event seq (daemon) or None (tests).
 EmitFn = Callable[[Dict[str, Any]], Awaitable[Optional[int]]]
@@ -216,6 +223,37 @@ def codex_current_model_from_config_options(config_options: Any) -> Optional[str
     return f"{cur}[{_CODEX_EFFORT_ATTR}={level}]"
 
 
+def _agent_argv(
+    provider: str, full_access: bool, model_id: Optional[str]
+) -> list[str]:
+    """Arguments after the agent binary (shared by run.sh and Windows)."""
+    if provider in ("claude", "codex"):
+        # claude-agent-acp and codex-acp are bare stdio ACP agents: model,
+        # reasoning effort and the approval preset are set per session over RPC.
+        return []
+    model = ["--model", model_id] if provider == "cursor" and model_id else []
+    if full_access:
+        return model + ["--force", "--approve-mcps", "--trust", "acp"]
+    return model + ["acp"]
+
+
+def _agent_env(
+    provider: str, api_key: Optional[str], model_id: Optional[str]
+) -> dict[str, str]:
+    """Secrets and model selection passed to the agent process."""
+    env: dict[str, str] = {}
+    if api_key:
+        if provider == "claude":
+            env["ANTHROPIC_API_KEY"] = api_key
+        elif provider == "codex":
+            env["OPENAI_API_KEY"] = api_key
+        else:
+            env["CURSOR_API_KEY"] = api_key
+    if provider == "claude" and model_id:
+        env["CLAUDE_ACP_MODEL"] = model_id
+    return env
+
+
 def _run_script(
     *,
     dir_path: str,
@@ -226,26 +264,14 @@ def _run_script(
     model_id: Optional[str] = None,
 ) -> str:
     q = _shell_quote
-    model_flag = ""
-    if provider == "cursor" and model_id:
-        model_flag = f"--model {q(model_id)} "
-    if provider == "claude":
-        agent_args = ""
-        skip_perms = (
-            "export CLAUDE_ACP_SKIP_PERMISSIONS=true\n" if full_access else ""
-        )
-    elif provider == "codex":
-        # codex-acp is a bare stdio ACP agent: model, reasoning effort and
-        # the approval preset are all set per session over RPC.
-        agent_args = ""
-        skip_perms = ""
-    else:
-        agent_args = (
-            f"{model_flag}--force --approve-mcps --trust acp"
-            if full_access
-            else f"{model_flag}acp"
-        )
-        skip_perms = ""
+    agent_args = " ".join(
+        q(a) for a in _agent_argv(provider, full_access, model_id)
+    )
+    skip_perms = (
+        "export CLAUDE_ACP_SKIP_PERMISSIONS=true\n"
+        if provider == "claude" and full_access
+        else ""
+    )
     exec_line = q(binary) if not agent_args else f"{q(binary)} {agent_args}"
     return f"""#!/bin/sh
 DIR={q(dir_path)}
@@ -281,19 +307,9 @@ def _env_file(
     model_id: Optional[str] = None,
 ) -> Optional[str]:
     lines: list[str] = []
-    if api_key:
-        if provider == "claude":
-            lines.append(f"ANTHROPIC_API_KEY={_shell_quote(api_key)}")
-            lines.append("export ANTHROPIC_API_KEY")
-        elif provider == "codex":
-            lines.append(f"OPENAI_API_KEY={_shell_quote(api_key)}")
-            lines.append("export OPENAI_API_KEY")
-        else:
-            lines.append(f"CURSOR_API_KEY={_shell_quote(api_key)}")
-            lines.append("export CURSOR_API_KEY")
-    if provider == "claude" and model_id:
-        lines.append(f"CLAUDE_ACP_MODEL={_shell_quote(model_id)}")
-        lines.append("export CLAUDE_ACP_MODEL")
+    for key, value in _agent_env(provider, api_key, model_id).items():
+        lines.append(f"{key}={_shell_quote(value)}")
+        lines.append(f"export {key}")
     if not lines:
         return None
     return "\n".join(lines) + "\n"
@@ -404,6 +420,105 @@ def ensure_tmux_worker(
     return state, size
 
 
+def ensure_agent_worker(
+    *,
+    chat_id: str,
+    cwd: str,
+    binary: str,
+    provider: str = "cursor",
+    api_key: Optional[str] = None,
+    full_access: bool = True,
+    model_id: Optional[str] = None,
+) -> tuple[str, int]:
+    """Start or adopt this chat's agent process. Returns (state, journal_size)."""
+    if not IS_WINDOWS:
+        return ensure_tmux_worker(
+            chat_id=chat_id,
+            cwd=cwd,
+            binary=binary,
+            provider=provider,
+            api_key=api_key,
+            full_access=full_access,
+            model_id=model_id,
+        )
+    env = _agent_env(provider, api_key, model_id)
+    if provider == "claude" and full_access:
+        env["CLAUDE_ACP_SKIP_PERMISSIONS"] = "true"
+    return winproc.ensure_worker(
+        chat_id=chat_id,
+        cwd=cwd,
+        binary=binary,
+        argv=_agent_argv(provider, full_access, model_id),
+        env=env,
+        full_access=full_access,
+        model_id=model_id,
+    )
+
+
+def agent_alive(chat_id: str) -> bool:
+    if IS_WINDOWS:
+        return winproc.alive(chat_id)
+    r = subprocess.run(
+        ["tmux", "has-session", "-t", paths.tmux_session_name(chat_id)],
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+def kill_agent(chat_id: str) -> None:
+    if IS_WINDOWS:
+        winproc.kill(chat_id)
+        return
+    subprocess.run(
+        ["tmux", "kill-session", "-t", paths.tmux_session_name(chat_id)],
+        capture_output=True,
+    )
+
+
+class _FifoInput:
+    """Write end of the tmux worker's stdin FIFO."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def write(self, data: bytes) -> None:
+        # FIFO may briefly block; retry with a hard deadline so a stalled
+        # reader cannot freeze the journal tail (and leave permissions
+        # unanswered).
+        remaining = data
+        deadline = time.monotonic() + 5.0
+        while remaining:
+            try:
+                n = os.write(self._fd, remaining)
+                remaining = remaining[n:]
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"FIFO write timed out ({len(data) - len(remaining)}/"
+                        f"{len(data)} bytes)"
+                    )
+                time.sleep(0.01)
+
+    def close(self) -> None:
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+
+
+class _PipeInput:
+    """Stdin pipe of a Windows agent process (owned by winproc)."""
+
+    def __init__(self, chat_id: str) -> None:
+        self._chat_id = chat_id
+
+    def write(self, data: bytes) -> None:
+        winproc.write(self._chat_id, data)
+
+    def close(self) -> None:
+        # The pipe lives as long as the process; kill_agent closes it.
+        pass
+
 def segment_message_id(chat_id: str, turn_id: str, seq: int) -> str:
     """Message id of the reply segment that starts with event [seq] of turn
     [turn_id]. Must match `_streamMessageId` in chat_session_runtime.dart."""
@@ -455,8 +570,7 @@ class Worker:
         self._seg_id: Optional[str] = None
         self._seg_text = ""
 
-        self._fifo_write: Optional[asyncio.StreamWriter] = None
-        self._fifo_fd: Optional[int] = None
+        self._input: Optional[_FifoInput | _PipeInput] = None
         self._tail_task: Optional[asyncio.Task[None]] = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._req_n = 0
@@ -515,9 +629,9 @@ class Worker:
         `session.prompt`, which used to fail with "FIFO not attached".
         """
         alive = await asyncio.to_thread(self._tmux_alive)
-        if self._fifo_fd is not None and alive:
+        if self._input is not None and alive:
             return
-        if self._fifo_fd is not None and not alive:
+        if self._input is not None and not alive:
             await self._detach_fifo()
 
         self._hydrate_launch_fields()
@@ -593,16 +707,7 @@ class Worker:
             # newly deployed servers.
             if force_new_session:
                 await self._detach_fifo()
-                await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "tmux",
-                        "kill-session",
-                        "-t",
-                        paths.tmux_session_name(self.chat_id),
-                    ],
-                    capture_output=True,
-                )
+                await asyncio.to_thread(kill_agent, self.chat_id)
                 try:
                     sid_path.unlink(missing_ok=True)
                 except OSError:
@@ -611,7 +716,7 @@ class Worker:
                 resume_session_id = None
 
             state, _size = await asyncio.to_thread(
-                ensure_tmux_worker,
+                ensure_agent_worker,
                 chat_id=self.chat_id,
                 cwd=cwd,
                 binary=binary,
@@ -640,18 +745,9 @@ class Worker:
             # set_model / model catalog all fail with "ACP session not ready".
             if not freshly and not effective:
                 await self._detach_fifo()
-                await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "tmux",
-                        "kill-session",
-                        "-t",
-                        paths.tmux_session_name(self.chat_id),
-                    ],
-                    capture_output=True,
-                )
+                await asyncio.to_thread(kill_agent, self.chat_id)
                 state, _size = await asyncio.to_thread(
-                    ensure_tmux_worker,
+                    ensure_agent_worker,
                     chat_id=self.chat_id,
                     cwd=cwd,
                     binary=binary,
@@ -876,23 +972,25 @@ class Worker:
             self._codex_native_presets = bool(data.get("codexNativePresets"))
 
     async def _attach_pipes(self) -> None:
-        if self._attached and self._fifo_fd is not None:
+        if self._attached and self._input is not None:
             return
-        fifo = self.dir / "in"
         journal = self.dir / "out.jsonl"
-        # Open FIFO for write without blocking (holder keeps read side open).
-        # Retry briefly — holder may not have opened the read end yet.
-        fd = None
-        for _ in range(50):
-            try:
-                fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
-                break
-            except OSError:
-                await asyncio.sleep(0.1)
-        if fd is None:
-            raise RuntimeError(f"could not open FIFO {fifo}")
-        self._fifo_fd = fd
-        self._fifo_write = None
+        if IS_WINDOWS:
+            self._input = _PipeInput(self.chat_id)
+        else:
+            fifo = self.dir / "in"
+            # Open FIFO for write without blocking (holder keeps read side
+            # open). Retry briefly — holder may not have opened the read end.
+            fd = None
+            for _ in range(50):
+                try:
+                    fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError:
+                    await asyncio.sleep(0.1)
+            if fd is None:
+                raise RuntimeError(f"could not open FIFO {fifo}")
+            self._input = _FifoInput(fd)
 
         # Tail from current end so we don't re-ingest historical ACP into events.
         self._journal_pos = journal.stat().st_size if journal.exists() else 0
@@ -902,13 +1000,9 @@ class Worker:
 
     async def _detach_fifo(self) -> None:
         """Close the write end so a recycled tmux worker can reopen cleanly."""
-        if self._fifo_fd is not None:
-            try:
-                os.close(self._fifo_fd)
-            except OSError:
-                pass
-            self._fifo_fd = None
-        self._fifo_write = None
+        if self._input is not None:
+            self._input.close()
+            self._input = None
         self._attached = False
         self._buffer = ""
         self._epoch = hex(int(time.time() * 1e6))[2:]
@@ -942,7 +1036,7 @@ class Worker:
                             if line:
                                 await self._handle_acp_line(line)
                 else:
-                    # Check tmux still alive occasionally.
+                    # Check the agent process is still alive occasionally.
                     alive = await asyncio.to_thread(self._tmux_alive)
                     if not alive and self.status not in (
                         protocol.STATUS_DEAD,
@@ -951,7 +1045,7 @@ class Worker:
                         await self._set_status(
                             self.chat_id,
                             protocol.STATUS_DEAD,
-                            "tmux session ended",
+                            "agent process ended",
                         )
                         await self._emit_event(
                             "status", status=protocol.STATUS_DEAD
@@ -965,31 +1059,13 @@ class Worker:
                 await asyncio.sleep(0.5)
 
     def _tmux_alive(self) -> bool:
-        r = subprocess.run(
-            ["tmux", "has-session", "-t", paths.tmux_session_name(self.chat_id)],
-            capture_output=True,
-        )
-        return r.returncode == 0
+        return agent_alive(self.chat_id)
 
     def _write_raw(self, obj: dict[str, Any]) -> None:
-        if self._fifo_fd is None:
+        if self._input is None:
             raise RuntimeError("FIFO not attached")
         data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-        # FIFO may briefly block; retry with a hard deadline so a stalled reader
-        # cannot freeze the journal tail (and leave permissions unanswered).
-        remaining = data
-        deadline = time.monotonic() + 5.0
-        while remaining:
-            try:
-                n = os.write(self._fifo_fd, remaining)
-                remaining = remaining[n:]
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"FIFO write timed out ({len(data) - len(remaining)}/"
-                        f"{len(data)} bytes)"
-                    )
-                time.sleep(0.01)
+        self._input.write(data)
 
     async def _write(self, obj: dict[str, Any]) -> None:
         await asyncio.to_thread(self._write_raw, obj)
@@ -1512,14 +1588,9 @@ class Worker:
         self.model_id = model_id
         await self._detach_fifo()
 
-        tmux = paths.tmux_session_name(self.chat_id)
+        await asyncio.to_thread(kill_agent, self.chat_id)
         await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "kill-session", "-t", tmux],
-            capture_output=True,
-        )
-        await asyncio.to_thread(
-            ensure_tmux_worker,
+            ensure_agent_worker,
             chat_id=self.chat_id,
             cwd=self.cwd,
             binary=self.binary,
@@ -1642,7 +1713,7 @@ class Worker:
         if self.acp_session_id:
             return
         alive = await asyncio.to_thread(self._tmux_alive)
-        if self._fifo_fd is None or not alive:
+        if self._input is None or not alive:
             await self._revive_transport()
             if self.acp_session_id:
                 return
@@ -2273,19 +2344,11 @@ class Worker:
             except asyncio.CancelledError:
                 pass
             self._tail_task = None
-        if self._fifo_fd is not None:
-            try:
-                os.close(self._fifo_fd)
-            except OSError:
-                pass
-            self._fifo_fd = None
+        if self._input is not None:
+            self._input.close()
+            self._input = None
         self._attached = False
-        tmux = paths.tmux_session_name(self.chat_id)
-        await asyncio.to_thread(
-            subprocess.run,
-            ["tmux", "kill-session", "-t", tmux],
-            capture_output=True,
-        )
+        await asyncio.to_thread(kill_agent, self.chat_id)
         if delete_files:
             import shutil
 

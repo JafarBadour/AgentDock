@@ -24,6 +24,7 @@ import 'cursor_acp_service.dart';
 import 'local_host_bootstrap.dart';
 import 'ssh_service.dart';
 import 'transcript_budget.dart';
+import 'windows_local_agent.dart';
 
 export 'adsm_version.dart';
 
@@ -289,23 +290,23 @@ fi
         Platform.environment['HOME'] ??
         Platform.environment['USERPROFILE'] ??
         '';
-    final path = [
-      if (home.isNotEmpty) '$home/.local/bin',
-      if (Platform.isMacOS) '/opt/homebrew/bin',
-      '/usr/local/bin',
-      Platform.environment['PATH'] ?? '',
-    ].where((s) => s.isNotEmpty).join(':');
-    final (shell, args) = localShellInvocation(_clientLaunch);
+    if (Platform.isWindows) {
+      // No bash wrapper on Windows: run the bridge with Python directly.
+      final adsm = AdsmClient._local(await WindowsLocalAgent.startClient());
+      adsm._listen();
+      final pong = await adsm
+          .request('ping', {})
+          .timeout(const Duration(seconds: 15));
+      adsm.protocolVersion = pong['version']?.toString();
+      return adsm;
+    }
     final Process process;
     try {
       process = await Process.start(
-        shell,
-        args,
+        localBashExecutable(),
+        ['-lc', _clientLaunch],
         workingDirectory: home.isEmpty ? null : home,
-        // WSL (Windows) keeps its own PATH.
-        environment: Platform.isWindows
-            ? null
-            : {...Platform.environment, 'PATH': path},
+        environment: {...Platform.environment, 'PATH': localShellPathEnv()},
       );
     } on ProcessException catch (e) {
       throw StateError(localShellMissingHint(e));

@@ -1,4 +1,4 @@
-"""ADSM asyncio daemon — Unix socket control plane."""
+"""ADSM asyncio daemon — Unix socket (loopback TCP on Windows) control plane."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from typing import Any, Optional
 
 from . import paths, protocol, scheduler
 from . import process_hygiene
+from . import transport
 from . import transcript as transcript_store
-from .worker import Worker
+from .worker import Worker, agent_alive
 
 
 # Idle workers (tmux + Claude/Cursor) are stopped after this many seconds so
@@ -55,22 +56,7 @@ class Daemon:
 
     async def start(self) -> None:
         paths.ensure_layout()
-        sock = paths.socket_path()
-        if sock.exists():
-            try:
-                sock.unlink()
-            except OSError:
-                pass
-
-        self._server = await asyncio.start_unix_server(
-            self._on_client,
-            path=str(sock),
-            limit=protocol.STREAM_LIMIT,
-        )
-        try:
-            os.chmod(sock, 0o600)
-        except OSError:
-            pass
+        self._server = await transport.start_server(self._on_client)
 
         pid = paths.pid_path()
         pid.write_text(str(os.getpid()), encoding="utf-8")
@@ -86,20 +72,7 @@ class Daemon:
                         set_status=self._set_status,
                     )
                     self.workers[chat_id] = w
-                    import subprocess
-
-                    alive = await asyncio.to_thread(
-                        lambda cid=chat_id: subprocess.run(
-                            [
-                                "tmux",
-                                "has-session",
-                                "-t",
-                                paths.tmux_session_name(cid),
-                            ],
-                            capture_output=True,
-                        ).returncode
-                        == 0
-                    )
+                    alive = await asyncio.to_thread(agent_alive, chat_id)
                     w.status = (
                         protocol.STATUS_IDLE if alive else protocol.STATUS_DEAD
                     )
@@ -807,7 +780,5 @@ async def run_serve() -> None:
     except OSError:
         pass
     if mine:
-        sock = paths.socket_path()
-        if sock.exists():
-            sock.unlink(missing_ok=True)
+        transport.remove_endpoint()
         pid.unlink(missing_ok=True)

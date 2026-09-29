@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -35,6 +36,7 @@ class ProcessHygieneTest(unittest.TestCase):
         self.assertTrue(process_hygiene._is_claude_sdk(cmd))
         self.assertFalse(process_hygiene._is_claude_sdk("python3 -m adsm serve"))
 
+    @unittest.skipIf(sys.platform == "win32", "reaper is POSIX-only")
     def test_reap_keeps_newest(self) -> None:
         # Fake three children; reap should kill the two older.
         with mock.patch.object(

@@ -33,6 +33,20 @@ existing Codex session on that host.
 
 All scripts are idempotent and install `tmux` when missing, then install/start **ADSM**.
 
+## This PC (Windows)
+
+Local agents on Windows run natively (no SSH, tmux or WSL). In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/windows-setup.ps1 | iex
+```
+
+Installs Python 3.9+ (runs ADSM), Node.js and the Claude ACP adapter via
+winget/npm; installers may show an administrator prompt. For Codex too:
+`$env:AGENTDOCK_AGENTS = "claude,codex"` before running it. Cursor is not
+supported on This PC under Windows yet. The app installs and starts ADSM
+itself, and also installs missing Python/Node/adapters on first connect.
+
 ## ADSM only
 
 ```bash

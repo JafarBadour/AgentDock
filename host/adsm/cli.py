@@ -8,14 +8,14 @@ import os
 import sys
 from pathlib import Path
 
-from . import paths, protocol
+from . import paths, protocol, transport
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agentdock-adsm")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("serve", help="Run the ADSM daemon (Unix socket)")
+    sub.add_parser("serve", help="Run the ADSM daemon")
     sub.add_parser(
         "client", help="Stdio NDJSON proxy to the daemon socket (for SSH)"
     )
@@ -47,8 +47,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _daemon_alive() -> bool:
-    sock = paths.socket_path()
-    if not sock.exists():
+    if not transport.endpoint_exists():
         return False
     try:
         return asyncio.run(_ping_ok())
@@ -58,10 +57,7 @@ def _daemon_alive() -> bool:
 
 async def _ping_ok() -> bool:
     try:
-        reader, writer = await asyncio.open_unix_connection(
-            path=str(paths.socket_path()),
-            limit=protocol.STREAM_LIMIT,
-        )
+        reader, writer = await transport.open_connection()
     except Exception:  # noqa: BLE001
         return False
     try:
@@ -84,13 +80,8 @@ def _ensure_running(python: str) -> int:
         print("ADSM already running")
         return 0
 
-    # Stale socket.
-    sock = paths.socket_path()
-    if sock.exists():
-        try:
-            sock.unlink()
-        except OSError:
-            pass
+    # Stale socket / endpoint file.
+    transport.remove_endpoint()
 
     # Locate package root (parent of adsm/).
     pkg_root = Path(__file__).resolve().parent.parent
@@ -105,13 +96,12 @@ def _ensure_running(python: str) -> int:
     log = paths.log_path()
     cmd = [python, "-m", "adsm", "serve"]
     logf = open(log, "a", encoding="utf-8")
-    subprocess.Popen(
+    _spawn_detached(
         cmd,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=logf,
         stderr=subprocess.STDOUT,
-        start_new_session=True,
         cwd=str(pkg_root),
     )
 
@@ -126,15 +116,35 @@ def _ensure_running(python: str) -> int:
     return 1
 
 
+def _spawn_detached(cmd: list[str], **kwargs) -> None:
+    """Start the daemon so it outlives the client that launched it."""
+    import subprocess
+
+    if not transport.IS_WINDOWS:
+        subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        return
+    # No console, own process group, not tied to the launching console. Try
+    # to leave the parent's job too: Agent Dock (or a terminal) may run in a
+    # job that kills its children when it closes.
+    flags = (
+        subprocess.DETACHED_PROCESS
+        | subprocess.CREATE_NEW_PROCESS_GROUP
+        | subprocess.CREATE_NO_WINDOW
+    )
+    try:
+        subprocess.Popen(
+            cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs
+        )
+    except OSError:
+        subprocess.Popen(cmd, creationflags=flags, **kwargs)
+
+
 async def _status() -> int:
-    if not paths.socket_path().exists():
+    if not transport.endpoint_exists():
         print("ADSM not running (no socket)")
         return 1
     try:
-        reader, writer = await asyncio.open_unix_connection(
-            path=str(paths.socket_path()),
-            limit=protocol.STREAM_LIMIT,
-        )
+        reader, writer = await transport.open_connection()
     except Exception as e:  # noqa: BLE001
         print(f"ADSM unreachable: {e}")
         return 1
@@ -152,6 +162,10 @@ async def _status() -> int:
 def _force_kill() -> None:
     import subprocess
 
+    if transport.IS_WINDOWS:
+        _force_kill_windows()
+        return
+
     # Matches python3 / python3.12 / python; bracketed so no shell whose
     # command line quotes this pattern can match itself.
     import time
@@ -168,12 +182,7 @@ def _force_kill() -> None:
     subprocess.run(
         ["pkill", "-KILL", "-f", pattern], check=False, capture_output=True
     )
-    sock = paths.socket_path()
-    if sock.exists():
-        try:
-            sock.unlink()
-        except OSError:
-            pass
+    transport.remove_endpoint()
     pid = paths.pid_path()
     if pid.exists():
         try:
@@ -182,15 +191,41 @@ def _force_kill() -> None:
             pass
 
 
+def _force_kill_windows() -> None:
+    """No pkill on Windows: kill the daemon (and its agents) by pid file."""
+    import subprocess
+
+    pid_file = paths.pid_path()
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = 0
+    # A stale pid file may name a pid Windows has since reused; only kill it
+    # when it is still a Python process.
+    image = ""
+    if pid > 0:
+        listing = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        image = listing.stdout.strip().split(",", 1)[0].strip('"').lower()
+    if image.startswith("python"):
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    transport.remove_endpoint()
+    pid_file.unlink(missing_ok=True)
+
+
 async def _stop() -> int:
     """Ask the daemon to exit; fall back to pkill if the socket is stale."""
-    sock = paths.socket_path()
-    if sock.exists():
+    if transport.endpoint_exists():
         try:
-            reader, writer = await asyncio.open_unix_connection(
-                path=str(sock),
-                limit=protocol.STREAM_LIMIT,
-            )
+            reader, writer = await transport.open_connection()
             try:
                 writer.write(
                     protocol.encode(
@@ -225,17 +260,18 @@ async def _stop() -> int:
 
 
 async def _client() -> int:
-    """Bridge stdio ↔ Unix socket (one long-lived SSH channel)."""
+    """Bridge stdio ↔ daemon socket (one long-lived SSH channel)."""
     paths.ensure_layout()
-    sock = paths.socket_path()
-    if not sock.exists():
-        # Best-effort auto-start.
-        _ensure_running(sys.executable)
+    if not (transport.endpoint_exists() and await _ping_ok()):
+        # Best-effort auto-start (also replaces a stale endpoint). It runs its
+        # own event loop, so keep it off this one. Its status lines go to
+        # stderr: stdout is the NDJSON channel.
+        import contextlib
+
+        with contextlib.redirect_stdout(sys.stderr):
+            await asyncio.to_thread(_ensure_running, sys.executable)
     try:
-        reader, writer = await asyncio.open_unix_connection(
-            path=str(sock),
-            limit=protocol.STREAM_LIMIT,
-        )
+        reader, writer = await transport.open_connection()
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"ADSM connect failed: {e}\n")
         return 1

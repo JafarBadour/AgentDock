@@ -18,6 +18,11 @@ def socket_path() -> Path:
     return agentdock_root() / "adsm.sock"
 
 
+def endpoint_path() -> Path:
+    """Windows only: loopback `{port, token}` for the daemon (see transport)."""
+    return agentdock_root() / "adsm.endpoint"
+
+
 def pid_path() -> Path:
     return agentdock_root() / "adsm.pid"
 

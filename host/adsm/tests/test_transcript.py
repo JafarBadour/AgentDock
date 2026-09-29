@@ -15,7 +15,10 @@ class TranscriptStoreTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
-        self._home_patch = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        # Windows `expanduser` reads USERPROFILE, not HOME.
+        self._home_patch = mock.patch.dict(
+            os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}
+        )
         self._home_patch.start()
         self.addCleanup(self._home_patch.stop)
         # Import after HOME is set so expanduser resolves into the temp tree.
@@ -211,7 +214,9 @@ class TranscriptRpcTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
-        self._home_patch = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        self._home_patch = mock.patch.dict(
+            os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}
+        )
         self._home_patch.start()
         from adsm.daemon import Daemon
 

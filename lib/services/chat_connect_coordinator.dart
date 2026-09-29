@@ -417,9 +417,10 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
       _patch(chat.id, (p) => p.copyWith(status: message));
     }
 
-    // This Mac/PC runs everything through a local shell; an SSH handshake
-    // here failed whenever Remote Login was off or had no authorized key.
-    if (!ssh.runsLocally(host)) {
+    // This Mac/PC runs everything locally (shell, files, ADSM), so there is
+    // no SSH session to open — an SSH handshake here failed whenever Remote
+    // Login was off or had no authorized key, and Windows rarely runs sshd.
+    if (!ssh.usesLocalShell(host)) {
       await ssh.connect(host).timeout(
         const Duration(seconds: 20),
         onTimeout: () =>
@@ -554,6 +555,22 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
               .timeout(const Duration(seconds: 25), onTimeout: () => false);
     if (!_current(chat.id, epoch)) return _AttemptOutcome.superseded;
     if (loggedIn) return null;
+
+    // The sign-in sheet drives the CLI over an SSH terminal, which This PC
+    // does not have. Sign in with the CLI itself instead.
+    if (Platform.isWindows && ssh.usesLocalShell(host)) {
+      final cli = provider == AgentProvider.claude ? 'claude' : 'codex login';
+      _patch(
+        chat.id,
+        (p) => p.copyWith(
+          phase: ConnectPhase.failed,
+          clearStatus: true,
+          error: '${provider.label} is not signed in on This PC. Run '
+              '`$cli` in a terminal, sign in, then reconnect.',
+        ),
+      );
+      return _AttemptOutcome.needsLogin;
+    }
 
     // Sign-in needs a sheet. With no screen attached, park rather than spend
     // the remaining retries on a prompt nobody can answer.

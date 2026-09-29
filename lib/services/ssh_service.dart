@@ -11,12 +11,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/host.dart';
+import '../data/models/remote_path.dart' as remote_path;
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
 import 'adsm_version.dart';
 import 'local_host_bootstrap.dart';
 import 'remote_setup_guide.dart';
 import 'ssh_no_delay_socket.dart';
+import 'windows_local_agent.dart';
 
 class SshConnectResult {
   const SshConnectResult({required this.ok, this.detail, this.error});
@@ -843,25 +845,17 @@ exit 0
   }) async {
     final home =
         Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
-    // WSL (Windows) keeps its own PATH; only POSIX hosts get the prefix.
-    final env = Platform.isWindows
-        ? null
-        : <String, String>{
-            ...Platform.environment,
-            'PATH': [
-              if (home != null && home.isNotEmpty) '$home/.local/bin',
-              if (Platform.isMacOS) '/opt/homebrew/bin',
-              '/usr/local/bin',
-              Platform.environment['PATH'] ?? '',
-            ].where((s) => s.isNotEmpty).join(':'),
-          };
-    final (shell, args) = localShellInvocation(command);
+    final env = <String, String>{
+      ...Platform.environment,
+      'PATH': localShellPathEnv(),
+    };
+    final bash = localBashExecutable();
     late final ProcessResult result;
     try {
       if (input == null) {
         result = await Process.run(
-          shell,
-          args,
+          bash,
+          ['-lc', command],
           workingDirectory: home != null && home.isNotEmpty ? home : null,
           environment: env,
           stdoutEncoding: utf8,
@@ -870,8 +864,8 @@ exit 0
       } else {
         result = await () async {
           final proc = await Process.start(
-            shell,
-            args,
+            bash,
+            ['-lc', command],
             workingDirectory: home != null && home.isNotEmpty ? home : null,
             environment: env,
           );
@@ -973,6 +967,8 @@ exit 0
     Host host, {
     void Function(String status)? onProgress,
   }) async {
+    // Windows agents are daemon-owned processes, not tmux sessions.
+    if (_isWindowsLocal(host)) return;
     onProgress?.call('Checking tmux…');
     var tmux = await _resolveTmuxPathOnHost(host);
     if (tmux != null) return;
@@ -1086,6 +1082,13 @@ exit 1
     if (cached != null) {
       onProgress?.call('Cursor CLI ready');
       return cached;
+    }
+    if (_isWindowsLocal(host)) {
+      throw MissingToolException(
+        'Cursor CLI',
+        'Cursor agents on This PC are not supported on Windows yet. '
+            'Use Claude or Codex here, or run Cursor on a remote host.',
+      );
     }
 
     onProgress?.call('Looking for Cursor CLI…');
@@ -1306,6 +1309,16 @@ test -x "$HOME/.local/bin/claude-code-acp"
       onProgress?.call('Claude ACP ready');
       return cached;
     }
+    if (_isWindowsLocal(host)) {
+      return _ensureWindowsNpmAgent(
+        host,
+        cacheKey: 'claude',
+        label: 'Claude ACP',
+        shimNames: const ['claude-agent-acp', 'claude-code-acp'],
+        package: '@agentclientprotocol/claude-agent-acp',
+        onProgress: onProgress,
+      );
+    }
 
     onProgress?.call('Looking for Claude ACP…');
     var path = await _resolveClaudeAcpPathOnHost(host);
@@ -1464,6 +1477,16 @@ test -x "$HOME/.local/bin/codex-acp"
       onProgress?.call('Codex ACP ready');
       return cached;
     }
+    if (_isWindowsLocal(host)) {
+      return _ensureWindowsNpmAgent(
+        host,
+        cacheKey: 'codex',
+        label: 'Codex ACP',
+        shimNames: const ['codex-acp'],
+        package: '@agentclientprotocol/codex-acp',
+        onProgress: onProgress,
+      );
+    }
 
     onProgress?.call('Looking for Codex ACP…');
     var path = await _resolveCodexAcpPathOnHost(host);
@@ -1565,11 +1588,86 @@ test -x "$HOME/.local/bin/codex-acp"
     }
   }
 
+  /// Find (or `npm install -g`) an ACP adapter on This PC.
+  Future<String> _ensureWindowsNpmAgent(
+    Host host, {
+    required String cacheKey,
+    required String label,
+    required List<String> shimNames,
+    required String package,
+    void Function(String status)? onProgress,
+  }) async {
+    onProgress?.call('Looking for $label…');
+    var path = await WindowsLocalAgent.findNpmAgent(shimNames);
+    if (path == null) {
+      try {
+        await WindowsLocalAgent.npmInstallGlobal(
+          package,
+          onProgress: onProgress,
+        );
+      } on StateError catch (e) {
+        throw MissingToolException(label, e.message);
+      }
+      path = await WindowsLocalAgent.findNpmAgent(shimNames);
+    }
+    if (path == null) {
+      throw MissingToolException(
+        label,
+        '`npm install -g $package` finished but `${shimNames.first}` was not '
+            'found. Check that npm\'s global folder is on PATH.',
+      );
+    }
+    _cacheToolPath('$cacheKey:${host.id}', path);
+    onProgress?.call('$label ready');
+    return path;
+  }
+
+  /// Windows This PC: install bundled ADSM and run it with Python directly.
+  Future<void> _ensureAdsmWindowsLocal(
+    Host host, {
+    void Function(String status)? onProgress,
+    required bool allowUpgrade,
+  }) async {
+    onProgress?.call('Checking ADSM…');
+    final running = await WindowsLocalAgent.runningVersion();
+    if (running != null &&
+        (adsmVersionMeets(running, kRequiredAdsmVersion) || !allowUpgrade)) {
+      _markAdsmReady(host.id, running);
+      onProgress?.call('ADSM ready');
+      return;
+    }
+    onProgress?.call('Installing ADSM v$kRequiredAdsmVersion…');
+    try {
+      await WindowsLocalAgent.installAndRestart(
+        await _loadBundledAdsmPayloads(),
+      );
+    } on StateError catch (e) {
+      throw MissingToolException('ADSM', e.message);
+    }
+    final version = await WindowsLocalAgent.runningVersion();
+    if (version == null || !adsmVersionMeets(version, kRequiredAdsmVersion)) {
+      throw MissingToolException(
+        'ADSM',
+        'ADSM did not come up on This PC (running: ${version ?? 'none'}). '
+            'See %USERPROFILE%\\.agentdock\\adsm.log.',
+      );
+    }
+    _markAdsmReady(host.id, version);
+    onProgress?.call('ADSM v$version ready');
+  }
+
   Future<void> _ensureAdsmBody(
     Host host, {
     void Function(String status)? onProgress,
     required bool allowUpgrade,
   }) async {
+    if (_isWindowsLocal(host)) {
+      return _ensureAdsmWindowsLocal(
+        host,
+        onProgress: onProgress,
+        allowUpgrade: allowUpgrade,
+      );
+    }
     final local = _preferLocalFs(host);
     SSHClient? client;
     if (!local) {
@@ -2016,6 +2114,8 @@ exit 0
     'transcript.py',
     'process_hygiene.py',
     'images.py',
+    'transport.py',
+    'winproc.py',
   ];
 
   Future<Map<String, Uint8List>> _loadBundledAdsmPayloads() async {
@@ -2621,6 +2721,12 @@ exit 1
   bool runsLocally(Host host) =>
       isDesktopLocalHostPlatform && isLocalThisComputerHost(host);
 
+  /// True for This Mac/PC: commands, files and ADSM run locally, never SSH.
+  bool usesLocalShell(Host host) => _preferLocalFs(host);
+
+  /// This PC on Windows: no tmux or bash scripts; see [WindowsLocalAgent].
+  bool _isWindowsLocal(Host host) => Platform.isWindows && _preferLocalFs(host);
+
   Future<RemoteFileListing> _listLocalEntries(String path) async {
     final normalized = normalizeRemotePath(path.replaceAll(r'\', '/'));
     final dir = Directory(localFsPath(normalized));
@@ -2964,36 +3070,17 @@ exit 1
   }
 
   /// True if [path] is [root] or a child of [root].
-  static bool isUnderRoot(String root, String path) {
-    final r = normalizeRemotePath(root);
-    final p = normalizeRemotePath(path);
-    if (r == '/') return true;
-    return p == r || p.startsWith('$r/');
-  }
+  static bool isUnderRoot(String root, String path) =>
+      remote_path.isUnderRemoteRoot(root, path);
 
-  static String normalizeRemotePath(String path) {
-    var p = path.trim();
-    if (p.isEmpty) return '/';
-    if (!p.startsWith('/')) p = '/$p';
-    while (p.length > 1 && p.endsWith('/')) {
-      p = p.substring(0, p.length - 1);
-    }
-    return p;
-  }
+  static String normalizeRemotePath(String path) =>
+      remote_path.normalizeRemotePath(path);
 
-  static String joinRemotePath(String parent, String child) {
-    final base = normalizeRemotePath(parent);
-    if (base == '/') return '/$child';
-    return '$base/$child';
-  }
+  static String joinRemotePath(String parent, String child) =>
+      remote_path.joinRemotePath(parent, child);
 
-  static String? parentRemotePath(String path) {
-    final normalized = normalizeRemotePath(path);
-    if (normalized == '/') return null;
-    final index = normalized.lastIndexOf('/');
-    if (index <= 0) return '/';
-    return normalized.substring(0, index);
-  }
+  static String? parentRemotePath(String path) =>
+      remote_path.parentRemotePath(path);
 
   /// `command -v` with an extended PATH (non-login; avoids hanging .bashrc).
   // ignore: unused_element
