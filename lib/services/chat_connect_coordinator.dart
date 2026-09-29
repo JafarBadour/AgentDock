@@ -281,8 +281,19 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
         // The remote is reachable and the tool is genuinely absent; two more
         // installs will fail the same way.
         if (!_current(chat.id, epoch)) return;
-        await _failTerminal(chat, host, _missingToolMessage(e, chat, host),
-            showGuide: true);
+        // Windows This PC installs natively (winget / npm): its hint is the
+        // real reason, and the remote bash guide does not apply.
+        final windowsLocal =
+            Platform.isWindows && _ref.read(sshServiceProvider).runsLocally(host);
+        await _failTerminal(
+          chat,
+          host,
+          windowsLocal
+              ? 'Could not set up ${e.tool} on ${host.displayLabel}.\n\n'
+                    '${e.installHint}'
+              : _missingToolMessage(e, chat, host),
+          showGuide: !windowsLocal,
+        );
         return;
       } catch (e) {
         lastError = e;
