@@ -101,28 +101,64 @@ Future<List<PastedImage>> _readImages(
   return out;
 }
 
+/// How long to wait for the platform to hand over one item's bytes.
+///
+/// Every wait here is bounded, because the platform delivers through a
+/// callback it is under no obligation to ever call. A drag from a browser,
+/// Photos or Mail carries a *promised* file the source app materialises on
+/// demand — and when that never arrives, an unbounded wait hangs the drop
+/// session, which holds the whole app frozen with no exception and no crash
+/// report. Timing out costs one skipped image; not timing out cost the app.
+const kImageReadTimeout = Duration(seconds: 20);
+
+/// Runs [start], which completes the given completer when the platform calls
+/// back, and gives up after [timeout] rather than waiting forever.
+@visibleForTesting
+Future<T?> awaitDelivery<T>(
+  String what,
+  void Function(Completer<T?> done) start, {
+  Duration timeout = kImageReadTimeout,
+}) {
+  final done = Completer<T?>();
+  try {
+    start(done);
+  } catch (e) {
+    SafeLog.d('$what could not start', e);
+    if (!done.isCompleted) done.complete(null);
+  }
+  return done.future.timeout(
+    timeout,
+    onTimeout: () {
+      SafeLog.d('$what never arrived', 'gave up after ${timeout.inSeconds}s');
+      return null;
+    },
+  );
+}
+
 /// A copied / dropped image file by path, for formats with no image flavor.
 Future<PastedImage?> _readImageFileUri(DataReader item) async {
   if (!item.canProvide(Formats.fileUri)) return null;
   try {
-    final got = Completer<Uri?>();
-    final progress = item.getValue<Uri>(
-      Formats.fileUri,
-      (v) async {
-        if (!got.isCompleted) got.complete(v);
-      },
-      onError: (_) {
-        if (!got.isCompleted) got.complete(null);
-      },
-    );
-    if (progress == null) return null;
-    final uri = await got.future;
+    final uri = await awaitDelivery<Uri>('dropped file path', (got) {
+      final progress = item.getValue<Uri>(
+        Formats.fileUri,
+        (v) async {
+          if (!got.isCompleted) got.complete(v);
+        },
+        onError: (_) {
+          if (!got.isCompleted) got.complete(null);
+        },
+      );
+      // No progress object means the read never started.
+      if (progress == null && !got.isCompleted) got.complete(null);
+    });
     if (uri == null || !uri.isScheme('file')) return null;
     final path = uri.toFilePath();
     final dot = path.lastIndexOf('.');
     final ext = dot < 0 ? '' : path.substring(dot + 1).toLowerCase();
     if (!_imageFileExts.contains(ext)) return null;
-    final bytes = await File(path).readAsBytes();
+    // A path can point at a stalled network mount, so bound this too.
+    final bytes = await File(path).readAsBytes().timeout(kImageReadTimeout);
     if (bytes.isEmpty) return null;
     return (bytes: bytes, name: path.split(RegExp(r'[\\/]')).last);
   } catch (e) {
@@ -132,22 +168,22 @@ Future<PastedImage?> _readImageFileUri(DataReader item) async {
 }
 
 Future<Uint8List?> _readFile(DataReader item, FileFormat format) {
-  final done = Completer<Uint8List?>();
-  void fail(Object e) {
-    SafeLog.d('clipboard image read failed', e);
-    if (!done.isCompleted) done.complete(null);
-  }
-
-  final progress = item.getFile(format, (file) async {
-    try {
-      final bytes = await file.readAll();
-      if (!done.isCompleted) done.complete(bytes);
-    } catch (e) {
-      fail(e);
+  return awaitDelivery<Uint8List>('image bytes', (done) {
+    void fail(Object e) {
+      SafeLog.d('clipboard image read failed', e);
+      if (!done.isCompleted) done.complete(null);
     }
-  }, onError: fail);
-  if (progress == null && !done.isCompleted) done.complete(null);
-  return done.future;
+
+    final progress = item.getFile(format, (file) async {
+      try {
+        final bytes = await file.readAll();
+        if (!done.isCompleted) done.complete(bytes);
+      } catch (e) {
+        fail(e);
+      }
+    }, onError: fail);
+    if (progress == null && !done.isCompleted) done.complete(null);
+  });
 }
 
 /// Accepts images dragged onto [child] (Finder / Explorer / browsers /
@@ -200,10 +236,28 @@ class _ImageDropRegionState extends State<ImageDropRegion> {
           for (final item in event.session.items)
             if (item.dataReader != null) item.dataReader!,
         ];
-        final images = await readDroppedImages(readers, max: widget.max);
+        // The platform keeps the drag session — and the window — waiting on
+        // this future, so it must always finish. Individual reads are already
+        // bounded; this is the backstop for anything else that stalls.
+        var timedOut = false;
+        final images =
+            await readDroppedImages(readers, max: widget.max).timeout(
+              kImageReadTimeout * 2,
+              onTimeout: () {
+                timedOut = true;
+                return const [];
+              },
+            );
         if (images.isEmpty) {
           messenger?.showSnackBar(
-            const SnackBar(content: Text('Only images can be dropped here')),
+            SnackBar(
+              content: Text(
+                timedOut
+                    ? 'That drop never finished sending — try saving the '
+                          'image first, then drop the file'
+                    : 'Only images can be dropped here',
+              ),
+            ),
           );
           return;
         }
