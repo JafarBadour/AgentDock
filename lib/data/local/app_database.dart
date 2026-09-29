@@ -1029,7 +1029,8 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
       maxBytes: maxBytes,
     );
     final pivot = all.indexWhere((m) => m.id == beforeId);
-    final olderCount = pivot < 0 ? 0 : pivot;
+    // An unknown pivot means everything stored is older than the view.
+    final olderCount = pivot < 0 ? all.length : pivot;
     return (
       messages: slice,
       hasMore: slice.isNotEmpty && slice.length < olderCount,

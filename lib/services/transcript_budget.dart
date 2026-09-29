@@ -54,7 +54,12 @@ List<ChatMessage> takeOlderMessagesByBytes(
 }) {
   if (chronological.isEmpty || maxBytes <= 0) return const [];
   final pivot = chronological.indexWhere((m) => m.id == beforeId);
-  if (pivot <= 0) return const [];
-  final older = chronological.sublist(0, pivot);
+  if (pivot == 0) return const [];
+  // Pivot absent: what is on screen is something this store has never seen —
+  // a live segment, or a message only the host holds. Everything here is
+  // therefore older than the view, so offer the newest chunk of it. Treating
+  // this like "pivot is the oldest" is what silently ended paging: the reply
+  // was "no earlier messages" while a whole archive sat underneath.
+  final older = pivot < 0 ? chronological : chronological.sublist(0, pivot);
   return takeRecentMessagesByBytes(older, maxBytes: maxBytes);
 }

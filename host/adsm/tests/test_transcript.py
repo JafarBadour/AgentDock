@@ -299,3 +299,42 @@ class TranscriptRpcTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PullPivotTest(unittest.TestCase):
+    """`before_id` the store has never seen must not look like an empty archive."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        self._home_patch = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        self._home_patch.start()
+        self.addCleanup(self._home_patch.stop)
+        from adsm import transcript as transcript_store
+
+        self.transcript = transcript_store
+        self.chat_id = "chat-pivot"
+        for i in range(6):
+            self.transcript.append_message(
+                self.chat_id,
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"message {i}",
+                message_id=f"m{i}",
+                created_at=f"2026-01-01T10:00:0{i}+00:00",
+            )
+
+    def test_unknown_before_id_still_returns_the_archive(self) -> None:
+        # The device is showing a live segment this store has never persisted.
+        page = self.transcript.pull_messages(self.chat_id, before_id="not-here")
+        self.assertEqual(6, len(page["messages"]))
+
+    def test_oldest_before_id_correctly_reports_nothing_older(self) -> None:
+        page = self.transcript.pull_messages(self.chat_id, before_id="m0")
+        self.assertEqual([], page["messages"])
+
+    def test_middle_before_id_returns_only_what_precedes_it(self) -> None:
+        page = self.transcript.pull_messages(self.chat_id, before_id="m3")
+        self.assertEqual(
+            ["m0", "m1", "m2"], [m["id"] for m in page["messages"]]
+        )

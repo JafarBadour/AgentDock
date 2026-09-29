@@ -102,7 +102,15 @@ def pull_messages(
             (i for i, m in enumerate(messages) if m.get("id") == before_id),
             -1,
         )
-        messages = messages[:pivot] if pivot > 0 else []
+        # pivot 0 → before_id is already the oldest, so nothing precedes it.
+        # pivot -1 → the caller is showing something this store has never seen
+        # (a live segment, or a device-only row), so everything here is older
+        # than the view. Returning [] for that case ended pagination early and
+        # reported an empty archive that was not empty.
+        if pivot == 0:
+            messages = []
+        elif pivot > 0:
+            messages = messages[:pivot]
 
     if max_bytes > 0:
         selected: list[dict[str, Any]] = []
