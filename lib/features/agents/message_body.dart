@@ -2,12 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:markdown/markdown.dart' as md;
-import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../services/file_kind.dart';
 import 'chat_markdown.dart';
 import 'file_mention.dart';
+import 'rich_copy.dart';
 
 /// A recognised link inside a chat message.
 enum RichLinkKind { githubPr, githubIssue, jira, generic }
@@ -42,10 +42,7 @@ class LinkSegment extends MessageSegment {
 }
 
 final _mdLink = RegExp(r'\[([^\]]+)\]\(([^)\s]+)\)');
-final _bareUrl = RegExp(
-  r'https?://[^\s<>\)\]]+',
-  caseSensitive: false,
-);
+final _bareUrl = RegExp(r'https?://[^\s<>\)\]]+', caseSensitive: false);
 final _githubPr = RegExp(
   r'^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/pull/(\d+)',
   caseSensitive: false,
@@ -58,9 +55,7 @@ final _jiraBrowse = RegExp(
   r'^https?://([^/]+)/browse/([A-Z][A-Z0-9]+-\d+)',
   caseSensitive: false,
 );
-final _jiraTicketInPath = RegExp(
-  r'/([A-Z][A-Z0-9]+-\d+)(?:[/?#]|$)',
-);
+final _jiraTicketInPath = RegExp(r'/([A-Z][A-Z0-9]+-\d+)(?:[/?#]|$)');
 
 /// Split [source] into text and link segments, preferring markdown links.
 List<MessageSegment> parseMessageSegments(String source) {
@@ -107,7 +102,8 @@ RichLink classifyLink(String url, String? markdownLabel) {
     final repo = pr.group(2)!;
     final n = pr.group(3)!;
     final short = '$repo#$n';
-    final label = (markdownLabel != null &&
+    final label =
+        (markdownLabel != null &&
             markdownLabel.isNotEmpty &&
             markdownLabel != url)
         ? markdownLabel
@@ -126,7 +122,8 @@ RichLink classifyLink(String url, String? markdownLabel) {
     final repo = issue.group(2)!;
     final n = issue.group(3)!;
     final short = '$repo#$n';
-    final label = (markdownLabel != null &&
+    final label =
+        (markdownLabel != null &&
             markdownLabel.isNotEmpty &&
             markdownLabel != url)
         ? markdownLabel
@@ -142,7 +139,8 @@ RichLink classifyLink(String url, String? markdownLabel) {
   final jira = _jiraBrowse.firstMatch(url);
   if (jira != null) {
     final key = jira.group(2)!.toUpperCase();
-    final label = (markdownLabel != null &&
+    final label =
+        (markdownLabel != null &&
             markdownLabel.isNotEmpty &&
             markdownLabel != url)
         ? markdownLabel
@@ -159,7 +157,8 @@ RichLink classifyLink(String url, String? markdownLabel) {
   if (url.contains('atlassian.net')) {
     final key = _jiraTicketInPath.firstMatch(url)?.group(1)?.toUpperCase();
     if (key != null) {
-      final label = (markdownLabel != null &&
+      final label =
+          (markdownLabel != null &&
               markdownLabel.isNotEmpty &&
               markdownLabel != url)
           ? markdownLabel
@@ -206,20 +205,24 @@ String toTeamsHtml(String source) {
     encodeHtml: true,
   );
 
-  // Light table styling so Teams keeps a readable grid after paste.
-  return body
+  return styleHtmlForTeams(body);
+}
+
+/// Light table styling so Teams keeps a readable grid after paste.
+String styleHtmlForTeams(String html) {
+  const border = 'border:1px solid #c8c8c8;';
+  const pad = 'padding:6px 10px;';
+  String cell(String tag, String style) => '<$tag style="$style"';
+  return html
       .replaceAll(
-        '<table>',
-        '<table style="border-collapse:collapse;border:1px solid #c8c8c8;">',
+        RegExp(r'<table(?=[\s>])'),
+        cell('table', 'border-collapse:collapse;$border'),
       )
       .replaceAll(
-        '<th>',
-        '<th style="border:1px solid #c8c8c8;padding:6px 10px;background:#f3f2f1;text-align:left;">',
+        RegExp(r'<th(?=[\s>])'),
+        cell('th', '$border${pad}background:#f3f2f1;text-align:left;'),
       )
-      .replaceAll(
-        '<td>',
-        '<td style="border:1px solid #c8c8c8;padding:6px 10px;">',
-      );
+      .replaceAll(RegExp(r'<td(?=[\s>])'), cell('td', '$border$pad'));
 }
 
 String _cleanUrl(String raw) {
@@ -248,10 +251,7 @@ String _shortUrl(String url) {
   return shown.length <= 48 ? shown : '${shown.substring(0, 47)}…';
 }
 
-Future<void> copyMessageForTeams(
-  BuildContext context,
-  String source,
-) async {
+Future<void> copyMessageForTeams(BuildContext context, String source) async {
   await Clipboard.setData(ClipboardData(text: toTeamsFriendlyCopy(source)));
 }
 
@@ -263,15 +263,7 @@ Future<void> copyMessageHtmlForTeams(
   final html = toTeamsHtml(source);
   final plain = toTeamsFriendlyCopy(source);
 
-  final clipboard = SystemClipboard.instance;
-  if (clipboard != null && html.isNotEmpty) {
-    final item = DataWriterItem();
-    item.add(Formats.htmlText(html));
-    item.add(Formats.plainText(plain));
-    await clipboard.write([item]);
-  } else {
-    await Clipboard.setData(ClipboardData(text: html.isEmpty ? plain : html));
-  }
+  await copyRichText(html: html, plain: plain);
 }
 
 Future<void> openRichLink(String url) async {
@@ -374,7 +366,8 @@ class _MessageBodyState extends State<MessageBody> {
     // Per-bubble selection — a list-wide SelectionArea made scroll hit-testing
     // pathologically expensive on desktop.
     _frozen = RepaintBoundary(
-      child: SelectionArea(
+      child: RichCopySelectionArea(
+        source: widget.text,
         child: _buildMarkdown(context, widget.text, base),
       ),
     );
@@ -398,9 +391,7 @@ class _MessageBodyState extends State<MessageBody> {
     final prefix = text.substring(0, splitAt).trimRight();
     var settled = _settledWidget;
     if (settled == null || prefix != _settledSource) {
-      settled = RepaintBoundary(
-        child: _buildMarkdown(context, prefix, base),
-      );
+      settled = RepaintBoundary(child: _buildMarkdown(context, prefix, base));
       _settledSource = prefix;
       _settledWidget = settled;
     }
@@ -410,7 +401,11 @@ class _MessageBodyState extends State<MessageBody> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
-      children: [settled, SizedBox(height: gap), tail],
+      children: [
+        settled,
+        SizedBox(height: gap),
+        tail,
+      ],
     );
   }
 
@@ -422,11 +417,11 @@ class _MessageBodyState extends State<MessageBody> {
     final mention = parseFileMention(raw);
     if (mention == null) return null;
     return () => showFileMentionSheet(
-          context,
-          host: scope.host,
-          rootPath: scope.rootPath,
-          mention: mention,
-        );
+      context,
+      host: scope.host,
+      rootPath: scope.rootPath,
+      mention: mention,
+    );
   }
 
   Widget _buildMarkdown(
@@ -550,25 +545,25 @@ class LinkChip extends StatelessWidget {
     final theme = Theme.of(context);
     final (Color bg, Color fg, IconData icon) = switch (link.kind) {
       RichLinkKind.githubPr => (
-          const Color(0xFF238636).withValues(alpha: 0.18),
-          const Color(0xFF3FB950),
-          Icons.merge_type_rounded,
-        ),
+        const Color(0xFF238636).withValues(alpha: 0.18),
+        const Color(0xFF3FB950),
+        Icons.merge_type_rounded,
+      ),
       RichLinkKind.githubIssue => (
-          const Color(0xFF1F6FEB).withValues(alpha: 0.18),
-          const Color(0xFF58A6FF),
-          Icons.error_outline_rounded,
-        ),
+        const Color(0xFF1F6FEB).withValues(alpha: 0.18),
+        const Color(0xFF58A6FF),
+        Icons.error_outline_rounded,
+      ),
       RichLinkKind.jira => (
-          const Color(0xFF0052CC).withValues(alpha: 0.18),
-          const Color(0xFF4C9AFF),
-          Icons.confirmation_number_outlined,
-        ),
+        const Color(0xFF0052CC).withValues(alpha: 0.18),
+        const Color(0xFF4C9AFF),
+        Icons.confirmation_number_outlined,
+      ),
       RichLinkKind.generic => (
-          theme.colorScheme.primary.withValues(alpha: 0.12),
-          theme.colorScheme.primary,
-          Icons.link_rounded,
-        ),
+        theme.colorScheme.primary.withValues(alpha: 0.12),
+        theme.colorScheme.primary,
+        Icons.link_rounded,
+      ),
     };
 
     return Material(
@@ -577,10 +572,8 @@ class LinkChip extends StatelessWidget {
       child: InkWell(
         borderRadius: BorderRadius.circular(8),
         onTap: () => openRichLink(link.url),
-        onLongPress: () => copyMessageForTeams(
-          context,
-          '${link.label} <${link.url}>',
-        ),
+        onLongPress: () =>
+            copyMessageForTeams(context, '${link.label} <${link.url}>'),
         child: Padding(
           padding: EdgeInsets.symmetric(
             horizontal: dense ? 6 : 8,

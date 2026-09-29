@@ -884,12 +884,7 @@ exit 0
     } on TimeoutException {
       throw TimeoutException('Local command timed out after $timeout');
     } on ProcessException catch (e) {
-      throw StateError(
-        Platform.isWindows
-            ? 'Could not run bash on This PC ($e). Install Git Bash '
-                  'or enable OpenSSH Server for agents.'
-            : 'Could not run local shell: $e',
-      );
+      throw StateError(localShellMissingHint(e));
     }
     if (result.exitCode != 0) {
       final err = (result.stderr as String).trim();
@@ -2182,21 +2177,23 @@ fi
     }
 
     try {
-      final home =
-          Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
-      if (home == null || home.isEmpty) {
-        throw StateError('HOME is not set');
-      }
-      final share = Directory('$home/.local/share/agentdock/host/adsm');
-      final binDir = Directory('$home/.local/bin');
+      await initLocalShellPaths();
+      final home = localHostHome();
+      final share = Directory(
+        localFsPath('$home/.local/share/agentdock/host/adsm'),
+      );
+      final binDir = Directory(localFsPath('$home/.local/bin'));
       await share.create(recursive: true);
       await binDir.create(recursive: true);
       for (final entry in payloads.entries) {
-        await File('${share.path}/${entry.key}').writeAsBytes(entry.value);
+        await File(
+          '${share.path}${Platform.pathSeparator}${entry.key}',
+        ).writeAsBytes(entry.value);
       }
-      final wrapper = File('${binDir.path}/agentdock-adsm');
-      await wrapper.writeAsString(_adsmWrapper);
-      await Process.run('chmod', ['+x', wrapper.path]);
+      // The restart script below marks it executable.
+      await File(
+        '${binDir.path}${Platform.pathSeparator}agentdock-adsm',
+      ).writeAsString(_adsmWrapper);
       await _execLocal(
         _adsmRestartScript,
         timeout: const Duration(seconds: 45),
@@ -2595,7 +2592,7 @@ exit 1
     final normalized = normalizeRemotePath(path.replaceAll(r'\', '/'));
     if (_preferLocalFs(host)) {
       try {
-        return await Directory(normalized).exists();
+        return await Directory(localFsPath(normalized)).exists();
       } catch (e) {
         SafeLog.d('localPathExists failed', e);
         return false;
@@ -2619,11 +2616,8 @@ exit 1
   /// (same idea as the local PTY terminal).
   Future<String> remoteHomeDirectory(Host host) async {
     if (_preferLocalFs(host)) {
-      final home =
-          Platform.environment['HOME'] ??
-          Platform.environment['USERPROFILE'] ??
-          '/';
-      return normalizeRemotePath(home.replaceAll(r'\', '/'));
+      await initLocalShellPaths();
+      return normalizeRemotePath(localHostHome());
     }
     final out = await exec(host, 'printf %s "\$HOME"');
     final home = out.trim();
@@ -2643,10 +2637,11 @@ exit 1
     final name = _localBasename(remote);
     if (_preferLocalFs(host)) {
       try {
-        final type = await FileSystemEntity.type(remote, followLinks: true);
+        final fsPath = localFsPath(remote);
+        final type = await FileSystemEntity.type(fsPath, followLinks: true);
         if (type == FileSystemEntityType.notFound) return null;
         final isDir = type == FileSystemEntityType.directory;
-        final stat = await FileStat.stat(remote);
+        final stat = await FileStat.stat(fsPath);
         return RemoteFileEntry(
           name: name,
           isDirectory: isDir,
@@ -2719,7 +2714,11 @@ exit 1
     return RemoteFileListing(path: normalized, entries: entries);
   }
 
-  bool _preferLocalFs(Host host) =>
+  bool _preferLocalFs(Host host) => runsLocally(host);
+
+  /// True for This Mac/PC on desktop: commands, files and ADSM go through a
+  /// local shell / filesystem instead of SSH.
+  bool runsLocally(Host host) =>
       isDesktopLocalHostPlatform && isLocalThisComputerHost(host);
 
   /// True for This Mac/PC: commands, files and ADSM run locally, never SSH.
@@ -2730,7 +2729,7 @@ exit 1
 
   Future<RemoteFileListing> _listLocalEntries(String path) async {
     final normalized = normalizeRemotePath(path.replaceAll(r'\', '/'));
-    final dir = Directory(normalized);
+    final dir = Directory(localFsPath(normalized));
     if (!await dir.exists()) {
       throw FileSystemException('Directory not found', normalized);
     }
@@ -2809,7 +2808,7 @@ exit 1
   }) async {
     final remote = normalizeRemotePath(remotePath);
     if (_preferLocalFs(host)) {
-      final src = File(remote);
+      final src = File(localFsPath(remote));
       final len = await src.length();
       onProgress?.call(0, len);
       await src.copy(localPath);
@@ -3011,8 +3010,9 @@ exit 1
   }) async {
     final remote = normalizeRemotePath(remotePath);
     if (_preferLocalFs(host)) {
-      await File(localPath).copy(remote);
-      onProgress?.call(await File(remote).length());
+      final dest = localFsPath(remote);
+      await File(localPath).copy(dest);
+      onProgress?.call(await File(dest).length());
       return;
     }
     final client = await connect(host);
@@ -3044,7 +3044,7 @@ exit 1
   Future<void> mkdirRemote(Host host, String remotePath) async {
     final remote = normalizeRemotePath(remotePath);
     if (_preferLocalFs(host)) {
-      await Directory(remote).create(recursive: true);
+      await Directory(localFsPath(remote)).create(recursive: true);
       return;
     }
     final client = await connect(host);
@@ -3055,11 +3055,12 @@ exit 1
   Future<void> removeRemoteFile(Host host, String remotePath) async {
     final remote = normalizeRemotePath(remotePath);
     if (_preferLocalFs(host)) {
-      final type = await FileSystemEntity.type(remote);
+      final fsPath = localFsPath(remote);
+      final type = await FileSystemEntity.type(fsPath);
       if (type == FileSystemEntityType.directory) {
-        await Directory(remote).delete(recursive: false);
+        await Directory(fsPath).delete(recursive: false);
       } else {
-        await File(remote).delete();
+        await File(fsPath).delete();
       }
       return;
     }

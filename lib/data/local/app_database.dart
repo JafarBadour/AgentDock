@@ -17,6 +17,7 @@ import '../models/remote_path.dart';
 import '../models/repo.dart';
 import '../models/scheduled_job.dart';
 import '../models/skill.dart';
+import '../../services/local_host_bootstrap.dart';
 import '../../services/transcript_budget.dart';
 
 /// Local metadata only — never stores secrets.
@@ -678,7 +679,14 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
       'hosts',
       orderBy: 'sort_order ASC, alias COLLATE NOCASE',
     );
-    return rows.map(Host.fromMap).toList();
+    return [
+      for (final row in rows)
+        // A desktop's "This Mac/PC" row arrives on phones via .ag import;
+        // 127.0.0.1 there is the phone itself.
+        if (isDesktopLocalHostPlatform ||
+            row['id'] != kLocalThisComputerHostId)
+          Host.fromMap(row),
+    ];
   }
 
   Future<int> nextHostSortOrder() async {

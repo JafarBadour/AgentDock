@@ -22,8 +22,14 @@ from .worker import Worker, agent_alive
 _IDLE_STOP_SECONDS = 15 * 60
 _MAINTENANCE_EVERY = 60
 # Stream chunks are fanned out live but must not accumulate in RAM.
-_EVENT_LOG_SKIP_KINDS = frozenset({"text", "thought", "activity"})
+_EVENT_LOG_SKIP_KINDS = frozenset({"text", "thought", "activity", "chat_changed"})
 _EVENT_LOG_MAX = 200
+# What a `digest` subscriber (a device keeping its chat list live) receives
+# for chats it has not opened: new messages, turn ends, status and catalog
+# changes — not the token stream.
+_DIGEST_KINDS = frozenset(
+    {"user_message", "prompt_accepted", "turn_complete", "status", "chat_changed"}
+)
 
 
 class Daemon:
@@ -32,6 +38,7 @@ class Daemon:
         self._seq = 0
         self._subscribers: dict[str, set[asyncio.StreamWriter]] = {}
         self._global_subscribers: set[asyncio.StreamWriter] = set()
+        self._digest_subscribers: set[asyncio.StreamWriter] = set()
         self._event_log: dict[str, list[dict[str, Any]]] = {}
         # In-flight `rpc.chunk` transfers: (writer_id, req_id) → buffer.
         self._chunk_bufs: dict[tuple[int, Any], dict[str, Any]] = {}
@@ -197,7 +204,7 @@ class Daemon:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    async def _worker_emit(self, payload: dict[str, Any]) -> None:
+    async def _worker_emit(self, payload: dict[str, Any]) -> int:
         chat_id = str(payload.get("chatId") or "")
         kind = str(payload.get("kind") or "status")
         self._seq += 1
@@ -215,6 +222,8 @@ class Daemon:
         dead: list[asyncio.StreamWriter] = []
         targets = set(self._global_subscribers)
         targets |= self._subscribers.get(chat_id, set())
+        if kind in _DIGEST_KINDS:
+            targets |= self._digest_subscribers
         raw = protocol.encode(event)
         for w in targets:
             try:
@@ -232,9 +241,11 @@ class Daemon:
                 await self._patch_agent_record(
                     chat_id, acp_session_id=str(sid)
                 )
+        return seq
 
     def _drop_writer(self, writer: asyncio.StreamWriter) -> None:
         self._global_subscribers.discard(writer)
+        self._digest_subscribers.discard(writer)
         for s in self._subscribers.values():
             s.discard(writer)
         wid = id(writer)
@@ -361,6 +372,10 @@ class Daemon:
                 result = await self._transcript_pull(params)
             elif method == "transcript.sync":
                 result = await self._transcript_sync(params)
+            elif method == "chats.notify":
+                result = await self._chats_notify(params)
+            elif method == "chats.fork":
+                result = await self._chats_fork(params)
             else:
                 writer.write(
                     protocol.encode(
@@ -436,6 +451,10 @@ class Daemon:
         chat_id = str(params.get("chatId") or "")
         if not chat_id:
             raise ValueError("chatId required")
+        is_new = (
+            chat_id not in self.workers
+            and not paths.agent_record_path(chat_id).exists()
+        )
         w = self._worker(chat_id)
         cwd = str(params.get("cwd") or "")
         binary = str(params.get("binary") or "")
@@ -462,7 +481,79 @@ class Daemon:
             binary=binary or None,
             provider=provider or None,
         )
+        if is_new:
+            await self._broadcast_chat_changed(chat_id, "created")
         return snap
+
+    async def _broadcast_chat_changed(self, chat_id: str, change: str) -> None:
+        """Tell every connected device a chat's catalog entry changed."""
+        await self._worker_emit(
+            {"chatId": chat_id, "kind": "chat_changed", "change": change}
+        )
+
+    async def _chats_notify(self, params: dict[str, Any]) -> dict[str, Any]:
+        """A device changed a chat record (rename, read marker, new chat,
+        delete) through the files; fan that out so other devices re-sync."""
+        chat_id = str(params.get("chatId") or "")
+        if not chat_id:
+            raise ValueError("chatId required")
+        change = str(params.get("change") or "updated")
+        await self._broadcast_chat_changed(chat_id, change)
+        return {"ok": True}
+
+    async def _chats_fork(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Start a new chat carrying another one's conversation.
+
+        The fork gets its own copy of the durable transcript but deliberately
+        no ACP session id: it opens a fresh session and rebuilds context from
+        that transcript on its first prompt (see Worker's history bootstrap).
+        Forking therefore costs nothing until the fork is actually used, and
+        the source chat keeps running untouched.
+        """
+        src = str(params.get("fromChatId") or "")
+        dst = str(params.get("chatId") or "")
+        if not src or not dst:
+            raise ValueError("fromChatId and chatId required")
+        if src == dst:
+            raise ValueError("cannot fork a chat onto itself")
+        if paths.agent_record_path(dst).exists():
+            raise ValueError(f"chat already exists: {dst}")
+
+        rows = await asyncio.to_thread(
+            transcript_store.fork_messages,
+            src,
+            dst,
+            through_id=str(params.get("throughMessageId") or "") or None,
+        )
+
+        # Land the fork in the same repo, on the same agent and model.
+        source: dict[str, Any] = {}
+        src_path = paths.agent_record_path(src)
+        if src_path.exists():
+            try:
+                source = json.loads(src_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                source = {}
+        await self._patch_agent_record(
+            dst,
+            status=protocol.STATUS_IDLE,
+            cwd=source.get("cwd"),
+            binary=source.get("binary"),
+            provider=source.get("provider"),
+            model_id=source.get("model_id"),
+        )
+
+        # Tells the worker to introduce the replayed history as a fork rather
+        # than as a dropped session. Consumed once, on the first prompt.
+        session_dir = paths.session_dir(dst)
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (session_dir / "forked_from").write_text(src, encoding="utf-8")
+        except OSError:
+            pass
+
+        await self._broadcast_chat_changed(dst, "created")
+        return {"chatId": dst, "fromChatId": src, "messages": len(rows)}
 
     async def _stop(
         self, params: dict[str, Any], *, delete: bool
@@ -477,6 +568,8 @@ class Daemon:
                 if rec.exists():
                     rec.unlink(missing_ok=True)
                 transcript_store.clear_messages(chat_id)
+        if delete and chat_id:
+            await self._broadcast_chat_changed(chat_id, "deleted")
         return {"ok": True}
 
     async def _subscribe(
@@ -492,6 +585,8 @@ class Daemon:
                 if seq > after:
                     writer.write(protocol.encode(ev))
             await writer.drain()
+        elif params.get("digest"):
+            self._digest_subscribers.add(writer)
         else:
             self._global_subscribers.add(writer)
         w = self.workers.get(chat_id) if chat_id else None

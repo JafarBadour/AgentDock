@@ -1,10 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:dartssh2/dartssh2.dart';
-
 import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
+import 'login_shell.dart';
 import 'ssh_service.dart';
 
 enum ClaudeLoginPhase {
@@ -16,11 +15,11 @@ enum ClaudeLoginPhase {
   error,
 }
 
-/// Drives `claude auth login` on a remote host over SSH PTY.
+/// Drives `claude auth login` in a PTY on a host (SSH, or local on This Mac/PC).
 class ClaudeRemoteAuthSession {
   ClaudeRemoteAuthSession._({
     required this.host,
-    required SSHSession session,
+    required LoginShell session,
   })  : _session = session,
         phase = ClaudeLoginPhase.starting;
 
@@ -30,9 +29,8 @@ class ClaudeRemoteAuthSession {
   String? error;
   String _buffer = '';
 
-  final SSHSession _session;
-  StreamSubscription<List<int>>? _stdoutSub;
-  StreamSubscription<List<int>>? _stderrSub;
+  final LoginShell _session;
+  StreamSubscription<List<int>>? _outputSub;
   Timer? _enterTimer;
   bool _closed = false;
 
@@ -117,7 +115,7 @@ class ClaudeRemoteAuthSession {
   void _write(String text) {
     if (_closed) return;
     try {
-      _session.stdin.add(utf8.encode(text));
+      _session.write(utf8.encode(text));
     } catch (e) {
       SafeLog.d('claude login stdin write failed', e);
     }
@@ -134,8 +132,7 @@ class ClaudeRemoteAuthSession {
     if (_closed) return;
     _closed = true;
     _enterTimer?.cancel();
-    await _stdoutSub?.cancel();
-    await _stderrSub?.cancel();
+    await _outputSub?.cancel();
     try {
       _session.close();
     } catch (_) {}
@@ -145,18 +142,10 @@ class ClaudeRemoteAuthSession {
     required SshService ssh,
     required Host host,
   }) async {
-    final client = await ssh.connect(host);
-    final session = await client.shell(
-      pty: const SSHPtyConfig(
-        type: 'xterm-256color',
-        width: 120,
-        height: 40,
-      ),
-    );
+    final session = await LoginShell.open(ssh, host);
 
     final auth = ClaudeRemoteAuthSession._(host: host, session: session);
-    auth._stdoutSub = session.stdout.listen(auth._appendBytes);
-    auth._stderrSub = session.stderr.listen(auth._appendBytes);
+    auth._outputSub = session.output.listen(auth._appendBytes);
 
     auth._write(
       'export PATH="\$HOME/.local/bin:\$HOME/.npm-global/bin:\$HOME/.cursor/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"\n',

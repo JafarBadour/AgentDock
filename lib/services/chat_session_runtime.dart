@@ -163,6 +163,9 @@ class ChatSessionRuntime extends ChangeNotifier {
   /// update one message instead of appending fragments.
   String? _assistantMessageId;
   DateTime? _assistantStartedAt;
+
+  /// Row id for the thought currently buffering (see [_streamMessageId]).
+  String? _thoughtMessageId;
   Timer? _assistantPersistTimer;
   Timer? _codeDeltaPersistTimer;
   int _writesInFlight = 0;
@@ -1512,6 +1515,36 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
   }
 
+  String? _streamMessageId(String? streamId) =>
+      streamSegmentMessageId(chatId, streamId);
+
+  bool _knowsMessage(String id) =>
+      entries.any((e) => e.messageId == id) ||
+      outboundQueue.any((m) => m.id == id);
+
+  /// A message sent into this chat from another device. The host fans every
+  /// accepted prompt out to all devices, messenger-style; this device's own
+  /// sends come back too and are dropped by id.
+  Future<void> _adoptRemoteUserMessage(ChatMessage m) async {
+    if (_knowsMessage(m.id)) return;
+    try {
+      if (await _db.getMessage(m.id) != null) return;
+    } catch (_) {}
+    if (_disposed || _knowsMessage(m.id)) return;
+    entries.add(TranscriptEntry.message(m));
+    _trimResidentTranscript();
+    _writesInFlight++;
+    try {
+      await _db.upsertMessage(m);
+      onLocalChange?.call(chatId);
+    } catch (e) {
+      SafeLog.d('store remote user message failed', e);
+    } finally {
+      _writesInFlight--;
+    }
+    _notifyUi(immediate: true);
+  }
+
   /// Move a queued message into the visible transcript, stamped *now* so it
   /// sorts after the turn that just finished.
   Future<void> _promoteQueuedMessage(ChatMessage message) async {
@@ -2145,6 +2178,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     switch (update.kind) {
       case AcpUpdateKind.ignored:
         break;
+      case AcpUpdateKind.userMessage:
+        final m = update.message;
+        if (m != null && m.chatId == chatId) {
+          unawaited(_adoptRemoteUserMessage(m));
+        }
       case AcpUpdateKind.status:
         // Only accept ACP-suggested titles while the row is still a placeholder
         // ("New agent"). User renames must stick across devices.
@@ -2241,7 +2279,8 @@ class ChatSessionRuntime extends ChangeNotifier {
         _appendAssistantText(update.text);
         // Assign id immediately so the live bubble and the checkpointed row
         // share one identity (avoids double-painting when id was still null).
-        _assistantMessageId ??= const Uuid().v4();
+        _assistantMessageId ??=
+            _streamMessageId(update.streamId) ?? const Uuid().v4();
         _assistantStartedAt ??= DateTime.now();
         if (update.text.trim().isNotEmpty) {
           onAssistantText?.call(update.text);
@@ -2257,6 +2296,9 @@ class ChatSessionRuntime extends ChangeNotifier {
         activityLabel ??= 'Thinking';
         if (assistantBuffer.isNotEmpty) {
           unawaited(flushAssistantBuffer());
+        }
+        if (thoughtBuffer.isEmpty) {
+          _thoughtMessageId = _streamMessageId(update.streamId);
         }
         _appendThoughtText(update.text);
         _notifyUi();
@@ -2437,12 +2479,14 @@ class ChatSessionRuntime extends ChangeNotifier {
   Future<void> commitThought() async {
     final text = thoughtBuffer.trim();
     thoughtBuffer = '';
+    final streamedId = _thoughtMessageId;
+    _thoughtMessageId = null;
     if (text.isEmpty) {
       _notifyUi();
       return;
     }
     final message = ChatMessage(
-      id: const Uuid().v4(),
+      id: streamedId ?? const Uuid().v4(),
       chatId: chatId,
       role: MessageRole.system,
       content: ThoughtMessage.encode(text),
@@ -2712,9 +2756,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       final existingId = _toolMessageIds[tool.toolCallId];
       final msgId = existingId ?? const Uuid().v4();
       _toolMessageIds[tool.toolCallId] = msgId;
-      entries.add(
-        TranscriptEntry.tool(_uiToolSummary(tool), messageId: msgId),
-      );
+      entries.add(TranscriptEntry.tool(_uiToolSummary(tool), messageId: msgId));
       _toolEntryIndexes[tool.toolCallId] = entries.length - 1;
       final message = ChatMessage(
         id: msgId,

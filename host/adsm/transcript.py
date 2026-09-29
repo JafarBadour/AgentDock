@@ -23,8 +23,11 @@ def ensure_messages_dir() -> None:
     messages_dir().mkdir(parents=True, exist_ok=True)
 
 
-def _now_iso() -> str:
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_now_iso = now_iso
 
 
 def _normalize(row: dict[str, Any], chat_id: str) -> Optional[dict[str, Any]]:
@@ -201,3 +204,45 @@ def clear_messages(chat_id: str) -> bool:
         path.unlink(missing_ok=True)
         return True
     return False
+
+
+def fork_messages(
+    src_chat_id: str,
+    dst_chat_id: str,
+    *,
+    through_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Copy [src_chat_id]'s durable transcript onto [dst_chat_id].
+
+    Message ids are regenerated: an id is unique per device database, not per
+    chat, so reusing them would collide with the source's rows once the fork
+    syncs back. Timestamps are kept, so the fork reads in the original order.
+
+    [through_id] forks the conversation up to and including that message,
+    leaving anything after it behind.
+    """
+    rows = list_messages(src_chat_id)
+    if through_id:
+        cut = next(
+            (i for i, m in enumerate(rows) if m.get("id") == through_id), -1
+        )
+        if cut >= 0:
+            rows = rows[: cut + 1]
+    forked = [
+        {
+            "id": str(uuid.uuid4()),
+            "chat_id": dst_chat_id,
+            "role": row["role"],
+            "content": row["content"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+    ensure_messages_dir()
+    path = messages_path(dst_chat_id)
+    tmp = path.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for row in forked:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    return forked

@@ -279,6 +279,33 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
     ref.invalidate(unreadCountsProvider);
   }
 
+  /// Branch [chat] into a second agent that starts with the same context.
+  Future<void> _forkChat(Host host, Chat chat) async {
+    final repo = await ref.read(appDatabaseProvider).getRepo(chat.repoId);
+    if (repo == null || !mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(
+      SnackBar(content: Text('Forking "${chat.title}"…')),
+    );
+    try {
+      final fork = await ref
+          .read(chatForkServiceProvider)
+          .fork(host: host, repo: repo, source: chat);
+      ref.invalidate(agentsTreeProvider);
+      if (!mounted) return;
+      messenger.hideCurrentSnackBar();
+      await _openChat(fork);
+    } catch (e) {
+      SafeLog.d('fork chat failed', e);
+      if (!mounted) return;
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(
+        SnackBar(content: Text('Could not fork "${chat.title}" — $e')),
+      );
+    }
+  }
+
   Future<void> _renameChat(Chat chat) async {
     final controller = TextEditingController(text: chat.title);
     final next = await showDialog<String>(
@@ -429,6 +456,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
       tag: tag,
       onTap: () => _openChat(chat),
       onRename: () => unawaited(_renameChat(chat)),
+      onFork: () => unawaited(_forkChat(host, chat)),
       onDelete: () async {
         if (await _confirmDeleteChat(host, chat)) {
           unawaited(_deleteChat(host, chat));
@@ -611,6 +639,7 @@ class _AgentsScreenState extends ConsumerState<AgentsScreen> {
           compact: widget.embedded,
           onTap: () => _openChat(chat),
           onRename: () => unawaited(_renameChat(chat)),
+          onFork: () => unawaited(_forkChat(item.host, chat)),
           onDelete: () async {
             if (await _confirmDeleteChat(item.host, chat)) {
               unawaited(_deleteChat(item.host, chat));
@@ -759,6 +788,7 @@ class _NestedAgentRow extends StatelessWidget {
     required this.runtime,
     required this.onTap,
     required this.onRename,
+    required this.onFork,
     required this.onDelete,
     this.tag,
     this.selected = false,
@@ -769,6 +799,7 @@ class _NestedAgentRow extends StatelessWidget {
   final Widget? tag;
   final VoidCallback onTap;
   final VoidCallback onRename;
+  final VoidCallback onFork;
   final VoidCallback onDelete;
   final bool selected;
 
@@ -799,6 +830,16 @@ class _NestedAgentRow extends StatelessWidget {
           ),
         ),
         PopupMenuItem(
+          value: 'fork',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.call_split),
+            title: Text('Fork agent'),
+            subtitle: Text('New agent, same context'),
+          ),
+        ),
+        PopupMenuItem(
           value: 'delete',
           child: ListTile(
             dense: true,
@@ -810,6 +851,7 @@ class _NestedAgentRow extends StatelessWidget {
       ],
     );
     if (choice == 'rename') onRename();
+    if (choice == 'fork') onFork();
     if (choice == 'delete') onDelete();
   }
 
@@ -1117,6 +1159,7 @@ class _PhoneChatCard extends StatelessWidget {
     required this.runtime,
     required this.onTap,
     required this.onRename,
+    required this.onFork,
     required this.onDelete,
     this.selected = false,
     this.compact = false,
@@ -1128,6 +1171,7 @@ class _PhoneChatCard extends StatelessWidget {
   final ChatSessionRuntime? runtime;
   final VoidCallback onTap;
   final VoidCallback onRename;
+  final VoidCallback onFork;
   final VoidCallback onDelete;
   final bool selected;
   final bool compact;
@@ -1159,6 +1203,16 @@ class _PhoneChatCard extends StatelessWidget {
           ),
         ),
         PopupMenuItem(
+          value: 'fork',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.call_split),
+            title: Text('Fork agent'),
+            subtitle: Text('New agent, same context'),
+          ),
+        ),
+        PopupMenuItem(
           value: 'delete',
           child: ListTile(
             dense: true,
@@ -1170,6 +1224,7 @@ class _PhoneChatCard extends StatelessWidget {
       ],
     );
     if (choice == 'rename') onRename();
+    if (choice == 'fork') onFork();
     if (choice == 'delete') onDelete();
   }
 

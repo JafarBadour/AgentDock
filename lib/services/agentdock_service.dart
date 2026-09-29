@@ -246,6 +246,14 @@ class AgentDockService {
   /// push down the pull-whole-file / rewrite-whole-file path.
   bool Function(String chatId)? hostOwnsTranscript;
 
+  /// Called after a push that changed what other devices show for the chat
+  /// in their list (title, read marker, queue, new chat), so they can be told
+  /// right away instead of on their next catalog refresh.
+  void Function(Host host, String chatId)? onChatMetaPushed;
+
+  /// Last pushed list-visible fields per chat — see [_noteMetaPushed].
+  final Map<String, String> _pushedMeta = {};
+
   final Map<String, Timer> _pushTimers = {};
   final Set<String> _dirtyChats = {};
   Future<String?>? _catalogSyncInFlight;
@@ -412,6 +420,7 @@ class AgentDockService {
         _pushedLines.remove(chatId);
         _pushedPrefixHash.remove(chatId);
         _dirtyChats.remove(chatId);
+        _noteMetaPushed(host, record);
         return;
       }
 
@@ -500,12 +509,29 @@ class AgentDockService {
       _pushedPrefixHash[chatId] = _hashPrefixTail(finalTail, finalTail.length);
       _dirtyChats.remove(chatId);
       _scheduleWatermarkSave();
+      _noteMetaPushed(host, record);
     } catch (e) {
       SafeLog.d('agentdock pushChat failed', e);
       // Force a full rewrite next time; the remote state is now unknown.
       _pushedLines.remove(chatId);
       _pushedPrefixHash.remove(chatId);
     }
+  }
+
+  /// Fire [onChatMetaPushed] when [record]'s list-visible fields differ from
+  /// the last push. Status and session handles churn every turn and reach
+  /// other devices through live ADSM events instead.
+  void _noteMetaPushed(Host host, AgentDockRecord record) {
+    final json = record.toJson()
+      ..remove('status')
+      ..remove('updated_at')
+      ..remove('acp_session_id')
+      ..remove('journal_offset')
+      ..remove('model_id');
+    final meta = jsonEncode(json);
+    if (_pushedMeta[record.id] == meta) return;
+    _pushedMeta[record.id] = meta;
+    onChatMetaPushed?.call(host, record.id);
   }
 
   Future<void> pushAgent({
@@ -699,7 +725,10 @@ class AgentDockService {
   ///
   /// Also removes local chats that were deleted on another device (tombstones
   /// under `~/.agentdock/deleted/`).
-  Future<int> syncHostCatalog(Host host) async {
+  ///
+  /// [probes]: also refresh remote MCP / skill state (slow; off for live
+  /// updates, which only need the chat records).
+  Future<int> syncHostCatalog(Host host, {bool probes = true}) async {
     final remote = await pullAgents(host).timeout(const Duration(seconds: 12));
     final deletedIds = await pullDeletedAgentIds(
       host,
@@ -775,6 +804,7 @@ class AgentDockService {
       deletedIds: deletedIds,
       remoteIds: remoteIds,
     );
+    if (!probes) return merged;
     try {
       await McpDeployService(
         _ssh,

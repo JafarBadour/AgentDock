@@ -418,15 +418,16 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
     }
 
     // This Mac/PC runs everything locally (shell, files, ADSM), so there is
-    // no SSH session to open — and on Windows there is usually no sshd.
+    // no SSH session to open — an SSH handshake here failed whenever Remote
+    // Login was off or had no authorized key, and Windows rarely runs sshd.
     if (!ssh.usesLocalShell(host)) {
       await ssh.connect(host).timeout(
         const Duration(seconds: 20),
         onTimeout: () =>
             throw TimeoutException('Timed out reaching ${host.displayLabel}'),
       );
-      if (!_current(chat.id, epoch)) return _AttemptOutcome.superseded;
     }
+    if (!_current(chat.id, epoch)) return _AttemptOutcome.superseded;
 
     // Pull the live session id the desktop wrote before attaching — without
     // it the agent starts over and only sees messages sent on this device.

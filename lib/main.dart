@@ -40,6 +40,7 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       unawaited(ref.read(localNotificationServiceProvider).init());
       // Keep provider alive so remote deletes tear down ACP sessions.
       ref.read(remoteDeletedChatsPrunerProvider);
+      ref.read(hostLiveSyncLifecycleProvider);
       // Mac / Windows: offer this machine as a host for local agents.
       unawaited(() async {
         final host = await ensureLocalThisComputerHost(

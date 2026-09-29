@@ -250,7 +250,8 @@ class _Renderer {
           children: [
             SizedBox(
               width: ordered ? fontSize * 1.8 : fontSize * 1.2,
-              child: Text(marker, style: s),
+              // Not selectable: a copied selection carries the list as HTML.
+              child: SelectionContainer.disabled(child: Text(marker, style: s)),
             ),
             Expanded(child: column(blocks(child.children, style: s))),
           ],
@@ -303,10 +304,12 @@ class _Renderer {
             child: Row(
               children: [
                 Expanded(
-                  child: Text(
-                    lang,
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: scheme.onSurfaceVariant,
+                  child: SelectionContainer.disabled(
+                    child: Text(
+                      lang,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
                 ),
