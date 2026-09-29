@@ -18,71 +18,27 @@ bool get isDesktopLocalHostPlatform {
 /// "This Mac" / "This PC" for the machine Agent Dock runs on.
 String get localComputerLabel => Platform.isMacOS ? 'This Mac' : 'This PC';
 
-// Windows: agents on This PC run inside WSL — ADSM needs tmux, FIFOs and Unix
-// sockets. Paths on this host are then WSL paths (`/home/me/x`,
-// `/mnt/c/Users/me/x`); dart:io reaches them through [localFsPath].
-String? _wslHome;
-String? _wslUncRoot;
-
-/// Process + arguments that run [script] in a login bash on this computer.
-(String, List<String>) localShellInvocation(String script) =>
-    Platform.isWindows
-        ? ('wsl.exe', ['-e', 'bash', '-lc', script])
-        : ('/bin/bash', ['-lc', script]);
+// Windows: agents on This PC run natively (see `WindowsLocalAgent`), and its
+// paths are drive paths with forward slashes (`C:/Users/me/x`), which dart:io
+// opens as they are.
 
 /// User-facing reason the local shell failed to start.
 String localShellMissingHint(Object error) => Platform.isWindows
-    ? 'Agents on This PC run in WSL, which is not available ($error).\n'
-          'Install it from an admin PowerShell with `wsl --install`, restart, '
-          'then open Agent Dock again.'
+    ? 'Could not run Git Bash on This PC ($error).\n'
+          'Install Git for Windows (`winget install Git.Git`), then open '
+          'Agent Dock again.'
     : 'Could not run local shell: $error';
-
-/// Learn the WSL home and its `\\wsl.localhost\<distro>` root (Windows only).
-Future<void> initLocalShellPaths() async {
-  if (!Platform.isWindows || _wslHome != null) return;
-  try {
-    final r = await Process.run('wsl.exe', [
-      '-e',
-      'sh',
-      '-c',
-      r'printf "%s\n" "$HOME"; wslpath -w /',
-    ]).timeout(const Duration(seconds: 20));
-    if (r.exitCode != 0) return;
-    final lines = (r.stdout as String)
-        .split(RegExp(r'\r?\n'))
-        .map((l) => l.trim())
-        .where((l) => l.isNotEmpty)
-        .toList();
-    if (lines.length < 2) return;
-    _wslHome = lines[0];
-    var root = lines[1];
-    while (root.endsWith(r'\')) {
-      root = root.substring(0, root.length - 1);
-    }
-    _wslUncRoot = root;
-  } catch (e) {
-    SafeLog.d('WSL path lookup failed', e);
-  }
-}
 
 /// Home directory of This Mac/PC, as the agent's shell sees it.
 String localHostHome() {
-  if (Platform.isWindows) return _wslHome ?? '/';
-  return Platform.environment['HOME'] ?? '/';
+  final home =
+      Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
+  if (home == null || home.isEmpty) return '/';
+  return Platform.isWindows ? home.replaceAll(r'\', '/') : home;
 }
 
-/// A path on This Mac/PC → a path dart:io can open. Identity except on
-/// Windows, where WSL paths map to drive letters or the WSL network share.
-String localFsPath(String hostPath) {
-  if (!Platform.isWindows) return hostPath;
-  final drive = RegExp(r'^/mnt/([a-zA-Z])(/.*)?$').firstMatch(hostPath);
-  if (drive != null) {
-    return '${drive.group(1)!.toUpperCase()}:${drive.group(2) ?? '/'}';
-  }
-  final root = _wslUncRoot;
-  if (root == null || !hostPath.startsWith('/')) return hostPath;
-  return '$root${hostPath.replaceAll('/', r'\')}';
-}
+/// A path on This Mac/PC → a path dart:io can open.
+String localFsPath(String hostPath) => hostPath;
 
 bool isLocalThisComputerHost(Host host) {
   if (host.id == kLocalThisComputerHostId) return true;
@@ -185,7 +141,6 @@ Future<String> localComputerDisplayName() async {
 /// Idempotent — does not overwrite an existing row the user may have edited.
 Future<Host?> ensureLocalThisComputerHost(AppDatabase db) async {
   if (!isDesktopLocalHostPlatform) return null;
-  await initLocalShellPaths();
 
   final existing = await db.getHost(kLocalThisComputerHostId);
   if (existing != null) {
