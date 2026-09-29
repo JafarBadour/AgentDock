@@ -58,6 +58,7 @@ class TranscriptView extends StatefulWidget {
     this.onLoadOlder,
     this.onJumpToLatest,
     this.overlay,
+    this.overlayHeight = 0,
   });
 
   final ValueListenable<TranscriptSnapshot> snapshot;
@@ -72,6 +73,11 @@ class TranscriptView extends StatefulWidget {
 
   /// Pinned over the bottom edge (activity strip); never resizes the viewport.
   final Widget? overlay;
+
+  /// Height [overlay] takes when it is showing. Reserved in the list padding
+  /// at all times — the strip is opaque, so without this the newest line hides
+  /// underneath it, and reserving only while it shows would jump the scroll.
+  final double overlayHeight;
 
   @override
   State<TranscriptView> createState() => _TranscriptViewState();
@@ -370,7 +376,12 @@ class _TranscriptViewState extends State<TranscriptView> {
               reverse: true,
               physics: const AlwaysScrollableScrollPhysics(),
               // Reversed: `bottom` is the edge nearest the composer.
-              padding: EdgeInsets.fromLTRB(sidePad, 12, sidePad, 16),
+              padding: EdgeInsets.fromLTRB(
+                sidePad,
+                12,
+                sidePad,
+                16 + widget.overlayHeight,
+              ),
               cacheExtent: _cacheExtent,
               // First frame builds only what is visible; the cache area (and
               // its markdown parsing) fills in on following frames.
@@ -389,25 +400,35 @@ class _TranscriptViewState extends State<TranscriptView> {
               ),
           ),
         ),
-        ValueListenableBuilder<bool>(
-          valueListenable: widget.controller.following,
-          builder: (context, following, _) {
-            if (following) return const SizedBox.shrink();
-            return Positioned(
-              left: 0,
-              right: 0,
-              bottom: 12,
-              child: Center(
-                child: _JumpToLatestButton(
-                  newCount: _newWhileFrozen,
-                  onTap: _jumpToLatest,
-                ),
+        // Both sit on the bottom edge, so stack them in one column rather than
+        // pinning each to it — the jump button used to land inside the
+        // activity strip's band and get painted over by it.
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ValueListenableBuilder<bool>(
+                valueListenable: widget.controller.following,
+                builder: (context, following, _) {
+                  if (following) return const SizedBox.shrink();
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Center(
+                      child: _JumpToLatestButton(
+                        newCount: _newWhileFrozen,
+                        onTap: _jumpToLatest,
+                      ),
+                    ),
+                  );
+                },
               ),
-            );
-          },
+              if (widget.overlay != null) widget.overlay!,
+            ],
+          ),
         ),
-        if (widget.overlay != null)
-          Positioned(left: 0, right: 0, bottom: 0, child: widget.overlay!),
       ],
     );
   }
