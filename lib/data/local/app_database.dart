@@ -1008,12 +1008,97 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     return rows.map(ChatMessage.fromMap).toList();
   }
 
+  /// How many of the newest [available] rows fit in [maxBytes].
+  ///
+  /// Reads byte lengths only. Deserializing whole rows to decide what to keep
+  /// meant opening a chat cost the entire archive — a 12 MB transcript was
+  /// 12 MB of row decoding on the UI isolate to display the newest 1 MiB, all
+  /// of it behind the opening spinner. Cost now tracks the window, not history.
+  Future<int> _windowRowCount(
+    DatabaseExecutor db,
+    String chatId, {
+    required int maxBytes,
+    int? limitToOldest,
+  }) async {
+    if (maxBytes <= 0) return 0;
+    // CAST to BLOB so this is UTF-8 bytes, matching [chatMessageBytes];
+    // LENGTH on TEXT counts characters and would over-admit non-ASCII chats.
+    final sizes = await db.rawQuery(
+      'SELECT LENGTH(CAST(content AS BLOB)) AS n FROM messages '
+      'WHERE chat_id = ? ORDER BY created_at DESC, rowid DESC'
+      '${limitToOldest != null ? ' LIMIT -1 OFFSET ?' : ''}',
+      [chatId, ?limitToOldest],
+    );
+    var kept = 0;
+    var used = 0;
+    for (final row in sizes) {
+      final bytes =
+          ((row['n'] as int?) ?? 0) + kTranscriptRowOverheadBytes;
+      if (kept > 0 && used + bytes > maxBytes) break;
+      kept++;
+      used += bytes;
+    }
+    return kept;
+  }
+
+  /// Rows of [chatId] at [offset], chronological — the window only.
+  Future<List<ChatMessage>> _windowRows(
+    DatabaseExecutor db,
+    String chatId, {
+    required int offset,
+    required int limit,
+  }) async {
+    if (limit <= 0) return const [];
+    final rows = await db.query(
+      'messages',
+      where: 'chat_id = ?',
+      whereArgs: [chatId],
+      orderBy: 'created_at ASC, rowid ASC',
+      limit: limit,
+      offset: offset,
+    );
+    return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Chronological index of [messageId], or -1 when this store has never
+  /// seen it (a live segment, or a row only the host holds).
+  Future<int> _chronologicalIndexOf(
+    DatabaseExecutor db,
+    String chatId,
+    String messageId,
+  ) async {
+    final self = await db.query(
+      'messages',
+      columns: ['created_at', 'rowid'],
+      where: 'chat_id = ? AND id = ?',
+      whereArgs: [chatId, messageId],
+      limit: 1,
+    );
+    if (self.isEmpty) return -1;
+    final createdAt = self.first['created_at'];
+    final rowid = self.first['rowid'];
+    final before = await db.rawQuery(
+      'SELECT COUNT(*) AS n FROM messages WHERE chat_id = ? AND '
+      '(created_at < ? OR (created_at = ? AND rowid < ?))',
+      [chatId, createdAt, createdAt, rowid],
+    );
+    return (before.first['n'] as int?) ?? 0;
+  }
+
   /// Last ~[maxBytes] of local message content (UTF-8), chronological.
   Future<({List<ChatMessage> messages, bool hasMore})>
   listRecentMessagesByBytes(String chatId, {required int maxBytes}) async {
-    final all = await listMessagesChronological(chatId);
-    final slice = takeRecentMessagesByBytes(all, maxBytes: maxBytes);
-    return (messages: slice, hasMore: slice.length < all.length);
+    final db = await database;
+    final total = await countMessages(chatId);
+    if (total == 0) return (messages: const <ChatMessage>[], hasMore: false);
+    final keep = await _windowRowCount(db, chatId, maxBytes: maxBytes);
+    final messages = await _windowRows(
+      db,
+      chatId,
+      offset: total - keep,
+      limit: keep,
+    );
+    return (messages: messages, hasMore: keep < total);
   }
 
   /// Next older ~[maxBytes] before [beforeId], chronological.
@@ -1022,19 +1107,28 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
     required String beforeId,
     required int maxBytes,
   }) async {
-    final all = await listMessagesChronological(chatId);
-    final slice = takeOlderMessagesByBytes(
-      all,
-      beforeId: beforeId,
-      maxBytes: maxBytes,
-    );
-    final pivot = all.indexWhere((m) => m.id == beforeId);
+    final db = await database;
+    final total = await countMessages(chatId);
+    if (total == 0) return (messages: const <ChatMessage>[], hasMore: false);
+    final pivot = await _chronologicalIndexOf(db, chatId, beforeId);
+    if (pivot == 0) {
+      return (messages: const <ChatMessage>[], hasMore: false);
+    }
     // An unknown pivot means everything stored is older than the view.
-    final olderCount = pivot < 0 ? all.length : pivot;
-    return (
-      messages: slice,
-      hasMore: slice.isNotEmpty && slice.length < olderCount,
+    final olderCount = pivot < 0 ? total : pivot;
+    final keep = await _windowRowCount(
+      db,
+      chatId,
+      maxBytes: maxBytes,
+      limitToOldest: total - olderCount,
     );
+    final messages = await _windowRows(
+      db,
+      chatId,
+      offset: olderCount - keep,
+      limit: keep,
+    );
+    return (messages: messages, hasMore: keep > 0 && keep < olderCount);
   }
 
   /// Stable chronological page without materializing the whole transcript.
