@@ -21,6 +21,7 @@ class HostLiveSync {
     required AdsmBridgePool pool,
     required AppDatabase db,
     required AgentDockService dock,
+    this.prepareHost,
     required this.isChatLive,
     required this.onMessages,
     required this.onCatalogChanged,
@@ -31,6 +32,9 @@ class HostLiveSync {
   final AdsmBridgePool _pool;
   final AppDatabase _db;
   final AgentDockService _dock;
+
+  /// Runs before each connect attempt (e.g. upgrade a stale local daemon).
+  final Future<void> Function(Host host)? prepareHost;
 
   /// True when [chatId] has an open runtime that applies its own events.
   final bool Function(String chatId) isChatLive;
@@ -182,6 +186,8 @@ class _HostLink {
     while (!_closed) {
       AdsmClient? c;
       try {
+        await owner.prepareHost?.call(host);
+        if (_closed) return;
         c = await owner._pool.acquire(host);
         if (_closed) {
           await owner._pool.releaseClient(host.id, c);
