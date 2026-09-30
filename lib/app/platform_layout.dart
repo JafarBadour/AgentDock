@@ -18,7 +18,7 @@ bool useDesktopShell([BuildContext? context]) {
 }
 
 DesktopRightPanel? desktopPanelForPath(String path) {
-  if (path.startsWith('/automate')) return DesktopRightPanel.automate;
+  if (path.startsWith('/archon')) return DesktopRightPanel.archon;
   if (path.startsWith('/hosts')) return DesktopRightPanel.hosts;
   if (path.startsWith('/vpn')) return DesktopRightPanel.vpn;
   if (path.startsWith('/settings')) return DesktopRightPanel.settings;
@@ -28,7 +28,7 @@ DesktopRightPanel? desktopPanelForPath(String path) {
 
 /// List roots that belong in the right panel only (not the center column).
 bool isDesktopPanelRoot(String path) {
-  return path == '/automate' ||
+  return path == '/archon' ||
       path == '/hosts' ||
       path == '/vpn' ||
       path == '/settings';
@@ -43,7 +43,7 @@ bool isDesktopDetailRoute(String path) {
   if (isDesktopPanelRoot(path)) return false;
   if (isDesktopSettingsSubroute(path)) return false;
   return path.startsWith('/hosts') ||
-      path.startsWith('/automate') ||
+      path.startsWith('/archon') ||
       path.startsWith('/vpn');
 }
 
@@ -86,8 +86,8 @@ void openAppPanel(
     return;
   }
   switch (panel) {
-    case DesktopRightPanel.automate:
-      context.go('/automate');
+    case DesktopRightPanel.archon:
+      context.go('/archon');
     case DesktopRightPanel.hosts:
       context.go('/hosts');
     case DesktopRightPanel.vpn:

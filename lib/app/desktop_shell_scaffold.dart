@@ -8,6 +8,7 @@ import '../features/agents/agents_screen.dart';
 import '../features/agents/chat_screen.dart';
 import '../features/agents/new_agent_flow.dart';
 import '../features/agents/project_files_screen.dart';
+import '../features/archon/archon_screen.dart';
 import '../features/automations/automations_screen.dart';
 import '../features/hosts/hosts_screen.dart';
 import '../features/settings/api_keys_screen.dart';
@@ -389,10 +390,10 @@ class _DesktopNavRail extends StatelessWidget {
             ),
             const Spacer(),
             _RailIcon(
-              tooltip: 'Automate',
+              tooltip: 'Archon',
               icon: Icons.schedule_outlined,
-              selected: activePanel == DesktopRightPanel.automate,
-              onTap: () => onSelectPanel(DesktopRightPanel.automate),
+              selected: activePanel == DesktopRightPanel.archon,
+              onTap: () => onSelectPanel(DesktopRightPanel.archon),
             ),
             _RailIcon(
               tooltip: 'Hosts',
@@ -504,7 +505,7 @@ class _DesktopRightPanel extends ConsumerWidget {
         ? _desktopSettingsBody(overlay)
         : null;
     final title = switch (panel) {
-      DesktopRightPanel.automate => 'Automate',
+      DesktopRightPanel.archon => 'Archon',
       DesktopRightPanel.hosts => 'Hosts',
       DesktopRightPanel.vpn => 'VPN',
       DesktopRightPanel.settings => settingsSub?.title ?? 'Settings',
@@ -513,7 +514,7 @@ class _DesktopRightPanel extends ConsumerWidget {
     };
 
     final body = switch (panel) {
-      DesktopRightPanel.automate => const AutomationsScreen(embedded: true),
+      DesktopRightPanel.archon => const ArchonScreen(embedded: true),
       DesktopRightPanel.hosts => const HostsScreen(embedded: true),
       DesktopRightPanel.vpn => const VpnScreen(embedded: true),
       DesktopRightPanel.settings =>

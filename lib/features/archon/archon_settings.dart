@@ -41,11 +41,18 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
 
   void unawaitedLoad() {
     () async {
-      final store = ref.read(secureStoreProvider);
-      final key = await store.readDeepgramApiKey();
-      final stt = await store.readDeepgramSttModel();
-      final tts = await store.readDeepgramTtsModel();
-      final language = await store.readDeepgramLanguage();
+      String? key, stt, tts, language;
+      try {
+        final store = ref.read(secureStoreProvider);
+        key = await store.readDeepgramApiKey();
+        stt = await store.readDeepgramSttModel();
+        tts = await store.readDeepgramTtsModel();
+        language = await store.readDeepgramLanguage();
+      } catch (e) {
+        // An unreadable store must not leave the sheet spinning forever —
+        // empty fields still let the user type a key and save one.
+        SafeLog.d('archon settings load failed', e);
+      }
       if (!mounted) return;
       setState(() {
         _hadKey = key != null && key.trim().isNotEmpty;

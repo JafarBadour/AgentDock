@@ -189,7 +189,7 @@ class _AutomationsScreenState extends ConsumerState<AutomationsScreen> {
                       ),
                     ],
                   ),
-                  onTap: () => context.push('/automate/edit/${job.id}'),
+                  onTap: () => context.push('/archon/schedule/edit/${job.id}'),
                 ),
               );
             },
@@ -223,7 +223,7 @@ class _AutomationsScreenState extends ConsumerState<AutomationsScreen> {
                 ),
                 const Spacer(),
                 FilledButton.tonalIcon(
-                  onPressed: () => context.push('/automate/new'),
+                  onPressed: () => context.push('/archon/schedule/new'),
                   icon: const Icon(Icons.add),
                   label: const Text('Schedule'),
                 ),
@@ -253,7 +253,7 @@ class _AutomationsScreenState extends ConsumerState<AutomationsScreen> {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/automate/new'),
+        onPressed: () => context.push('/archon/schedule/new'),
         icon: const Icon(Icons.add),
         label: const Text('Schedule'),
       ),

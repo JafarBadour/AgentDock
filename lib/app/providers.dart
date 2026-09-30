@@ -11,6 +11,7 @@ import '../services/agent_runtime_host.dart';
 import '../services/agent_session.dart';
 import '../services/agentdock_service.dart';
 import '../services/background_keep_alive.dart';
+import '../services/archon_service.dart';
 import '../services/chat_fork.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
@@ -27,6 +28,11 @@ import '../services/ssh_socks_service.dart';
 import '../services/transcript_budget.dart';
 
 final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
+
+/// Where Archon runs, and moving it (see [ArchonService]).
+final archonServiceProvider = Provider<ArchonService>(
+  (ref) => ArchonService(ref.watch(appDatabaseProvider)),
+);
 
 final localNotificationServiceProvider = Provider<LocalNotificationService>(
   (ref) => LocalNotificationService(),
@@ -691,7 +697,7 @@ final focusedChatIdProvider = StateProvider<String?>((ref) => null);
 
 enum DesktopRightPanel {
   none,
-  automate,
+  archon,
   hosts,
   vpn,
   settings,

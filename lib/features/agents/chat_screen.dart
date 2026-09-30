@@ -1726,7 +1726,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         if (arg.isNotEmpty) 'prompt': arg,
         'useCtx': '1',
       };
-      final uri = Uri(path: '/automate/new', queryParameters: q);
+      final uri = Uri(path: '/archon/schedule/new', queryParameters: q);
       if (mounted) context.push(uri.toString());
       return;
     }

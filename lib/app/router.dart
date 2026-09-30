@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../features/agents/agents_screen.dart';
 import '../features/agents/chat_screen.dart';
+import '../features/archon/archon_screen.dart';
 import '../features/automations/automations_screen.dart';
 import '../features/automations/schedule_edit_screen.dart';
 import '../features/hosts/host_edit_screen.dart';
@@ -54,11 +55,13 @@ final goRouterProvider = Provider<GoRouter>((ref) {
           StatefulShellBranch(
             routes: [
               GoRoute(
-                path: '/automate',
-                builder: (context, state) => const AutomationsScreen(),
+                path: '/archon',
+                builder: (context, state) => const ArchonScreen(),
                 routes: [
+                  // Archon absorbs the automated jobs, so the schedule editor
+                  // lives under it rather than behind its own tab.
                   GoRoute(
-                    path: 'new',
+                    path: 'schedule/new',
                     builder: (context, state) {
                       final q = state.uri.queryParameters;
                       return ScheduleEditScreen(
@@ -69,10 +72,15 @@ final goRouterProvider = Provider<GoRouter>((ref) {
                     },
                   ),
                   GoRoute(
-                    path: 'edit/:jobId',
+                    path: 'schedule/edit/:jobId',
                     builder: (context, state) => ScheduleEditScreen(
                       jobId: state.pathParameters['jobId'],
                     ),
+                  ),
+                  GoRoute(
+                    path: 'schedule',
+                    builder: (context, state) =>
+                        const AutomationsScreen(embedded: false),
                   ),
                 ],
               ),

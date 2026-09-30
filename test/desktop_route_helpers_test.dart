@@ -6,7 +6,7 @@ void main() {
   group('desktop route helpers', () {
     test('panel roots open the right rail panel only', () {
       expect(isDesktopPanelRoot('/hosts'), isTrue);
-      expect(isDesktopPanelRoot('/automate'), isTrue);
+      expect(isDesktopPanelRoot('/archon'), isTrue);
       expect(isDesktopPanelRoot('/vpn'), isTrue);
       expect(isDesktopPanelRoot('/connect'), isFalse);
       expect(isDesktopPanelRoot('/settings'), isTrue);
@@ -14,13 +14,13 @@ void main() {
       expect(isDesktopDetailRoute('/hosts'), isFalse);
     });
 
-    test('nested host/automate routes are desktop details; settings stay in panel',
+    test('nested host/schedule routes are desktop details; settings stay in panel',
         () {
       expect(isDesktopDetailRoute('/hosts/new'), isTrue);
       expect(isDesktopDetailRoute('/hosts/edit/abc'), isTrue);
       expect(isDesktopDetailRoute('/hosts/terminal/abc'), isTrue);
-      expect(isDesktopDetailRoute('/automate/new'), isTrue);
-      expect(isDesktopDetailRoute('/automate/edit/1'), isTrue);
+      expect(isDesktopDetailRoute('/archon/schedule/new'), isTrue);
+      expect(isDesktopDetailRoute('/archon/schedule/edit/1'), isTrue);
       expect(isDesktopDetailRoute('/settings/mcp/new'), isFalse);
       expect(isDesktopDetailRoute('/settings/mcp/x'), isFalse);
       expect(isDesktopDetailRoute('/settings/keys'), isFalse);
@@ -40,7 +40,7 @@ void main() {
 
     test('panel-for-path still maps sections', () {
       expect(desktopPanelForPath('/hosts/new'), DesktopRightPanel.hosts);
-      expect(desktopPanelForPath('/automate/edit/1'), DesktopRightPanel.automate);
+      expect(desktopPanelForPath('/archon'), DesktopRightPanel.archon);
       expect(desktopPanelForPath('/vpn'), DesktopRightPanel.vpn);
       expect(desktopPanelForPath('/connect'), DesktopRightPanel.settings);
       expect(desktopPanelForPath('/agents/chat/1'), isNull);
