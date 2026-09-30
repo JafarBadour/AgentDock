@@ -171,6 +171,7 @@ class Daemon:
         cwd: Optional[str] = None,
         binary: Optional[str] = None,
         provider: Optional[str] = None,
+        permission_ask: Optional[bool] = None,
     ) -> None:
         path = paths.agent_record_path(chat_id)
         data: dict[str, Any] = {}
@@ -193,6 +194,13 @@ class Daemon:
             data["binary"] = binary
         if provider:
             data["provider"] = provider
+        if permission_ask is not None:
+            # Recorded because it is a permission, and something other than
+            # the device that set it may want to know: Archon acts with the
+            # user's own rights, so an agent left on "ask" — where a human
+            # approves each tool on their device — is one Archon must not
+            # drive unattended.
+            data["permission_ask"] = bool(permission_ask)
         if error is not None:
             if error:
                 data["last_error"] = error
@@ -480,6 +488,7 @@ class Daemon:
             cwd=cwd or None,
             binary=binary or None,
             provider=provider or None,
+            permission_ask=bool(params.get("permissionAsk", False)),
         )
         if is_new:
             await self._broadcast_chat_changed(chat_id, "created")
