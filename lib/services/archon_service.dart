@@ -26,12 +26,12 @@ class ArchonService {
   /// host always resolves to the same row instead of accumulating duplicates.
   static String repoIdFor(String hostId) => 'archon-workspace-$hostId';
 
-  /// Archon's working directory on the host.
+  /// Archon's working directory, when the host's home is not known.
   ///
-  /// Its own folder rather than one of the user's repos: Archon directs agents
-  /// and never executes anything itself, so it has no reason to sit inside
-  /// code it might be asked about but must not touch. `$HOME` is left for the
-  /// remote shell to expand — this path is used on the host, not here.
+  /// Only a fallback: placement resolves the real home and stores an absolute
+  /// path. A literal `\$HOME` here is normalised into `/\$HOME/...` when it is
+  /// saved as a repo path — a directory that can never exist, which the agent
+  /// then reports only as a failure to open its FIFO.
   static const workspacePath = r'$HOME/.agentdock/archon/workspace';
 
   static const workspaceName = 'Archon';
@@ -56,14 +56,15 @@ class ArchonService {
   Future<Chat> placeOn(Host host) async {
     // Before anything is written down: without its skill Archon is an
     // ordinary agent sitting in an empty folder, which is a worse outcome
-    // than the placement visibly failing.
-    await _skillDeploy?.ensureOn(host);
+    // than the placement visibly failing. This also creates that folder and
+    // reports where it actually is.
+    final install = await _skillDeploy?.ensureOn(host);
 
     final repo = Repo(
       id: repoIdFor(host.id),
       hostId: host.id,
       name: workspaceName,
-      remotePath: workspacePath,
+      remotePath: install?.workspace ?? workspacePath,
       createdAt: DateTime.now(),
     );
     await _db.upsertRepo(repo);

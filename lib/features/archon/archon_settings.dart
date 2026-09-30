@@ -283,7 +283,10 @@ class _ArchonHostSectionState extends ConsumerState<_ArchonHostSection> {
         ],
       ),
     );
-    if (chosen == null || chosen.id == current?.id) return;
+    if (chosen == null) return;
+    // Re-picking the host Archon is already on is allowed on purpose: it
+    // re-runs placement, which reinstalls the skill and repairs the workspace
+    // path. Refusing it would leave a bad placement with no way back.
     await _moveTo(chosen);
   }
 
@@ -300,7 +303,7 @@ class _ArchonHostSectionState extends ConsumerState<_ArchonHostSection> {
         const SizedBox(height: 4),
         Text(
           'One host at a time. Moving brings the conversation and its memory '
-          'with it.',
+          'with it. Picking the current host again reinstalls the skill.',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),

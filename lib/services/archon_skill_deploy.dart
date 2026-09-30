@@ -44,6 +44,15 @@ class ArchonSkillDeploy {
   static const skillName = 'archon';
 
   /// The skill folder under a host's home directory.
+  /// Archon's working directory on the host, absolute.
+  ///
+  /// Absolute because the value is stored as a repo path and normalised, and
+  /// a literal `\$HOME` survives that as `/\$HOME/...` — a directory that can
+  /// never exist, which the agent reports only as a failure to open its FIFO.
+  static String workspaceIn(String home) =>
+      '${home.endsWith('/') ? home.substring(0, home.length - 1) : home}'
+      '/.agentdock/archon/workspace';
+
   static String dirIn(String home) => '$home/.claude/skills/$skillName';
 
   /// The skill file under a host's home directory.
@@ -66,7 +75,11 @@ class ArchonSkillDeploy {
     final probe = await _probe(host);
 
     if (probe.content == desired) {
-      return ArchonSkillInstall(path: pathIn(probe.home), wrote: false);
+      return ArchonSkillInstall(
+        path: pathIn(probe.home),
+        workspace: workspaceIn(probe.home),
+        wrote: false,
+      );
     }
 
     final path = pathIn(probe.home);
@@ -81,7 +94,11 @@ class ArchonSkillDeploy {
       timeout: const Duration(seconds: 30),
       what: 'write ${pathIn('~')}',
     );
-    return ArchonSkillInstall(path: path, wrote: true);
+    return ArchonSkillInstall(
+      path: path,
+      workspace: workspaceIn(probe.home),
+      wrote: true,
+    );
   }
 
   Future<String> _desiredContent() async {
@@ -109,9 +126,13 @@ class ArchonSkillDeploy {
   /// file is multi-line and the home path is not.
   Future<_Probe> _probe(Host host) async {
     const homeLine = r'''printf '%s\n' "$HOME"''';
+    // Archon's working directory is made here rather than in a call of its
+    // own: a chat whose cwd does not exist cannot start, and the agent's
+    // failure ("could not open FIFO") says nothing about the missing folder.
+    const makeWorkspace = r'''mkdir -p "$HOME/.agentdock/archon/workspace"''';
     final out = await _run(
       host,
-      '$homeLine; cat $_remotePathExpr 2>/dev/null || true',
+      '$homeLine; $makeWorkspace; cat $_remotePathExpr 2>/dev/null || true',
       timeout: const Duration(seconds: 20),
       what: 'read ${pathIn('~')}',
     );
@@ -146,7 +167,14 @@ class ArchonSkillDeploy {
 
 /// What [ArchonSkillDeploy.ensureOn] did.
 class ArchonSkillInstall {
-  const ArchonSkillInstall({required this.path, required this.wrote});
+  const ArchonSkillInstall({
+    required this.path,
+    required this.workspace,
+    required this.wrote,
+  });
+
+  /// Archon's working directory, created alongside the skill.
+  final String workspace;
 
   /// Absolute path of the skill on the host.
   final String path;
