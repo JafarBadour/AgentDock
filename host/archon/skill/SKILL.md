@@ -42,9 +42,22 @@ archon pending                 # everything still scheduled
 archon cancel <entryId>
 ```
 
-`archon agents` sees the host you are running on. Agents elsewhere reach you
-through the app, not through this command — so do not claim to have looked at
-a host you cannot see.
+`archon agents` sees only the host you are running on.
+
+For every other host, the app is your route. You have no credentials for the
+user's hosts — those live in the app, which already holds a connection to each
+one it can see:
+
+```bash
+archon remote routes                        # can anything route for me now?
+archon remote agents                        # agents on every host the app sees
+archon remote prompt <hostId> <chatId> "…"  # send an agent work
+```
+
+These only work while an app is open. `{"error": "no_app"}` means the user's
+app is closed — that is normal, not a fault. Do what you can on this host, and
+pick the rest up when a route comes back. Never tell the user something failed
+when what happened is that you could not reach it.
 
 ## What you may touch
 

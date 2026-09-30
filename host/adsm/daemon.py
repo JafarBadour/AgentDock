@@ -39,6 +39,11 @@ class Daemon:
         self._subscribers: dict[str, set[asyncio.StreamWriter]] = {}
         self._global_subscribers: set[asyncio.StreamWriter] = set()
         self._digest_subscribers: set[asyncio.StreamWriter] = set()
+        # Apps offering to reach hosts on Archon's behalf, and the calls
+        # waiting on them.
+        self._relay_subscribers: set[asyncio.StreamWriter] = set()
+        self._relay_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._relay_seq = 0
         self._event_log: dict[str, list[dict[str, Any]]] = {}
         # In-flight `rpc.chunk` transfers: (writer_id, req_id) → buffer.
         self._chunk_bufs: dict[tuple[int, Any], dict[str, Any]] = {}
@@ -251,9 +256,13 @@ class Daemon:
                 )
         return seq
 
+    def _drop_relay(self, writer: asyncio.StreamWriter) -> None:
+        self._relay_subscribers.discard(writer)
+
     def _drop_writer(self, writer: asyncio.StreamWriter) -> None:
         self._global_subscribers.discard(writer)
         self._digest_subscribers.discard(writer)
+        self._relay_subscribers.discard(writer)
         for s in self._subscribers.values():
             s.discard(writer)
         wid = id(writer)
@@ -384,6 +393,12 @@ class Daemon:
                 result = await self._chats_notify(params)
             elif method == "chats.fork":
                 result = await self._chats_fork(params)
+            elif method == "archon.relay":
+                result = await self._archon_relay(params)
+            elif method == "archon.reply":
+                result = await self._archon_reply(params)
+            elif method == "archon.routes":
+                result = {"apps": len(self._relay_subscribers)}
             else:
                 writer.write(
                     protocol.encode(
@@ -510,6 +525,98 @@ class Daemon:
         await self._broadcast_chat_changed(chat_id, change)
         return {"ok": True}
 
+    # Archon runs on one host but manages agents on all of them. It cannot
+    # open an SSH connection to another host itself — the credentials are the
+    # user's and live in the app. So the app is the route: it already holds
+    # bridges to every host it can see, and lends one on request.
+    #
+    # The call travels Archon -> this daemon -> a live app -> the far host,
+    # and the answer comes back the same way. No app connected means no route,
+    # which is a normal state to be in at 3am and is reported as such rather
+    # than left to hang.
+    _RELAY_TIMEOUT_SECONDS = 60.0
+
+    async def _archon_relay(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Ask a live app to do something Archon cannot reach on its own."""
+        action = str(params.get("action") or "")
+        if not action:
+            raise ValueError("action required")
+        if not self._relay_subscribers:
+            return {
+                "ok": False,
+                "error": "no_app",
+                "message": (
+                    "No Agent Dock app is connected, so I cannot reach other "
+                    "hosts right now."
+                ),
+            }
+
+        self._relay_seq += 1
+        call_id = f"relay-{self._relay_seq}"
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._relay_waiters[call_id] = waiter
+
+        # Offered to every connected app; the first to answer wins. Apps reach
+        # different sets of hosts, so the one that can do it is the one that
+        # replies rather than one picked here blind.
+        event = protocol.event(
+            "", 0, "archon_request",
+            callId=call_id,
+            action=action,
+            payload=params.get("payload") or {},
+        )
+        raw = protocol.encode(event)
+        dead: list[asyncio.StreamWriter] = []
+        for w in list(self._relay_subscribers):
+            try:
+                w.write(raw)
+                await w.drain()
+            except Exception:  # noqa: BLE001
+                dead.append(w)
+        for w in dead:
+            self._drop_relay(w)
+        if not self._relay_subscribers:
+            self._relay_waiters.pop(call_id, None)
+            return {
+                "ok": False,
+                "error": "no_app",
+                "message": "The app disconnected before it could answer.",
+            }
+
+        timeout = float(params.get("timeout") or self._RELAY_TIMEOUT_SECONDS)
+        try:
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "error": "timeout",
+                "message": (
+                    f"No app answered within {int(timeout)}s — it may have "
+                    "lost its connection to that host."
+                ),
+            }
+        finally:
+            self._relay_waiters.pop(call_id, None)
+
+    async def _archon_reply(self, params: dict[str, Any]) -> dict[str, Any]:
+        """An app answering a relayed call."""
+        call_id = str(params.get("callId") or "")
+        waiter = self._relay_waiters.get(call_id)
+        # A second app answering after the first, or answering a call that
+        # already timed out, is ordinary — not an error worth raising.
+        if waiter is None or waiter.done():
+            return {"accepted": False}
+        waiter.set_result(
+            {
+                "ok": bool(params.get("ok", True)),
+                "result": params.get("result"),
+                "error": params.get("error"),
+                "message": params.get("message"),
+            }
+        )
+        return {"accepted": True}
+
     async def _chats_fork(self, params: dict[str, Any]) -> dict[str, Any]:
         """Start a new chat carrying another one's conversation.
 
@@ -594,6 +701,9 @@ class Daemon:
                 if seq > after:
                     writer.write(protocol.encode(ev))
             await writer.drain()
+        elif params.get("relay"):
+            # An app volunteering as Archon's route to other hosts.
+            self._relay_subscribers.add(writer)
         elif params.get("digest"):
             self._digest_subscribers.add(writer)
         else:

@@ -25,6 +25,64 @@ def _print(value: Any) -> None:
     sys.stdout.write("\n")
 
 
+
+def relay(action: str, payload: Optional[dict[str, Any]] = None,
+          *, timeout: float = 60.0) -> dict[str, Any]:
+    """Ask a live app to reach another host on Archon's behalf.
+
+    Archon has no credentials for the user's other hosts — those live in the
+    app, which already holds a bridge to each host it can see. So the call
+    goes Archon -> this host's daemon -> a live app -> the far host.
+
+    With no app connected there is simply no route. That is a normal state to
+    be in at 3am, and it comes back as an answer rather than an error.
+    """
+    import asyncio
+
+    from adsm import protocol
+    from adsm import paths as adsm_paths
+
+    async def call() -> dict[str, Any]:
+        reader, writer = await asyncio.open_unix_connection(
+            path=str(adsm_paths.socket_path()), limit=protocol.STREAM_LIMIT
+        )
+        try:
+            writer.write(
+                protocol.encode(
+                    {
+                        "id": 1,
+                        "method": "archon.relay",
+                        "params": {
+                            "action": action,
+                            "payload": payload or {},
+                            "timeout": timeout,
+                        },
+                    }
+                )
+            )
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout + 10)
+            message = protocol.decode_line(line.decode("utf-8", "replace"))
+            return (message or {}).get("result") or {}
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        return asyncio.run(call())
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "no_daemon",
+            "message": "ADSM is not running on this host.",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "relay_failed", "message": str(e)}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="archon",
@@ -33,6 +91,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("agents", help="Every agent on this host")
+
+    p_remote = sub.add_parser(
+        "remote", help="Reach another host through a live app"
+    )
+    remote_sub = p_remote.add_subparsers(dest="remote_cmd", required=True)
+    remote_sub.add_parser("agents", help="Agents on every host the app sees")
+    remote_sub.add_parser("routes", help="Whether any app can route for me")
+    p_rprompt = remote_sub.add_parser("prompt", help="Send an agent work")
+    p_rprompt.add_argument("host_id")
+    p_rprompt.add_argument("chat_id")
+    p_rprompt.add_argument("text")
     sub.add_parser("goals", help="Agents switched on, with a goal, allowed")
     sub.add_parser("blocked", help="Switched on but set to Ask — off limits")
 
@@ -74,6 +143,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "agents":
         _print(directory.describe(directory.load_records()))
         return 0
+
+    if args.cmd == "remote":
+        if args.remote_cmd == "routes":
+            _print(relay("routes", timeout=10.0))
+            return 0
+        if args.remote_cmd == "agents":
+            answer = relay("agents")
+            _print(answer)
+            return 0 if answer.get("ok") else 1
+        if args.remote_cmd == "prompt":
+            answer = relay(
+                "prompt",
+                {
+                    "hostId": args.host_id,
+                    "chatId": args.chat_id,
+                    "text": args.text,
+                },
+            )
+            _print(answer)
+            return 0 if answer.get("ok") else 1
+        return 1
 
     if args.cmd == "goals":
         _print(directory.describe(directory.manageable(directory.load_records())))
