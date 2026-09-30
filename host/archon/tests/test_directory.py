@@ -142,3 +142,110 @@ class RecordedPolicyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoManageTest(unittest.TestCase):
+    """The user picks who Archon looks after, and what done means."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patch = mock.patch.dict(os.environ, {"HOME": self._tmp.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        from adsm import paths as adsm_paths
+        from archon import directory
+
+        adsm_paths.ensure_layout()
+        self.adsm_paths = adsm_paths
+        self.directory = directory
+
+    def _record(self, chat_id: str, **fields) -> dict:
+        record = {"id": chat_id, **fields}
+        self.adsm_paths.agent_record_path(chat_id).write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+        return record
+
+    def test_managed_with_a_goal_is_work_archon_picks_up(self) -> None:
+        self._record(
+            "a",
+            title="Build",
+            permission_ask=False,
+            archon_managed=True,
+            archon_goal="green CI on main",
+        )
+        got = self.directory.manageable(self.directory.load_records())
+        self.assertEqual(["Build"], [r["title"] for r in got])
+
+    def test_switched_on_without_a_goal_is_not_work(self) -> None:
+        # Nothing to work toward means nothing to decide is finished.
+        self._record("a", title="Build", permission_ask=False, archon_managed=True)
+        self.assertEqual([], self.directory.manageable(self.directory.load_records()))
+
+    def test_permission_beats_the_toggle(self) -> None:
+        # The toggle is the user's intent; the permission is their authority.
+        self._record(
+            "a",
+            title="Deploy",
+            permission_ask=True,
+            archon_managed=True,
+            archon_goal="ship it",
+        )
+        records = self.directory.load_records()
+        self.assertEqual([], self.directory.manageable(records))
+        self.assertEqual(["Deploy"], [r["title"] for r in self.directory.blocked(records)])
+
+    def test_finishing_switches_it_off_and_says_why(self) -> None:
+        self._record(
+            "a",
+            title="Build",
+            permission_ask=False,
+            archon_managed=True,
+            archon_goal="green CI on main",
+        )
+        updated = self.directory.complete("a", "CI green since 14:02; flake fixed.")
+        self.assertFalse(self.directory.is_managed(updated))
+        self.assertEqual("CI green since 14:02; flake fixed.", self.directory.note_of(updated))
+        self.assertIn(self.directory.DONE_AT, updated)
+        # A toggle left on beside a note would read as work still in progress.
+        self.assertEqual([], self.directory.manageable(self.directory.load_records()))
+
+    def test_finishing_survives_a_reread(self) -> None:
+        self._record("a", title="Build", permission_ask=False, archon_managed=True,
+                     archon_goal="g")
+        self.directory.complete("a", "done")
+        reread = self.directory.load_records()[0]
+        self.assertFalse(self.directory.is_managed(reread))
+        self.assertEqual("done", self.directory.note_of(reread))
+
+    def test_finishing_keeps_everything_else_on_the_record(self) -> None:
+        self._record(
+            "a", title="Build", provider="claude", permission_ask=False,
+            archon_managed=True, archon_goal="g", acp_session_id="sess-1",
+        )
+        updated = self.directory.complete("a", "done")
+        self.assertEqual("Build", updated["title"])
+        self.assertEqual("sess-1", updated["acp_session_id"])
+        self.assertFalse(updated["permission_ask"])
+
+    def test_finishing_an_agent_that_is_gone_is_not_fatal(self) -> None:
+        self.assertIsNone(self.directory.complete("nope", "done"))
+
+    def test_a_blank_goal_does_not_count_as_one(self) -> None:
+        self._record("a", title="Build", permission_ask=False,
+                     archon_managed=True, archon_goal="   ")
+        self.assertEqual([], self.directory.manageable(self.directory.load_records()))
+
+    def test_the_directory_shows_the_goal_and_the_note(self) -> None:
+        self._record("a", title="Build", permission_ask=False,
+                     archon_managed=True, archon_goal="green CI")
+        entry = self.directory.describe(self.directory.load_records())[0]
+        self.assertTrue(entry["managed"])
+        self.assertEqual("green CI", entry["goal"])
+        self.assertIsNone(entry["note"])
+
+        self.directory.complete("a", "CI green")
+        after = self.directory.describe(self.directory.load_records())[0]
+        self.assertFalse(after["managed"])
+        self.assertEqual("CI green", after["note"])

@@ -14,6 +14,7 @@ import '../../app/providers.dart';
 import '../../data/models/agent_mode.dart';
 import '../../data/models/agent_model.dart';
 import '../../data/models/agent_provider.dart';
+import '../../data/models/archon_chat.dart';
 import '../../data/models/chat.dart';
 import '../../data/models/chat_message.dart';
 import '../../data/models/host.dart';
@@ -29,6 +30,8 @@ import '../../services/cursor_acp_service.dart';
 import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_activity_strip.dart';
+import '../archon/archon_managed_panel.dart';
+import '../archon/archon_settings.dart';
 import 'agent_setup_guide.dart';
 import 'agent_status_indicators.dart';
 import 'composer_model_footer.dart';
@@ -2747,7 +2750,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   },
                   icon: const Icon(Icons.terminal),
                 ),
-              if (_repo != null && _host != null && _chat != null)
+              // Archon's own controls: who it looks after, and how it speaks.
+              if (_chat?.isArchon ?? false) ...[
+                IconButton(
+                  tooltip: 'Auto-managed agents',
+                  icon: const Icon(Icons.checklist_outlined),
+                  onPressed: () => unawaited(ArchonManagedPanel.show(context)),
+                ),
+                IconButton(
+                  tooltip: 'Archon settings',
+                  icon: const Icon(Icons.settings_outlined),
+                  onPressed: () => unawaited(ArchonSettingsSheet.show(context)),
+                ),
+              ],
+              // Forking Archon would make a second manager; there is one.
+              if (_repo != null &&
+                  _host != null &&
+                  _chat != null &&
+                  !_chat!.isArchon)
                 IconButton(
                   tooltip: 'Fork agent — new agent, same context',
                   onPressed: _forking ? null : () => unawaited(_forkChat()),

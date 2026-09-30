@@ -92,6 +92,9 @@ def describe(
             "lastActivity": record.get("updated_at"),
             "permission": policy_of(record),
             "commandable": is_commandable(record),
+            "managed": is_managed(record),
+            "goal": goal_of(record),
+            "note": note_of(record),
         }
         if host:
             entry["host"] = host
@@ -101,3 +104,84 @@ def describe(
 
 def commandable(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in records if is_commandable(r)]
+
+
+# --- auto-management -------------------------------------------------------
+#
+# The user picks which agents Archon looks after and gives each a goal. Archon
+# works toward that goal, and when it is met it switches the agent back off and
+# leaves a note saying what happened — so the toggle means "Archon is still on
+# this", not "Archon was once asked about this".
+
+MANAGED = "archon_managed"
+GOAL = "archon_goal"
+NOTE = "archon_note"
+DONE_AT = "archon_done_at"
+
+
+def is_managed(record: dict[str, Any]) -> bool:
+    return bool(record.get(MANAGED))
+
+
+def goal_of(record: dict[str, Any]) -> Optional[str]:
+    goal = record.get(GOAL)
+    return goal.strip() if isinstance(goal, str) and goal.strip() else None
+
+
+def note_of(record: dict[str, Any]) -> Optional[str]:
+    note = record.get(NOTE)
+    return note.strip() if isinstance(note, str) and note.strip() else None
+
+
+def manageable(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agents Archon should actually be working on.
+
+    Being switched on is not enough: the permission gate still applies, so an
+    agent the user later moved to Ask drops out of Archon's work even though
+    its toggle is still on. The toggle is the user's intent; the permission is
+    the user's authority, and the narrower one wins.
+    """
+    return [
+        r
+        for r in records
+        if is_managed(r) and is_commandable(r) and goal_of(r) is not None
+    ]
+
+
+def blocked(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Switched on, but Archon may not touch them — worth saying out loud."""
+    return [r for r in records if is_managed(r) and not is_commandable(r)]
+
+
+def complete(
+    chat_id: str,
+    note: str,
+    *,
+    at: Optional[str] = None,
+    agents_dir: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Mark the goal met: switch the agent off and record why.
+
+    Writing both in one step is the point — a toggle left on with a note
+    attached would read as work still in progress.
+    """
+    from datetime import datetime, timezone
+
+    directory = agents_dir or adsm_paths.agents_dir()
+    path = directory / f"{adsm_paths.safe_chat_id(chat_id)}.json"
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+
+    record[MANAGED] = False
+    record[NOTE] = note.strip()
+    record[DONE_AT] = at or datetime.now(timezone.utc).isoformat()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return record

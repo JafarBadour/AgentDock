@@ -27,10 +27,17 @@ void main() {
 
     final reopened = await AppDatabase(overridePath: path).database;
     final version = await reopened.rawQuery('PRAGMA user_version');
-    expect(version.single.values.single, 21);
+    expect(version.single.values.single, 22);
 
     final cols = await reopened.rawQuery('PRAGMA table_info(mcp_host_links)');
     expect(cols.where((c) => c['name'] == 'targets_json'), hasLength(1));
+
+    // Re-running a migration over a schema that already has the table must
+    // not fail — this rewind replays every step against a complete database.
+    final archon = await reopened.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='archon_managed'",
+    );
+    expect(archon, hasLength(1));
     await reopened.close();
   });
 }

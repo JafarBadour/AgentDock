@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
+import '../models/archon_brief.dart';
 import '../models/chat.dart';
 import '../models/chat_message.dart';
 import '../models/code_change_stats.dart';
@@ -58,7 +59,7 @@ class AppDatabase {
         );
     return openDatabase(
       path,
-      version: 21,
+      version: 22,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -132,6 +133,7 @@ CREATE TABLE messages (
         await _createMcpTables(db);
         await _createSkillTables(db);
         await _createScheduledJobsTable(db);
+        await _createArchonTables(db);
         await db.execute(
           'CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_servers_name_unique '
           'ON mcp_servers(name COLLATE NOCASE)',
@@ -293,8 +295,30 @@ AND (
         if (oldVersion < 21) {
           await stripInlineToolImages(db);
         }
+        if (oldVersion < 22) {
+          await _createArchonTables(db);
+        }
       },
     );
+  }
+
+  /// Which agents Archon looks after, and what "done" means for each.
+  ///
+  /// Its own table rather than columns on `chats`: this is Archon's brief
+  /// about an agent, not something the agent itself has, and it is deleted
+  /// with the chat it refers to.
+  static Future<void> _createArchonTables(DatabaseExecutor db) async {
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS archon_managed (
+  chat_id TEXT PRIMARY KEY NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  goal TEXT,
+  note TEXT,
+  done_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
+)
+''');
   }
 
   /// SQLite has no IF NOT EXISTS for ADD COLUMN — check first.
@@ -1147,6 +1171,45 @@ CREATE TABLE IF NOT EXISTS skill_host_links (
       offset: offset,
     );
     return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  /// Archon's brief for [chatId], or null when it was never set.
+  Future<ArchonBrief?> archonBrief(String chatId) async {
+    final db = await database;
+    final rows = await db.query(
+      'archon_managed',
+      where: 'chat_id = ?',
+      whereArgs: [chatId],
+      limit: 1,
+    );
+    return rows.isEmpty ? null : ArchonBrief.fromMap(rows.first);
+  }
+
+  Future<Map<String, ArchonBrief>> archonBriefs() async {
+    final db = await database;
+    final rows = await db.query('archon_managed');
+    return {
+      for (final row in rows)
+        row['chat_id']! as String: ArchonBrief.fromMap(row),
+    };
+  }
+
+  Future<void> saveArchonBrief(ArchonBrief brief) async {
+    final db = await database;
+    await db.insert(
+      'archon_managed',
+      brief.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<void> deleteArchonBrief(String chatId) async {
+    final db = await database;
+    await db.delete(
+      'archon_managed',
+      where: 'chat_id = ?',
+      whereArgs: [chatId],
+    );
   }
 
   Future<int> countMessages(String chatId) async {
