@@ -32,6 +32,9 @@ class _FakeHost {
   /// Commands that changed the host — the idempotency assertion.
   final writes = <String>[];
 
+  /// The `archon` package and wrapper, written on every placement.
+  final packageWrites = <String>[];
+
   /// Set to make the next exec throw, standing in for a dropped connection.
   Object? failWith;
 
@@ -48,7 +51,13 @@ class _FakeHost {
     }
     if (command.contains('base64 -d')) {
       writes.add(command);
-      skill = utf8.decode(base64Decode(_payloadOf(command)));
+      // Placement writes two things: the skill, and the package that makes
+      // its instructions runnable. Only the first is this host's `skill`.
+      if (command.contains('.claude')) {
+        skill = utf8.decode(base64Decode(_payloadOf(command)));
+      } else {
+        packageWrites.add(command);
+      }
       return '';
     }
     if (command.contains('cat ')) {
@@ -65,15 +74,21 @@ class _FakeHost {
   }
 }
 
+/// Serves the skill and the package, the way the app bundle does. Placement
+/// installs both, so a loader that only knew the skill would fail on the
+/// package rather than on anything the test is about.
+Future<String> Function(String) _assets(String skill) => (key) async {
+  if (key == ArchonSkillDeploy.assetKey) return skill;
+  expect(key, startsWith('host/archon/'));
+  return '# $key\n';
+};
+
 void main() {
   test('fresh host gets the skill written under ~/.claude/skills', () async {
     final remote = _FakeHost();
     final deploy = ArchonSkillDeploy(
       exec: remote.exec,
-      loadAsset: (key) async {
-        expect(key, ArchonSkillDeploy.assetKey);
-        return _skillV1;
-      },
+      loadAsset: _assets(_skillV1),
     );
 
     final result = await deploy.ensureOn(_host);
@@ -82,14 +97,14 @@ void main() {
     expect(result.path, _skillPath);
     expect(remote.skill, _skillV1);
     // The folder has to exist first on a host that has never run Archon.
-    expect(remote.writes.single, contains('mkdir -p'));
+    expect(remote.writes.last, contains('mkdir -p'));
   });
 
-  test('second deploy of the same skill writes nothing', () async {
+  test('second deploy leaves the skill alone but refreshes the package', () async {
     final remote = _FakeHost();
     final deploy = ArchonSkillDeploy(
       exec: remote.exec,
-      loadAsset: (_) async => _skillV1,
+      loadAsset: _assets(_skillV1),
     );
 
     await deploy.ensureOn(_host);
@@ -100,16 +115,28 @@ void main() {
 
     expect(second.wrote, isFalse);
     expect(second.path, _skillPath);
-    expect(remote.writes, isEmpty);
-    // And it costs one round trip, since this runs on every placement.
-    expect(remote.commands, hasLength(1));
+    // The skill is untouched when it already matches...
+    expect(
+      remote.commands.where(
+        (c) => c.contains('base64 -d') && c.contains('.claude'),
+      ),
+      isEmpty,
+    );
+    // ...but the package is refreshed every time: it is what makes the
+    // skill's instructions runnable, and the two can fall out of step.
+    expect(
+      remote.commands.where((c) => c.contains('.local/bin/archon')),
+      hasLength(1),
+    );
+    // Probe plus that one install — no per-file round trips.
+    expect(remote.commands, hasLength(2));
   });
 
   test('a skill edited on the host is replaced', () async {
     final remote = _FakeHost(skill: _skillV1);
     final deploy = ArchonSkillDeploy(
       exec: remote.exec,
-      loadAsset: (_) async => _skillV2,
+      loadAsset: _assets(_skillV2),
     );
 
     final result = await deploy.ensureOn(_host);
@@ -122,7 +149,7 @@ void main() {
     final remote = _FakeHost(skill: _skillV2);
     final deploy = ArchonSkillDeploy(
       exec: remote.exec,
-      loadAsset: (_) async => _skillV1,
+      loadAsset: _assets(_skillV1),
     );
 
     expect((await deploy.ensureOn(_host)).wrote, isTrue);
@@ -133,7 +160,7 @@ void main() {
     final remote = _FakeHost()..failWith = Exception('ssh: connect refused');
     final deploy = ArchonSkillDeploy(
       exec: remote.exec,
-      loadAsset: (_) async => _skillV1,
+      loadAsset: _assets(_skillV1),
     );
 
     await expectLater(
@@ -161,7 +188,9 @@ void main() {
       String command, {
       Duration timeout = const Duration(seconds: 12),
     }) async {
-      if (command.contains('base64 -d')) {
+      // Only the skill write — the package install is a separate step with
+      // its own message, covered below.
+      if (command.contains('base64 -d') && command.contains('.claude')) {
         throw Exception('No space left on device');
       }
       return remote.exec(host, command, timeout: timeout);
@@ -170,7 +199,7 @@ void main() {
     await expectLater(
       ArchonSkillDeploy(
         exec: failingExec,
-        loadAsset: (_) async => _skillV1,
+        loadAsset: _assets(_skillV1),
       ).ensureOn(_host),
       throwsA(
         isA<ArchonSkillDeployException>().having(
@@ -189,14 +218,21 @@ void main() {
       final remote = _FakeHost();
       final deploy = ArchonSkillDeploy(
         exec: remote.exec,
-        loadAsset: (_) async => throw Exception('Unable to load asset'),
+        loadAsset: (key) async {
+          if (key == ArchonSkillDeploy.assetKey) {
+            throw Exception('Unable to load asset');
+          }
+          return '# $key\n';
+        },
       );
 
       await expectLater(
         deploy.ensureOn(_host),
         throwsA(isA<ArchonSkillDeployException>()),
       );
-      expect(remote.commands, isEmpty);
+      // An empty skill on the host would be worse than none: Archon would
+      // read it, learn nothing, and behave like an ordinary agent.
+      expect(remote.skill, isNull);
     },
   );
 
@@ -224,7 +260,7 @@ void main() {
     await expectLater(
       ArchonSkillDeploy(
         exec: exec,
-        loadAsset: (_) async => _skillV1,
+        loadAsset: _assets(_skillV1),
       ).ensureOn(_host),
       throwsA(
         isA<ArchonSkillDeployException>().having(
@@ -242,13 +278,42 @@ void main() {
       final remote = _FakeHost(skill: _skillV1);
       await ArchonSkillDeploy(
         exec: remote.exec,
-        loadAsset: (_) async => _skillV1,
+        loadAsset: _assets(_skillV1),
       ).ensureOn(_host);
 
       expect(
-        remote.commands.single,
+        remote.commands.first,
         contains(r'cat "$HOME/.claude/skills/archon/SKILL.md"'),
       );
     },
   );
+
+  test('a failed package install is reported, not passed over', () async {
+    // The skill tells Archon to run `archon`. An install that quietly failed
+    // would leave it following instructions it cannot carry out.
+    final remote = _FakeHost();
+    Future<String> failingExec(
+      Host host,
+      String command, {
+      Duration timeout = const Duration(seconds: 12),
+    }) async {
+      if (command.contains('.local/bin/archon')) {
+        throw Exception('Read-only file system');
+      }
+      return remote.exec(host, command, timeout: timeout);
+    }
+
+    await expectLater(
+      ArchonSkillDeploy(
+        exec: failingExec,
+        loadAsset: _assets(_skillV1),
+      ).ensureOn(_host),
+      throwsA(
+        isA<ArchonSkillDeployException>()
+            .having((e) => e.message, 'message', contains('archon command'))
+            .having((e) => '$e', 'toString', contains('Read-only')),
+      ),
+    );
+  });
 }
+

@@ -39,6 +39,38 @@ class ArchonSkillDeploy {
   /// Where the skill is authored in this repo; listed in `pubspec.yaml` assets.
   static const assetKey = 'host/archon/skill/SKILL.md';
 
+  /// Archon's package, installed with the skill.
+  ///
+  /// Deliberately not left to the ADSM upload. That only runs when the host
+  /// reports an older ADSM than the app wants, so a host already on the
+  /// current version never receives Archon — and the skill would tell it to
+  /// run `archon`, which would not be there. Placement is the moment Archon
+  /// is meant to work on a host, so placement installs everything it needs.
+  static const packageAssets = <String>[
+    '__init__.py',
+    '__main__.py',
+    'paths.py',
+    'store.py',
+    'triggers.py',
+    'directory.py',
+    'cli.py',
+    'daemon.py',
+  ];
+
+  /// `archon` on PATH. `python3 -m archon`, found the same way the ADSM
+  /// wrapper finds an interpreter new enough to run it.
+  static const wrapper = r'''
+#!/usr/bin/env bash
+export PYTHONPATH="$HOME/.local/share/agentdock/host${PYTHONPATH:+:$PYTHONPATH}"
+export PATH="$HOME/.local/bin:$PATH"
+for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    exec "$py" -m archon "$@"
+  fi
+done
+exec python3 -m archon "$@"
+''';
+
   /// Must match the `name:` in the skill's front matter — Claude keys a skill
   /// by its folder, and a mismatch loads nothing.
   static const skillName = 'archon';
@@ -73,6 +105,10 @@ class ArchonSkillDeploy {
   Future<ArchonSkillInstall> ensureOn(Host host) async {
     final desired = await _desiredContent();
     final probe = await _probe(host);
+
+    // Always, even when the skill is unchanged: the package is what makes the
+    // skill's instructions runnable, and the two can be out of step.
+    await _installPackage(host, probe.home);
 
     if (probe.content == desired) {
       return ArchonSkillInstall(
@@ -146,6 +182,46 @@ class ArchonSkillDeploy {
       );
     }
     return _Probe(home, split < 0 ? '' : out.substring(split + 1));
+  }
+
+  /// Put Archon's package on the host and `archon` on PATH.
+  ///
+  /// One script: a per-file round trip to a bastion is slow enough to be felt
+  /// during placement, and a half-written package is worse than none.
+  Future<void> _installPackage(Host host, String home) async {
+    final buf = StringBuffer()
+      ..writeln('set -e')
+      ..writeln('mkdir -p "\$HOME/.local/share/agentdock/host/archon" '
+          '"\$HOME/.local/bin"');
+    for (final name in packageAssets) {
+      final String source;
+      try {
+        source = await _loadAsset('host/archon/$name');
+      } catch (e) {
+        throw ArchonSkillDeployException(
+          "Archon's package is missing from the app bundle (host/archon/$name)",
+          cause: e,
+        );
+      }
+      final b64 = base64Encode(utf8.encode(source));
+      buf.writeln(
+        'printf %s ${SshService.shellQuote(b64)} | base64 -d > '
+        '"\$HOME/.local/share/agentdock/host/archon/$name"',
+      );
+    }
+    buf
+      ..writeln(
+        'printf %s ${SshService.shellQuote(base64Encode(utf8.encode(wrapper)))}'
+        ' | base64 -d > "\$HOME/.local/bin/archon"',
+      )
+      ..writeln('chmod +x "\$HOME/.local/bin/archon"');
+
+    await _run(
+      host,
+      buf.toString(),
+      timeout: const Duration(seconds: 90),
+      what: 'install the archon command',
+    );
   }
 
   Future<String> _run(
