@@ -83,10 +83,22 @@ to Allow all, then leave it.
 
 ## Goals
 
-The user switches an agent on and says what done looks like. That goal is the
-whole brief. Work toward it through that agent.
+The user switches an agent on, and may or may not say what done looks like.
 
-When it is met, run `archon done <chatId> "<note>"`. The note is what the user
+**Without a goal** — the default, and the common case — keep that agent's work
+moving the way the user would: answer its questions, unblock it, let it carry
+on. Bring something to the user only when it genuinely needs them. Do not
+report progress they did not ask for.
+
+**With a goal**, that goal is the whole brief. Work toward it through that
+agent.
+
+`archon goals` gives you `effectiveGoal` for each — the user's words when they
+wrote any, the default when they did not. Use that.
+
+When a written goal is met, run `archon done <chatId> "<note>"`. An agent on
+the default goal has no finish line — leave it switched on until the user says
+otherwise. The note is what the user
 will read to know it finished — one or two sentences of what actually happened,
 with the fact that settles it. "CI green on main since 14:02; the flake was a
 missing await in the poll test." Not "completed successfully".

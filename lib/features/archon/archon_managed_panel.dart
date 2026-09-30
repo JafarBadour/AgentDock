@@ -95,9 +95,10 @@ class ArchonManagedPanel extends ConsumerWidget {
               Text('Auto-managed agents', style: theme.textTheme.titleMedium),
               const SizedBox(height: 6),
               Text(
-                'Switch on the agents Archon should look after and say what '
-                'done looks like. Archon switches each one off again when it '
-                'gets there, and leaves a note.',
+                'Switch on the agents Archon should look after. Without a '
+                'goal it keeps their chats moving the way you would and only '
+                'comes to you when it matters. Give one a goal and it works '
+                'to that instead, then switches itself off with a note.',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -137,30 +138,31 @@ class _ManagedRow extends ConsumerWidget {
     ref.invalidate(managedAgentsProvider);
   }
 
+  /// Switch Archon's attention on or off. Nothing else — a goal is optional
+  /// and set from the pencil, because most agents only need their chat kept
+  /// moving and asking for a brief first made this into paperwork.
   Future<void> _toggle(BuildContext context, WidgetRef ref, bool on) async {
-    final existing = agent.brief;
-    // Turning it on without a goal leaves nothing to call finished, so ask
-    // for one at the moment it is needed rather than accepting a blank brief.
-    if (on && !(existing?.hasGoal ?? false)) {
-      final goal = await _askForGoal(context);
-      if (goal == null || goal.trim().isEmpty) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final existing =
+        agent.brief ??
+        ArchonBrief(chatId: agent.chat.id, updatedAt: DateTime.now());
+    try {
       await _write(
         ref,
-        (existing ??
-                ArchonBrief(
-                  chatId: agent.chat.id,
-                  updatedAt: DateTime.now(),
-                ))
-            .copyWith(enabled: true, goal: goal.trim(), clearNote: true),
+        // Turning it back on clears the last result: a note beside a live
+        // switch would read as the finished thing still running.
+        on
+            ? existing.copyWith(enabled: true, clearNote: true)
+            : existing.copyWith(enabled: false),
       );
-      return;
+    } catch (e) {
+      // This used to be swallowed, so a switch that did not move looked like
+      // the switch being broken rather than the write failing.
+      SafeLog.d('archon brief write failed', e);
+      messenger.showSnackBar(
+        SnackBar(content: Text('Could not update ${agent.chat.title} — $e')),
+      );
     }
-    await _write(
-      ref,
-      (existing ??
-              ArchonBrief(chatId: agent.chat.id, updatedAt: DateTime.now()))
-          .copyWith(enabled: on),
-    );
   }
 
   Future<String?> _askForGoal(BuildContext context) async {
@@ -213,9 +215,19 @@ class _ManagedRow extends ConsumerWidget {
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          if (agent.enabled && goal != null) ...[
+          if (agent.enabled) ...[
             const SizedBox(height: 4),
-            Text(goal, style: theme.textTheme.bodySmall),
+            Text(
+              goal ?? ArchonBrief.defaultGoal,
+              style: theme.textTheme.bodySmall?.copyWith(
+                // The default is Archon's standing behaviour, not something
+                // the user wrote; it should not read as their words.
+                fontStyle: goal == null ? FontStyle.italic : null,
+                color: goal == null
+                    ? theme.colorScheme.onSurfaceVariant
+                    : null,
+              ),
+            ),
           ],
           if (agent.isDone && note != null) ...[
             const SizedBox(height: 4),
@@ -240,26 +252,34 @@ class _ManagedRow extends ConsumerWidget {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (agent.enabled)
-            IconButton(
-              tooltip: 'Edit goal',
-              icon: const Icon(Icons.edit_outlined, size: 18),
+          IconButton(
+              tooltip: agent.goal == null ? 'Add a goal' : 'Edit goal',
+              icon: Icon(
+                agent.goal == null
+                    ? Icons.add_comment_outlined
+                    : Icons.edit_outlined,
+                size: 18,
+              ),
               onPressed: () async {
                 final goal = await _askForGoal(context);
-                if (goal == null || goal.trim().isEmpty) return;
+                if (goal == null) return;
+                final base =
+                    agent.brief ??
+                    ArchonBrief(
+                      chatId: agent.chat.id,
+                      updatedAt: DateTime.now(),
+                    );
                 await _write(
                   ref,
-                  agent.brief!.copyWith(goal: goal.trim(), clearNote: true),
+                  // An emptied box means "no particular goal", not "keep the
+                  // old one" — so it falls back to the default.
+                  base.copyWith(goal: goal.trim(), clearNote: true),
                 );
               },
             ),
           Switch(
             value: agent.enabled,
-            onChanged: (on) => unawaited(
-              _toggle(context, ref, on).catchError((Object e) {
-                SafeLog.d('archon brief write failed', e);
-              }),
-            ),
+            onChanged: (on) => unawaited(_toggle(context, ref, on)),
           ),
         ],
       ),

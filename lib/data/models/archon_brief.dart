@@ -23,13 +23,24 @@ class ArchonBrief {
   /// What Archon reported on switching itself off.
   final String? note;
 
+  /// What Archon does for an agent switched on without a goal of its own.
+  /// Kept in step with `DEFAULT_GOAL` in host/archon/directory.py.
+  static const defaultGoal =
+      "Answer this agent's chat the way the user would, keeping its work "
+      'moving. Only bring something to the user when it genuinely needs them.';
+
+  /// What Archon actually works toward — the user's words, or the default.
+  String get effectiveGoal => hasGoal ? goal!.trim() : defaultGoal;
+
   final DateTime? doneAt;
   final DateTime updatedAt;
 
   bool get hasGoal => (goal ?? '').trim().isNotEmpty;
 
-  /// Archon is actively working on this.
-  bool get isActive => enabled && hasGoal;
+  /// Archon is working on this. A goal is optional — most agents only need
+  /// their chat kept moving, and requiring a brief made switching one on into
+  /// paperwork.
+  bool get isActive => enabled;
 
   /// Finished, with something to show for it.
   bool get isDone => !enabled && (note ?? '').trim().isNotEmpty;

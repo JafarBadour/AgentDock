@@ -178,10 +178,22 @@ class AutoManageTest(unittest.TestCase):
         got = self.directory.manageable(self.directory.load_records())
         self.assertEqual(["Build"], [r["title"] for r in got])
 
-    def test_switched_on_without_a_goal_is_not_work(self) -> None:
-        # Nothing to work toward means nothing to decide is finished.
+    def test_switched_on_without_a_goal_still_gets_worked(self) -> None:
+        # A goal is optional. The common case is "just keep this moving", and
+        # requiring a brief made switching an agent on into paperwork.
         self._record("a", title="Build", permission_ask=False, archon_managed=True)
-        self.assertEqual([], self.directory.manageable(self.directory.load_records()))
+        got = self.directory.manageable(self.directory.load_records())
+        self.assertEqual(["Build"], [r["title"] for r in got])
+        self.assertEqual(
+            self.directory.DEFAULT_GOAL,
+            self.directory.effective_goal_of(got[0]),
+        )
+
+    def test_a_written_goal_wins_over_the_default(self) -> None:
+        self._record("a", title="Build", permission_ask=False,
+                     archon_managed=True, archon_goal="green CI")
+        record = self.directory.load_records()[0]
+        self.assertEqual("green CI", self.directory.effective_goal_of(record))
 
     def test_permission_beats_the_toggle(self) -> None:
         # The toggle is the user's intent; the permission is their authority.
@@ -232,10 +244,14 @@ class AutoManageTest(unittest.TestCase):
     def test_finishing_an_agent_that_is_gone_is_not_fatal(self) -> None:
         self.assertIsNone(self.directory.complete("nope", "done"))
 
-    def test_a_blank_goal_does_not_count_as_one(self) -> None:
+    def test_a_blank_goal_falls_back_to_the_default(self) -> None:
         self._record("a", title="Build", permission_ask=False,
                      archon_managed=True, archon_goal="   ")
-        self.assertEqual([], self.directory.manageable(self.directory.load_records()))
+        record = self.directory.load_records()[0]
+        self.assertIsNone(self.directory.goal_of(record))
+        self.assertEqual(
+            self.directory.DEFAULT_GOAL, self.directory.effective_goal_of(record)
+        )
 
     def test_the_directory_shows_the_goal_and_the_note(self) -> None:
         self._record("a", title="Build", permission_ask=False,

@@ -45,10 +45,21 @@ void main() {
       expect(b.isDone, isFalse);
     });
 
-    test('switched on without a goal is not work', () {
-      // Nothing to work toward means nothing to call finished.
-      expect(brief(enabled: true).isActive, isFalse);
-      expect(brief(enabled: true, goal: '   ').isActive, isFalse);
+    test('switched on without a goal is still work', () {
+      // A goal is optional: the common case is "just keep this moving", and
+      // requiring a brief made switching an agent on into paperwork.
+      expect(brief(enabled: true).isActive, isTrue);
+      expect(brief(enabled: true, goal: '   ').isActive, isTrue);
+    });
+
+    test('no goal falls back to the standing one', () {
+      expect(brief(enabled: true).effectiveGoal, ArchonBrief.defaultGoal);
+      expect(brief(enabled: true, goal: '  ').effectiveGoal,
+          ArchonBrief.defaultGoal);
+    });
+
+    test('a written goal wins over the default', () {
+      expect(brief(enabled: true, goal: ' green CI ').effectiveGoal, 'green CI');
     });
 
     test('off with a note is finished', () {

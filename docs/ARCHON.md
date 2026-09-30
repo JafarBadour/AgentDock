@@ -61,8 +61,12 @@ The user switches an agent on and gives it a goal. Archon works toward it, and
 when it is met **switches the agent off and leaves a note, in one step**. A
 toggle left on beside a note would read as work still running.
 
-- Turning an agent on **asks for the goal there and then** — without one there
-  is nothing to call finished, so a blank brief is refused rather than stored.
+- **A goal is optional.** Switching an agent on works on its own; without a
+  goal Archon keeps that chat moving the way the user would and interrupts
+  them only when it matters. Asking for a brief first turned switching an
+  agent on into paperwork, and the common case needs no brief at all.
+- **An agent on the default goal has no finish line** and stays on until the
+  user says otherwise. Only a written goal can be "met".
 - The **permission gate still decides**. The toggle is the user's intent; the
   permission is their authority, and the narrower wins.
 - The note must carry the fact that settles it — *"CI green on main since

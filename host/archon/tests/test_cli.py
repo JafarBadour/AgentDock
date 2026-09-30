@@ -50,8 +50,10 @@ class ArchonCliTest(unittest.TestCase):
                     archon_managed=True, archon_goal="green CI")
         self._agent("b", title="Deploy", permission_ask=True,
                     archon_managed=True, archon_goal="ship")
-        self._agent("c", title="Idle", permission_ask=False)
-        self.assertEqual(["Build"], [e["title"] for e in self.run_cli(["goals"])])
+        # "c" has no goal, which is allowed — it gets the default.
+        self._agent("c", title="Idle", permission_ask=False, archon_managed=True)
+        titles = [e["title"] for e in self.run_cli(["goals"])]
+        self.assertEqual({"Build", "Idle"}, set(titles))
 
     def test_blocked_says_why_and_how_to_unblock(self) -> None:
         self._agent("b", title="Deploy", permission_ask=True,

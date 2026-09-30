@@ -94,6 +94,7 @@ def describe(
             "commandable": is_commandable(record),
             "managed": is_managed(record),
             "goal": goal_of(record),
+            "effectiveGoal": effective_goal_of(record),
             "note": note_of(record),
         }
         if host:
@@ -115,6 +116,14 @@ def commandable(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 MANAGED = "archon_managed"
 GOAL = "archon_goal"
+
+# What Archon does for an agent switched on without a goal of its own. Most
+# agents do not need a brief — the useful default is simply to keep the
+# conversation moving the way the user would, and to interrupt them rarely.
+DEFAULT_GOAL = (
+    "Answer this agent's chat the way the user would, keeping its work "
+    "moving. Only bring something to the user when it genuinely needs them."
+)
 NOTE = "archon_note"
 DONE_AT = "archon_done_at"
 
@@ -124,8 +133,18 @@ def is_managed(record: dict[str, Any]) -> bool:
 
 
 def goal_of(record: dict[str, Any]) -> Optional[str]:
+    """The goal the user typed, or None if they did not type one."""
     goal = record.get(GOAL)
     return goal.strip() if isinstance(goal, str) and goal.strip() else None
+
+
+def effective_goal_of(record: dict[str, Any]) -> str:
+    """What Archon should actually work toward — never empty.
+
+    A goal is optional. Requiring one made switching an agent on a small piece
+    of paperwork, when the common case is "just keep this moving".
+    """
+    return goal_of(record) or DEFAULT_GOAL
 
 
 def note_of(record: dict[str, Any]) -> Optional[str]:
@@ -141,11 +160,7 @@ def manageable(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     its toggle is still on. The toggle is the user's intent; the permission is
     the user's authority, and the narrower one wins.
     """
-    return [
-        r
-        for r in records
-        if is_managed(r) and is_commandable(r) and goal_of(r) is not None
-    ]
+    return [r for r in records if is_managed(r) and is_commandable(r)]
 
 
 def blocked(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
