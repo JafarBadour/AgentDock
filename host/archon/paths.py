@@ -30,10 +30,20 @@ def db_path() -> Path:
     return archon_root() / "archon.db"
 
 
+def workspace_dir() -> Path:
+    """Archon's working directory.
+
+    Its own folder rather than one of the user's repos: Archon directs agents
+    and never executes anything itself, so it has no reason to sit inside code
+    it might be asked about but must not touch.
+    """
+    return archon_root() / "workspace"
+
+
 def chat_path(chat_id: str) -> Path:
     return chats_dir() / f"{adsm_paths.safe_chat_id(chat_id)}.jsonl"
 
 
 def ensure_layout() -> None:
-    for d in (archon_root(), chats_dir(), memory_dir()):
+    for d in (archon_root(), chats_dir(), memory_dir(), workspace_dir()):
         d.mkdir(parents=True, exist_ok=True)
