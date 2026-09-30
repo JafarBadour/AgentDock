@@ -28,6 +28,7 @@ Consequences:
 | Archon's chat id | reserved (`archon`), not a schema column — only one is active at a time, and moving hosts repoints its row rather than making a second |
 | Hidden from the Agents list | filtered where the list is built, not in the database, so storage and catalog sync keep treating it as the ordinary chat it is |
 | No Fork button | forking the manager would make a second manager |
+| Changing its host | Archon settings (the gear), not the tab — once placed, the tab is its chat |
 | Its workspace | `~/.agentdock/archon/workspace`, its own folder — Archon directs agents and never executes, so it has no reason to sit inside code it might be asked about but must not touch |
 
 ## Permissions

@@ -1,9 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/providers.dart';
+import '../../data/models/host.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/deepgram_service.dart';
+import '../agents/agents_screen.dart';
+import 'archon_screen.dart';
 
 /// Archon's settings: which host it runs on, and how it hears and speaks.
 ///
@@ -127,6 +132,8 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  const _ArchonHostSection(),
+                  const SizedBox(height: 24),
                   Text('Archon voice', style: theme.textTheme.titleMedium),
                   const SizedBox(height: 4),
                   Text(
@@ -212,6 +219,120 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
                 ],
               ),
       ),
+    );
+  }
+}
+
+/// Which host Archon runs on, and moving it.
+///
+/// Only reachable once Archon exists — before that the whole page is the
+/// picker. Moving keeps the conversation and takes its folder along; what it
+/// cannot take is the ACP session, which belonged to the old host.
+class _ArchonHostSection extends ConsumerStatefulWidget {
+  const _ArchonHostSection();
+
+  @override
+  ConsumerState<_ArchonHostSection> createState() => _ArchonHostSectionState();
+}
+
+class _ArchonHostSectionState extends ConsumerState<_ArchonHostSection> {
+  bool _moving = false;
+
+  Future<void> _moveTo(Host host) async {
+    setState(() => _moving = true);
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref.read(archonServiceProvider).placeOn(host);
+      ref.read(agentsCatalogEpochProvider.notifier).state++;
+      ref.invalidate(archonHostProvider);
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text('Archon now runs on ${host.alias}')),
+      );
+    } catch (e) {
+      // Placement installs the skill first, and a failure there means Archon
+      // would be an ordinary agent on that host — worth saying, not swallowing.
+      SafeLog.d('moving archon failed', e);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('Could not move — $e')));
+    } finally {
+      if (mounted) setState(() => _moving = false);
+    }
+  }
+
+  Future<void> _pick(List<Host> hosts, Host? current) async {
+    final chosen = await showDialog<Host>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Run Archon on'),
+        children: [
+          for (final host in hosts)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, host),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(
+                  host.id == current?.id
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                ),
+                title: Text(host.alias),
+                subtitle: Text('${host.username}@${host.hostname}'),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null || chosen.id == current?.id) return;
+    await _moveTo(chosen);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final current = ref.watch(archonHostProvider);
+    final tree = ref.watch(agentsTreeProvider);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('Where Archon runs', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'One host at a time. Moving brings the conversation and its memory '
+          'with it.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.dns_outlined),
+          title: Text(
+            current.valueOrNull?.alias ?? 'Not running anywhere yet',
+          ),
+          subtitle: current.valueOrNull == null
+              ? null
+              : Text(
+                  '${current.value!.username}@${current.value!.hostname}',
+                ),
+          trailing: _moving
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : TextButton(
+                  onPressed: tree.valueOrNull == null
+                      ? null
+                      : () => unawaited(
+                          _pick(tree.value!.hosts, current.valueOrNull),
+                        ),
+                  child: const Text('Move'),
+                ),
+        ),
+      ],
     );
   }
 }
