@@ -78,5 +78,13 @@ flutter:
     - host/adsm/transcript.py
     - host/adsm/process_hygiene.py
     - host/adsm/images.py
+    - host/archon/__init__.py
+    - host/archon/__main__.py
+    - host/archon/paths.py
+    - host/archon/store.py
+    - host/archon/triggers.py
+    - host/archon/directory.py
+    - host/archon/cli.py
+    - host/archon/skill/SKILL.md
     - host/adsm/transport.py
     - host/adsm/winproc.py

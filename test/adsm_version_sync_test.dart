@@ -25,6 +25,27 @@ void main() {
     );
   });
 
+  test('every Archon module is shipped too', () {
+    // Archon rides the same upload as ADSM; a module left out of the assets
+    // reaches no host, and the failure looks like Archon simply not working.
+    final pubspec = File('pubspec.yaml').readAsStringSync();
+    final shipped = RegExp(r'host/archon/(\w+\.py)')
+        .allMatches(pubspec)
+        .map((m) => m.group(1))
+        .toSet();
+    final needed = Directory('host/archon')
+        .listSync()
+        .whereType<File>()
+        .map((f) => f.uri.pathSegments.last)
+        .where((n) => n.endsWith('.py'))
+        .toSet();
+    expect(
+      needed.difference(shipped),
+      isEmpty,
+      reason: 'add the new Archon module to pubspec.yaml assets',
+    );
+  });
+
   test('every daemon RPC method is reachable from a bundled asset', () {
     // The daemon is only as deployable as the file list in pubspec.yaml.
     final pubspec = File('pubspec.yaml').readAsStringSync();
