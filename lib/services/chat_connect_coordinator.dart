@@ -183,6 +183,28 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
 
   bool _current(String chatId, int epoch) => _epochs[chatId] == epoch;
 
+  /// Bring up [chat] for a relayed command from Archon.
+  ///
+  /// Archon reaches agents on other hosts through this app, and a worker that
+  /// is not running has to be started before it can be given anything. It is
+  /// brought up on the permission the user already set for that agent — the
+  /// relay has already refused anything set to Ask, so this cannot widen what
+  /// Archon may do; it only avoids starting the worker under a policy the user
+  /// did not choose.
+  Future<void> ensureForRelay(Host host, Chat chat) async {
+    final repo = await _ref.read(appDatabaseProvider).getRepo(chat.repoId);
+    if (repo == null) {
+      throw StateError('No project on ${host.displayLabel} for ${chat.title}');
+    }
+    await ensure(
+      chat: chat,
+      repo: repo,
+      host: host,
+      mode: AgentSessionMode.agent,
+      permission: PermissionPolicy.allowAll,
+    );
+  }
+
   /// Bring up a session for [chat], retrying transport failures up to
   /// [maxAttempts] times. Re-entrant: a second call while one is in flight
   /// joins it instead of racing a duplicate handshake.

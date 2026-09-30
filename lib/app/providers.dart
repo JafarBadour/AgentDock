@@ -13,6 +13,7 @@ import '../services/agentdock_service.dart';
 import '../services/background_keep_alive.dart';
 import '../services/archon_service.dart';
 import '../services/archon_skill_deploy.dart';
+import '../services/archon_relay_service.dart';
 import '../services/archon_voice.dart';
 import '../services/deepgram_service.dart';
 import '../services/chat_fork.dart';
@@ -149,6 +150,46 @@ final chatForkServiceProvider = Provider<ChatForkService>((ref) {
     db: ref.watch(appDatabaseProvider),
     dock: ref.watch(agentDockServiceProvider),
   );
+});
+
+/// The app as Archon's route to other hosts (see [ArchonRelayService]).
+///
+/// Archon runs on one host and has no credentials for the rest; the app
+/// already holds a connection to each host it can see, and lends one on
+/// request. Driven by [archonRelayLifecycleProvider].
+final archonRelayServiceProvider = Provider<ArchonRelayService>((ref) {
+  final service = ArchonRelayService.overBridgePool(
+    pool: ref.watch(adsmBridgePoolProvider),
+    db: ref.watch(appDatabaseProvider),
+    archonHost: () => ref.read(archonServiceProvider).currentHost(),
+    // Prompting an agent with no live worker needs the provider API key, which
+    // only the connect path can reach; without this the relay can talk to
+    // agents that are already up and nothing else.
+    prepareChat: (host, chat) =>
+        ref.read(chatConnectCoordinatorProvider.notifier).ensureForRelay(host, chat),
+  );
+  ref.onDispose(() => unawaited(service.stop()));
+  return service;
+});
+
+/// Runs the relay while the app is in the foreground — a closed app is not a
+/// route, and Archon is built to expect that.
+final archonRelayLifecycleProvider = Provider<void>((ref) {
+  final relay = ref.watch(archonRelayServiceProvider);
+  void apply(bool foreground) {
+    if (foreground) {
+      unawaited(relay.start());
+    } else {
+      unawaited(relay.stop());
+    }
+  }
+
+  ref.listen<bool>(appInForegroundProvider, (_, fg) => apply(fg));
+  // Archon may have been placed on, or moved to, a different host.
+  ref.listen<int>(agentsCatalogEpochProvider, (_, _) {
+    if (relay.running) unawaited(relay.refreshHost());
+  });
+  apply(ref.read(appInForegroundProvider));
 });
 
 /// Live, messenger-style sync of every chat on every host (see

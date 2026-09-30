@@ -4,7 +4,8 @@ Companion to the design doc. That says what Archon should be; this records
 what was actually built, and the choices made where the design left room.
 Written as it was built, for review — anything here is changeable.
 
-Status: **foundation complete, not yet a working manager.** See [Open](#open).
+Status: **all pieces built and wired.** Untested against real hosts — see
+[Open](#open).
 
 ---
 
@@ -156,22 +157,48 @@ now a test reading `VERSION` out of `protocol.py` and asserting the app agrees.
 
 ---
 
+## Built in parallel
+
+Four pieces were built concurrently by subagents, each confined to new files
+with tests, and integrated here. The shared wiring — providers, the composer,
+the coordinator — was kept out of them deliberately: it is the one thing
+concurrent work reliably corrupts.
+
+- **Relay (app side)** — subscribes on Archon's host only, not every host;
+  Archon runs in one place and subscribing everywhere would open SSH bridges
+  for nothing. Every action answers within a budget under the daemon's
+  timeout, so a call never dies in silence. A `callId` is claimed before the
+  work runs, so a redelivered call cannot prompt an agent twice. **Archon may
+  not prompt itself** — that loop would bill every lap.
+- **Skill deploy** — Claude root only, and it throws rather than degrading: a
+  skill written to a relative path is exactly the silent "Archon acts like a
+  plain agent" failure it exists to prevent.
+- **Wake loop** — surveys from records; only counts agents Archon may actually
+  drive, because waking a paid turn over an agent set to Ask is the worst
+  trade available. Only wakes that produced work are logged, so the tab is not
+  filled with "nothing happened".
+- **Voice bar** — hold-to-talk with slide-away-to-cancel on a raw pointer
+  listener, so the gesture arena cannot steal a take mid-word.
+
+Relayed commands bring a stopped worker up on **the permission the user
+already set**, never a widened one. The relay has already refused anything on
+Ask, so this cannot broaden what Archon may do.
+
 ## Open
 
-Not built, in the order that matters for Archon actually working:
-
-1. **The app side of the relay.** `archon remote *` always answers `no_app`
-   because nothing in the app subscribes as a route. Until this exists Archon
-   manages one host.
-2. **Deploying the skill on placement.** The skill is written and shipped but
-   nothing installs it on Archon's host, so Archon currently behaves like a
-   plain agent.
-3. **The wake loop.** Triggers and the schedule exist; nothing runs Archon on
-   them, so it only acts when spoken to.
-4. **Voice controls in the composer.** `ArchonVoice` works and is tested, but
-   no UI calls it.
-5. **Absorbing the Automate jobs.** The editor moved under `/archon/schedule`;
+1. **Nothing has run against a real host.** Every layer is unit-tested and the
+   app builds, but Archon has not yet been placed, woken, or asked to manage
+   anything end to end. That is the next thing to find out, and the most
+   likely source of surprises.
+2. **The wake loop is not started by anything.** `ArchonDaemon` exists and is
+   tested; no process runs it on the host yet. Archon still only acts when
+   spoken to.
+3. **Absorbing the Automate jobs.** The editor moved under `/archon/schedule`;
    Archon does not run those jobs yet.
+4. **"Changed since I last looked" is an in-memory watermark.** After a restart
+   the first tick treats every managed agent as changed and gives Archon one
+   catch-up look — cheap and self-correcting, but it is a restart-triggered
+   paid turn. Worth persisting if that is not wanted.
 
 ## Deliberately not done
 

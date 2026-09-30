@@ -41,6 +41,8 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
       // Keep provider alive so remote deletes tear down ACP sessions.
       ref.read(remoteDeletedChatsPrunerProvider);
       ref.read(hostLiveSyncLifecycleProvider);
+      // The app is Archon's only way to reach the user's other hosts.
+      ref.read(archonRelayLifecycleProvider);
       // Mac / Windows: offer this machine as a host for local agents.
       unawaited(() async {
         final host = await ensureLocalThisComputerHost(
