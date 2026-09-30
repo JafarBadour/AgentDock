@@ -11,6 +11,7 @@ import '../../app/providers.dart';
 import 'agent_provider_ui.dart';
 import '../../data/models/agent_provider.dart';
 import '../../data/models/chat.dart';
+import '../../data/models/archon_chat.dart';
 import '../../data/models/host.dart';
 import '../../data/models/repo.dart';
 import '../../data/secure/safe_log.dart';
@@ -46,7 +47,9 @@ final agentsTreeProvider = FutureProvider.autoDispose<AgentsTree>((ref) async {
   ]);
   final hosts = results[0] as List<Host>;
   final repos = results[1] as List<Repo>;
-  final chats = results[2] as List<Chat>;
+  // Archon manages these agents; it is not one of them, so it is kept out of
+  // the list and its badges. Its row is otherwise an ordinary chat.
+  final chats = withoutArchon(results[2] as List<Chat>);
   final chatsByRepo = <String, List<Chat>>{};
   for (final chat in chats) {
     chatsByRepo.putIfAbsent(chat.repoId, () => []).add(chat);
@@ -64,7 +67,12 @@ final unreadCountsProvider = FutureProvider.autoDispose<Map<String, int>>((
   ref,
 ) async {
   ref.watch(chatActivityTickProvider);
-  return ref.watch(appDatabaseProvider).unreadCounts();
+  final counts = await ref.watch(appDatabaseProvider).unreadCounts();
+  // Archon is not in the list, so it must not badge it either.
+  return {
+    for (final entry in counts.entries)
+      if (entry.key != kArchonChatId) entry.key: entry.value,
+  };
 });
 
 /// Flat chat row for the Agents list (phone + desktop sidebar).
