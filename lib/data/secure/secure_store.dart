@@ -31,6 +31,10 @@ class SecureStore {
   static const _openAiApiKey = 'openai_api_key';
   static const _gcpSpeechApiKey = 'gcp_speech_api_key';
   static const _gcpSpeechLanguage = 'gcp_speech_language';
+  static const _deepgramApiKey = 'deepgram_api_key';
+  static const _deepgramSttModel = 'deepgram_stt_model';
+  static const _deepgramTtsModel = 'deepgram_tts_model';
+  static const _deepgramLanguage = 'deepgram_language';
   static const _hostPasswordPrefix = 'host_password_';
 
   final FlutterSecureStorage _storage;
@@ -191,6 +195,49 @@ class SecureStore {
       SafeLog.d('dotenv read failed', e);
     }
     return null;
+  }
+
+  Future<void> saveDeepgramApiKey(String? key) async {
+    if (key == null || key.trim().isEmpty) {
+      await _delete(_deepgramApiKey);
+      return;
+    }
+    await _write(_deepgramApiKey, key.trim());
+  }
+
+  /// Deepgram key from Archon settings, else `DEEPGRAM_API_KEY` env / `.env`.
+  Future<String?> readDeepgramApiKey() async {
+    final stored = await _read(_deepgramApiKey);
+    if (stored != null && stored.trim().isNotEmpty) return stored.trim();
+    final fromEnv = Platform.environment['DEEPGRAM_API_KEY']?.trim();
+    if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
+    return _readDotEnvValue('DEEPGRAM_API_KEY');
+  }
+
+  Future<bool> hasDeepgramApiKey() async {
+    final value = await readDeepgramApiKey();
+    return value != null && value.trim().isNotEmpty;
+  }
+
+  Future<void> saveDeepgramSttModel(String? model) =>
+      _writeOrClear(_deepgramSttModel, model);
+  Future<String?> readDeepgramSttModel() => _read(_deepgramSttModel);
+
+  Future<void> saveDeepgramTtsModel(String? model) =>
+      _writeOrClear(_deepgramTtsModel, model);
+  Future<String?> readDeepgramTtsModel() => _read(_deepgramTtsModel);
+
+  /// BCP-47 tag Deepgram transcribes in; null lets Deepgram detect.
+  Future<void> saveDeepgramLanguage(String? code) =>
+      _writeOrClear(_deepgramLanguage, code);
+  Future<String?> readDeepgramLanguage() => _read(_deepgramLanguage);
+
+  Future<void> _writeOrClear(String key, String? value) async {
+    if (value == null || value.trim().isEmpty) {
+      await _delete(key);
+      return;
+    }
+    await _write(key, value.trim());
   }
 
   Future<void> saveGcpSpeechLanguage(String? code) async {
