@@ -20,7 +20,11 @@ void main() {
       // 0.7.1 carries the transcript.pull pivot fix, so 0.7.0 is stale.
       expect(adsmVersionMeets('0.7.0', kRequiredAdsmVersion), isFalse);
       expect(adsmVersionMeets('0.7.1', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.2', kRequiredAdsmVersion), isTrue);
+      // 0.7.3 is the first daemon that answers `archon.relay`. 0.7.2 shipped
+      // on main without it, so a host reporting 0.7.2 must read as stale —
+      // treating it as current is what left Archon with no route.
+      expect(adsmVersionMeets('0.7.2', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.3', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -31,7 +35,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.2');
+      expect(kRequiredAdsmVersion, '0.7.3');
     });
   });
 }

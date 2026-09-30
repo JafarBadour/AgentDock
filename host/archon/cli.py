@@ -108,8 +108,18 @@ def relay(action: str, payload: Optional[dict[str, Any]] = None,
             )
             await writer.drain()
             line = await asyncio.wait_for(reader.readline(), timeout + 10)
-            message = protocol.decode_line(line.decode("utf-8", "replace"))
-            return (message or {}).get("result") or {}
+            message = protocol.decode_line(line.decode("utf-8", "replace")) or {}
+            # A daemon too old to know `archon.relay` answers with an error,
+            # not a result. Reporting that as `{}` would read exactly like the
+            # normal "no app is connected" state and send Archon looking for a
+            # missing app instead of a stale host.
+            if "error" in message:
+                return {
+                    "ok": False,
+                    "error": "daemon_error",
+                    "message": str(message["error"].get("message")),
+                }
+            return message.get("result") or {}
         finally:
             writer.close()
             try:

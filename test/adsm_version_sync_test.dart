@@ -74,6 +74,77 @@ void main() {
     );
   });
 
+  /// The method set the daemon answers, recorded against the VERSION that
+  /// first answered it. Add a method and this map no longer describes the
+  /// daemon, so the only way to make it true again is a new entry under a new
+  /// VERSION — which is the bump that makes hosts actually receive the code.
+  ///
+  /// Keeping the numbers in sync is not enough on its own: `archon.relay`
+  /// shipped while both sides read 0.7.2, so every host already at 0.7.2 was
+  /// judged up to date and never got the daemon that could answer it. Archon
+  /// then reported "no route", which reads as "no app is connected" rather
+  /// than "this host is stale".
+  const methodsByVersion = <String, List<String>>{
+    '0.7.3': [
+      'agents.delete',
+      'agents.ensure',
+      'agents.list',
+      'agents.stop',
+      'archon.log',
+      'archon.relay',
+      'archon.reply',
+      'archon.routes',
+      'chats.fork',
+      'chats.notify',
+      'daemon.shutdown',
+      'daemon.status',
+      'ping',
+      'schedules.delete',
+      'schedules.list',
+      'schedules.run_now',
+      'schedules.upsert',
+      'session.cancel',
+      'session.prompt',
+      'session.refresh_models',
+      'session.respond_permission',
+      'session.set_mode',
+      'session.set_model',
+      'session.subscribe',
+      'transcript.pull',
+      'transcript.sync',
+    ],
+  };
+
+  test('the daemon RPC surface is pinned to the declared VERSION', () {
+    final daemon = File('host/adsm/daemon.py').readAsStringSync();
+    final actual = RegExp(r'''method == ["']([a-z_.]+)["']''')
+        .allMatches(daemon)
+        .map((m) => m.group(1)!)
+        .toSet();
+    expect(actual, isNotEmpty, reason: 'no dispatch found in daemon.py');
+
+    final pinned = methodsByVersion[kRequiredAdsmVersion];
+    expect(
+      pinned,
+      isNotNull,
+      reason:
+          'No method list recorded for v$kRequiredAdsmVersion. The daemon RPC '
+          'surface changed, so bump host/adsm/protocol.py VERSION and '
+          'kRequiredAdsmVersion and record the new list here — otherwise every '
+          'host already on the old version is treated as up to date and never '
+          'receives the new daemon.',
+    );
+    expect(
+      actual,
+      pinned!.toSet(),
+      reason:
+          'The daemon answers a different set of methods than v'
+          '$kRequiredAdsmVersion records. Bump the version and add a new '
+          'entry to methodsByVersion; editing the current entry in place '
+          'leaves provisioned hosts on a daemon that answers -32601.',
+    );
+  });
+
   test('every daemon RPC method is reachable from a bundled asset', () {
     // The daemon is only as deployable as the file list in pubspec.yaml.
     final pubspec = File('pubspec.yaml').readAsStringSync();
