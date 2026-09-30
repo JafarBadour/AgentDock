@@ -19,7 +19,8 @@ void main() {
       expect(adsmVersionMeets('0.6.0', kRequiredAdsmVersion), isFalse);
       // 0.7.1 carries the transcript.pull pivot fix, so 0.7.0 is stale.
       expect(adsmVersionMeets('0.7.0', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.1', kRequiredAdsmVersion), isTrue);
+      expect(adsmVersionMeets('0.7.1', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.2', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -30,7 +31,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.1');
+      expect(kRequiredAdsmVersion, '0.7.2');
     });
   });
 }

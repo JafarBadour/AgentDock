@@ -25,6 +25,34 @@ void main() {
     );
   });
 
+  test('every Archon module is uploaded to the host', () {
+    // Being listed in the app's assets only puts a module *in the app*. The
+    // upload has its own list, and a module missing from it reaches no host —
+    // which is how Archon came to read its skill, run `archon agents` exactly
+    // as told, and be answered with "command not found".
+    final ssh = File('lib/services/ssh_service.dart').readAsStringSync();
+    final block = RegExp(
+      r'_bundledArchonFiles = <String>\[(.*?)\]',
+      dotAll: true,
+    ).firstMatch(ssh);
+    expect(block, isNotNull, reason: 'no _bundledArchonFiles list');
+    final uploaded = RegExp(r"'(\w+\.py)'")
+        .allMatches(block!.group(1)!)
+        .map((m) => m.group(1))
+        .toSet();
+    final onDisk = Directory('host/archon')
+        .listSync()
+        .whereType<File>()
+        .map((f) => f.uri.pathSegments.last)
+        .where((n) => n.endsWith('.py'))
+        .toSet();
+    expect(
+      onDisk.difference(uploaded),
+      isEmpty,
+      reason: 'add the new Archon module to _bundledArchonFiles in ssh_service',
+    );
+  });
+
   test('every Archon module is shipped too', () {
     // Archon rides the same upload as ADSM; a module left out of the assets
     // reaches no host, and the failure looks like Archon simply not working.

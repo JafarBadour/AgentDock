@@ -2118,13 +2118,32 @@ exit 0
     'winproc.py',
   ];
 
+  /// Archon's package, uploaded beside ADSM.
+  ///
+  /// Listing these in the app's assets only puts them *in the app*. Until
+  /// they are uploaded too, Archon reads its skill, runs `archon agents` as
+  /// instructed, and gets "command not found" — which is what happened.
+  static const _bundledArchonFiles = <String>[
+    '__init__.py',
+    '__main__.py',
+    'paths.py',
+    'store.py',
+    'triggers.py',
+    'directory.py',
+    'cli.py',
+    'daemon.py',
+  ];
+
   Future<Map<String, Uint8List>> _loadBundledAdsmPayloads() async {
     final payloads = <String, Uint8List>{};
+    Uint8List read(ByteData data) =>
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
     for (final name in _bundledAdsmFiles) {
-      final data = await rootBundle.load('host/adsm/$name');
-      payloads[name] = data.buffer.asUint8List(
-        data.offsetInBytes,
-        data.lengthInBytes,
+      payloads['adsm/$name'] = read(await rootBundle.load('host/adsm/$name'));
+    }
+    for (final name in _bundledArchonFiles) {
+      payloads['archon/$name'] = read(
+        await rootBundle.load('host/archon/$name'),
       );
     }
     return payloads;
@@ -2142,6 +2161,19 @@ for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 pytho
   fi
 done
 exec python3 -m adsm "$@"
+''';
+
+  /// `archon` on PATH, so the skill's instructions are runnable.
+  static const _archonWrapper = r'''
+#!/usr/bin/env bash
+export PYTHONPATH="$HOME/.local/share/agentdock/host${PYTHONPATH:+:$PYTHONPATH}"
+export PATH="$HOME/.local/bin:$PATH"
+for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    exec "$py" -m archon "$@"
+  fi
+done
+exec python3 -m archon "$@"
 ''';
 
   static const _adsmRestartScript = r'''
@@ -2180,20 +2212,31 @@ fi
       await initLocalShellPaths();
       final home = localHostHome();
       final share = Directory(
-        localFsPath('$home/.local/share/agentdock/host/adsm'),
+        localFsPath('$home/.local/share/agentdock/host'),
       );
       final binDir = Directory(localFsPath('$home/.local/bin'));
-      await share.create(recursive: true);
       await binDir.create(recursive: true);
       for (final entry in payloads.entries) {
-        await File(
-          '${share.path}${Platform.pathSeparator}${entry.key}',
-        ).writeAsBytes(entry.value);
+        // Keys carry their package directory (`adsm/…`, `archon/…`).
+        final file = File(
+          '${share.path}${Platform.pathSeparator}'
+          '${entry.key.replaceAll('/', Platform.pathSeparator)}',
+        );
+        await file.parent.create(recursive: true);
+        await file.writeAsBytes(entry.value);
       }
-      // The restart script below marks it executable.
+      // The restart script below marks agentdock-adsm executable.
       await File(
         '${binDir.path}${Platform.pathSeparator}agentdock-adsm',
       ).writeAsString(_adsmWrapper);
+      final archonBin = File(
+        '${binDir.path}${Platform.pathSeparator}archon',
+      );
+      await archonBin.writeAsString(_archonWrapper);
+      await _execLocal(
+        'chmod +x ${shellQuote(archonBin.path)}',
+        timeout: const Duration(seconds: 15),
+      );
       await _execLocal(
         _adsmRestartScript,
         timeout: const Duration(seconds: 45),
@@ -2292,9 +2335,9 @@ fi
   }) async {
     final buf = StringBuffer()
       ..writeln('set -euo pipefail')
-      ..writeln('SHARE="\$HOME/.local/share/agentdock/host/adsm"')
+      ..writeln('SHARE="\$HOME/.local/share/agentdock/host"')
       ..writeln('BIN="\$HOME/.local/bin"')
-      ..writeln('mkdir -p "\$SHARE" "\$BIN"');
+      ..writeln('mkdir -p "\$SHARE/adsm" "\$SHARE/archon" "\$BIN"');
     for (final entry in payloads.entries) {
       buf
         ..writeln('base64 -d > "\$SHARE/${entry.key}" <<\'ADSM_B64\'')
@@ -2305,6 +2348,10 @@ fi
       ..writeln('cat > "\$BIN/agentdock-adsm" <<\'ADSM_WRAP\'')
       ..writeln(_adsmWrapper.trimRight())
       ..writeln('ADSM_WRAP')
+      ..writeln('cat > "\$BIN/archon" <<\'ARCHON_WRAP\'')
+      ..writeln(_archonWrapper.trimRight())
+      ..writeln('ARCHON_WRAP')
+      ..writeln('chmod +x "\$BIN/archon"')
       ..writeln(_adsmRestartScript);
     await _runScriptViaStdin(
       client,
@@ -2330,11 +2377,12 @@ fi
       throw Exception('Could not resolve remote HOME');
     }
 
-    final share = '$home/.local/share/agentdock/host/adsm';
+    final share = '$home/.local/share/agentdock/host';
     final binDir = '$home/.local/bin';
     await _run(
       client,
-      'mkdir -p ${shellQuote(share)} ${shellQuote(binDir)}',
+      'mkdir -p ${shellQuote('$share/adsm')} ${shellQuote('$share/archon')} '
+      '${shellQuote(binDir)}',
       hostId: hostId,
       timeout: const Duration(seconds: 10),
     );
@@ -2357,24 +2405,35 @@ fi
         }
       }
 
-      final wrapperPath = '$binDir/agentdock-adsm';
-      final wrapperFile = await sftp.open(
-        wrapperPath,
-        mode:
-            SftpFileOpenMode.create |
-            SftpFileOpenMode.truncate |
-            SftpFileOpenMode.write,
-      );
-      try {
-        await wrapperFile.writeBytes(
-          Uint8List.fromList(utf8.encode(_adsmWrapper)),
+      for (final wrapper in {
+        '$binDir/agentdock-adsm': _adsmWrapper,
+        '$binDir/archon': _archonWrapper,
+      }.entries) {
+        final wrapperFile = await sftp.open(
+          wrapper.key,
+          mode:
+              SftpFileOpenMode.create |
+              SftpFileOpenMode.truncate |
+              SftpFileOpenMode.write,
         );
-      } finally {
-        await wrapperFile.close();
+        try {
+          await wrapperFile.writeBytes(
+            Uint8List.fromList(utf8.encode(wrapper.value)),
+          );
+        } finally {
+          await wrapperFile.close();
+        }
       }
     } finally {
       sftp.close();
     }
+    // SFTP does not carry the execute bit.
+    await _run(
+      client,
+      'chmod +x ${shellQuote('$binDir/archon')}',
+      hostId: hostId,
+      timeout: const Duration(seconds: 10),
+    );
 
     await _run(
       client,
