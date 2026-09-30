@@ -7,6 +7,7 @@ import '../data/local/app_database.dart';
 import '../data/models/host.dart';
 import '../data/models/skill.dart';
 import '../data/secure/safe_log.dart';
+import 'archon_skill_deploy.dart';
 import 'ssh_service.dart';
 
 /// Installs / removes Agent Skills (`SKILL.md`) on remotes via SSH.
@@ -294,6 +295,11 @@ PY
       final name = '${entry['name'] ?? ''}'.trim();
       final key = name.toLowerCase();
       if (key.isEmpty || !AgentSkill.isValidName(name)) continue;
+      // Archon's own skill is installed and kept current by the app, not by
+      // the user. Importing it here would put an editable stub in the skills
+      // list whose body is a placeholder — saving that over the real one would
+      // quietly turn Archon back into an ordinary agent.
+      if (key == ArchonSkillDeploy.skillName) continue;
       final desc = '${entry['description'] ?? ''}'.trim();
       final existing = byName[key];
       if (existing == null) {

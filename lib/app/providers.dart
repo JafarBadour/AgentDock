@@ -12,6 +12,9 @@ import '../services/agent_session.dart';
 import '../services/agentdock_service.dart';
 import '../services/background_keep_alive.dart';
 import '../services/archon_service.dart';
+import '../services/archon_skill_deploy.dart';
+import '../services/archon_voice.dart';
+import '../services/deepgram_service.dart';
 import '../services/chat_fork.dart';
 import '../services/chat_session_runtime.dart';
 import '../services/config_backup_service.dart';
@@ -31,8 +34,25 @@ final secureStoreProvider = Provider<SecureStore>((ref) => SecureStore());
 
 /// Where Archon runs, and moving it (see [ArchonService]).
 final archonServiceProvider = Provider<ArchonService>(
-  (ref) => ArchonService(ref.watch(appDatabaseProvider)),
+  (ref) => ArchonService(
+    ref.watch(appDatabaseProvider),
+    skillDeploy: ArchonSkillDeploy(exec: ref.watch(sshServiceProvider).exec),
+  ),
 );
+
+/// Deepgram, for Archon's voice. Speech only — the reply comes from Archon's
+/// agent session, not from here.
+final deepgramServiceProvider = Provider<DeepgramService>((ref) {
+  final service = DeepgramService.fromStore(ref.watch(secureStoreProvider));
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+final archonVoiceProvider = Provider<ArchonVoice>((ref) {
+  final voice = ArchonVoice(deepgram: ref.watch(deepgramServiceProvider));
+  ref.onDispose(() => unawaited(voice.dispose()));
+  return voice;
+});
 
 final localNotificationServiceProvider = Provider<LocalNotificationService>(
   (ref) => LocalNotificationService(),

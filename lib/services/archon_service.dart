@@ -5,6 +5,7 @@ import '../data/models/chat.dart';
 import '../data/models/host.dart';
 import '../data/models/repo.dart';
 import 'agent_runtime_host.dart';
+import 'archon_skill_deploy.dart';
 
 /// Where Archon lives, and moving it.
 ///
@@ -12,9 +13,14 @@ import 'agent_runtime_host.dart';
 /// user picks. Only one is active at a time, so moving hosts repoints that
 /// single row rather than making a second Archon.
 class ArchonService {
-  ArchonService(this._db);
+  ArchonService(this._db, {ArchonSkillDeploy? skillDeploy})
+    : _skillDeploy = skillDeploy;
 
   final AppDatabase _db;
+
+  /// Installs the skill that makes Archon a manager. Optional only so tests
+  /// can place Archon without a host to talk to.
+  final ArchonSkillDeploy? _skillDeploy;
 
   /// Repo row id for Archon's workspace on [hostId] — derived, so the same
   /// host always resolves to the same row instead of accumulating duplicates.
@@ -48,6 +54,11 @@ class ArchonService {
   /// no-op; called with a different one it moves, keeping the transcript —
   /// the conversation with Archon is the user's, not the host's.
   Future<Chat> placeOn(Host host) async {
+    // Before anything is written down: without its skill Archon is an
+    // ordinary agent sitting in an empty folder, which is a worse outcome
+    // than the placement visibly failing.
+    await _skillDeploy?.ensureOn(host);
+
     final repo = Repo(
       id: repoIdFor(host.id),
       hostId: host.id,

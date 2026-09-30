@@ -85,6 +85,7 @@ flutter:
     - host/archon/triggers.py
     - host/archon/directory.py
     - host/archon/cli.py
+    - host/archon/daemon.py
     - host/archon/skill/SKILL.md
     - host/adsm/transport.py
     - host/adsm/winproc.py

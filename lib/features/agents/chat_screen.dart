@@ -24,6 +24,7 @@ import '../../data/models/tool_call_state.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/adsm_client.dart';
 import '../../services/agent_session.dart';
+import '../../services/archon_voice.dart';
 import '../../services/chat_connect_coordinator.dart';
 import '../../services/chat_session_runtime.dart';
 import '../../services/cursor_acp_service.dart';
@@ -31,6 +32,7 @@ import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_activity_strip.dart';
 import '../archon/archon_activity_panel.dart';
+import '../archon/archon_voice_bar.dart';
 import '../archon/archon_managed_panel.dart';
 import '../archon/archon_settings.dart';
 import 'agent_setup_guide.dart';
@@ -71,6 +73,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _loading = true;
   bool _sending = false;
   bool _forking = false;
+
+  /// Whether Archon should speak its replies, and how. Set by the voice bar;
+  /// read when a reply completes.
+  ArchonVoiceMode _archonVoiceMode = ArchonVoiceMode.text;
 
   /// SSH/ADSM bring-up — ValueNotifiers so progress never setStates the
   /// whole transcript (that was freezing scroll/typing on the UI isolate).
@@ -467,6 +473,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final working = runtime.isWorking;
       final turnEnded = _wasWorking && !working;
       _wasWorking = working;
+      if (turnEnded) unawaited(_speakArchonReply(runtime));
       final queueLen = runtime.outboundQueue.length;
       final queueChanged = queueLen != _lastOutboundQueueLen;
       _lastOutboundQueueLen = queueLen;
@@ -1437,6 +1444,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       messenger.showSnackBar(SnackBar(content: Text('Could not fork — $e')));
     } finally {
       if (mounted) setState(() => _forking = false);
+    }
+  }
+
+  /// Say Archon's reply out loud, when the user asked for one.
+  ///
+  /// Only on a finished turn: speaking a reply while it is still streaming
+  /// would start mid-sentence and be overtaken by the rest of it.
+  Future<void> _speakArchonReply(ChatSessionRuntime runtime) async {
+    if (!(_chat?.isArchon ?? false)) return;
+    if (_archonVoiceMode == ArchonVoiceMode.text) return;
+    final text = runtime.entries.reversed
+        .map((e) => e.message)
+        .whereType<ChatMessage>()
+        .where((m) => m.role == MessageRole.assistant)
+        .map((m) => m.content.trim())
+        .firstWhere((c) => c.isNotEmpty, orElse: () => '');
+    if (text.isEmpty) return;
+    try {
+      await ref.read(archonVoiceProvider).speak(text);
+    } catch (e) {
+      // A reply that could not be spoken is still on screen; saying so in a
+      // snackbar would interrupt reading it.
+      SafeLog.d('speaking archon reply failed', e);
     }
   }
 
@@ -3405,6 +3435,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: [
                                 if (_showSlashMenu) _buildSlashMenu(theme),
+                                // Archon is the one chat you can hold a
+                                // conversation with out loud.
+                                if (_chat?.isArchon ?? false)
+                                  ArchonVoiceBar(
+                                    voice: ref.read(archonVoiceProvider),
+                                    onTranscribed: (text) {
+                                      _composer.text = text;
+                                      unawaited(_send());
+                                    },
+                                    onModeChanged: (mode) =>
+                                        _archonVoiceMode = mode,
+                                  ),
                                 _buildComposerField(
                                   theme: theme,
                                   streaming: runtimeState.streaming,
