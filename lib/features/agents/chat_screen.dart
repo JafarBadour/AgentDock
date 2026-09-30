@@ -30,6 +30,7 @@ import '../../services/cursor_acp_service.dart';
 import '../../services/gcp_speech_service.dart';
 import '../../services/ssh_service.dart';
 import 'agent_activity_strip.dart';
+import '../archon/archon_activity_panel.dart';
 import '../archon/archon_managed_panel.dart';
 import '../archon/archon_settings.dart';
 import 'agent_setup_guide.dart';
@@ -2752,6 +2753,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ),
               // Archon's own controls: who it looks after, and how it speaks.
               if (_chat?.isArchon ?? false) ...[
+                IconButton(
+                  tooltip: 'What Archon did',
+                  icon: const Icon(Icons.history),
+                  onPressed: () => unawaited(ArchonActivityPanel.show(context)),
+                ),
                 IconButton(
                   tooltip: 'Auto-managed agents',
                   icon: const Icon(Icons.checklist_outlined),

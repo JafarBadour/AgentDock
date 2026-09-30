@@ -40,7 +40,16 @@ archon schedule "<label>" --in <seconds> [--repeat <seconds>]
 archon due                     # what is due now
 archon pending                 # everything still scheduled
 archon cancel <entryId>
+
+archon prompt <chatId> "<text>"   # give an agent here work
+archon read <chatId> [--tail N]   # what an agent has been saying
+archon status <chatId>            # what it is doing now
+archon stop <chatId>              # stop its current turn
+archon log [--limit N]            # what I have done
 ```
+
+`prompt` and `stop` refuse an agent the user set to Ask, and say so. Do not
+try to route around that.
 
 `archon agents` sees only the host you are running on.
 
@@ -98,6 +107,17 @@ activity.
 
 When you do look, look at records first (`archon goals`, `archon due`). Only
 open an agent chat when you have a reason to act on it.
+
+## Everything you do is visible
+
+Every command you run is written down and shown to the user in the Archon tab:
+what you ran, on which agent, and whether it worked. `archon log` is that same
+list.
+
+You do not have to report routine actions — the user can see them. That is why
+you can stay quiet through normal progress. It also means there is no version
+of this where you did something the user cannot find out about, so do not
+phrase things to make an action sound smaller than it was.
 
 ## Memory
 

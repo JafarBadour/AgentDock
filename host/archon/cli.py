@@ -26,6 +26,52 @@ def _print(value: Any) -> None:
 
 
 
+def daemon_call(
+    method: str, params: dict[str, Any], *, timeout: float = 60.0
+) -> dict[str, Any]:
+    """One request to the ADSM daemon on this host."""
+    import asyncio
+
+    from adsm import paths as adsm_paths
+    from adsm import protocol
+
+    async def call() -> dict[str, Any]:
+        reader, writer = await asyncio.open_unix_connection(
+            path=str(adsm_paths.socket_path()), limit=protocol.STREAM_LIMIT
+        )
+        try:
+            writer.write(
+                protocol.encode({"id": 1, "method": method, "params": params})
+            )
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout + 10)
+            message = protocol.decode_line(line.decode("utf-8", "replace")) or {}
+            if "error" in message:
+                return {
+                    "ok": False,
+                    "error": "daemon_error",
+                    "message": str(message["error"].get("message")),
+                }
+            return {"ok": True, "result": message.get("result")}
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        return asyncio.run(call())
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "no_daemon",
+            "message": "ADSM is not running on this host.",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "call_failed", "message": str(e)}
+
+
 def relay(action: str, payload: Optional[dict[str, Any]] = None,
           *, timeout: float = 60.0) -> dict[str, Any]:
     """Ask a live app to reach another host on Archon's behalf.
@@ -83,7 +129,57 @@ def relay(action: str, payload: Optional[dict[str, Any]] = None,
         return {"ok": False, "error": "relay_failed", "message": str(e)}
 
 
+# Detail the running command attaches to its own log row.
+_DETAIL: dict[str, Any] = {}
+
+
+def _detail(*, target: Optional[str] = None, summary: Optional[str] = None) -> None:
+    if target is not None:
+        _DETAIL["target"] = target
+    if summary is not None:
+        _DETAIL["summary"] = summary
+
+
+# Reading is not doing. These answer questions Archon asks itself on every
+# wake, and logging them would bury the things it actually did.
+_QUIET = frozenset({"log", "agents", "goals", "blocked", "recall", "due",
+                    "pending", "remote routes", "remote agents"})
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    """Run one command, and write down that it ran.
+
+    Recorded here rather than inside each command so there is no way to act
+    without it being visible: a manager working while nobody watches is only
+    acceptable if the user can see afterwards exactly what it did.
+    """
+    _DETAIL.clear()
+    code = _run(argv)
+    argv_list = list(argv if argv is not None else sys.argv[1:])
+    if not argv_list:
+        return code
+    # `remote agents` reads better than `remote`; everything else is one word.
+    command = (
+        f"{argv_list[0]} {argv_list[1]}"
+        if argv_list[0] == "remote" and len(argv_list) > 1
+        else argv_list[0]
+    )
+    if argv_list[0] not in _QUIET and command not in _QUIET:
+        try:
+            paths.ensure_layout()
+            ArchonStore().record_action(
+                command,
+                target=_DETAIL.get("target"),
+                summary=_DETAIL.get("summary"),
+                ok=code == 0,
+            )
+        except Exception:  # noqa: BLE001
+            # Never let bookkeeping turn a working command into a failure.
+            pass
+    return code
+
+
+def _run(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="archon",
         description="What Archon can see on this host, and what it can do.",
@@ -102,6 +198,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_rprompt.add_argument("host_id")
     p_rprompt.add_argument("chat_id")
     p_rprompt.add_argument("text")
+    p_prompt = sub.add_parser("prompt", help="Give an agent on this host work")
+    p_prompt.add_argument("chat_id")
+    p_prompt.add_argument("text")
+
+    p_read = sub.add_parser("read", help="An agent's recent transcript")
+    p_read.add_argument("chat_id")
+    p_read.add_argument("--tail", type=int, default=20)
+
+    p_status = sub.add_parser("status", help="What an agent is doing now")
+    p_status.add_argument("chat_id")
+
+    p_stop = sub.add_parser("stop", help="Stop an agent's current turn")
+    p_stop.add_argument("chat_id")
+
+    p_log = sub.add_parser("log", help="What I have been doing")
+    p_log.add_argument("--limit", type=int, default=50)
+
     sub.add_parser("goals", help="Agents switched on, with a goal, allowed")
     sub.add_parser("blocked", help="Switched on but set to Ask — off limits")
 
@@ -153,6 +266,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             _print(answer)
             return 0 if answer.get("ok") else 1
         if args.remote_cmd == "prompt":
+            _detail(
+                target=f"{args.host_id}/{args.chat_id}",
+                summary=args.text[:200],
+            )
             answer = relay(
                 "prompt",
                 {
@@ -183,6 +300,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "done":
+        _detail(target=args.chat_id, summary=args.note[:200])
         updated = directory.complete(args.chat_id, args.note)
         if updated is None:
             print(f"no such agent: {args.chat_id}", file=sys.stderr)
@@ -192,7 +310,64 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     store = ArchonStore()
 
+    def guarded(chat_id: str) -> Optional[dict[str, Any]]:
+        """Refuse an agent the user did not put on Allow all."""
+        records = {r["id"]: r for r in directory.load_records()}
+        record = records.get(chat_id)
+        if record is None:
+            return {"ok": False, "error": "no_agent",
+                    "message": f"No agent {chat_id} on this host."}
+        if not directory.is_commandable(record):
+            return {"ok": False, "error": "not_permitted",
+                    "message": directory.refusal_for(record)}
+        return None
+
+    if args.cmd == "prompt":
+        refusal = guarded(args.chat_id)
+        if refusal is not None:
+            _detail(target=args.chat_id, summary=refusal["message"])
+            _print(refusal)
+            return 1
+        answer = daemon_call(
+            "session.prompt",
+            {"chatId": args.chat_id,
+             "blocks": [{"type": "text", "text": args.text}]},
+        )
+        _detail(target=args.chat_id, summary=args.text[:200])
+        _print(answer)
+        return 0 if answer.get("ok") else 1
+
+    if args.cmd == "read":
+        answer = daemon_call(
+            "transcript.pull", {"chatId": args.chat_id, "limit": args.tail}
+        )
+        _detail(target=args.chat_id, summary=f"last {args.tail}")
+        _print(answer)
+        return 0 if answer.get("ok") else 1
+
+    if args.cmd == "status":
+        answer = daemon_call("agents.list", {})
+        _detail(target=args.chat_id)
+        _print(answer)
+        return 0 if answer.get("ok") else 1
+
+    if args.cmd == "stop":
+        refusal = guarded(args.chat_id)
+        if refusal is not None:
+            _detail(target=args.chat_id, summary=refusal["message"])
+            _print(refusal)
+            return 1
+        answer = daemon_call("session.cancel", {"chatId": args.chat_id})
+        _detail(target=args.chat_id)
+        _print(answer)
+        return 0 if answer.get("ok") else 1
+
+    if args.cmd == "log":
+        _print(store.actions(limit=args.limit))
+        return 0
+
     if args.cmd == "remember":
+        _detail(target=args.scope, summary=args.body[:200])
         entry = store.remember(args.scope, args.body)
         _print({"id": entry, "stored": entry is not None})
         return 0
@@ -202,6 +377,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "schedule":
+        _detail(target=args.label, summary=f"in {args.seconds}s")
         from datetime import timedelta
 
         entry = store.schedule(
@@ -227,6 +403,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "cancel":
+        _detail(target=args.entry_id)
         _print({"cancelled": store.cancel(args.entry_id)})
         return 0
 

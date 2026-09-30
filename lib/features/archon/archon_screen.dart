@@ -9,6 +9,7 @@ import '../../data/models/host.dart';
 import '../../data/secure/safe_log.dart';
 import '../agents/agents_screen.dart';
 import '../agents/chat_screen.dart';
+import 'archon_activity_panel.dart';
 import 'archon_managed_panel.dart';
 import 'archon_settings.dart';
 
@@ -82,6 +83,11 @@ class _ChooseArchonHostState extends ConsumerState<_ChooseArchonHost> {
       appBar: AppBar(
         title: const Text('Archon'),
         actions: [
+          IconButton(
+            tooltip: 'What Archon did',
+            icon: const Icon(Icons.history),
+            onPressed: () => unawaited(ArchonActivityPanel.show(context)),
+          ),
           IconButton(
             tooltip: 'Auto-managed agents',
             icon: const Icon(Icons.checklist_outlined),

@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS memory (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS memory_scope ON memory (scope, created_at);
+
+CREATE TABLE IF NOT EXISTS actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  command TEXT NOT NULL,
+  target TEXT,
+  summary TEXT,
+  ok INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS actions_at ON actions (at DESC);
 """
 
 
@@ -233,3 +243,62 @@ class ArchonStore:
             return db.execute(
                 "DELETE FROM memory WHERE id = ?", (entry_id,)
             ).rowcount > 0
+
+    # ---- actions -----------------------------------------------------------
+    #
+    # Everything Archon does is written down. A manager acting on its own
+    # while nobody is watching is only acceptable if the user can see exactly
+    # what it did afterwards, so this is recorded by the command runner rather
+    # than left to Archon to remember to log.
+
+    def record_action(
+        self,
+        command: str,
+        *,
+        target: Optional[str] = None,
+        summary: Optional[str] = None,
+        ok: bool = True,
+        at: Optional[datetime] = None,
+    ) -> int:
+        with self._connect() as db:
+            cursor = db.execute(
+                "INSERT INTO actions (at, command, target, summary, ok) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    _iso(at or now_utc()),
+                    command,
+                    target,
+                    summary,
+                    1 if ok else 0,
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+
+    def actions(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Newest first — what Archon has been doing, most recent at the top."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id, at, command, target, summary, ok FROM actions "
+                "ORDER BY at DESC, id DESC LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "at": r["at"],
+                "command": r["command"],
+                "target": r["target"],
+                "summary": r["summary"],
+                "ok": bool(r["ok"]),
+            }
+            for r in rows
+        ]
+
+    def trim_actions(self, *, keep: int = 2000) -> int:
+        """Bound the log; it grows with every wake, forever otherwise."""
+        with self._connect() as db:
+            return db.execute(
+                "DELETE FROM actions WHERE id NOT IN ("
+                "SELECT id FROM actions ORDER BY at DESC, id DESC LIMIT ?)",
+                (max(1, keep),),
+            ).rowcount

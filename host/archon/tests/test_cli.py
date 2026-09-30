@@ -104,3 +104,97 @@ class ArchonCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActionLogTest(unittest.TestCase):
+    """Everything Archon does is written down, by the runner rather than by
+    Archon — a manager acting while nobody watches is only acceptable if the
+    user can see afterwards exactly what it did."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patch = mock.patch.dict(os.environ, {"HOME": self._tmp.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        from adsm import paths as adsm_paths
+        from archon import cli
+        from archon.store import ArchonStore
+
+        adsm_paths.ensure_layout()
+        self.adsm_paths = adsm_paths
+        self.cli = cli
+        self.store = ArchonStore()
+
+    def _agent(self, chat_id: str, **fields) -> None:
+        self.adsm_paths.agent_record_path(chat_id).write_text(
+            json.dumps({"id": chat_id, **fields}), encoding="utf-8"
+        )
+
+    def run_cli(self, argv: list[str]) -> int:
+        with redirect_stdout(io.StringIO()):
+            return self.cli.main(argv)
+
+    def _log(self) -> list[dict]:
+        return self.store.actions()
+
+    def test_an_action_is_recorded_without_being_asked_to_be(self) -> None:
+        self._agent("a", title="Build", permission_ask=False)
+        self.run_cli(["done", "a", "CI green since 14:02."])
+        entry = self._log()[0]
+        self.assertEqual("done", entry["command"])
+        self.assertEqual("a", entry["target"])
+        self.assertEqual("CI green since 14:02.", entry["summary"])
+        self.assertTrue(entry["ok"])
+
+    def test_a_refusal_is_recorded_with_its_reason(self) -> None:
+        # What Archon was stopped from doing matters as much as what it did.
+        self._agent("b", title="Deploy", permission_ask=True)
+        self.run_cli(["prompt", "b", "deploy it"])
+        entry = self._log()[0]
+        self.assertEqual("prompt", entry["command"])
+        self.assertFalse(entry["ok"])
+        self.assertIn("Allow all", entry["summary"])
+
+    def test_reading_is_not_doing_and_stays_out_of_the_log(self) -> None:
+        # These run on every wake; logging them would bury the real actions.
+        self._agent("a", title="Build", permission_ask=False)
+        for argv in (["agents"], ["goals"], ["blocked"], ["due"], ["pending"],
+                     ["recall", "user"], ["log"]):
+            self.run_cli(argv)
+        self.assertEqual([], self._log())
+
+    def test_remote_calls_name_the_host_they_were_aimed_at(self) -> None:
+        self.run_cli(["remote", "prompt", "hostB", "c9", "rerun the test"])
+        entry = self._log()[0]
+        self.assertEqual("remote prompt", entry["command"])
+        self.assertEqual("hostB/c9", entry["target"])
+
+    def test_the_log_is_newest_first(self) -> None:
+        self._agent("a", title="Build", permission_ask=False)
+        self.run_cli(["remember", "user", "first"])
+        self.run_cli(["schedule", "second", "--in", "60"])
+        self.assertEqual("schedule", self._log()[0]["command"])
+
+    def test_the_log_is_bounded(self) -> None:
+        for i in range(30):
+            self.store.record_action("remember", target="user", summary=f"{i}")
+        self.store.trim_actions(keep=10)
+        self.assertEqual(10, len(self.store.actions(limit=100)))
+        # The newest survive, not the oldest.
+        self.assertEqual("29", self.store.actions()[0]["summary"])
+
+    def test_a_broken_log_never_fails_the_command(self) -> None:
+        # Bookkeeping must not turn a working action into a failed one: the
+        # command already had its effect by the time the row is written.
+        from archon.store import ArchonStore
+
+        self._agent("a", title="Build", permission_ask=False)
+        with mock.patch.object(
+            ArchonStore, "record_action", side_effect=OSError("disk full")
+        ):
+            self.assertEqual(0, self.run_cli(["done", "a", "finished"]))
+        # And the action really did happen, log or no log.
+        from archon import directory
+
+        self.assertFalse(directory.is_managed(directory.load_records()[0]))

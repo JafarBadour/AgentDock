@@ -399,6 +399,8 @@ class Daemon:
                 result = await self._archon_reply(params)
             elif method == "archon.routes":
                 result = {"apps": len(self._relay_subscribers)}
+            elif method == "archon.log":
+                result = await self._archon_log(params)
             else:
                 writer.write(
                     protocol.encode(
@@ -598,6 +600,25 @@ class Daemon:
             }
         finally:
             self._relay_waiters.pop(call_id, None)
+
+    async def _archon_log(self, params: dict[str, Any]) -> dict[str, Any]:
+        """What Archon has done, for the app to show.
+
+        Read here rather than through Archon: the point of the log is that the
+        user can check it without asking the thing being checked.
+        """
+        limit = int(params.get("limit") or 100)
+
+        def read() -> list[dict[str, Any]]:
+            try:
+                from archon.store import ArchonStore
+
+                return ArchonStore().actions(limit=limit)
+            except Exception:  # noqa: BLE001
+                # Archon may never have run on this host.
+                return []
+
+        return {"actions": await asyncio.to_thread(read)}
 
     async def _archon_reply(self, params: dict[str, Any]) -> dict[str, Any]:
         """An app answering a relayed call."""
