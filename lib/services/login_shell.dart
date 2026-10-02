@@ -6,6 +6,7 @@ import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_pty/flutter_pty.dart';
 
 import '../data/models/host.dart';
+import 'local_host_bootstrap.dart';
 import 'ssh_service.dart';
 
 /// An interactive PTY shell on a host, for CLI sign-in flows
@@ -62,17 +63,19 @@ class _LocalLoginShell implements LoginShell {
 
   factory _LocalLoginShell.start() {
     final env = {...Platform.environment, 'TERM': 'xterm-256color'};
-    // Windows: sign in inside WSL, where This PC's agents run.
-    final pty = Platform.isWindows
-        ? Pty.start('wsl.exe', arguments: const ['--cd', '~'], environment: env)
-        : Pty.start(
-            Platform.environment['SHELL'] ?? '/bin/bash',
-            arguments: const ['-l'],
-            workingDirectory: Platform.environment['HOME'],
-            environment: env,
-            columns: 120,
-            rows: 40,
-          );
+    // Windows: Git Bash, so the sign-in scripts (bash) run as written and the
+    // credentials land in %USERPROFILE%, where the native agents read them.
+    final pty = Pty.start(
+      Platform.isWindows
+          ? localBashExecutable()
+          : Platform.environment['SHELL'] ?? '/bin/bash',
+      arguments: const ['-l'],
+      workingDirectory:
+          Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'],
+      environment: env,
+      columns: 120,
+      rows: 40,
+    );
     return _LocalLoginShell(pty);
   }
 

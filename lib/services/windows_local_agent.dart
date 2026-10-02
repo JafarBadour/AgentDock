@@ -84,8 +84,17 @@ class WindowsLocalAgent {
     return null;
   }
 
-  /// `winget install <id>` (may show an administrator prompt).
-  static Future<void> _wingetInstall(String id, String label) async {
+  static final Map<String, Future<void>> _wingetInflight = {};
+
+  /// `winget install <id>` (may show an administrator prompt). Concurrent
+  /// callers share one run: a second winget for the same package fails at
+  /// once with "file in use" while the first waits on that prompt.
+  static Future<void> _wingetInstall(String id, String label) =>
+      _wingetInflight[id] ??= _wingetRun(id, label).whenComplete(
+        () => _wingetInflight.remove(id),
+      );
+
+  static Future<void> _wingetRun(String id, String label) async {
     ProcessResult r;
     try {
       r = await Process.run('winget', [
@@ -220,15 +229,29 @@ class WindowsLocalAgent {
     return null;
   }
 
+  static final Map<String, Future<void>> _npmInflight = {};
+
   /// `npm install -g <package>`, installing Node.js with winget first when
   /// it is missing. Throws with guidance when that is not possible.
+  /// Concurrent callers for one package share a single install.
   static Future<void> npmInstallGlobal(
+    String package, {
+    void Function(String status)? onProgress,
+  }) =>
+      _npmInflight[package] ??= _npmInstall(
+        package,
+        onProgress: onProgress,
+      ).whenComplete(() => _npmInflight.remove(package));
+
+  static Future<void> _npmInstall(
     String package, {
     void Function(String status)? onProgress,
   }) async {
     var npm = await _findNpm();
     if (npm == null) {
-      onProgress?.call('Installing Node.js (winget)…');
+      onProgress?.call(
+        'Installing Node.js — approve the Windows admin prompt if one appears…',
+      );
       await _wingetInstall('OpenJS.NodeJS.LTS', 'Node.js');
       npm = await _findNpm();
     }
@@ -257,7 +280,8 @@ class WindowsLocalAgent {
   }
 
   static String _nodeHint(String package) =>
-      'Node.js is not installed on This PC. Install it '
+      'Node.js is missing on This PC and could not be installed '
+      '(was the Windows admin prompt declined?). Install it '
       '(`winget install OpenJS.NodeJS.LTS`), then run '
       '`npm install -g $package` and reconnect.';
 }

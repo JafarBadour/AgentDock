@@ -324,6 +324,14 @@ class SshService {
     return v != null && adsmVersionMeets(v, kRequiredAdsmVersion);
   }
 
+  /// Before a background (non-chat) connect: on Windows This PC, upgrade a
+  /// stale daemon first — pre-0.7 ADSM uses Unix sockets, which the Windows
+  /// client cannot reach, so live sync would fail until a chat is opened.
+  Future<void> ensureAdsmForBackground(Host host) async {
+    if (!_isWindowsLocal(host) || isAdsmReady(host.id)) return;
+    await ensureAdsm(host);
+  }
+
   void _markAdsmReady(String hostId, String version) {
     _adsmVerifiedVersion[hostId] = version;
   }
@@ -2209,7 +2217,6 @@ fi
     }
 
     try {
-      await initLocalShellPaths();
       final home = localHostHome();
       final share = Directory(
         localFsPath('$home/.local/share/agentdock/host'),
@@ -2675,7 +2682,6 @@ exit 1
   /// (same idea as the local PTY terminal).
   Future<String> remoteHomeDirectory(Host host) async {
     if (_preferLocalFs(host)) {
-      await initLocalShellPaths();
       return normalizeRemotePath(localHostHome());
     }
     final out = await exec(host, 'printf %s "\$HOME"');

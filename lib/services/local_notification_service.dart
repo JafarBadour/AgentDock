@@ -27,10 +27,18 @@ class LocalNotificationService {
       requestBadgePermission: true,
       requestSoundPermission: true,
     );
+    // Windows refuses to initialize without an identity; the GUID must stay
+    // fixed so toasts keep grouping under the same app.
+    const windows = WindowsInitializationSettings(
+      appName: 'Agent Dock',
+      appUserModelId: 'com.agenticphone.agentdock',
+      guid: '3d43b973-853b-4f97-8894-1519e33d6976',
+    );
     const init = InitializationSettings(
       android: android,
       iOS: ios,
       macOS: mac,
+      windows: windows,
     );
     try {
       await _plugin.initialize(settings: init);

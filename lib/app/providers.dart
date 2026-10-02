@@ -210,6 +210,7 @@ final hostLiveSyncProvider = Provider<HostLiveSync>((ref) {
     pool: ref.watch(adsmBridgePoolProvider),
     db: ref.watch(appDatabaseProvider),
     dock: dock,
+    prepareHost: ref.watch(sshServiceProvider).ensureAdsmForBackground,
     isChatLive: (chatId) {
       final runtime = ref.read(activeAcpSessionsProvider)[chatId];
       return runtime != null && !runtime.closed;

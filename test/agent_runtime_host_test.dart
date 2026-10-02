@@ -11,6 +11,15 @@ RemoteAgentSession _session({int journalSize = 0}) => RemoteAgentSession(
       journalSize: journalSize,
     );
 
+/// `sh` is on PATH everywhere but Windows, where Git for Windows ships one.
+final String _sh = () {
+  if (!Platform.isWindows) return 'sh';
+  final programFiles =
+      Platform.environment['ProgramFiles'] ?? r'C:\Program Files';
+  final gitSh = File('$programFiles\\Git\\bin\\sh.exe');
+  return gitSh.existsSync() ? gitSh.path : 'sh';
+}();
+
 void main() {
   group('session naming', () {
     test('strips characters tmux cannot take in a session name', () {
@@ -73,7 +82,7 @@ void main() {
     /// several layers of nested quoting still parse.
     void expectParses(String script, String name) {
       final file = File('${tmp.path}/$name')..writeAsStringSync(script);
-      final result = Process.runSync('sh', ['-n', file.path]);
+      final result = Process.runSync(_sh, ['-n', file.path]);
       expect(
         result.exitCode,
         0,

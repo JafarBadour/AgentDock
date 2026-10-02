@@ -19,6 +19,7 @@ void main() {
       expect(adsmVersionMeets('0.6.0', kRequiredAdsmVersion), isFalse);
       // 0.7.1 carries the transcript.pull pivot fix, so 0.7.0 is stale.
       expect(adsmVersionMeets('0.7.0', kRequiredAdsmVersion), isFalse);
+      // 0.7.2 exits when its server fails to start, so 0.7.1 is stale.
       expect(adsmVersionMeets('0.7.1', kRequiredAdsmVersion), isFalse);
       // 0.7.3 is the first daemon that answers `archon.relay`. 0.7.2 shipped
       // on main without it, so a host reporting 0.7.2 must read as stale —
