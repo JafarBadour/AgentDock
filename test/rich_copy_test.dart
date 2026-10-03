@@ -1,5 +1,5 @@
-import 'package:agent_dock/features/agents/chat_markdown.dart';
-import 'package:agent_dock/features/agents/rich_copy.dart';
+import 'package:agentplantation/features/agents/chat_markdown.dart';
+import 'package:agentplantation/features/agents/rich_copy.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';

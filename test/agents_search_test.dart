@@ -1,8 +1,8 @@
-import 'package:agent_dock/data/models/agent_provider.dart';
-import 'package:agent_dock/data/models/chat.dart';
-import 'package:agent_dock/data/models/host.dart';
-import 'package:agent_dock/data/models/repo.dart';
-import 'package:agent_dock/features/agents/agents_screen.dart';
+import 'package:agentplantation/data/models/agent_provider.dart';
+import 'package:agentplantation/data/models/chat.dart';
+import 'package:agentplantation/data/models/host.dart';
+import 'package:agentplantation/data/models/repo.dart';
+import 'package:agentplantation/features/agents/agents_screen.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

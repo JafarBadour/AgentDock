@@ -1,8 +1,8 @@
 import 'dart:convert';
 
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/data/models/inline_images.dart';
-import 'package:agent_dock/data/models/tool_call_state.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/data/models/inline_images.dart';
+import 'package:agentplantation/data/models/tool_call_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

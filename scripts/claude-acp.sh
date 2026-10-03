@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Agent Dock — remote Claude ACP runtime installer
+# AgentPlantation — remote Claude ACP runtime installer
 #
-# Installs Claude Code + the ACP adapter Agent Dock launches over SSH.
+# Installs Claude Code + the ACP adapter AgentPlantation launches over SSH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/claude-acp.sh | bash
 #
@@ -19,7 +19,7 @@ ensure_path_line() {
   for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
     [ -f "$rc" ] || touch "$rc"
     if ! grep -Fqs '.local/bin' "$rc" 2>/dev/null; then
-      printf '\n# Agent Dock\n%s\n' "$line" >>"$rc"
+      printf '\n# AgentPlantation\n%s\n' "$line" >>"$rc"
     fi
   done
   # shellcheck disable=SC2086
@@ -35,7 +35,7 @@ load_nvm() {
   fi
 }
 
-say "Agent Dock · Claude ACP setup"
+say "AgentPlantation · Claude ACP setup"
 
 mkdir -p "$HOME/.local/bin"
 ensure_path_line
@@ -98,7 +98,7 @@ fi
 # Wrapper so non-login shells (tmux) still find `node` via nvm.
 cat >"$HOME/.local/bin/claude-code-acp" <<EOF
 #!/usr/bin/env bash
-# Agent Dock wrapper — ensure nvm node is on PATH for #!/usr/bin/env node.
+# AgentPlantation wrapper — ensure nvm node is on PATH for #!/usr/bin/env node.
 export NVM_DIR="\${NVM_DIR:-\$HOME/.nvm}"
 [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
 for d in "\$HOME"/.nvm/versions/node/*/bin; do
@@ -116,7 +116,7 @@ ok "wrapper → $HOME/.local/bin/claude-code-acp"
 
 # --- tmux -------------------------------------------------------------------
 if [ "${AGENTDOCK_SKIP_TMUX:-}" = "1" ]; then
-  say "tmux (skipped — Agent Dock already checked)"
+  say "tmux (skipped — AgentPlantation already checked)"
 else
   say "tmux (durable sessions)"
   if have tmux; then
@@ -138,9 +138,9 @@ fi
 
 # --- ADSM (session manager) -------------------------------------------------
 if [ "${AGENTDOCK_SKIP_ADSM:-}" = "1" ]; then
-  say "ADSM (skipped — Agent Dock manages ADSM separately)"
+  say "ADSM (skipped — AgentPlantation manages ADSM separately)"
 else
-  say "ADSM (Agent Dock Session Manager)"
+  say "ADSM (AgentPlantation Session Manager)"
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
   if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/install-adsm.sh" ]; then
     bash "${SCRIPT_DIR}/install-adsm.sh"
@@ -154,9 +154,9 @@ cat <<'EOF'
 
 Next — pick ONE auth method:
   A) On this host:   claude login
-  B) In Agent Dock:  Settings → save Anthropic API key
+  B) In AgentPlantation:  Settings → save Anthropic API key
 
-Then in Agent Dock create a Claude agent and connect.
+Then in AgentPlantation create a Claude agent and connect.
 
 Smoke:
   claude --version

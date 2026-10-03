@@ -1,5 +1,5 @@
-import 'package:agent_dock/data/models/remote_path.dart';
-import 'package:agent_dock/services/local_host_bootstrap.dart';
+import 'package:agentplantation/data/models/remote_path.dart';
+import 'package:agentplantation/services/local_host_bootstrap.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

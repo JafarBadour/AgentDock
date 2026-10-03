@@ -1,7 +1,7 @@
 import 'dart:io';
 
-import 'package:agent_dock/data/models/agent_provider.dart';
-import 'package:agent_dock/services/agent_runtime_host.dart';
+import 'package:agentplantation/data/models/agent_provider.dart';
+import 'package:agentplantation/services/agent_runtime_host.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 RemoteAgentSession _session({int journalSize = 0}) => RemoteAgentSession(

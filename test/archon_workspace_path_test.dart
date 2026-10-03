@@ -1,5 +1,5 @@
-import 'package:agent_dock/data/models/remote_path.dart';
-import 'package:agent_dock/services/archon_skill_deploy.dart';
+import 'package:agentplantation/data/models/remote_path.dart';
+import 'package:agentplantation/services/archon_skill_deploy.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Archon's first real placement failed here. Its repo path was the literal

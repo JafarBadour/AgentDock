@@ -227,7 +227,7 @@ class _VpnScreenState extends ConsumerState<VpnScreen> {
         const SizedBox(height: 24),
         Text(
           'Only one tunnel runs at a time. Starting another stops the '
-          'current one. While the proxy is up, Agent Dock keeps a foreground '
+          'current one. While the proxy is up, AgentPlantation keeps a foreground '
           'notification so Android does not suspend the tunnel when you open '
           'the browser. If SSH still drops, you get a notification and an '
           'automatic reconnect (up to twice).',

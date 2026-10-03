@@ -40,7 +40,7 @@ abstract final class AutoRunTag {
   }
 }
 
-/// A prompt that Agent Dock should deliver to an existing chat on a schedule.
+/// A prompt that AgentPlantation should deliver to an existing chat on a schedule.
 ///
 /// Execution lives on the host ADSM scheduler; the phone keeps a SQLite cache
 /// and syncs via `schedules.*` RPCs.

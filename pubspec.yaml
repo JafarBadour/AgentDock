@@ -1,4 +1,4 @@
-name: agent_dock
+name: agentplantation
 description: Mobile Agents window over SSH — Cursor ACP on remote hosts via tmux.
 publish_to: 'none'
 version: 0.1.0+1

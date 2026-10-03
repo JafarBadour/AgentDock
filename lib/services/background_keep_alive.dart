@@ -102,7 +102,7 @@ class BackgroundKeepAlive {
         channelId: 'agent_dock_bridge',
         channelName: 'Background agent bridge',
         channelDescription:
-            'Keeps Agent Dock running so agents stay connected when you leave the app.',
+            'Keeps AgentPlantation running so agents stay connected when you leave the app.',
         onlyAlertOnce: true,
       ),
       iosNotificationOptions: const IOSNotificationOptions(
@@ -193,24 +193,24 @@ class BackgroundKeepAlive {
   (String, String) _copyFor(int sessionCount) {
     if (_vpnLabel != null) {
       return (
-        'Agent Dock · VPN proxy',
+        'AgentPlantation · VPN proxy',
         _vpnLabel!,
       );
     }
     if (sessionCount <= 0) {
       return (
-        'Agent Dock is running',
+        'AgentPlantation is running',
         'Background mode on — agents reconnect instantly',
       );
     }
     if (sessionCount == 1) {
       return (
-        'Agent Dock · 1 agent live',
+        'AgentPlantation · 1 agent live',
         'Connected in the background',
       );
     }
     return (
-      'Agent Dock · $sessionCount agents live',
+      'AgentPlantation · $sessionCount agents live',
       'Connected in the background',
     );
   }

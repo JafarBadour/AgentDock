@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:agent_dock/data/models/agent_provider.dart';
-import 'package:agent_dock/data/secure/safe_log.dart';
-import 'package:agent_dock/services/cursor_acp_service.dart';
-import 'package:agent_dock/services/ssh_service.dart';
+import 'package:agentplantation/data/models/agent_provider.dart';
+import 'package:agentplantation/data/secure/safe_log.dart';
+import 'package:agentplantation/services/cursor_acp_service.dart';
+import 'package:agentplantation/services/ssh_service.dart';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
 

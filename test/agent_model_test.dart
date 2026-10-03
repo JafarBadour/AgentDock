@@ -1,4 +1,4 @@
-import 'package:agent_dock/data/models/agent_model.dart';
+import 'package:agentplantation/data/models/agent_model.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Real strings taken from a live `cursor-agent acp` session/new response.

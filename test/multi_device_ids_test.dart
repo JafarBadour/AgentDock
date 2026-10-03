@@ -1,5 +1,5 @@
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/services/adsm_client.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/services/adsm_client.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

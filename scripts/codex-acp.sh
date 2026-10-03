@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Agent Dock — remote Codex ACP runtime installer
+# AgentPlantation — remote Codex ACP runtime installer
 #
 # Installs the Codex ACP adapter (@agentclientprotocol/codex-acp, which bundles
-# the OpenAI Codex CLI) that Agent Dock launches over SSH.
+# the OpenAI Codex CLI) that AgentPlantation launches over SSH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/codex-acp.sh | bash
 #
@@ -20,7 +20,7 @@ ensure_path_line() {
   for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
     [ -f "$rc" ] || touch "$rc"
     if ! grep -Fqs '.local/bin' "$rc" 2>/dev/null; then
-      printf '\n# Agent Dock\n%s\n' "$line" >>"$rc"
+      printf '\n# AgentPlantation\n%s\n' "$line" >>"$rc"
     fi
   done
   # shellcheck disable=SC2086
@@ -46,7 +46,7 @@ node_ok() {
   [ "${major:-0}" -ge "$NODE_MIN_MAJOR" ]
 }
 
-say "Agent Dock · Codex ACP setup"
+say "AgentPlantation · Codex ACP setup"
 
 mkdir -p "$HOME/.local/bin"
 ensure_path_line
@@ -94,7 +94,7 @@ fi
 # Wrapper so non-login shells (tmux) still find `node` via nvm.
 {
   printf '#!/usr/bin/env bash\n'
-  printf '# Agent Dock wrapper — ensure nvm node is on PATH for #!/usr/bin/env node.\n'
+  printf '# AgentPlantation wrapper — ensure nvm node is on PATH for #!/usr/bin/env node.\n'
   printf 'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"\n'
   printf '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\n'
   printf 'for d in "$HOME"/.nvm/versions/node/*/bin; do\n'
@@ -130,7 +130,7 @@ ok "wrapper → $HOME/.local/bin/codex-acp"
 
 # --- tmux -------------------------------------------------------------------
 if [ "${AGENTDOCK_SKIP_TMUX:-}" = "1" ]; then
-  say "tmux (skipped — Agent Dock already checked)"
+  say "tmux (skipped — AgentPlantation already checked)"
 else
   say "tmux (durable sessions)"
   if have tmux; then
@@ -152,9 +152,9 @@ fi
 
 # --- ADSM (session manager) -------------------------------------------------
 if [ "${AGENTDOCK_SKIP_ADSM:-}" = "1" ]; then
-  say "ADSM (skipped — Agent Dock manages ADSM separately)"
+  say "ADSM (skipped — AgentPlantation manages ADSM separately)"
 else
-  say "ADSM (Agent Dock Session Manager)"
+  say "ADSM (AgentPlantation Session Manager)"
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
   if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/install-adsm.sh" ]; then
     bash "${SCRIPT_DIR}/install-adsm.sh"
@@ -169,10 +169,10 @@ cat <<'DONE'
 Next — pick ONE auth method:
   A) On this host:   codex login --device-auth
                      (starting a login signs out any existing Codex session)
-  B) In Agent Dock:  Settings → save OpenAI API key
+  B) In AgentPlantation:  Settings → save OpenAI API key
                      (Codex keeps it in ~/.codex/auth.json on this host)
 
-Then in Agent Dock create a Codex agent and connect.
+Then in AgentPlantation create a Codex agent and connect.
 
 Smoke:
   codex login status

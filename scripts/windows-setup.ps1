@@ -1,7 +1,7 @@
-# Agent Dock - This PC (Windows) setup
+# AgentPlantation - This PC (Windows) setup
 #
 # Installs what local agents on This PC need: Python (runs ADSM), Node.js,
-# and the ACP adapter(s). Agent Dock installs and starts ADSM itself from the
+# and the ACP adapter(s). AgentPlantation installs and starts ADSM itself from the
 # app on first connect.
 #
 #   irm https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/windows-setup.ps1 | iex
@@ -52,7 +52,7 @@ function Python-Ok {
 $agents = if ($env:AGENTDOCK_AGENTS) { $env:AGENTDOCK_AGENTS } else { 'claude' }
 $agents = $agents.ToLower().Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
-Say "Agent Dock - This PC setup ($($agents -join ', '))"
+Say "AgentPlantation - This PC setup ($($agents -join ', '))"
 
 # --- Python (ADSM) ------------------------------------------------------------
 Say "Python 3.9+ (runs ADSM)"
@@ -108,9 +108,9 @@ Write-Host @"
 
 Next - sign in (pick ONE per agent):
   Claude:  run  claude  in a terminal and log in, or save an Anthropic API key
-           in Agent Dock -> Settings
-  Codex:   save an OpenAI API key in Agent Dock -> Settings
+           in AgentPlantation -> Settings
+  Codex:   save an OpenAI API key in AgentPlantation -> Settings
 
-Then restart Agent Dock, create an agent on This PC and send a message.
+Then restart AgentPlantation, create an agent on This PC and send a message.
 ADSM is installed and started by the app on first connect.
 "@

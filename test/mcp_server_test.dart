@@ -1,4 +1,4 @@
-import 'package:agent_dock/data/models/mcp_server.dart';
+import 'package:agentplantation/data/models/mcp_server.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

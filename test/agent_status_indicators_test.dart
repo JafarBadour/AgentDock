@@ -1,4 +1,4 @@
-import 'package:agent_dock/features/agents/agent_status_indicators.dart';
+import 'package:agentplantation/features/agents/agent_status_indicators.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

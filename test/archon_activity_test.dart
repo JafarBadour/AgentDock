@@ -1,4 +1,4 @@
-import 'package:agent_dock/features/archon/archon_activity_panel.dart';
+import 'package:agentplantation/features/archon/archon_activity_panel.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The log is what the user checks instead of taking Archon's word for it, so

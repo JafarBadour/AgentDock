@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Agent Dock — install / start ADSM (Agent Dock Session Manager) on the host.
+# AgentPlantation — install / start ADSM (AgentPlantation Session Manager) on the host.
 #
 #   curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/install-adsm.sh | bash
 #
@@ -28,7 +28,7 @@ elif [ -d "$(pwd)/host/adsm" ]; then
   LOCAL_HOST="$(pwd)/host"
 fi
 
-say "Agent Dock · ADSM install"
+say "AgentPlantation · ADSM install"
 
 if [ -n "$LOCAL_HOST" ]; then
   ok "using local package at $LOCAL_HOST"
@@ -72,7 +72,7 @@ line='export PATH="$HOME/.local/bin:$PATH"'
 for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
   [ -f "$rc" ] || touch "$rc"
   if ! grep -Fqs '.local/bin' "$rc" 2>/dev/null; then
-    printf '\n# Agent Dock\n%s\n' "$line" >>"$rc"
+    printf '\n# AgentPlantation\n%s\n' "$line" >>"$rc"
   fi
 done
 

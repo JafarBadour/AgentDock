@@ -16,14 +16,14 @@ import 'features/hosts/hosts_screen.dart';
 import 'features/agents/agents_screen.dart';
 import 'services/local_host_bootstrap.dart';
 
-class AgentDockApp extends ConsumerStatefulWidget {
-  const AgentDockApp({super.key});
+class AgentPlantationApp extends ConsumerStatefulWidget {
+  const AgentPlantationApp({super.key});
 
   @override
-  ConsumerState<AgentDockApp> createState() => _AgentDockAppState();
+  ConsumerState<AgentPlantationApp> createState() => _AgentPlantationAppState();
 }
 
-class _AgentDockAppState extends ConsumerState<AgentDockApp>
+class _AgentPlantationAppState extends ConsumerState<AgentPlantationApp>
     with WidgetsBindingObserver {
   @override
   void initState() {
@@ -116,7 +116,7 @@ class _AgentDockAppState extends ConsumerState<AgentDockApp>
     final theme = buildAppTheme(dense: dense);
     return WithForegroundTask(
       child: MaterialApp.router(
-        title: 'Agent Dock',
+        title: 'AgentPlantation',
         debugShowCheckedModeBanner: false,
         theme: theme,
         darkTheme: theme,
@@ -152,5 +152,5 @@ void main() {
     databaseFactory = databaseFactoryFfi;
   }
   FlutterForegroundTask.initCommunicationPort();
-  runApp(const ProviderScope(child: AgentDockApp()));
+  runApp(const ProviderScope(child: AgentPlantationApp()));
 }

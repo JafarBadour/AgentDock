@@ -15,7 +15,7 @@ bool get isDesktopLocalHostPlatform {
   return Platform.isMacOS || Platform.isWindows || Platform.isLinux;
 }
 
-/// "This Mac" / "This PC" for the machine Agent Dock runs on.
+/// "This Mac" / "This PC" for the machine AgentPlantation runs on.
 String get localComputerLabel => Platform.isMacOS ? 'This Mac' : 'This PC';
 
 // Windows: agents on This PC run natively (see `WindowsLocalAgent`), and its
@@ -26,7 +26,7 @@ String get localComputerLabel => Platform.isMacOS ? 'This Mac' : 'This PC';
 String localShellMissingHint(Object error) => Platform.isWindows
     ? 'Could not run Git Bash on This PC ($error).\n'
           'Install Git for Windows (`winget install Git.Git`), then open '
-          'Agent Dock again.'
+          'AgentPlantation again.'
     : 'Could not run local shell: $error';
 
 /// Home directory of This Mac/PC, as the agent's shell sees it.
@@ -43,7 +43,7 @@ String localFsPath(String hostPath) => hostPath;
 bool isLocalThisComputerHost(Host host) {
   if (host.id == kLocalThisComputerHostId) return true;
   // ProxyJump / SSH tunnels (e.g. VDI via bastion on localhost:2255) are not
-  // the machine Agent Dock is running on.
+  // the machine AgentPlantation is running on.
   if (host.jumpHostId != null && host.jumpHostId!.isNotEmpty) return false;
   final h = host.hostname.trim().toLowerCase();
   final loopback = h == 'localhost' || h == '127.0.0.1' || h == '::1';
@@ -133,7 +133,7 @@ Future<String> localComputerDisplayName() async {
   return localComputerLabel;
 }
 
-/// Ensure a Host entry for the machine Agent Dock is running on (Mac / Windows).
+/// Ensure a Host entry for the machine AgentPlantation is running on (Mac / Windows).
 ///
 /// Uses `127.0.0.1` so agents/ADSM talk to the local SSH daemon (Remote Login
 /// on macOS, OpenSSH Server on Windows). The in-app terminal for this host uses
@@ -231,14 +231,14 @@ String localThisComputerSshHint() {
   if (Platform.isMacOS) {
     return 'Could not reach 127.0.0.1:22 (Remote Login appears off).\n\n'
         'Agents and Terminal on This Mac usually do not need Remote Login '
-        'anymore — reopen Agent Dock and try again.\n\n'
+        'anymore — reopen AgentPlantation and try again.\n\n'
         'If you still need SSH for something else: System Settings → General → '
         'Sharing → Remote Login (allow your user).';
   }
   if (Platform.isWindows) {
     return 'Could not reach 127.0.0.1:22 (OpenSSH Server appears off).\n\n'
         'Agents and Terminal on This PC usually do not need OpenSSH '
-        'anymore — reopen Agent Dock and try again.\n\n'
+        'anymore — reopen AgentPlantation and try again.\n\n'
         'If you still need SSH: install/start OpenSSH Server in Optional Features.';
   }
   return 'Local SSH on 127.0.0.1:22 refused the connection.';

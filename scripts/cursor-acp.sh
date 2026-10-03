@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Agent Dock — remote Cursor ACP runtime installer
+# AgentPlantation — remote Cursor ACP runtime installer
 #
-# One-shot install for the host Agent Dock talks to over SSH.
+# One-shot install for the host AgentPlantation talks to over SSH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/cursor-acp.sh | bash
 #
@@ -19,7 +19,7 @@ ensure_path_line() {
   for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
     [ -f "$rc" ] || touch "$rc"
     if ! grep -Fqs '.local/bin' "$rc" 2>/dev/null; then
-      printf '\n# Agent Dock\n%s\n' "$line" >>"$rc"
+      printf '\n# AgentPlantation\n%s\n' "$line" >>"$rc"
     fi
   done
   # shellcheck disable=SC2086
@@ -28,7 +28,7 @@ ensure_path_line() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-say "Agent Dock · Cursor ACP setup"
+say "AgentPlantation · Cursor ACP setup"
 
 mkdir -p "$HOME/.local/bin"
 ensure_path_line
@@ -48,7 +48,7 @@ if have cursor-agent; then
 elif have agent; then
   ok "agent → $(command -v agent)"
   agent --version 2>/dev/null || true
-  # Stable name Agent Dock looks for first.
+  # Stable name AgentPlantation looks for first.
   ln -sfn "$(command -v agent)" "$HOME/.local/bin/cursor-agent"
   ok "linked ~/.local/bin/cursor-agent"
 else
@@ -92,7 +92,7 @@ else
 fi
 
 # --- ADSM (session manager) -------------------------------------------------
-say "ADSM (Agent Dock Session Manager)"
+say "ADSM (AgentPlantation Session Manager)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/install-adsm.sh" ]; then
   bash "${SCRIPT_DIR}/install-adsm.sh"
@@ -105,8 +105,8 @@ cat <<'EOF'
 
 Next:
   1. Log in on this host:  agent login
-     (or set CURSOR_API_KEY in Agent Dock Settings)
+     (or set CURSOR_API_KEY in AgentPlantation Settings)
   2. Smoke test:           cursor-agent --version && agentdock-adsm status
-  3. In Agent Dock: create a Cursor agent and connect
+  3. In AgentPlantation: create a Cursor agent and connect
 
 EOF

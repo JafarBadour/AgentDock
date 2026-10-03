@@ -38,11 +38,11 @@ jobs:
           echo "$KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
       - run: flutter build apk --release
       - name: Rename APK
-        run: cp build/app/outputs/flutter-apk/app-release.apk AgentDock-android.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk AgentPlantation-android.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: AgentDock-android
-          path: AgentDock-android.apk
+          name: AgentPlantation-android
+          path: AgentPlantation-android.apk
 
   macos:
     name: Build macOS
@@ -59,11 +59,11 @@ jobs:
       - name: Package
         run: |
           cd build/macos/Build/Products/Release
-          zip -r "$GITHUB_WORKSPACE/AgentDock-macos.zip" "Agent Dock.app"
+          zip -r "$GITHUB_WORKSPACE/AgentPlantation-macos.zip" "AgentPlantation.app"
       - uses: actions/upload-artifact@v4
         with:
-          name: AgentDock-macos
-          path: AgentDock-macos.zip
+          name: AgentPlantation-macos
+          path: AgentPlantation-macos.zip
 
   windows:
     name: Build Windows
@@ -81,11 +81,11 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path build/windows/x64/runner/Release/* `
-            -DestinationPath AgentDock-windows-x64.zip
+            -DestinationPath AgentPlantation-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: AgentDock-windows-x64
-          path: AgentDock-windows-x64.zip
+          name: AgentPlantation-windows-x64
+          path: AgentPlantation-windows-x64.zip
 
   linux:
     name: Build Linux (Ubuntu)
@@ -106,12 +106,12 @@ jobs:
       - run: flutter build linux --release
       - name: Package
         run: |
-          tar -czf AgentDock-linux-x64.tar.gz \
+          tar -czf AgentPlantation-linux-x64.tar.gz \
             -C build/linux/x64/release/bundle .
       - uses: actions/upload-artifact@v4
         with:
-          name: AgentDock-linux-x64
-          path: AgentDock-linux-x64.tar.gz
+          name: AgentPlantation-linux-x64
+          path: AgentPlantation-linux-x64.tar.gz
 
   ios:
     name: Build iOS (unsigned)
@@ -126,16 +126,16 @@ jobs:
       - run: flutter pub get
       - name: Build iOS (no codesign)
         run: flutter build ios --release --no-codesign
-      - name: Package Agent Dock.app
+      - name: Package AgentPlantation.app
         run: |
           cd build/ios/iphoneos
-          APP="Agent Dock.app"
+          APP="AgentPlantation.app"
           if [ ! -d "$APP" ]; then APP="Runner.app"; fi
-          zip -r "$GITHUB_WORKSPACE/AgentDock-ios-unsigned.zip" "$APP"
+          zip -r "$GITHUB_WORKSPACE/AgentPlantation-ios-unsigned.zip" "$APP"
       - uses: actions/upload-artifact@v4
         with:
-          name: AgentDock-ios-unsigned
-          path: AgentDock-ios-unsigned.zip
+          name: AgentPlantation-ios-unsigned
+          path: AgentPlantation-ios-unsigned.zip
 
   release:
     name: GitHub Release
@@ -151,16 +151,16 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            ## Agent Dock builds
+            ## AgentPlantation builds
 
-            - **macOS**: unzip `AgentDock-macos.zip` and open `Agent Dock.app`
-            - **Android**: install `AgentDock-android.apk` (sideload)
-            - **Windows**: unzip `AgentDock-windows-x64.zip` and run `agent_dock.exe`
-            - **Linux (Ubuntu)**: `tar -xzf AgentDock-linux-x64.tar.gz` then run `./agent_dock`
-            - **iOS**: `AgentDock-ios-unsigned.zip` contains unsigned `Agent Dock.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
+            - **macOS**: unzip `AgentPlantation-macos.zip` and open `AgentPlantation.app`
+            - **Android**: install `AgentPlantation-android.apk` (sideload)
+            - **Windows**: unzip `AgentPlantation-windows-x64.zip` and run `agentplantation.exe`
+            - **Linux (Ubuntu)**: `tar -xzf AgentPlantation-linux-x64.tar.gz` then run `./agentplantation`
+            - **iOS**: `AgentPlantation-ios-unsigned.zip` contains unsigned `AgentPlantation.app` — sign with your Apple Developer team in Xcode before installing on a device or submitting to App Store Connect
           files: |
-            artifacts/AgentDock-macos/AgentDock-macos.zip
-            artifacts/AgentDock-android/AgentDock-android.apk
-            artifacts/AgentDock-windows-x64/AgentDock-windows-x64.zip
-            artifacts/AgentDock-linux-x64/AgentDock-linux-x64.tar.gz
-            artifacts/AgentDock-ios-unsigned/AgentDock-ios-unsigned.zip
+            artifacts/AgentPlantation-macos/AgentPlantation-macos.zip
+            artifacts/AgentPlantation-android/AgentPlantation-android.apk
+            artifacts/AgentPlantation-windows-x64/AgentPlantation-windows-x64.zip
+            artifacts/AgentPlantation-linux-x64/AgentPlantation-linux-x64.tar.gz
+            artifacts/AgentPlantation-ios-unsigned/AgentPlantation-ios-unsigned.zip

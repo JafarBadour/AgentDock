@@ -15,7 +15,7 @@ Archon is **an ordinary chat** on a host you pick, with a skill that makes it
 behave like a manager and a `archon` command that gives it reach.
 
 That was the biggest decision. The design says Archon's LLM is "a session on
-the host, the same kind a regular AgentDock agent uses", and taking that
+the host, the same kind a regular AgentPlantation agent uses", and taking that
 literally pays for itself: transcript, streaming, reconnect, multi-device sync
 and the permission system all already work and are not reimplemented. The
 alternative — a bespoke Archon runtime — duplicates ~3000 lines of chat

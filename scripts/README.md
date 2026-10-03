@@ -1,4 +1,4 @@
-# Remote install scripts (Agent Dock)
+# Remote install scripts (AgentPlantation)
 
 The app runs these automatically on **Connect** when something is missing.
 You can also run them by hand on the SSH host.
@@ -17,7 +17,7 @@ Then: `agent login` (or set `CURSOR_API_KEY` in the app).
 curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/claude-acp.sh | bash
 ```
 
-Then: `claude login` **or** save an Anthropic API key in Agent Dock → Settings.
+Then: `claude login` **or** save an Anthropic API key in AgentPlantation → Settings.
 
 ## Codex
 
@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/JafarBadour/AgentDock/main/scripts/
 
 Installs `@agentclientprotocol/codex-acp` (bundles the Codex CLI) and a
 `~/.local/bin/codex-acp` wrapper. Then: `codex login --device-auth` on the host
-**or** save an OpenAI API key in Agent Dock → Settings (Codex persists it in
+**or** save an OpenAI API key in AgentPlantation → Settings (Codex persists it in
 `~/.codex/auth.json` on the host). Starting a new `codex login` signs out any
 existing Codex session on that host.
 

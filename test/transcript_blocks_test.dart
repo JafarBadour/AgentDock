@@ -1,9 +1,9 @@
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/data/models/thought_message.dart';
-import 'package:agent_dock/data/models/tool_call_state.dart';
-import 'package:agent_dock/data/models/turn_stats_message.dart';
-import 'package:agent_dock/features/agents/transcript_blocks.dart';
-import 'package:agent_dock/services/chat_session_runtime.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/data/models/thought_message.dart';
+import 'package:agentplantation/data/models/tool_call_state.dart';
+import 'package:agentplantation/data/models/turn_stats_message.dart';
+import 'package:agentplantation/features/agents/transcript_blocks.dart';
+import 'package:agentplantation/services/chat_session_runtime.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 ChatMessage _msg(

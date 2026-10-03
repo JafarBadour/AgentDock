@@ -1,19 +1,19 @@
 import 'dart:async';
 
-import 'package:agent_dock/data/local/app_database.dart';
-import 'package:agent_dock/data/models/agent_provider.dart';
-import 'package:agent_dock/data/models/agent_mode.dart';
-import 'package:agent_dock/data/models/agent_model.dart';
-import 'package:agent_dock/data/models/chat.dart';
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/data/models/host.dart';
-import 'package:agent_dock/data/models/prompt_image.dart';
-import 'package:agent_dock/data/models/repo.dart';
-import 'package:agent_dock/data/models/tool_call_state.dart';
-import 'package:agent_dock/services/adsm_client.dart';
-import 'package:agent_dock/services/agent_session.dart';
-import 'package:agent_dock/services/chat_session_runtime.dart';
-import 'package:agent_dock/services/cursor_acp_service.dart';
+import 'package:agentplantation/data/local/app_database.dart';
+import 'package:agentplantation/data/models/agent_provider.dart';
+import 'package:agentplantation/data/models/agent_mode.dart';
+import 'package:agentplantation/data/models/agent_model.dart';
+import 'package:agentplantation/data/models/chat.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/data/models/host.dart';
+import 'package:agentplantation/data/models/prompt_image.dart';
+import 'package:agentplantation/data/models/repo.dart';
+import 'package:agentplantation/data/models/tool_call_state.dart';
+import 'package:agentplantation/services/adsm_client.dart';
+import 'package:agentplantation/services/agent_session.dart';
+import 'package:agentplantation/services/chat_session_runtime.dart';
+import 'package:agentplantation/services/cursor_acp_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 

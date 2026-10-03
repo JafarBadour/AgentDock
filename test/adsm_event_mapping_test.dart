@@ -1,6 +1,6 @@
-import 'package:agent_dock/services/adsm_client.dart';
-import 'package:agent_dock/services/cursor_acp_service.dart';
-import 'package:agent_dock/data/models/tool_call_state.dart';
+import 'package:agentplantation/services/adsm_client.dart';
+import 'package:agentplantation/services/cursor_acp_service.dart';
+import 'package:agentplantation/data/models/tool_call_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

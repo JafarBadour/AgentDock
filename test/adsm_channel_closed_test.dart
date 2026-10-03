@@ -1,4 +1,4 @@
-import 'package:agent_dock/services/ssh_service.dart';
+import 'package:agentplantation/services/ssh_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

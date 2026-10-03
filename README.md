@@ -1,4 +1,4 @@
-# Agent Dock
+# AgentPlantation
 
 Flutter app (Android-first, iOS beta, plus a desktop build) for a Cursor-style
 **Agents** window over SSH. Desktop — macOS, Windows, Linux — gets the
@@ -7,7 +7,7 @@ three-column shell; phones get bottom nav.
 - **Connect** — SSH private key (and optional Cursor / Anthropic / OpenAI API key) in the device keystore
 - **Hosts** — remotes like SSH config entries
 - **Repos** — remote directories under a host
-- **Agents** — many chats per repo; each chat talks to **ADSM** (Agent Dock Session Manager) on the remote, which owns Cursor / Claude / Codex ACP workers
+- **Agents** — many chats per repo; each chat talks to **ADSM** (the session-manager daemon) on the remote, which owns Cursor / Claude / Codex ACP workers
 
 Chats are local-first: the transcript is read from SQLite and painted before any
 network call, and remote state is merged in afterwards.
@@ -106,7 +106,7 @@ SSH access; host can reach GitHub raw URLs for install scripts. Auth: `agent log
 `claude login` or `codex login --device-auth` (or API keys in Settings).
 
 Those CLI sign-in flows run from the app over a real PTY. On the machine running
-Agent Dock that PTY is **local**, so signing a host in there needs no Remote
+AgentPlantation that PTY is **local**, so signing a host in there needs no Remote
 Login / OpenSSH Server.
 
 ## Run

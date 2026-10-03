@@ -1,4 +1,4 @@
-import 'package:agent_dock/services/claude_remote_auth.dart';
+import 'package:agentplantation/services/claude_remote_auth.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

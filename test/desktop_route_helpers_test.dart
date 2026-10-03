@@ -1,5 +1,5 @@
-import 'package:agent_dock/app/platform_layout.dart';
-import 'package:agent_dock/app/providers.dart';
+import 'package:agentplantation/app/platform_layout.dart';
+import 'package:agentplantation/app/providers.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

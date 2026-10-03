@@ -568,7 +568,7 @@ PY
         if (existing != null &&
             existing.enabled &&
             existing.installStatus == McpHostInstallStatus.installed) {
-          // Was installed via Agent Dock but vanished from all configs.
+          // Was installed via AgentPlantation but vanished from all configs.
           await _db.upsertMcpHostLink(
             existing.copyWith(
               enabled: false,

@@ -30,7 +30,7 @@ class LocalNotificationService {
     // Windows refuses to initialize without an identity; the GUID must stay
     // fixed so toasts keep grouping under the same app.
     const windows = WindowsInitializationSettings(
-      appName: 'Agent Dock',
+      appName: 'AgentPlantation',
       appUserModelId: 'com.agenticphone.agentdock',
       guid: '3d43b973-853b-4f97-8894-1519e33d6976',
     );
@@ -109,7 +109,7 @@ class LocalNotificationService {
     try {
       await _plugin.show(
         id: id,
-        title: title.isEmpty ? 'Agent Dock' : title,
+        title: title.isEmpty ? 'AgentPlantation' : title,
         body: body,
         notificationDetails: const NotificationDetails(
           android: AndroidNotificationDetails(

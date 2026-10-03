@@ -548,7 +548,7 @@ class Daemon:
                 "ok": False,
                 "error": "no_app",
                 "message": (
-                    "No Agent Dock app is connected, so I cannot reach other "
+                    "No AgentPlantation app is connected, so I cannot reach other "
                     "hosts right now."
                 ),
             }

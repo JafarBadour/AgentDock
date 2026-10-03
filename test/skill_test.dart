@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:agent_dock/data/models/skill.dart';
-import 'package:agent_dock/services/skill_folder_importer.dart';
+import 'package:agentplantation/data/models/skill.dart';
+import 'package:agentplantation/services/skill_folder_importer.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

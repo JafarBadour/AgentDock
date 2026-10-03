@@ -1,7 +1,7 @@
 import 'dart:convert';
 
-import 'package:agent_dock/data/models/code_change_stats.dart';
-import 'package:agent_dock/data/models/tool_call_state.dart';
+import 'package:agentplantation/data/models/code_change_stats.dart';
+import 'package:agentplantation/data/models/tool_call_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

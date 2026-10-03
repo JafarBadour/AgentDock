@@ -2450,7 +2450,7 @@ fi
     );
   }
 
-  /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.
+  /// Downloads and runs an AgentPlantation `scripts/*.sh` installer on the host.
   ///
   /// Returns false when the download/run failed so callers can try a fallback.
   Future<bool> _runAgentDockInstallScriptOnHost(
@@ -2473,7 +2473,7 @@ curl -fsSL ${shellQuote(url)} | bash
 ''', timeout: timeout);
         return true;
       } catch (e) {
-        SafeLog.d('Agent Dock install script $scriptName failed (local)', e);
+        SafeLog.d('AgentPlantation install script $scriptName failed (local)', e);
         onProgress?.call('Install script failed — trying fallback…');
         return false;
       }
@@ -2493,7 +2493,7 @@ curl -fsSL ${shellQuote(url)} | bash
     );
   }
 
-  /// Downloads and runs an Agent Dock `scripts/*.sh` installer on the host.
+  /// Downloads and runs an AgentPlantation `scripts/*.sh` installer on the host.
   ///
   /// Returns false when the download/run failed so callers can try a fallback.
   Future<bool> _runAgentDockInstallScript(
@@ -2522,7 +2522,7 @@ curl -fsSL ${shellQuote(url)} | bash
       );
       return true;
     } catch (e) {
-      SafeLog.d('Agent Dock install script $scriptName failed', e);
+      SafeLog.d('AgentPlantation install script $scriptName failed', e);
       onProgress?.call('Install script failed — trying fallback…');
       return false;
     }

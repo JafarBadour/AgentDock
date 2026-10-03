@@ -1,7 +1,7 @@
-import 'package:agent_dock/app/app_theme.dart';
-import 'package:agent_dock/features/agents/agent_activity_strip.dart';
-import 'package:agent_dock/features/agents/transcript_snapshot.dart';
-import 'package:agent_dock/features/agents/transcript_view.dart';
+import 'package:agentplantation/app/app_theme.dart';
+import 'package:agentplantation/features/agents/agent_activity_strip.dart';
+import 'package:agentplantation/features/agents/transcript_snapshot.dart';
+import 'package:agentplantation/features/agents/transcript_view.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

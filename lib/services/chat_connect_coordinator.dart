@@ -417,16 +417,16 @@ class ChatConnectCoordinator extends StateNotifier<Map<String, ConnectProgress>>
       return mismatch
           ? 'ADSM mismatch — cannot run until the host matches this app '
                 '(needs v$kRequiredAdsmVersion).\n'
-                'Agent Dock tried to update automatically. Leave this chat '
+                'AgentPlantation tried to update automatically. Leave this chat '
                 'and open it again to retry, or update ADSM on the remote.\n\n'
                 '${e.installHint}'
           : 'Could not install ADSM on ${host.displayLabel}.\n'
-                'Agent Dock tried automatically — run the setup below on the '
+                'AgentPlantation tried automatically — run the setup below on the '
                 'remote, then Connect again.\n\n'
                 '${e.tool} still missing.';
     }
     return 'Could not install $providerLabel on ${host.displayLabel}.\n'
-        'Agent Dock tried automatically — run the setup below on the '
+        'AgentPlantation tried automatically — run the setup below on the '
         'remote (or fix network/sudo), then Connect again.\n\n'
         '${e.tool} still missing.';
   }

@@ -980,7 +980,7 @@ String _humanizeAgentError(String raw) {
       (lower.contains('expected array, received object') ||
           lower.contains('headers'))) {
     return 'MCP config rejected by the agent (headers/env must be '
-        'name/value arrays). Start a new session after updating Agent Dock.';
+        'name/value arrays). Start a new session after updating AgentPlantation.';
   }
   if (lower.contains('mcpservers') && lower.contains('invalid params')) {
     return 'MCP servers failed validation on session/new. '

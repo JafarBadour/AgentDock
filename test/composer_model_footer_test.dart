@@ -1,7 +1,7 @@
 import 'dart:io';
 
-import 'package:agent_dock/app/app_theme.dart';
-import 'package:agent_dock/features/agents/composer_model_footer.dart';
+import 'package:agentplantation/app/app_theme.dart';
+import 'package:agentplantation/features/agents/composer_model_footer.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';

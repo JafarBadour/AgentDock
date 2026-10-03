@@ -124,7 +124,7 @@ def _spawn_detached(cmd: list[str], **kwargs) -> None:
         subprocess.Popen(cmd, start_new_session=True, **kwargs)
         return
     # No console, own process group, not tied to the launching console. Try
-    # to leave the parent's job too: Agent Dock (or a terminal) may run in a
+    # to leave the parent's job too: AgentPlantation (or a terminal) may run in a
     # job that kills its children when it closes.
     flags = (
         subprocess.DETACHED_PROCESS

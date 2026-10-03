@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:agent_dock/services/adsm_client.dart';
+import 'package:agentplantation/services/adsm_client.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

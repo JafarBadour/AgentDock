@@ -77,7 +77,7 @@ class ArchonVoice {
     if (_state != ArchonVoiceState.idle) return;
     if (!await _recorder.hasPermission()) {
       throw StateError(
-        'Microphone access is off — allow it for Agent Dock to talk to Archon.',
+        'Microphone access is off — allow it for AgentPlantation to talk to Archon.',
       );
     }
     final dir = await _tempDir();

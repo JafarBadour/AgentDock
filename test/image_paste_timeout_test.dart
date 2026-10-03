@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:agent_dock/features/agents/image_paste.dart';
+import 'package:agentplantation/features/agents/image_paste.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// A promised file the source app never materialises (browser, Photos, Mail)

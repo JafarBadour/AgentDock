@@ -1,6 +1,6 @@
-import 'package:agent_dock/data/models/code_change_stats.dart';
-import 'package:agent_dock/data/models/turn_stats_message.dart';
-import 'package:agent_dock/services/cursor_acp_service.dart';
+import 'package:agentplantation/data/models/code_change_stats.dart';
+import 'package:agentplantation/data/models/turn_stats_message.dart';
+import 'package:agentplantation/services/cursor_acp_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

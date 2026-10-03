@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:agent_dock/services/adsm_version.dart';
+import 'package:agentplantation/services/adsm_version.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The app ships `host/adsm/` as assets and uploads it to a host only when the
@@ -85,7 +85,7 @@ void main() {
   /// then reported "no route", which reads as "no app is connected" rather
   /// than "this host is stale".
   const methodsByVersion = <String, List<String>>{
-    '0.7.3': [
+    '0.7.4': [
       'agents.delete',
       'agents.ensure',
       'agents.list',

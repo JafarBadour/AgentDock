@@ -1,4 +1,4 @@
-/// One-liner installers for the remote host Agent Dock SSH-connects to.
+/// One-liner installers for the remote host AgentPlantation SSH-connects to.
 ///
 /// Scripts live in the AgentDock GitHub repo under `scripts/`.
 const kAgentDockScriptsBase =
@@ -6,12 +6,12 @@ const kAgentDockScriptsBase =
 
 /// Commands to install Cursor agent runtime on the remote.
 const kRemoteCursorSetupGuide = '''
-# Agent Dock · Cursor on this host (copy-paste)
+# AgentPlantation · Cursor on this host (copy-paste)
 curl -fsSL $kAgentDockScriptsBase/cursor-acp.sh | bash
 
 # Then authenticate:
 agent login
-# or save CURSOR_API_KEY in Agent Dock Settings
+# or save CURSOR_API_KEY in AgentPlantation Settings
 
 # Smoke:
 cursor-agent --version || agent --version
@@ -20,12 +20,12 @@ tmux -V
 
 /// Commands to install Claude Code + ACP adapter on the remote.
 const kRemoteClaudeSetupGuide = '''
-# Agent Dock · Claude on this host (copy-paste)
+# AgentPlantation · Claude on this host (copy-paste)
 curl -fsSL $kAgentDockScriptsBase/claude-acp.sh | bash
 
 # Then authenticate (pick one):
 claude login
-# or save ANTHROPIC_API_KEY in Agent Dock Settings
+# or save ANTHROPIC_API_KEY in AgentPlantation Settings
 
 # Smoke:
 claude --version
@@ -35,12 +35,12 @@ tmux -V
 
 /// Commands to install the Codex ACP adapter (bundles the Codex CLI).
 const kRemoteCodexSetupGuide = '''
-# Agent Dock · Codex on this host (copy-paste)
+# AgentPlantation · Codex on this host (copy-paste)
 curl -fsSL $kAgentDockScriptsBase/codex-acp.sh | bash
 
 # Then authenticate (pick one):
 codex login --device-auth
-# or save OPENAI_API_KEY in Agent Dock Settings
+# or save OPENAI_API_KEY in AgentPlantation Settings
 # (starting a new login signs out any existing Codex session on this host)
 
 # Smoke:
@@ -49,7 +49,7 @@ command -v codex-acp
 tmux -V
 ''';
 
-const kRemoteTmuxSetupGuide = r'''# Install tmux on the remote (required by Agent Dock)
+const kRemoteTmuxSetupGuide = r'''# Install tmux on the remote (required by AgentPlantation)
 
 # --- HPC / shared clusters (no sudo) ---
 module spider tmux        # see available modules
@@ -74,7 +74,7 @@ tmux -V
 
 /// Shown only if the app’s automatic ADSM install somehow fails.
 const kRemoteAdsmSetupGuide = '''
-# Agent Dock installs/upgrades ADSM automatically when you open an agent.
+# AgentPlantation installs/upgrades ADSM automatically when you open an agent.
 # On version mismatch it re-runs install-adsm.sh so the host matches the app.
 # If that failed, run once on the remote:
 

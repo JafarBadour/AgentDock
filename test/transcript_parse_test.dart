@@ -1,7 +1,7 @@
 import 'dart:convert';
 
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/services/transcript_parse.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/services/transcript_parse.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 ChatMessage _msg(String id, MessageRole role, String content) => ChatMessage(

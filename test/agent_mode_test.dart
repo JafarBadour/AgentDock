@@ -1,5 +1,5 @@
-import 'package:agent_dock/data/models/agent_mode.dart';
-import 'package:agent_dock/data/models/agent_provider.dart';
+import 'package:agentplantation/data/models/agent_mode.dart';
+import 'package:agentplantation/data/models/agent_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

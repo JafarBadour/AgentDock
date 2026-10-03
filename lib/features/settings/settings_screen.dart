@@ -76,7 +76,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       SnackBar(
         content: Text(
           value
-              ? 'Background mode on — like a pedometer, Agent Dock keeps running'
+              ? 'Background mode on — like a pedometer, AgentPlantation keeps running'
               : 'Background mode off — connections drop when you leave the app',
         ),
       ),
@@ -158,7 +158,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           'agent-dock-${DateTime.now().toIso8601String().split('T').first}.ag';
 
       String? path = await FilePicker.saveFile(
-        dialogTitle: 'Export Agent Dock config',
+        dialogTitle: 'Export AgentPlantation config',
         fileName: suggested,
         type: FileType.custom,
         allowedExtensions: const ['ag', 'json'],
@@ -221,7 +221,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     });
     try {
       final result = await FilePicker.pickFiles(
-        dialogTitle: 'Import Agent Dock config',
+        dialogTitle: 'Import AgentPlantation config',
         type: FileType.custom,
         allowedExtensions: const ['ag', 'json'],
         withData: false,

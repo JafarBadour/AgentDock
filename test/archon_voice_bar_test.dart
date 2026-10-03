@@ -2,10 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:agent_dock/app/app_theme.dart';
-import 'package:agent_dock/features/archon/archon_voice_bar.dart';
-import 'package:agent_dock/services/archon_voice.dart';
-import 'package:agent_dock/services/deepgram_service.dart';
+import 'package:agentplantation/app/app_theme.dart';
+import 'package:agentplantation/features/archon/archon_voice_bar.dart';
+import 'package:agentplantation/services/archon_voice.dart';
+import 'package:agentplantation/services/deepgram_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;

@@ -1,14 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:agent_dock/app/app_theme.dart';
-import 'package:agent_dock/data/local/app_database.dart';
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/data/models/tool_call_state.dart';
-import 'package:agent_dock/features/agents/transcript_blocks.dart';
-import 'package:agent_dock/features/agents/transcript_snapshot.dart';
-import 'package:agent_dock/features/agents/transcript_view.dart';
-import 'package:agent_dock/services/chat_session_runtime.dart';
+import 'package:agentplantation/app/app_theme.dart';
+import 'package:agentplantation/data/local/app_database.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/data/models/tool_call_state.dart';
+import 'package:agentplantation/features/agents/transcript_blocks.dart';
+import 'package:agentplantation/features/agents/transcript_snapshot.dart';
+import 'package:agentplantation/features/agents/transcript_view.dart';
+import 'package:agentplantation/services/chat_session_runtime.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';

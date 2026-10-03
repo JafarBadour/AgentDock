@@ -1,4 +1,4 @@
-import 'package:agent_dock/services/adsm_version.dart';
+import 'package:agentplantation/services/adsm_version.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -25,7 +25,10 @@ void main() {
       // on main without it, so a host reporting 0.7.2 must read as stale —
       // treating it as current is what left Archon with no route.
       expect(adsmVersionMeets('0.7.2', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.3', kRequiredAdsmVersion), isTrue);
+      // 0.7.4 renames the product in the daemon's own user-visible messages,
+      // which only reach a host when the version says the host is behind.
+      expect(adsmVersionMeets('0.7.3', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.4', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -36,7 +39,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.3');
+      expect(kRequiredAdsmVersion, '0.7.4');
     });
   });
 }

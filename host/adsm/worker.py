@@ -1187,12 +1187,12 @@ class Worker:
         if self.provider == "codex":
             return (
                 "Codex is not logged in on this host — run `codex login` "
-                "there or save an OpenAI API key in Agent Dock Settings"
+                "there or save an OpenAI API key in AgentPlantation Settings"
             )
         if self.provider == "claude":
             return (
                 "Claude is not logged in on this host — run `claude login` "
-                "there or save an Anthropic API key in Agent Dock Settings"
+                "there or save an Anthropic API key in AgentPlantation Settings"
             )
         return "Agent authentication required — run `agent login` on this host"
 
@@ -1674,7 +1674,7 @@ class Worker:
         body = "\n\n".join(lines)
         if self._take_fork_marker():
             preamble = (
-                "[Agent Dock] This agent was forked from another chat and "
+                "[AgentPlantation] This agent was forked from another chat and "
                 "starts with that chat's history below, so you keep full "
                 "context. You are now a separate agent: the original is still "
                 "running on its own, so treat the work below as done and do "
@@ -1682,7 +1682,7 @@ class Worker:
             )
         else:
             preamble = (
-                "[Agent Dock] The previous ACP session ended (stop/cancel or "
+                "[AgentPlantation] The previous ACP session ended (stop/cancel or "
                 "restart). Here is the recent chat history from this agent so "
                 "you keep full context. Do not re-explore work already covered "
                 "below unless the user asks."

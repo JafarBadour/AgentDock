@@ -1,6 +1,6 @@
-import 'package:agent_dock/data/models/archon_chat.dart';
-import 'package:agent_dock/data/models/agent_provider.dart';
-import 'package:agent_dock/data/models/chat.dart';
+import 'package:agentplantation/data/models/archon_chat.dart';
+import 'package:agentplantation/data/models/agent_provider.dart';
+import 'package:agentplantation/data/models/chat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 Chat _chat(String id) => Chat(

@@ -1,7 +1,7 @@
 import 'dart:convert';
 
-import 'package:agent_dock/data/models/host.dart';
-import 'package:agent_dock/services/archon_skill_deploy.dart';
+import 'package:agentplantation/data/models/host.dart';
+import 'package:agentplantation/services/archon_skill_deploy.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 final _host = Host(

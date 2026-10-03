@@ -1,5 +1,5 @@
-import 'package:agent_dock/data/models/chat_message.dart';
-import 'package:agent_dock/services/transcript_budget.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
+import 'package:agentplantation/services/transcript_budget.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 ChatMessage _m(String id, String body, int sec) => ChatMessage(
