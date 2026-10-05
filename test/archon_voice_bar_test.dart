@@ -323,4 +323,133 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+
+  // Hands-free. Holding the mic through a back-and-forth is the thing this
+  // replaces: one tap per turn, and Archon's reply arms the next take.
+  Future<void> tapConversation(WidgetTester tester) async {
+    await tester.tap(find.byKey(ArchonVoiceBar.conversationKey));
+    await tester.pumpAndSettle();
+  }
+
+  Future<void> tapMic(WidgetTester tester) async {
+    await tester.tap(find.byKey(ArchonVoiceBar.micKey));
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('starting a conversation listens without holding', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    await pumpBar(tester, voice: h.voice, onTranscribed: (_) {});
+
+    await tapConversation(tester);
+
+    expect(h.rec.started, isTrue);
+    expect(h.voice.state, ArchonVoiceState.recording);
+    expect(find.textContaining('tap the mic to send'), findsOneWidget);
+  });
+
+  testWidgets('starting a conversation asks for spoken replies', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    final modes = <ArchonVoiceMode>[];
+    await pumpBar(
+      tester,
+      voice: h.voice,
+      onTranscribed: (_) {},
+      onModeChanged: modes.add,
+    );
+
+    await tapConversation(tester);
+
+    // A conversation where only one side talks is not one.
+    expect(modes, [ArchonVoiceMode.talkAndText]);
+  });
+
+  testWidgets('a tap sends the turn while conversing', (tester) async {
+    final h = buildVoice(transcript: 'what is still running?');
+    final sent = <String>[];
+    await pumpBar(tester, voice: h.voice, onTranscribed: sent.add);
+
+    await tapConversation(tester);
+    await tapMic(tester);
+
+    expect(sent, ['what is still running?']);
+    expect(h.voice.state, ArchonVoiceState.idle);
+  });
+
+  testWidgets('the next turn arms itself when Archon stops speaking', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    await pumpBar(tester, voice: h.voice, onTranscribed: (_) {});
+    await tapConversation(tester);
+    await tapMic(tester);
+    expect(h.voice.state, ArchonVoiceState.idle);
+    h.rec.started = false;
+
+    final speaking = h.voice.speak('Two agents are still running.');
+    await tester.pump();
+    await tester.pump();
+    expect(find.textContaining('Archon is speaking'), findsOneWidget);
+
+    await h.voice.stopSpeaking();
+    await speaking;
+    await tester.pumpAndSettle();
+
+    expect(h.rec.started, isTrue, reason: 'the user should not have to ask');
+    expect(h.voice.state, ArchonVoiceState.recording);
+  });
+
+  testWidgets('a reply does not arm a take once the conversation ends', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    await pumpBar(tester, voice: h.voice, onTranscribed: (_) {});
+    await tapConversation(tester);
+    await tapMic(tester);
+    await tapConversation(tester);
+    h.rec.started = false;
+
+    final speaking = h.voice.speak('Done.');
+    await tester.pump();
+    await tester.pump();
+    await h.voice.stopSpeaking();
+    await speaking;
+    await tester.pumpAndSettle();
+
+    expect(h.rec.started, isFalse);
+  });
+
+  testWidgets('ending a conversation discards the take in progress', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    final sent = <String>[];
+    await pumpBar(tester, voice: h.voice, onTranscribed: sent.add);
+
+    await tapConversation(tester);
+    expect(h.voice.state, ArchonVoiceState.recording);
+
+    await tapConversation(tester);
+
+    expect(h.rec.cancelled, isTrue);
+    expect(sent, isEmpty);
+    expect(h.voice.state, ArchonVoiceState.idle);
+  });
+
+  testWidgets('holding still works when no conversation is running', (
+    tester,
+  ) async {
+    final h = buildVoice(transcript: 'push it');
+    final sent = <String>[];
+    await pumpBar(tester, voice: h.voice, onTranscribed: sent.add);
+
+    final gesture = await holdMic(tester);
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(sent, ['push it']);
+  });
 }

@@ -87,6 +87,9 @@ class ArchonVoiceBar extends StatefulWidget {
   /// Lets a test grab the mic without depending on which icon it wears.
   static const micKey = ValueKey<String>('archon-voice-mic');
 
+  /// The hands-free toggle, for the same reason.
+  static const conversationKey = ValueKey<String>('archon-voice-conversation');
+
   /// How far the finger must travel off the mic to abandon the take. Roughly
   /// a thumb's width, so a shaky hold does not throw the message away.
   static const cancelDistance = 56.0;
@@ -105,6 +108,11 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
   bool _speaking = false;
   String? _message;
   bool _messageIsError = false;
+
+  /// Hands-free. The mic latches instead of being held, and the next take
+  /// arms itself as soon as Archon stops speaking, so a back-and-forth costs
+  /// one tap per turn instead of a thumb held down through all of it.
+  bool _conversing = false;
 
   Offset _origin = Offset.zero;
 
@@ -129,7 +137,14 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
       // Only speaking is watched: it is the one state the caller starts, so
       // it is the one the bar cannot learn from its own await.
       final speaking = state == ArchonVoiceState.speaking;
-      if (speaking != _speaking) setState(() => _speaking = speaking);
+      if (speaking == _speaking) return;
+      final replyEnded = _speaking && !speaking;
+      setState(() => _speaking = speaking);
+      // Archon has finished its answer — take the next turn without being
+      // asked. This is the whole of what makes it a conversation.
+      if (replyEnded && _conversing && _phase == _Phase.idle) {
+        if (widget.enabled) unawaited(_start());
+      }
     });
   }
 
@@ -171,6 +186,33 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
       _message = null;
     });
     widget.onModeChanged?.call(mode);
+  }
+
+  /// Enter or leave hands-free.
+  ///
+  /// Turning it on also asks for spoken replies when the user was on written
+  /// ones — a conversation where only one side talks is not one, and the
+  /// auto-arm has nothing to wait for without a reply to finish. Turning it
+  /// off leaves the reply mode alone rather than undoing a deliberate choice.
+  void _toggleConversation() {
+    if (!widget.enabled) return;
+    if (_conversing) {
+      setState(() {
+        _conversing = false;
+        _message = 'Conversation ended.';
+      });
+      if (_phase == _Phase.recording || _phase == _Phase.cancelling) {
+        unawaited(_finish(cancel: true));
+      }
+      return;
+    }
+    if (_mode == ArchonVoiceMode.text) _pickMode(ArchonVoiceMode.talkAndText);
+    setState(() {
+      _conversing = true;
+      _message = null;
+      _messageIsError = false;
+    });
+    if (_phase == _Phase.idle && !_speaking) unawaited(_start());
   }
 
   Future<void> _start() async {
@@ -231,7 +273,11 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
     if (trimmed.isEmpty) {
       // Releasing without speaking is ordinary, so this is a nudge, not a
       // failure: nothing is sent and nothing is coloured red.
-      _say('Nothing heard — hold the mic and speak.');
+      _say(
+        _conversing
+            ? 'Nothing heard — tap the mic and speak.'
+            : 'Nothing heard — hold the mic and speak.',
+      );
       return;
     }
     _say(null);
@@ -245,10 +291,15 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
 
   void _pointerDown(PointerDownEvent event) {
     _origin = event.position;
+    // Latched: the take starts and ends on taps, so nothing happens on press.
+    if (_conversing) return;
     unawaited(_start());
   }
 
   void _pointerMove(PointerMoveEvent event) {
+    // Slide-away-to-cancel belongs to the held take. Latched, the finger is
+    // long gone by the time the user changes their mind.
+    if (_conversing) return;
     if (_phase != _Phase.recording && _phase != _Phase.cancelling) return;
     final away =
         (event.position - _origin).distance > ArchonVoiceBar.cancelDistance;
@@ -256,13 +307,25 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
     if (next != _phase) setState(() => _phase = next);
   }
 
-  void _pointerUp(PointerUpEvent event) =>
-      unawaited(_finish(cancel: _phase == _Phase.cancelling));
+  void _pointerUp(PointerUpEvent event) {
+    if (_conversing) {
+      if (_phase == _Phase.idle) {
+        unawaited(_start());
+      } else if (_phase == _Phase.recording) {
+        unawaited(_finish(cancel: false));
+      }
+      return;
+    }
+    unawaited(_finish(cancel: _phase == _Phase.cancelling));
+  }
 
   /// The system stealing the pointer (a scroll, a call) must not send a take
-  /// the user never released.
-  void _pointerCancel(PointerCancelEvent event) =>
-      unawaited(_finish(cancel: true));
+  /// the user never released. Latched takes are not held, so there is nothing
+  /// for a stolen pointer to abandon.
+  void _pointerCancel(PointerCancelEvent event) {
+    if (_conversing) return;
+    unawaited(_finish(cancel: true));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -301,6 +364,7 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
                   color: AppColors.accent,
                   onPressed: () => unawaited(widget.voice.stopSpeaking()),
                 ),
+              _conversationButton(),
               const SizedBox(width: 4),
               _mic(theme),
             ],
@@ -310,9 +374,43 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
     );
   }
 
+  /// Hands-free, so the user is not holding anything and the ordinary
+  /// "release to send" wording would be a lie.
+  Widget _conversationButton() {
+    return Semantics(
+      button: true,
+      enabled: widget.enabled,
+      toggled: _conversing,
+      label: _conversing ? 'End conversation' : 'Start conversation',
+      child: IconButton(
+        key: ArchonVoiceBar.conversationKey,
+        tooltip: _conversing
+            ? 'End the hands-free conversation'
+            : 'Talk with Archon hands-free',
+        isSelected: _conversing,
+        onPressed: widget.enabled ? _toggleConversation : null,
+        iconSize: 22,
+        visualDensity: VisualDensity.compact,
+        style: IconButton.styleFrom(
+          backgroundColor: _conversing
+              ? AppColors.accent.withValues(alpha: 0.18)
+              : Colors.transparent,
+          foregroundColor: _conversing ? AppColors.accent : AppColors.chatMeta,
+        ),
+        icon: Icon(
+          _conversing ? Icons.voice_chat : Icons.voice_chat_outlined,
+        ),
+      ),
+    );
+  }
+
   Widget _status(ThemeData theme) {
     final (text, color) = switch (_phase) {
       _Phase.cancelling => ('Release to discard', theme.colorScheme.error),
+      _Phase.recording when _conversing => (
+        'Listening… tap the mic to send',
+        AppColors.mist,
+      ),
       _Phase.recording => ('Recording… slide away to cancel', AppColors.mist),
       _Phase.transcribing => ('Transcribing…', AppColors.mist),
       _Phase.idle when _message != null => (
@@ -320,6 +418,10 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
         _messageIsError ? theme.colorScheme.error : AppColors.chatMeta,
       ),
       _Phase.idle when _speaking => ('Archon is speaking…', AppColors.accent),
+      _Phase.idle when _conversing => (
+        'Your turn — tap the mic',
+        AppColors.accent,
+      ),
       _Phase.idle => (_mode.hint, AppColors.chatMeta),
     };
     return Text(
@@ -382,10 +484,17 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
       child: glyph,
     );
 
+    final label = switch ((_conversing, recording || cancelling)) {
+      (true, true) => 'Tap to send',
+      (true, false) => 'Tap to talk',
+      (false, true) => 'Release to send',
+      (false, false) => 'Hold to talk',
+    };
+
     return Semantics(
       button: true,
       enabled: widget.enabled,
-      label: recording || cancelling ? 'Release to send' : 'Hold to talk',
+      label: label,
       child: Listener(
         key: ArchonVoiceBar.micKey,
         behavior: HitTestBehavior.opaque,

@@ -14,8 +14,14 @@ import 'archon_managed_panel.dart';
 import 'archon_settings.dart';
 
 /// Where Archon currently runs, or null when it has not been placed yet.
+///
+/// Deliberately depends on nothing that churns. This used to watch
+/// [agentsCatalogEpochProvider], which HostLiveSync bumps every 400ms and a
+/// streaming chat every 3s — so the placement was re-resolved constantly, and
+/// each pass dropped the provider to loading and tore the whole chat below it
+/// down for a spinner. Placement only changes when Archon is actually placed
+/// or moved, and both of those invalidate this provider by hand.
 final archonHostProvider = FutureProvider.autoDispose<Host?>((ref) async {
-  ref.watch(agentsCatalogEpochProvider);
   return ref.watch(archonServiceProvider).currentHost();
 });
 
@@ -32,17 +38,21 @@ class ArchonScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final host = ref.watch(archonHostProvider);
-    return host.when(
-      loading: () =>
-          const Scaffold(body: Center(child: CircularProgressIndicator())),
-      error: (e, _) => Scaffold(
-        appBar: AppBar(title: const Text('Archon')),
-        body: Center(child: Text('Could not load Archon — $e')),
-      ),
-      data: (placed) => placed == null
+    // Once the placement is known, keep showing it. A refresh must never put
+    // a spinner here: this subtree is the whole Archon chat, and replacing it
+    // loses scroll position, composer text and every bit of streamed state.
+    if (host.hasValue) {
+      return host.requireValue == null
           ? const _ChooseArchonHost()
-          : const ChatScreen(chatId: kArchonChatId),
-    );
+          : const ChatScreen(chatId: kArchonChatId);
+    }
+    if (host.hasError) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Archon')),
+        body: Center(child: Text('Could not load Archon — ${host.error}')),
+      );
+    }
+    return const Scaffold(body: Center(child: CircularProgressIndicator()));
   }
 }
 
