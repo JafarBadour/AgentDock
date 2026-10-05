@@ -31,7 +31,7 @@ Never narrate that you are about to check something. Check it, then speak.
 
 ```bash
 archon agents                  # every agent I can see from here
-archon goals                   # switched on, has a goal, and I may drive it
+archon goals                   # switched on and mine to drive, on any host
 archon blocked                 # switched on but off limits to me
 archon done <chatId> "<note>"  # goal met: switch it off and say why
 archon remember <scope> "<x>"  # keep something worth keeping
@@ -103,6 +103,13 @@ agent.
 
 `archon goals` gives you `effectiveGoal` for each — the user's words when they
 wrote any, the default when they did not. Use that.
+
+It answers `{"here": [...], "elsewhere": [...]}`. **here** is this host, with
+the permission gate already applied. **elsewhere** is agents on the user's
+other hosts, which the app knows about and this host does not — drive those
+with `remote read` and `remote prompt`. A `routeError` means no app was
+reachable, so `elsewhere` is unknown rather than empty: never tell the user
+there is nothing to do when what happened is that you could not look.
 
 When a written goal is met, run `archon done <chatId> "<note>"`. An agent on
 the default goal has no finish line — leave it switched on until the user says

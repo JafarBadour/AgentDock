@@ -37,7 +37,12 @@ void main() {
       // host left on 0.7.5 has no way to read a remote agent before driving
       // it — which is the whole point of the command.
       expect(adsmVersionMeets('0.7.5', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.6', kRequiredAdsmVersion), isTrue);
+      // 0.7.7 makes `archon goals` look past this host. The command and the
+      // skill that explains it both live in the archon package, so a host
+      // left on 0.7.6 keeps reporting no managed agents however many the
+      // user has switched on in the app.
+      expect(adsmVersionMeets('0.7.6', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.7', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -48,7 +53,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.6');
+      expect(kRequiredAdsmVersion, '0.7.7');
     });
   });
 }

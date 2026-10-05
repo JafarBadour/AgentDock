@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:agentplantation/data/local/app_database.dart';
 import 'package:agentplantation/data/models/agent_provider.dart';
+import 'package:agentplantation/data/models/archon_brief.dart';
 import 'package:agentplantation/data/models/chat.dart';
 import 'package:agentplantation/data/models/chat_message.dart';
 import 'package:agentplantation/data/models/host.dart';
@@ -185,6 +186,36 @@ void main() {
     expect(answer['ok'], isTrue);
     final hosts = (answer['result'] as Map)['hosts'] as List;
     expect(hosts.map((h) => (h as Map)['hostId']), containsAll(['a', 'b']));
+  });
+
+  test('remote agents carry the goal the user set in the app', () async {
+    // The toggle and goal live in the app's own store; Archon reads agent
+    // records on its host, which never carry them. The relay is the only
+    // place the two meet, so without this Archon sees no managed agents.
+    await db.saveArchonBrief(
+      ArchonBrief(
+        chatId: 'chat-b',
+        enabled: true,
+        goal: 'verify his results and rerun the experiments',
+        updatedAt: DateTime.utc(2026, 10, 6),
+      ),
+    );
+    await startRelay();
+    archonChannel.push(_request('relay-g1', 'agents'));
+
+    final answer = await reply();
+    final agents = (answer['result'] as Map)['agents'] as List;
+    final b = agents.firstWhere((a) => (a as Map)['chatId'] == 'chat-b') as Map;
+    expect(b['managed'], isTrue);
+    expect(b['goal'], 'verify his results and rerun the experiments');
+    expect(b['effectiveGoal'], 'verify his results and rerun the experiments');
+
+    // An agent nobody switched on is still listed, just not managed.
+    final a = agents.firstWhere((x) => (x as Map)['chatId'] == 'chat-a') as Map;
+    expect(a['managed'], isFalse);
+    expect(a['goal'], isNull);
+    // Without a goal of its own it still has something to work toward.
+    expect(a['effectiveGoal'], ArchonBrief.defaultGoal);
   });
 
   test('reads a remote agent live from the host it lives on', () async {

@@ -5,6 +5,7 @@ import 'package:uuid/uuid.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/agent_provider.dart';
+import '../data/models/archon_brief.dart';
 import '../data/models/archon_chat.dart';
 import '../data/models/chat.dart';
 import '../data/models/host.dart';
@@ -264,6 +265,11 @@ class ArchonRelayService {
     final hosts = await _db.listHosts();
     final repos = {for (final r in await _db.listRepos()) r.id: r};
     final chats = await _db.listAllChats();
+    // The user switches agents on and sets goals in the app, and that was
+    // only ever written to the app's own store — so Archon, reading agent
+    // records on its host, saw no managed agents and no goals at all. The
+    // relay is the only place the two sides meet.
+    final briefs = await _db.archonBriefs();
 
     final agents = <Map<String, Object?>>[];
     final unreachable = <Map<String, Object?>>[];
@@ -282,7 +288,9 @@ class ArchonRelayService {
       for (final chat in chats) {
         final repo = repos[chat.repoId];
         if (repo == null || repo.hostId != host.id) continue;
-        agents.add(_agentEntry(host, chat, repo, live.remove(chat.id)));
+        agents.add(
+          _agentEntry(host, chat, repo, live.remove(chat.id), briefs[chat.id]),
+        );
       }
       // Started on the host itself, or on a device this one has not synced
       // with — Archon can still reach it, so it belongs in the list.
@@ -308,6 +316,7 @@ class ArchonRelayService {
     Chat chat,
     Repo repo,
     Map<String, dynamic>? live,
+    ArchonBrief? brief,
   ) => {
     'hostId': host.id,
     'host': host.displayLabel,
@@ -323,6 +332,12 @@ class ArchonRelayService {
     if (live?['lastError'] != null) 'lastError': live?['lastError'].toString(),
     'updatedAt': chat.updatedAt.toIso8601String(),
     'isArchon': chat.id == kArchonChatId,
+    // Named the same as the host directory's fields so an agent reads the
+    // same whether Archon found it here or on its own host.
+    'managed': brief?.isActive ?? false,
+    'goal': brief?.hasGoal ?? false ? brief!.goal!.trim() : null,
+    'effectiveGoal': brief?.effectiveGoal ?? ArchonBrief.defaultGoal,
+    if (brief?.note != null) 'note': brief!.note,
   };
 
   /// Live worker snapshots on [host], keyed by chat id.

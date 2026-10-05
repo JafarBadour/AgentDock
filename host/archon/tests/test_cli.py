@@ -52,8 +52,43 @@ class ArchonCliTest(unittest.TestCase):
                     archon_managed=True, archon_goal="ship")
         # "c" has no goal, which is allowed — it gets the default.
         self._agent("c", title="Idle", permission_ask=False, archon_managed=True)
-        titles = [e["title"] for e in self.run_cli(["goals"])]
+        got = self.run_cli(["goals"])
+        titles = [e["title"] for e in got["here"]]
         self.assertEqual({"Build", "Idle"}, set(titles))
+
+    def test_goals_says_when_it_could_not_check_the_other_hosts(self) -> None:
+        # No app here, so `elsewhere` is unknown rather than empty. Reporting
+        # it as empty would tell the user there is nothing to do when the
+        # truth is that Archon could not look.
+        self._agent("a", title="Build", permission_ask=False,
+                    archon_managed=True, archon_goal="green CI")
+        got = self.run_cli(["goals"])
+        self.assertEqual([], got["elsewhere"])
+        self.assertIn("routeError", got)
+
+    def test_goals_includes_agents_the_app_manages_on_other_hosts(self) -> None:
+        # The user switches an agent on in the app; that never reaches this
+        # host's records, so without the relay `goals` reads empty even
+        # straight after they set a goal.
+        self._agent("a", title="Build", permission_ask=False,
+                    archon_managed=True, archon_goal="green CI")
+        answer = {
+            "ok": True,
+            "result": {
+                "agents": [
+                    {"chatId": "far", "title": "diegoRl2Grid", "hostId": "h2",
+                     "managed": True, "goal": "verify his results"},
+                    {"chatId": "idle", "title": "Idle", "managed": False},
+                    # Already in `here`; the app's copy must not double it up.
+                    {"chatId": "a", "title": "Build", "managed": True},
+                ]
+            },
+        }
+        with mock.patch.object(self.cli, "relay", return_value=answer):
+            got = self.run_cli(["goals"])
+        self.assertEqual(["Build"], [e["title"] for e in got["here"]])
+        self.assertEqual(["diegoRl2Grid"], [e["title"] for e in got["elsewhere"]])
+        self.assertNotIn("routeError", got)
 
     def test_blocked_says_why_and_how_to_unblock(self) -> None:
         self._agent("b", title="Deploy", permission_ask=True,
@@ -68,7 +103,7 @@ class ArchonCliTest(unittest.TestCase):
         done = self.run_cli(["done", "a", "CI green since 14:02."])
         self.assertFalse(done["managed"])
         self.assertEqual("CI green since 14:02.", done["note"])
-        self.assertEqual([], self.run_cli(["goals"]))
+        self.assertEqual([], self.run_cli(["goals"])["here"])
 
     def test_done_on_a_missing_agent_reports_failure(self) -> None:
         self.assertEqual(1, self.cli.main(["done", "nope", "x"]))

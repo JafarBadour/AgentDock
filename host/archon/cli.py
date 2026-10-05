@@ -317,7 +317,33 @@ def _run(argv: Optional[list[str]] = None) -> int:
         return 1
 
     if args.cmd == "goals":
-        _print(directory.describe(directory.manageable(directory.load_records())))
+        # The user switches agents on in the app, which stores that in the app
+        # — not in the agent records on this host. So reading records alone
+        # reported "no managed agents" even right after the user set a goal,
+        # and an agent on another host could never appear here at all.
+        here = directory.describe(
+            directory.manageable(directory.load_records())
+        )
+        elsewhere: list[dict[str, Any]] = []
+        route_error: Optional[str] = None
+        answer = relay("agents", timeout=20.0)
+        if answer.get("ok"):
+            for entry in (answer.get("result") or {}).get("agents") or []:
+                if not entry.get("managed"):
+                    continue
+                # An agent on this host is already in `here`, with the
+                # permission gate applied; the app's copy would duplicate it.
+                if any(e.get("chatId") == entry.get("chatId") for e in here):
+                    continue
+                elsewhere.append(entry)
+        else:
+            # No app, no answer about other hosts — say so rather than imply
+            # there is nothing to do.
+            route_error = answer.get("message") or answer.get("error")
+        out: dict[str, Any] = {"here": here, "elsewhere": elsewhere}
+        if route_error:
+            out["routeError"] = route_error
+        _print(out)
         return 0
 
     if args.cmd == "blocked":
