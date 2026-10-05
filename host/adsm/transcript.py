@@ -23,6 +23,12 @@ def ensure_messages_dir() -> None:
     messages_dir().mkdir(parents=True, exist_ok=True)
 
 
+# How far back `upsert_messages` looks for a repeated body. Matches the
+# `duplicateWindow` floor in app_database.dart so both sides agree on what
+# counts as the same turn arriving twice.
+_DUPLICATE_WINDOW = 1_800
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -173,9 +179,27 @@ def append_message(
 
 
 def upsert_messages(chat_id: str, messages: list[dict[str, Any]]) -> int:
-    """Merge [messages] into the host file (id keyed, longer body wins)."""
+    """Merge [messages] into the host file (id keyed, longer body wins).
+
+    Keying on id alone was not enough. A device that stores a streamed
+    segment under a locally minted id pushes a row the host already holds
+    under its own deterministic id, so every sync appended another copy of
+    the history — in one real chat 3742 of 6418 rows were re-imports, which
+    then crowded the user's turns out of the replayed context window. Repeat
+    bodies are therefore dropped the way `mergeMessages` already drops them
+    on the device, within the same bounded window so a genuine repeat later
+    in a long chat still lands.
+    """
     ensure_messages_dir()
-    existing = {m["id"]: m for m in list_messages(chat_id)}
+    current = list_messages(chat_id)
+    existing = {m["id"]: m for m in current}
+    # User turns carry a stable id minted once, and "yes"/"go on" recur in
+    # normal use, so only agent-side rows are matched by body.
+    recent_bodies = {
+        (m["role"], m["content"])
+        for m in current[-_DUPLICATE_WINDOW:]
+        if m["role"] != "user"
+    }
     changed = 0
     for raw in messages:
         if not isinstance(raw, dict):
@@ -185,6 +209,11 @@ def upsert_messages(chat_id: str, messages: list[dict[str, Any]]) -> int:
             continue
         prev = existing.get(row["id"])
         if prev is None:
+            body = (row["role"], row["content"])
+            if row["role"] != "user":
+                if body in recent_bodies:
+                    continue
+                recent_bodies.add(body)
             existing[row["id"]] = row
             changed += 1
         elif len(row["content"]) > len(prev["content"]):

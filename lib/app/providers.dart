@@ -502,6 +502,13 @@ class ActiveAcpSessions extends StateNotifier<Map<String, ChatSessionRuntime>> {
         }),
         eagerError: false,
       );
+      // The outbound queue drains on focus, reconnect and turn_complete. A
+      // prompt the host refused because a turn was already running can miss
+      // all three and then sit there looking sent, so re-check every sweep
+      // now that statuses are fresh.
+      for (final runtime in state.values) {
+        runtime.retryPendingOutbound();
+      }
     } catch (e) {
       SafeLog.d('ADSM status poll sweep failed', e);
     } finally {

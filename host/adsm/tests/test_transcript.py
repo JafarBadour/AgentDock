@@ -166,6 +166,98 @@ class TranscriptStoreTest(unittest.TestCase):
             "already long body here",
         )
 
+    def test_upsert_rejects_the_same_body_under_a_fresh_id(self) -> None:
+        # A device that stored the segment under its own id pushes it back.
+        # Keyed on id alone this appended a second copy on every sync.
+        self.transcript.append_message(
+            self.chat_id,
+            role="assistant",
+            content="Running the tests now:",
+            message_id="host-id",
+            created_at="2026-01-01T10:00:00+00:00",
+        )
+        changed = self.transcript.upsert_messages(
+            self.chat_id,
+            [
+                {
+                    "id": "device-id",
+                    "role": "assistant",
+                    "content": "Running the tests now:",
+                    "created_at": "2026-01-01T10:00:01+00:00",
+                }
+            ],
+        )
+        self.assertEqual(changed, 0)
+        self.assertEqual(1, len(self.transcript.list_messages(self.chat_id)))
+
+    def test_upsert_collapses_a_re_imported_history(self) -> None:
+        batch = [
+            {
+                "id": f"orig-{i}",
+                "role": "assistant",
+                "content": f"segment {i}",
+                "created_at": f"2026-01-01T10:00:{i:02d}+00:00",
+            }
+            for i in range(20)
+        ]
+        self.transcript.upsert_messages(self.chat_id, batch)
+        # Same history, fresh ids and fresh timestamps — a bulk re-import.
+        again = [
+            {**row, "id": f"reimport-{i}", "created_at": "2026-02-02T09:00:00+00:00"}
+            for i, row in enumerate(batch)
+        ]
+        changed = self.transcript.upsert_messages(self.chat_id, again)
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(20, len(self.transcript.list_messages(self.chat_id)))
+
+    def test_upsert_keeps_a_repeated_user_turn(self) -> None:
+        # "yes" twice is two real turns, not a re-import.
+        changed = self.transcript.upsert_messages(
+            self.chat_id,
+            [
+                {
+                    "id": "u1",
+                    "role": "user",
+                    "content": "yes",
+                    "created_at": "2026-01-01T10:00:00+00:00",
+                },
+                {
+                    "id": "u2",
+                    "role": "user",
+                    "content": "yes",
+                    "created_at": "2026-01-01T10:05:00+00:00",
+                },
+            ],
+        )
+        self.assertEqual(changed, 2)
+        self.assertEqual(2, len(self.transcript.list_messages(self.chat_id)))
+
+    def test_upsert_still_accepts_genuinely_new_agent_rows(self) -> None:
+        self.transcript.append_message(
+            self.chat_id,
+            role="assistant",
+            content="first",
+            message_id="a1",
+            created_at="2026-01-01T10:00:00+00:00",
+        )
+        changed = self.transcript.upsert_messages(
+            self.chat_id,
+            [
+                {
+                    "id": "a2",
+                    "role": "assistant",
+                    "content": "second",
+                    "created_at": "2026-01-01T10:00:01+00:00",
+                }
+            ],
+        )
+        self.assertEqual(changed, 1)
+        self.assertEqual(
+            ["first", "second"],
+            [m["content"] for m in self.transcript.list_messages(self.chat_id)],
+        )
+
     def test_clear_messages(self) -> None:
         self.transcript.append_message(
             self.chat_id, role="user", content="bye", message_id="u1"

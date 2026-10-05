@@ -117,6 +117,15 @@ def _uses_config_options(provider: str) -> bool:
 
 _CODEX_EFFORT_ATTR = "effort"
 
+# History replayed into a fresh ACP session (see _history_bootstrap_prompt).
+# The cap is the byte budget; the message count is only a sanity ceiling. A
+# flat 40-message cap used to fill the window with short assistant preambles
+# and leave 85% of the budget unspent.
+_BOOTSTRAP_BUDGET = 28_000
+_BOOTSTRAP_MAX_MESSAGES = 200
+_BOOTSTRAP_MAX_CHARS_PER_MESSAGE = 6_000
+_BOOTSTRAP_MIN_USER_TURNS = 6
+
 
 def _config_option(config_options: Any, opt_id: str) -> Optional[dict[str, Any]]:
     if not isinstance(config_options, list):
@@ -1640,9 +1649,13 @@ class Worker:
         rows = transcript_store.list_messages(self.chat_id)
         if not rows:
             return ""
-        budget = 28_000
-        used = 0
-        picked: list[dict[str, Any]] = []
+        # Newest-first, deduped. One streamed segment is one row, so a chat
+        # can hold fifty assistant rows for every user turn; re-imports add
+        # the same turn again under a fresh id. Both used to crowd the user
+        # out of the window, and the agent then answered its own old chatter
+        # instead of the message it had just been sent.
+        eligible: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
         for row in reversed(rows):
             mid = str(row.get("id") or "")
             if exclude_message_id and mid == exclude_message_id:
@@ -1653,24 +1666,66 @@ class Worker:
             content = str(row.get("content") or "").strip()
             if not content:
                 continue
-            if len(content) > 6_000:
-                content = content[:6_000].rstrip() + "\n…(truncated)"
-            chunk_len = len(content) + 16
-            if used + chunk_len > budget and picked:
-                break
-            picked.append(
-                {"role": role, "content": content}
-            )
-            used += chunk_len
-            if len(picked) >= 40:
-                break
-        picked.reverse()
-        if not picked:
+            key = (role, content)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(content) > _BOOTSTRAP_MAX_CHARS_PER_MESSAGE:
+                content = (
+                    content[:_BOOTSTRAP_MAX_CHARS_PER_MESSAGE].rstrip()
+                    + "\n…(truncated)"
+                )
+            eligible.append((role, content))
+        if not eligible:
             return ""
+
+        used = 0
+        taken: dict[int, tuple[str, str]] = {}
+
+        def _take(pos: int) -> bool:
+            """Claim eligible[pos] if it fits. False once the budget is full."""
+            nonlocal used
+            if pos in taken:
+                return True
+            role, content = eligible[pos]
+            cost = len(content) + 16
+            if taken and used + cost > _BOOTSTRAP_BUDGET:
+                return False
+            taken[pos] = (role, content)
+            used += cost
+            return True
+
+        # The user's own turns are the anchor, so reserve them before the
+        # recent window spends the budget on assistant rows.
+        quota = _BOOTSTRAP_MIN_USER_TURNS
+        for pos, (role, _) in enumerate(eligible):
+            if quota == 0:
+                break
+            if role != "user":
+                continue
+            if not _take(pos):
+                break
+            quota -= 1
+        for pos in range(len(eligible)):
+            if len(taken) >= _BOOTSTRAP_MAX_MESSAGES:
+                break
+            if not _take(pos):
+                break
+        if not taken:
+            return ""
+
         lines = []
-        for row in picked:
-            label = "User" if row["role"] == "user" else "Assistant"
-            lines.append(f"{label}:\n{row['content']}")
+        prev: Optional[int] = None
+        # eligible is newest-first; render oldest-first.
+        for pos in sorted(taken, reverse=True):
+            if prev is not None and pos != prev - 1:
+                # A reserved user turn from further back — say so, so the
+                # agent does not read it as the immediately preceding turn.
+                lines.append("…")
+            role, content = taken[pos]
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"{label}:\n{content}")
+            prev = pos
         body = "\n\n".join(lines)
         if self._take_fork_marker():
             preamble = (

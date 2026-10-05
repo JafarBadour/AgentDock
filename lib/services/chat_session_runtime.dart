@@ -778,6 +778,28 @@ class ChatSessionRuntime extends ChangeNotifier {
     _notifyUi(immediate: true);
   }
 
+  /// True when a queued prompt is waiting and nothing is in the way.
+  ///
+  /// The host refuses a prompt while a turn is running, so a message sent
+  /// mid-turn lands back on the queue. Every other drain point fires on an
+  /// event — focus, reconnect, turn_complete — and a message that misses all
+  /// of them used to sit queued indefinitely while the chat looked sent.
+  bool get hasUndeliveredOutbound =>
+      !_disposed &&
+      !closed &&
+      !reconnecting &&
+      !promptInFlight &&
+      !remoteTurnActive &&
+      !sendingToHost &&
+      outboundQueue.isNotEmpty;
+
+  /// Periodic safety net for [hasUndeliveredOutbound]; see the status sweep.
+  void retryPendingOutbound() {
+    if (!hasUndeliveredOutbound) return;
+    SafeLog.d('retrying ${outboundQueue.length} queued message(s) for $chatId');
+    resumeOutboundQueue();
+  }
+
   /// If the agent is idle and work is waiting, start the next queued prompt.
   void resumeOutboundQueue() {
     if (_disposed || closed || promptInFlight || outboundQueue.isEmpty) return;
