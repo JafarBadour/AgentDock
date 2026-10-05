@@ -60,8 +60,16 @@ one it can see:
 ```bash
 archon remote routes                        # can anything route for me now?
 archon remote agents                        # agents on every host the app sees
+archon remote read <hostId> <chatId>        # what that agent has been doing
 archon remote prompt <hostId> <chatId> "…"  # send an agent work
 ```
+
+Plain `archon read` only ever asks this host's daemon, so it comes back empty
+for a chat that lives somewhere else. Use `remote read` for those, and read
+before you prompt: taking a chat over without seeing it is sending into the
+dark. The answer carries `source` — `host` is the live transcript, `app` is
+the copy the app had synced, which may lag. Say which one you are working
+from when it matters.
 
 These only work while an app is open. `{"error": "no_app"}` means the user's
 app is closed — that is normal, not a fault. Do what you can on this host, and

@@ -172,6 +172,15 @@ class ActionLogTest(unittest.TestCase):
         self.assertEqual("remote prompt", entry["command"])
         self.assertEqual("hostB/c9", entry["target"])
 
+    def test_remote_read_names_the_agent_it_went_to_look_at(self) -> None:
+        # Plain `read` asks this host's daemon, which holds nothing for a chat
+        # living elsewhere — so taking a remote chat over meant prompting
+        # blind until `remote read` existed.
+        self.run_cli(["remote", "read", "hostB", "c9", "--tail", "5"])
+        entry = self._log()[0]
+        self.assertEqual("remote read", entry["command"])
+        self.assertEqual("hostB/c9", entry["target"])
+
     def test_the_log_is_newest_first(self) -> None:
         self._agent("a", title="Build", permission_ask=False)
         self.run_cli(["remember", "user", "first"])

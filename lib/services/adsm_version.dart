@@ -2,7 +2,7 @@
 ///
 /// Keep in sync with `host/adsm/protocol.py` `VERSION`. On connect, AgentPlantation
 /// upgrades the remote daemon when the host is older than this.
-const String kRequiredAdsmVersion = '0.7.5';
+const String kRequiredAdsmVersion = '0.7.6';
 
 /// Compare dotted versions (`1.2.3`). Returns negative / zero / positive like
 /// `Comparable.compare`. Missing / empty versions sort as older than anything.

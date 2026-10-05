@@ -204,6 +204,12 @@ def _run(argv: Optional[list[str]] = None) -> int:
     remote_sub = p_remote.add_subparsers(dest="remote_cmd", required=True)
     remote_sub.add_parser("agents", help="Agents on every host the app sees")
     remote_sub.add_parser("routes", help="Whether any app can route for me")
+    p_rread = remote_sub.add_parser(
+        "read", help="An agent's recent transcript, on any host"
+    )
+    p_rread.add_argument("host_id")
+    p_rread.add_argument("chat_id")
+    p_rread.add_argument("--tail", type=int, default=40)
     p_rprompt = remote_sub.add_parser("prompt", help="Send an agent work")
     p_rprompt.add_argument("host_id")
     p_rprompt.add_argument("chat_id")
@@ -273,6 +279,24 @@ def _run(argv: Optional[list[str]] = None) -> int:
             return 0
         if args.remote_cmd == "agents":
             answer = relay("agents")
+            _print(answer)
+            return 0 if answer.get("ok") else 1
+        if args.remote_cmd == "read":
+            # `read` asks this host's daemon, which holds nothing for a chat
+            # that lives elsewhere. Going through the app is the only way to
+            # see a remote agent's work before taking it over.
+            answer = relay(
+                "read",
+                {
+                    "hostId": args.host_id,
+                    "chatId": args.chat_id,
+                    "limit": args.tail,
+                },
+            )
+            _detail(
+                target=f"{args.host_id}/{args.chat_id}",
+                summary=f"last {args.tail}",
+            )
             _print(answer)
             return 0 if answer.get("ok") else 1
         if args.remote_cmd == "prompt":

@@ -85,7 +85,7 @@ void main() {
   /// then reported "no route", which reads as "no app is connected" rather
   /// than "this host is stale".
   const methodsByVersion = <String, List<String>>{
-    '0.7.5': [
+    '0.7.6': [
       'agents.delete',
       'agents.ensure',
       'agents.list',

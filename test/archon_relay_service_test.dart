@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:agentplantation/data/local/app_database.dart';
 import 'package:agentplantation/data/models/agent_provider.dart';
 import 'package:agentplantation/data/models/chat.dart';
+import 'package:agentplantation/data/models/chat_message.dart';
 import 'package:agentplantation/data/models/host.dart';
 import 'package:agentplantation/data/models/repo.dart';
 import 'package:agentplantation/services/archon_relay_service.dart';
@@ -184,6 +185,99 @@ void main() {
     expect(answer['ok'], isTrue);
     final hosts = (answer['result'] as Map)['hosts'] as List;
     expect(hosts.map((h) => (h as Map)['hostId']), containsAll(['a', 'b']));
+  });
+
+  test('reads a remote agent live from the host it lives on', () async {
+    final hostB = _FakeChannel();
+    channels['b'] = hostB;
+    hostB.handlers['transcript.pull'] = (params) async => {
+      'messages': [
+        {
+          'id': 'm1',
+          'role': 'user',
+          'content': 'run wave 2',
+          'createdAt': '2026-10-05T23:40:00Z',
+        },
+        {
+          'id': 'm2',
+          'role': 'assistant',
+          'content': 'queued tier 2',
+          'createdAt': '2026-10-05T23:41:00Z',
+        },
+      ],
+    };
+    await startRelay();
+    archonChannel.push(
+      _request('relay-r1', 'read', {'hostId': 'b', 'chatId': 'chat-b'}),
+    );
+
+    final answer = await reply();
+    expect(answer['ok'], isTrue);
+    final result = answer['result'] as Map;
+    expect(result['source'], 'host');
+    expect(result['hostId'], 'b');
+    expect(result['count'], 2);
+    final messages = result['messages'] as List;
+    expect((messages.first as Map)['text'], 'run wave 2');
+    expect((messages.last as Map)['role'], 'assistant');
+    // The host decides the slice, so the limit has to reach it.
+    expect(hostB.paramsFor('transcript.pull').single['chatId'], 'chat-b');
+  });
+
+  test('falls back to the app copy when the host cannot be reached', () async {
+    // chat-b lives on host b, which has no channel in this test.
+    await db.insertMessage(
+      ChatMessage(
+        id: 'local-1',
+        chatId: 'chat-b',
+        role: MessageRole.assistant,
+        content: 'what the app last synced',
+        createdAt: DateTime.utc(2026, 10, 5, 23, 30),
+      ),
+    );
+    await startRelay();
+    archonChannel.push(
+      _request('relay-r2', 'read', {'hostId': 'b', 'chatId': 'chat-b'}),
+    );
+
+    final answer = await reply();
+    // A sleeping host should cost staleness, not the whole answer.
+    expect(answer['ok'], isTrue);
+    final result = answer['result'] as Map;
+    expect(result['source'], 'app');
+    expect(result['staleBecause'], isNotNull);
+    expect((result['messages'] as List).single, containsPair(
+      'text',
+      'what the app last synced',
+    ));
+  });
+
+  test('finds the host from the chat when Archon names the wrong one', () async {
+    final hostB = _FakeChannel();
+    channels['b'] = hostB;
+    hostB.handlers['transcript.pull'] = (params) async => {
+      'messages': [
+        {'id': 'm1', 'role': 'assistant', 'content': 'here'},
+      ],
+    };
+    await startRelay();
+    // Archon knows the chat but guesses a host id that does not exist.
+    archonChannel.push(
+      _request('relay-r3', 'read', {'hostId': 'nope', 'chatId': 'chat-b'}),
+    );
+
+    final answer = await reply();
+    expect(answer['ok'], isTrue);
+    expect((answer['result'] as Map)['hostId'], 'b');
+  });
+
+  test('a read without a chatId is refused, not guessed at', () async {
+    await startRelay();
+    archonChannel.push(_request('relay-r4', 'read', {'hostId': 'b'}));
+
+    final answer = await reply();
+    expect(answer['ok'], isFalse);
+    expect(answer['error'], 'bad_request');
   });
 
   test(

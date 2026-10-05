@@ -228,6 +228,8 @@ class ArchonRelayService {
         return _routes();
       case 'agents':
         return _agents();
+      case 'read':
+        return _read(payload);
       case 'prompt':
         return _prompt(payload);
       default:
@@ -235,7 +237,8 @@ class ArchonRelayService {
         // Archon can pick another way round instead of waiting a minute.
         throw _RelayRefusal(
           'unknown_action',
-          'This app cannot do "$action". It can do: routes, agents, prompt.',
+          'This app cannot do "$action". '
+          'It can do: routes, agents, read, prompt.',
         );
     }
   }
@@ -366,13 +369,7 @@ class ArchonRelayService {
     }
 
     final chat = await _db.getChat(chatId);
-    var host = hostId.isEmpty ? null : await _db.getHost(hostId);
-    if (host == null && chat != null) {
-      // Archon may know the chat but guess the host id wrong; the chat's own
-      // repo is authoritative and saves a pointless round trip.
-      final repo = await _db.getRepo(chat.repoId);
-      if (repo != null) host = await _db.getHost(repo.hostId);
-    }
+    final host = await _hostFor(hostId, chat);
     if (host == null) {
       throw _RelayRefusal(
         'unknown_host',
@@ -418,6 +415,115 @@ class ArchonRelayService {
       'messageId': messageId,
       'delivered': true,
     };
+  }
+
+  /// The host a chat actually lives on.
+  ///
+  /// Archon may know the chat but guess the host id wrong; the chat's own repo
+  /// is authoritative and saves a pointless round trip.
+  Future<Host?> _hostFor(String hostId, Chat? chat) async {
+    final named = hostId.isEmpty ? null : await _db.getHost(hostId);
+    if (named != null) return named;
+    if (chat == null) return null;
+    final repo = await _db.getRepo(chat.repoId);
+    return repo == null ? null : await _db.getHost(repo.hostId);
+  }
+
+  /// An agent's recent transcript, from whichever host it lives on.
+  ///
+  /// Archon could already send a remote agent work but had no way to see what
+  /// came back, so taking a chat over meant prompting into the dark — `archon
+  /// read` only ever asked the daemon Archon itself runs on, which holds
+  /// nothing for a chat on another host.
+  ///
+  /// The live pull wins; the app's own synced copy is the fallback, so a host
+  /// that is asleep costs staleness rather than the whole answer. `source`
+  /// always says which one it got: acting on a stale transcript is a different
+  /// risk from acting on a live one, and Archon should be able to tell.
+  Future<Object?> _read(Map<String, dynamic> payload) async {
+    final chatId = payload['chatId']?.toString() ?? '';
+    if (chatId.isEmpty) {
+      throw const _RelayRefusal('bad_request', 'A read needs a chatId.');
+    }
+    final limit = (int.tryParse('${payload['limit'] ?? ''}') ?? 40).clamp(
+      1,
+      400,
+    );
+
+    final chat = await _db.getChat(chatId);
+    final host = await _hostFor(payload['hostId']?.toString() ?? '', chat);
+    if (host == null) {
+      throw _RelayRefusal(
+        'unknown_host',
+        'This app does not know which host chat $chatId lives on.',
+      );
+    }
+
+    Map<String, Object?> envelope(String source, int count) => {
+      'hostId': host.id,
+      'host': host.displayLabel,
+      'chatId': chatId,
+      'title': chat?.title,
+      'source': source,
+      'count': count,
+    };
+
+    String? stale;
+    try {
+      final channel = await _open(host).timeout(_perHostTimeout);
+      try {
+        final result = await channel.request('transcript.pull', {
+          'chatId': chatId,
+          'limit': limit,
+        }, timeout: _perHostTimeout);
+        final messages = _transcriptRows(result['messages']);
+        if (messages.isNotEmpty) {
+          return {...envelope('host', messages.length), 'messages': messages};
+        }
+        // Reaching the host and finding nothing is a real answer about the
+        // host, not a failure — but the app may still hold the history, so
+        // it is worth looking before reporting an empty chat.
+        stale = 'the host has no stored transcript for that chat';
+      } finally {
+        await _release(host, channel);
+      }
+    } catch (e) {
+      SafeLog.d('archon relay read ${host.alias} live pull failed', e);
+      stale = SafeLog.redact('$e');
+    }
+
+    final local = await _db.listRecentMessages(chatId, limit: limit);
+    return {
+      ...envelope('app', local.length),
+      'staleBecause': stale,
+      'messages': [
+        for (final m in local)
+          {
+            'id': m.id,
+            'role': m.role.name,
+            'text': m.content,
+            'createdAt': m.createdAt.toUtc().toIso8601String(),
+          },
+      ],
+    };
+  }
+
+  /// Normalise a host transcript into the shape Archon reads, so a live pull
+  /// and the app's own copy are indistinguishable to whatever consumes them.
+  List<Map<String, Object?>> _transcriptRows(Object? raw) {
+    if (raw is! List) return const [];
+    final out = <Map<String, Object?>>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final row = Map<String, dynamic>.from(item);
+      out.add({
+        'id': row['id']?.toString(),
+        'role': row['role']?.toString(),
+        'text': (row['content'] ?? row['text'])?.toString(),
+        'createdAt': (row['createdAt'] ?? row['created_at'])?.toString(),
+      });
+    }
+    return out;
   }
 
   /// True when the host refused because no worker exists for the chat yet.

@@ -32,7 +32,12 @@ void main() {
       // re-imports duplicating the transcript. A host left on 0.7.4 keeps
       // answering its own old output instead of the message just sent.
       expect(adsmVersionMeets('0.7.4', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.5', kRequiredAdsmVersion), isTrue);
+      // 0.7.6 adds `archon remote read`. The command lives in the archon
+      // package on the host, which rides the same version-gated upload, so a
+      // host left on 0.7.5 has no way to read a remote agent before driving
+      // it — which is the whole point of the command.
+      expect(adsmVersionMeets('0.7.5', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.6', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -43,7 +48,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.5');
+      expect(kRequiredAdsmVersion, '0.7.6');
     });
   });
 }
