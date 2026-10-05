@@ -210,6 +210,14 @@ def _run(argv: Optional[list[str]] = None) -> int:
     p_rread.add_argument("host_id")
     p_rread.add_argument("chat_id")
     p_rread.add_argument("--tail", type=int, default=40)
+    for name, blurb in (
+        ("connect", "Bring a host's ADSM up, installing it if stale"),
+        ("reconnect", "Soft reconnect — never restarts a busy daemon"),
+        ("forceconnect", "Stop a wedged daemon and bring it back up"),
+        ("adsm-off", "Stop a host's ADSM and leave it off"),
+    ):
+        p_host = remote_sub.add_parser(name, help=blurb)
+        p_host.add_argument("host_id")
     p_rprompt = remote_sub.add_parser("prompt", help="Send an agent work")
     p_rprompt.add_argument("host_id")
     p_rprompt.add_argument("chat_id")
@@ -279,6 +287,20 @@ def _run(argv: Optional[list[str]] = None) -> int:
             return 0
         if args.remote_cmd == "agents":
             answer = relay("agents")
+            _print(answer)
+            return 0 if answer.get("ok") else 1
+        if args.remote_cmd in ("connect", "reconnect", "forceconnect",
+                               "adsm-off"):
+            # Host-level work is the user's machine, not an agent's chat, so
+            # it is always logged: they should be able to see that Archon
+            # restarted something without being asked.
+            answer = relay(
+                args.remote_cmd, {"hostId": args.host_id}, timeout=180.0
+            )
+            _detail(
+                target=args.host_id,
+                summary=(answer.get("message") or args.remote_cmd),
+            )
             _print(answer)
             return 0 if answer.get("ok") else 1
         if args.remote_cmd == "read":

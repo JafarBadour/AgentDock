@@ -216,6 +216,19 @@ class ActionLogTest(unittest.TestCase):
         self.assertEqual("remote read", entry["command"])
         self.assertEqual("hostB/c9", entry["target"])
 
+    def test_host_level_work_is_always_logged(self) -> None:
+        # Restarting the user's daemon is their machine, not an agent's chat.
+        # It must never be possible to do it without them being able to see.
+        for cmd in ("connect", "reconnect", "forceconnect", "adsm-off"):
+            self.cli.main(["remote", cmd, "hostB"])
+        commands = [e["command"] for e in self._log()]
+        self.assertEqual(
+            {"remote connect", "remote reconnect", "remote forceconnect",
+             "remote adsm-off"},
+            set(commands),
+        )
+        self.assertEqual("hostB", self._log()[0]["target"])
+
     def test_the_log_is_newest_first(self) -> None:
         self._agent("a", title="Build", permission_ask=False)
         self.run_cli(["remember", "user", "first"])

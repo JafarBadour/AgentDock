@@ -62,7 +62,23 @@ archon remote routes                        # can anything route for me now?
 archon remote agents                        # agents on every host the app sees
 archon remote read <hostId> <chatId>        # what that agent has been doing
 archon remote prompt <hostId> <chatId> "…"  # send an agent work
+
+archon remote connect <hostId>              # bring its ADSM up, install if stale
+archon remote reconnect <hostId>            # soft: never restarts a busy daemon
+archon remote forceconnect <hostId>         # wedged: stop it, then bring it back
+archon remote adsm-off <hostId>             # stop its ADSM and leave it off
 ```
+
+A host that is down is yours to fix now rather than something to wait on the
+user for. Reach for `reconnect` first — it will not restart a daemon that other
+agents are working through. Use `forceconnect` only when a host is genuinely
+wedged, because it stops the daemon and every live agent on that host with it,
+and `adsm-off` only when the user has asked for the host to go quiet. These
+four are always written to your action log: the user should be able to see that
+you restarted their machine's daemon without being asked.
+
+You cannot stop or force the host you are running on — that daemon is what
+carries these calls, so you would cut your own line. Ask the user instead.
 
 Plain `archon read` only ever asks this host's daemon, so it comes back empty
 for a chat that lives somewhere else. Use `remote read` for those, and read
