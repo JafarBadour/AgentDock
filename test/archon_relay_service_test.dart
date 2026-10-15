@@ -112,6 +112,7 @@ void main() {
   late Map<String, _FakeChannel> channels;
   late _FakeChannel archonChannel;
   late List<(Host, Chat)> prepared;
+  late List<String> hostOps;
 
   /// Hosts a and b, each with one repo and one chat; only a is reachable
   /// unless a test adds b to [channels].
@@ -135,6 +136,7 @@ void main() {
     archonChannel = _FakeChannel();
     channels = {'a': archonChannel};
     prepared = [];
+    hostOps = [];
     addTearDown(() {
       for (final c in channels.values) {
         c.dispose();
@@ -145,6 +147,7 @@ void main() {
   Future<ArchonRelayService> startRelay({
     Duration actionBudget = const Duration(seconds: 45),
     bool withPrepare = true,
+    bool withHostControl = true,
   }) async {
     final service = ArchonRelayService(
       db: db,
@@ -156,6 +159,13 @@ void main() {
       },
       prepareChat: withPrepare
           ? (host, chat) async => prepared.add((host, chat))
+          : null,
+      ensureHost: withHostControl
+          ? (host, {required bool upgrade, bool force = false}) async =>
+                hostOps.add('ensure:${host.id}:upgrade=$upgrade:force=$force')
+          : null,
+      stopHost: withHostControl
+          ? (host) async => hostOps.add('stop:${host.id}')
           : null,
       actionBudget: actionBudget,
     );
@@ -186,6 +196,84 @@ void main() {
     expect(answer['ok'], isTrue);
     final hosts = (answer['result'] as Map)['hosts'] as List;
     expect(hosts.map((h) => (h as Map)['hostId']), containsAll(['a', 'b']));
+  });
+
+  test('connect brings a host up, installing a stale daemon', () async {
+    await startRelay();
+    archonChannel.push(_request('relay-h1', 'connect', {'hostId': 'b'}));
+
+    expect((await reply())['ok'], isTrue);
+    expect(hostOps, ['ensure:b:upgrade=true:force=false']);
+  });
+
+  test('reconnect is the soft path and never restarts a busy daemon', () async {
+    // Other agents work through that daemon; a reconnect that restarts it
+    // was the reconnect loop this flag exists to prevent.
+    await startRelay();
+    archonChannel.push(_request('relay-h2', 'reconnect', {'hostId': 'b'}));
+
+    expect((await reply())['ok'], isTrue);
+    expect(hostOps, ['ensure:b:upgrade=false:force=false']);
+  });
+
+  test('forceconnect stops a wedged daemon before bringing it back', () async {
+    await startRelay();
+    archonChannel.push(_request('relay-h3', 'forceconnect', {'hostId': 'b'}));
+
+    expect((await reply())['ok'], isTrue);
+    expect(hostOps, ['ensure:b:upgrade=true:force=true']);
+  });
+
+  test('adsm-off stops a host and says what it did', () async {
+    await startRelay();
+    archonChannel.push(_request('relay-h4', 'adsm-off', {'hostId': 'b'}));
+
+    final answer = await reply();
+    expect(answer['ok'], isTrue);
+    expect((answer['result'] as Map)['action'], 'adsm-off');
+    expect(hostOps, ['stop:b']);
+  });
+
+  test('refuses to stop the daemon carrying the request', () async {
+    // Host a is where Archon runs; stopping it cuts the line this very call
+    // travels on, and Archon would not be there to notice it had.
+    await startRelay();
+    archonChannel.push(_request('relay-h5', 'adsm-off', {'hostId': 'a'}));
+
+    final answer = await reply();
+    expect(answer['ok'], isFalse);
+    expect(answer['error'], 'refused');
+    expect(hostOps, isEmpty);
+  });
+
+  test('refuses forceconnect on its own host too', () async {
+    // Same hole by the back door: forceconnect stops the daemon first.
+    await startRelay();
+    archonChannel.push(_request('relay-h6', 'forceconnect', {'hostId': 'a'}));
+
+    final answer = await reply();
+    expect(answer['ok'], isFalse);
+    expect(answer['error'], 'refused');
+    expect(hostOps, isEmpty);
+  });
+
+  test('a host op for an unknown host is refused, not guessed at', () async {
+    await startRelay();
+    archonChannel.push(_request('relay-h7', 'connect', {'hostId': 'ghost'}));
+
+    final answer = await reply();
+    expect(answer['ok'], isFalse);
+    expect(answer['error'], 'unknown_host');
+    expect(hostOps, isEmpty);
+  });
+
+  test('says so when the build cannot drive hosts at all', () async {
+    await startRelay(withHostControl: false);
+    archonChannel.push(_request('relay-h8', 'connect', {'hostId': 'b'}));
+
+    final answer = await reply();
+    expect(answer['ok'], isFalse);
+    expect(answer['error'], 'unsupported');
   });
 
   test('remote agents carry the goal the user set in the app', () async {

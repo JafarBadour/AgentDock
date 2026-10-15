@@ -42,7 +42,11 @@ void main() {
       // left on 0.7.6 keeps reporting no managed agents however many the
       // user has switched on in the app.
       expect(adsmVersionMeets('0.7.6', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.7', kRequiredAdsmVersion), isTrue);
+      // 0.7.8 lets Archon connect, reconnect and stop a host's daemon. The
+      // subcommands live in the archon package on the host, so a host left on
+      // 0.7.7 still has to wait for the user to come and press Connect.
+      expect(adsmVersionMeets('0.7.7', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.8', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -53,7 +57,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.7');
+      expect(kRequiredAdsmVersion, '0.7.8');
     });
   });
 }

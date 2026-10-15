@@ -172,6 +172,19 @@ final archonRelayServiceProvider = Provider<ArchonRelayService>((ref) {
     prepareChat: (host, chat) => ref
         .read(chatConnectCoordinatorProvider.notifier)
         .ensureForRelay(host, chat),
+    // The same calls the app makes for itself. `force` drops the cached
+    // readiness and stops the daemon first, so a wedged host can be recovered
+    // without waiting for the user to come back and press Connect.
+    ensureHost: (host, {required bool upgrade, bool force = false}) async {
+      final ssh = ref.read(sshServiceProvider);
+      if (force) {
+        ssh.clearAdsmReady(host.id);
+        ssh.abandonAdsmEnsure(host.id);
+        await ssh.stopAdsm(host);
+      }
+      await ssh.ensureAdsm(host, allowUpgrade: upgrade);
+    },
+    stopHost: (host) => ref.read(sshServiceProvider).stopAdsm(host),
   );
   ref.onDispose(() => unawaited(service.stop()));
   return service;

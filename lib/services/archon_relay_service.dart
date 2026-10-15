@@ -57,6 +57,17 @@ typedef ArchonPrepareChat = Future<void> Function(Host host, Chat chat);
 /// The daemon gives up on a call after 60s, so every request is answered —
 /// with an error if that is all there is to say. A relay that goes quiet looks
 /// to Archon exactly like a phone in a tunnel, and it stops trusting the route.
+/// Bring ADSM up on a host for Archon.
+///
+/// [upgrade] false is the soft reconnect that must never restart a daemon
+/// mid-chat; [force] discards cached readiness and stops the daemon first, for
+/// when a host is wedged rather than merely stale.
+typedef ArchonHostEnsure =
+    Future<void> Function(Host host, {required bool upgrade, bool force});
+
+/// Stop the ADSM daemon on a host.
+typedef ArchonHostStop = Future<void> Function(Host host);
+
 class ArchonRelayService {
   ArchonRelayService({
     required AppDatabase db,
@@ -64,6 +75,8 @@ class ArchonRelayService {
     required ArchonChannelOpen open,
     ArchonChannelClose? close,
     ArchonPrepareChat? prepareChat,
+    ArchonHostEnsure? ensureHost,
+    ArchonHostStop? stopHost,
     Duration retryDelay = const Duration(seconds: 5),
     Duration actionBudget = const Duration(seconds: 45),
   }) : _db = db,
@@ -71,6 +84,8 @@ class ArchonRelayService {
        _open = open,
        _close = close,
        _prepareChat = prepareChat,
+       _ensureHost = ensureHost,
+       _stopHost = stopHost,
        _retryDelay = retryDelay,
        _actionBudget = actionBudget;
 
@@ -80,6 +95,8 @@ class ArchonRelayService {
     required AppDatabase db,
     required Future<Host?> Function() archonHost,
     ArchonPrepareChat? prepareChat,
+    ArchonHostEnsure? ensureHost,
+    ArchonHostStop? stopHost,
   }) => ArchonRelayService(
     db: db,
     archonHost: archonHost,
@@ -90,6 +107,8 @@ class ArchonRelayService {
       }
     },
     prepareChat: prepareChat,
+    ensureHost: ensureHost,
+    stopHost: stopHost,
   );
 
   final AppDatabase _db;
@@ -101,6 +120,8 @@ class ArchonRelayService {
   final ArchonChannelOpen _open;
   final ArchonChannelClose? _close;
   final ArchonPrepareChat? _prepareChat;
+  final ArchonHostEnsure? _ensureHost;
+  final ArchonHostStop? _stopHost;
   final Duration _retryDelay;
 
   _RelayLink? _link;
@@ -229,6 +250,11 @@ class ArchonRelayService {
         return _routes();
       case 'agents':
         return _agents();
+      case 'connect':
+      case 'reconnect':
+      case 'forceconnect':
+      case 'adsm-off':
+        return _hostOp(action, payload);
       case 'read':
         return _read(payload);
       case 'prompt':
@@ -238,8 +264,8 @@ class ArchonRelayService {
         // Archon can pick another way round instead of waiting a minute.
         throw _RelayRefusal(
           'unknown_action',
-          'This app cannot do "$action". '
-          'It can do: routes, agents, read, prompt.',
+          'This app cannot do "$action". It can do: routes, agents, read, '
+          'prompt, connect, reconnect, forceconnect, adsm-off.',
         );
     }
   }
@@ -429,6 +455,70 @@ class ArchonRelayService {
       'chatId': chatId,
       'messageId': messageId,
       'delivered': true,
+    };
+  }
+
+  /// Bring a host's ADSM up, or take it down, on Archon's behalf.
+  ///
+  /// Archon has no credentials for the user's hosts, so a wedged daemon used
+  /// to mean waiting for the user to open the app and press Connect. These are
+  /// the same operations the app performs itself, not a second implementation.
+  ///
+  /// - `connect` installs a stale daemon and brings it up.
+  /// - `reconnect` is the soft path: it will not restart a daemon mid-chat,
+  ///   so it is safe while other agents are working.
+  /// - `forceconnect` discards cached readiness and stops the daemon first,
+  ///   for a host that is wedged rather than merely out of date.
+  /// - `adsm-off` stops it and leaves it off.
+  Future<Object?> _hostOp(String action, Map<String, dynamic> payload) async {
+    final ensure = _ensureHost;
+    final stop = _stopHost;
+    if (ensure == null || stop == null) {
+      throw _RelayRefusal(
+        'unsupported',
+        'This app build cannot "$action" a host.',
+      );
+    }
+
+    final hostId = payload['hostId']?.toString() ?? '';
+    if (hostId.isEmpty) {
+      throw _RelayRefusal('bad_request', 'A $action needs a hostId.');
+    }
+    final host = await _db.getHost(hostId);
+    if (host == null) {
+      throw _RelayRefusal('unknown_host', 'This app has no host "$hostId".');
+    }
+
+    // Stopping ADSM on Archon's own host kills the daemon this very call is
+    // travelling through — Archon would cut its own line and not be there to
+    // notice. Restarting it is the same hole, so both are refused.
+    final stopsDaemon = action == 'adsm-off' || action == 'forceconnect';
+    if (stopsDaemon) {
+      final mine = await _archonHost();
+      if (mine != null && mine.id == host.id) {
+        throw _RelayRefusal(
+          'refused',
+          'That is the host Archon runs on — "$action" would stop the daemon '
+              'carrying this request. Ask the user to do it from the app.',
+        );
+      }
+    }
+
+    switch (action) {
+      case 'connect':
+        await ensure(host, upgrade: true, force: false);
+      case 'reconnect':
+        await ensure(host, upgrade: false, force: false);
+      case 'forceconnect':
+        await ensure(host, upgrade: true, force: true);
+      case 'adsm-off':
+        await stop(host);
+    }
+    return {
+      'hostId': host.id,
+      'host': host.displayLabel,
+      'action': action,
+      'done': true,
     };
   }
 
