@@ -3446,6 +3446,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     },
                                     onModeChanged: (mode) =>
                                         _archonVoiceMode = mode,
+                                    readMic: ref
+                                        .read(secureStoreProvider)
+                                        .readArchonMicDevice,
+                                    saveMic: ref
+                                        .read(secureStoreProvider)
+                                        .saveArchonMicDevice,
                                   ),
                                 _buildComposerField(
                                   theme: theme,
@@ -3490,11 +3496,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       _runtime?.usageTokensUsed,
       _runtime?.usageContextSize,
     );
-    return ComposerModelFooter(
-      label: label,
-      usage: usage,
-      onTap: _pickModel,
-    );
+    return ComposerModelFooter(label: label, usage: usage, onTap: _pickModel);
   }
 }
 

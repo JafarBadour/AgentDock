@@ -1,6 +1,9 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/app_theme.dart';
 import '../../services/archon_voice.dart';
@@ -60,6 +63,8 @@ class ArchonVoiceBar extends StatefulWidget {
     this.onError,
     this.enabled = true,
     this.animate = true,
+    this.readMic,
+    this.saveMic,
   });
 
   final ArchonVoice voice;
@@ -83,6 +88,12 @@ class ArchonVoiceBar extends StatefulWidget {
   /// Off in tests: the recording ring and the transcribing spinner repeat
   /// forever, and `pumpAndSettle` never returns while a ticker is alive.
   final bool animate;
+
+  /// The microphone in use (null is the system default) and how to change
+  /// it. Given both, right-clicking the mic — or Ctrl-clicking it on a Mac —
+  /// offers every microphone. A long press cannot: it is how you talk.
+  final Future<String?> Function()? readMic;
+  final Future<void> Function(String? id)? saveMic;
 
   /// Lets a test grab the mic without depending on which icon it wears.
   static const micKey = ValueKey<String>('archon-voice-mic');
@@ -289,11 +300,82 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
     widget.onError?.call(message);
   }
 
+  /// Set by a press that opened the mic menu, so its release is not also
+  /// taken as "send" or, hands-free, as "start talking".
+  bool _menuPress = false;
+
+  bool _wantsMenu(PointerDownEvent event) {
+    if (widget.readMic == null || widget.saveMic == null) return false;
+    if (event.kind != PointerDeviceKind.mouse) return false;
+    if (event.buttons & kSecondaryMouseButton != 0) return true;
+    // A one-button Mac mouse right-clicks with Control held.
+    return defaultTargetPlatform == TargetPlatform.macOS &&
+        event.buttons & kPrimaryMouseButton != 0 &&
+        HardwareKeyboard.instance.isControlPressed;
+  }
+
   void _pointerDown(PointerDownEvent event) {
     _origin = event.position;
+    if (_wantsMenu(event)) {
+      _menuPress = true;
+      // Picking a mic mid-take would leave the take on the old one.
+      if (_phase == _Phase.idle) unawaited(_showMicMenu(event.position));
+      return;
+    }
     // Latched: the take starts and ends on taps, so nothing happens on press.
     if (_conversing) return;
     unawaited(_start());
+  }
+
+  Future<void> _showMicMenu(Offset at) async {
+    final List<VoiceInputDevice> mics;
+    final String? current;
+    try {
+      mics = await widget.voice.inputDevices();
+      current = await widget.readMic!();
+    } catch (e) {
+      _fail('Could not list microphones — $e');
+      return;
+    }
+    if (!mounted) return;
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final chosen = await showMenu<_MicChoice>(
+      context: context,
+      position: RelativeRect.fromRect(
+        at & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        const PopupMenuItem<_MicChoice>(
+          enabled: false,
+          height: 32,
+          child: Text('Microphone'),
+        ),
+        CheckedPopupMenuItem<_MicChoice>(
+          value: const _MicChoice(null),
+          checked: current == null,
+          child: const Text('System default'),
+        ),
+        for (final m in mics)
+          CheckedPopupMenuItem<_MicChoice>(
+            value: _MicChoice(m.id),
+            checked: m.id == current,
+            child: Text(m.label, overflow: TextOverflow.ellipsis),
+          ),
+      ],
+    );
+    if (chosen == null || chosen.id == current || !mounted) return;
+    try {
+      await widget.saveMic!(chosen.id);
+    } catch (e) {
+      _fail('Could not save the microphone — $e');
+      return;
+    }
+    if (!mounted) return;
+    final label = chosen.id == null
+        ? 'the system default'
+        : mics.firstWhere((m) => m.id == chosen.id).label;
+    _say('Listening with $label.');
   }
 
   void _pointerMove(PointerMoveEvent event) {
@@ -308,6 +390,10 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
   }
 
   void _pointerUp(PointerUpEvent event) {
+    if (_menuPress) {
+      _menuPress = false;
+      return;
+    }
     if (_conversing) {
       if (_phase == _Phase.idle) {
         unawaited(_start());
@@ -323,6 +409,10 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
   /// the user never released. Latched takes are not held, so there is nothing
   /// for a stolen pointer to abandon.
   void _pointerCancel(PointerCancelEvent event) {
+    if (_menuPress) {
+      _menuPress = false;
+      return;
+    }
     if (_conversing) return;
     unawaited(_finish(cancel: true));
   }
@@ -397,9 +487,7 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
               : Colors.transparent,
           foregroundColor: _conversing ? AppColors.accent : AppColors.chatMeta,
         ),
-        icon: Icon(
-          _conversing ? Icons.voice_chat : Icons.voice_chat_outlined,
-        ),
+        icon: Icon(_conversing ? Icons.voice_chat : Icons.voice_chat_outlined),
       ),
     );
   }
@@ -508,6 +596,13 @@ class _ArchonVoiceBarState extends State<ArchonVoiceBar> {
       ),
     );
   }
+}
+
+/// A menu pick. Wrapped because a bare null would read as "dismissed" rather
+/// than "the system default".
+class _MicChoice {
+  const _MicChoice(this.id);
+  final String? id;
 }
 
 class _ModeButton extends StatelessWidget {

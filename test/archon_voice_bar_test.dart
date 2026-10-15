@@ -6,6 +6,7 @@ import 'package:agentplantation/app/app_theme.dart';
 import 'package:agentplantation/features/archon/archon_voice_bar.dart';
 import 'package:agentplantation/services/archon_voice.dart';
 import 'package:agentplantation/services/deepgram_service.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -22,7 +23,12 @@ class _FakeRecorder implements VoiceRecorder {
   @override
   Future<bool> hasPermission() async => permitted;
   @override
-  Future<void> start(String p) async => started = true;
+  Future<List<VoiceInputDevice>> inputDevices() async => const [
+    VoiceInputDevice(id: 'sonar', label: 'Sonar Microphone'),
+    VoiceInputDevice(id: 'arctis', label: 'Arctis Microphone'),
+  ];
+  @override
+  Future<void> start(String p, {String? deviceId}) async => started = true;
   @override
   Future<Uint8List?> stop() async => captured;
   @override
@@ -63,12 +69,7 @@ void main() {
     },
   });
 
-  ({
-    ArchonVoice voice,
-    _FakeRecorder rec,
-    _FakePlayer play,
-    List<String> calls,
-  })
+  ({ArchonVoice voice, _FakeRecorder rec, _FakePlayer play, List<String> calls})
   buildVoice({
     Uint8List? captured,
     bool permitted = true,
@@ -113,6 +114,8 @@ void main() {
     required void Function(String) onTranscribed,
     void Function(String)? onError,
     void Function(ArchonVoiceMode)? onModeChanged,
+    Future<String?> Function()? readMic,
+    Future<void> Function(String?)? saveMic,
   }) async {
     await tester.pumpWidget(
       MaterialApp(
@@ -128,6 +131,8 @@ void main() {
                 onTranscribed: onTranscribed,
                 onError: onError,
                 onModeChanged: onModeChanged,
+                readMic: readMic,
+                saveMic: saveMic,
               ),
             ],
           ),
@@ -451,5 +456,85 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(sent, ['push it']);
+  });
+
+  testWidgets('right-clicking the mic picks a microphone, not a take', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    String? saved = 'sonar';
+    await pumpBar(
+      tester,
+      voice: h.voice,
+      onTranscribed: (_) {},
+      readMic: () async => saved,
+      saveMic: (id) async => saved = id,
+    );
+
+    await tester.tap(
+      find.byKey(ArchonVoiceBar.micKey),
+      buttons: kSecondaryMouseButton,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pumpAndSettle();
+    expect(h.rec.started, isFalse, reason: 'a right-click is not a take');
+    expect(find.text('System default'), findsOneWidget);
+
+    await tester.tap(find.text('Arctis Microphone'));
+    await tester.pumpAndSettle();
+    expect(saved, 'arctis');
+    expect(find.text('Listening with Arctis Microphone.'), findsOneWidget);
+    expect(h.rec.started, isFalse);
+  });
+
+  testWidgets('the system default can be picked back', (tester) async {
+    final h = buildVoice();
+    String? saved = 'arctis';
+    await pumpBar(
+      tester,
+      voice: h.voice,
+      onTranscribed: (_) {},
+      readMic: () async => saved,
+      saveMic: (id) async => saved = id,
+    );
+
+    await tester.tap(
+      find.byKey(ArchonVoiceBar.micKey),
+      buttons: kSecondaryMouseButton,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('System default'));
+    await tester.pumpAndSettle();
+    expect(saved, isNull);
+  });
+
+  testWidgets('right-clicking in a conversation does not start a take', (
+    tester,
+  ) async {
+    final h = buildVoice();
+    await pumpBar(
+      tester,
+      voice: h.voice,
+      onTranscribed: (_) {},
+      readMic: () async => null,
+      saveMic: (_) async {},
+    );
+    await tester.tap(find.byKey(ArchonVoiceBar.conversationKey));
+    await tester.pumpAndSettle();
+    // Turning the conversation on arms a take; send it so the bar is idle.
+    final gesture = await holdMic(tester);
+    await gesture.up();
+    await tester.pumpAndSettle();
+    h.rec.started = false;
+
+    await tester.tap(
+      find.byKey(ArchonVoiceBar.micKey),
+      buttons: kSecondaryMouseButton,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('System default'), findsOneWidget);
+    expect(h.rec.started, isFalse);
   });
 }

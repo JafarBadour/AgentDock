@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
 import '../../data/secure/safe_log.dart';
+import '../../services/archon_voice.dart';
 import '../../services/deepgram_service.dart';
 import '../agents/agents_screen.dart';
 import 'archon_screen.dart';
@@ -38,6 +39,11 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
   bool _saving = false;
   bool _hadKey = false;
 
+  /// Null is the system default. Windows often defaults to a virtual or
+  /// switched-off headset mic that records nothing but silence.
+  String? _mic;
+  List<VoiceInputDevice> _mics = const [];
+
   @override
   void initState() {
     super.initState();
@@ -46,17 +52,24 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
 
   void unawaitedLoad() {
     () async {
-      String? key, stt, tts, language;
+      String? key, stt, tts, language, mic;
+      var mics = const <VoiceInputDevice>[];
       try {
         final store = ref.read(secureStoreProvider);
         key = await store.readDeepgramApiKey();
         stt = await store.readDeepgramSttModel();
         tts = await store.readDeepgramTtsModel();
         language = await store.readDeepgramLanguage();
+        mic = await store.readArchonMicDevice();
       } catch (e) {
         // An unreadable store must not leave the sheet spinning forever —
         // empty fields still let the user type a key and save one.
         SafeLog.d('archon settings load failed', e);
+      }
+      try {
+        mics = await ref.read(archonVoiceProvider).inputDevices();
+      } catch (e) {
+        SafeLog.d('archon mic list failed', e);
       }
       if (!mounted) return;
       setState(() {
@@ -65,6 +78,10 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
         _stt.text = stt ?? '';
         _tts.text = tts ?? '';
         _language.text = language ?? '';
+        _mics = mics;
+        // A saved mic that is unplugged now still shows, so saving does not
+        // quietly forget it.
+        _mic = mic;
         _loading = false;
       });
     }();
@@ -91,6 +108,7 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
       await store.saveDeepgramSttModel(_stt.text);
       await store.saveDeepgramTtsModel(_tts.text);
       await store.saveDeepgramLanguage(_language.text);
+      await store.saveArchonMicDevice(_mic);
       if (!mounted) return;
       Navigator.of(context).pop();
     } catch (e) {
@@ -108,6 +126,35 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
     await ref.read(secureStoreProvider).saveDeepgramApiKey(null);
     if (!mounted) return;
     setState(() => _hadKey = false);
+  }
+
+  Widget _micPicker() {
+    final known = _mics.any((m) => m.id == _mic);
+    return DropdownButtonFormField<String?>(
+      initialValue: _mic,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        labelText: 'Microphone',
+        helperText: 'If Archon hears only silence, pick the mic you talk into',
+      ),
+      items: [
+        const DropdownMenuItem<String?>(
+          value: null,
+          child: Text('System default'),
+        ),
+        for (final m in _mics)
+          DropdownMenuItem<String?>(
+            value: m.id,
+            child: Text(m.label, overflow: TextOverflow.ellipsis),
+          ),
+        if (_mic != null && !known)
+          DropdownMenuItem<String?>(
+            value: _mic,
+            child: const Text('Saved mic (not connected)'),
+          ),
+      ],
+      onChanged: _saving ? null : (id) => setState(() => _mic = id),
+    );
   }
 
   @override
@@ -163,6 +210,8 @@ class _ArchonSettingsSheetState extends ConsumerState<ArchonSettingsSheet> {
                           : null,
                     ),
                   ),
+                  const SizedBox(height: 12),
+                  _micPicker(),
                   const SizedBox(height: 12),
                   TextField(
                     controller: _stt,
@@ -312,14 +361,10 @@ class _ArchonHostSectionState extends ConsumerState<_ArchonHostSection> {
         ListTile(
           contentPadding: EdgeInsets.zero,
           leading: const Icon(Icons.dns_outlined),
-          title: Text(
-            current.valueOrNull?.alias ?? 'Not running anywhere yet',
-          ),
+          title: Text(current.valueOrNull?.alias ?? 'Not running anywhere yet'),
           subtitle: current.valueOrNull == null
               ? null
-              : Text(
-                  '${current.value!.username}@${current.value!.hostname}',
-                ),
+              : Text('${current.value!.username}@${current.value!.hostname}'),
           trailing: _moving
               ? const SizedBox(
                   width: 18,

@@ -50,7 +50,11 @@ final deepgramServiceProvider = Provider<DeepgramService>((ref) {
 });
 
 final archonVoiceProvider = Provider<ArchonVoice>((ref) {
-  final voice = ArchonVoice(deepgram: ref.watch(deepgramServiceProvider));
+  final store = ref.watch(secureStoreProvider);
+  final voice = ArchonVoice(
+    deepgram: ref.watch(deepgramServiceProvider),
+    inputDeviceId: store.readArchonMicDevice,
+  );
   ref.onDispose(() => unawaited(voice.dispose()));
   return voice;
 });
@@ -165,8 +169,9 @@ final archonRelayServiceProvider = Provider<ArchonRelayService>((ref) {
     // Prompting an agent with no live worker needs the provider API key, which
     // only the connect path can reach; without this the relay can talk to
     // agents that are already up and nothing else.
-    prepareChat: (host, chat) =>
-        ref.read(chatConnectCoordinatorProvider.notifier).ensureForRelay(host, chat),
+    prepareChat: (host, chat) => ref
+        .read(chatConnectCoordinatorProvider.notifier)
+        .ensureForRelay(host, chat),
   );
   ref.onDispose(() => unawaited(service.stop()));
   return service;
