@@ -38,7 +38,7 @@ dependencies:
   audioplayers: ^6.5.0
   flutter_local_notifications: ^22.3.0
   speech_to_text: ^7.4.0
-  pdfrx: ^2.4.7
+  pdfrx: ^2.6.5
   sqflite_common_ffi: ^2.4.0+3
   flutter_pty: ^0.4.2
   super_sliver_list: ^0.4.1

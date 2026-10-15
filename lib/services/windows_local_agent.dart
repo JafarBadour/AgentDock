@@ -181,17 +181,18 @@ class WindowsLocalAgent {
     return null;
   }
 
-  /// Install [payloads] (`adsm/<name>` → bytes), then restart the daemon.
+  /// Install [payloads] (`adsm/<name>`, `archon/<name>` → bytes), then
+  /// restart the daemon. Keys carry their package directory.
   static Future<void> installAndRestart(Map<String, Uint8List> payloads) async {
-    final dir = Directory(p.join(adsmHostDir, 'adsm'));
-    await dir.create(recursive: true);
     // Stop first: the running daemon holds these modules open.
     await runAdsm(['stop']).catchError((Object e) {
       SafeLog.d('local ADSM stop failed', e);
       return ProcessResult(0, 1, '', '$e');
     });
     for (final entry in payloads.entries) {
-      await File(p.join(dir.path, entry.key)).writeAsBytes(entry.value);
+      final file = File(p.joinAll([adsmHostDir, ...entry.key.split('/')]));
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(entry.value);
     }
     final started = await runAdsm(['ensure-running']);
     if (started.exitCode != 0) {

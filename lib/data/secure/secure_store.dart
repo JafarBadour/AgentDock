@@ -16,13 +16,14 @@ import 'safe_log.dart';
 ///   we never touch Keychain on desktop so the OS never asks.
 class SecureStore {
   SecureStore({FlutterSecureStorage? storage})
-      : _storage = storage ??
-            const FlutterSecureStorage(
-              aOptions: AndroidOptions(encryptedSharedPreferences: true),
-              iOptions: IOSOptions(
-                accessibility: KeychainAccessibility.first_unlock_this_device,
-              ),
-            );
+    : _storage =
+          storage ??
+          const FlutterSecureStorage(
+            aOptions: AndroidOptions(encryptedSharedPreferences: true),
+            iOptions: IOSOptions(
+              accessibility: KeychainAccessibility.first_unlock_this_device,
+            ),
+          );
 
   static const _sshPrivateKey = 'ssh_private_key';
   static const _sshPassphrase = 'ssh_key_passphrase';
@@ -35,12 +36,14 @@ class SecureStore {
   static const _deepgramSttModel = 'deepgram_stt_model';
   static const _deepgramTtsModel = 'deepgram_tts_model';
   static const _deepgramLanguage = 'deepgram_language';
+  static const _archonMicDevice = 'archon_mic_device';
   static const _hostPasswordPrefix = 'host_password_';
 
   final FlutterSecureStorage _storage;
 
   /// Desktop always uses files. Mobile uses keystore unless a write fails once.
-  bool? _useFileFallback = (!kIsWeb && (Platform.isMacOS || Platform.isLinux || Platform.isWindows))
+  bool? _useFileFallback =
+      (!kIsWeb && (Platform.isMacOS || Platform.isLinux || Platform.isWindows))
       ? true
       : null;
 
@@ -69,7 +72,8 @@ class SecureStore {
     return value != null && value.trim().isNotEmpty;
   }
 
-  static String _hostPasswordKey(String hostId) => '$_hostPasswordPrefix$hostId';
+  static String _hostPasswordKey(String hostId) =>
+      '$_hostPasswordPrefix$hostId';
 
   /// Per-host SSH password (never stored in SQLite).
   Future<void> saveHostPassword(String hostId, String? password) async {
@@ -232,6 +236,11 @@ class SecureStore {
       _writeOrClear(_deepgramLanguage, code);
   Future<String?> readDeepgramLanguage() => _read(_deepgramLanguage);
 
+  /// The microphone Archon records from; null records from the system default.
+  Future<void> saveArchonMicDevice(String? id) =>
+      _writeOrClear(_archonMicDevice, id);
+  Future<String?> readArchonMicDevice() => _read(_archonMicDevice);
+
   Future<void> _writeOrClear(String key, String? value) async {
     if (value == null || value.trim().isEmpty) {
       await _delete(key);
@@ -315,7 +324,39 @@ class SecureStore {
         await Process.run('chmod', ['700', secretsDir.path]);
       }
     }
+    await (_legacyMigration ??= migrateLegacyWindowsSecrets(dir, secretsDir));
     return File(p.join(secretsDir.path, key));
+  }
+
+  Future<void>? _legacyMigration;
+
+  /// Windows keys Application Support by the exe's ProductName, so renaming
+  /// `agent_dock` to AgentPlantation moved it to a new, empty folder and the
+  /// app lost its SSH key and host passwords. Copy them across once; files
+  /// already in the new folder win.
+  @visibleForTesting
+  static Future<void> migrateLegacyWindowsSecrets(
+    Directory supportDir,
+    Directory secretsDir,
+  ) async {
+    if (!Platform.isWindows) return;
+    final marker = File(p.join(secretsDir.path, '.migrated_from_agent_dock'));
+    final legacy = Directory(
+      p.join(p.dirname(supportDir.path), 'agent_dock', 'secrets'),
+    );
+    try {
+      if (await marker.exists() || !await legacy.exists()) return;
+      await for (final entity in legacy.list()) {
+        if (entity is! File) continue;
+        final target = File(p.join(secretsDir.path, p.basename(entity.path)));
+        if (await target.exists()) continue;
+        await entity.copy(target.path);
+      }
+      await marker.writeAsString('');
+      SafeLog.d('Copied secrets from the pre-rename agent_dock folder');
+    } catch (e) {
+      SafeLog.d('legacy secrets migration failed', e);
+    }
   }
 
   Future<void> _fileWrite(String key, String value) async {
