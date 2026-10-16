@@ -165,6 +165,30 @@ class Daemon:
                 w.last_error = error or None
         await self._patch_agent_record(chat_id, status=status, error=error)
 
+    def _read_agent_record(self, chat_id: str) -> dict[str, Any]:
+        path = paths.agent_record_path(chat_id)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _recorded_provider(self, chat_id: str) -> Optional[str]:
+        """What this agent already is, for a caller that did not say."""
+        value = self._read_agent_record(chat_id).get("provider")
+        return value if isinstance(value, str) and value else None
+
+    def _recorded_cwd(self, chat_id: str) -> Optional[str]:
+        """Where it already runs. `repo_path` is the placement's own record."""
+        rec = self._read_agent_record(chat_id)
+        for key in ("cwd", "repo_path"):
+            value = rec.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
     async def _patch_agent_record(
         self,
         chat_id: str,
@@ -483,7 +507,16 @@ class Daemon:
         w = self._worker(chat_id)
         cwd = str(params.get("cwd") or "")
         binary = str(params.get("binary") or "")
-        provider = str(params.get("provider") or "cursor")
+        # Falling straight back to "cursor" rewrote the identity of any agent
+        # whose caller simply did not mention a provider — a reconnect, a
+        # health check — and a Claude agent relaunched as Cursor in no working
+        # directory cannot answer at all. An existing record is the better
+        # answer than a default; the default is only for a genuinely new one.
+        provider = str(params.get("provider") or "")
+        if not provider:
+            provider = self._recorded_provider(chat_id) or "cursor"
+        if not cwd:
+            cwd = self._recorded_cwd(chat_id) or ""
         snap = await w.ensure(
             cwd=cwd,
             binary=binary,

@@ -46,7 +46,12 @@ void main() {
       // subcommands live in the archon package on the host, so a host left on
       // 0.7.7 still has to wait for the user to come and press Connect.
       expect(adsmVersionMeets('0.7.7', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.8', kRequiredAdsmVersion), isTrue);
+      // 0.7.9 stops `agents.ensure` rewriting an agent's provider and
+      // working directory when the caller did not name them. A host left on
+      // 0.7.8 can still relaunch a Claude agent as Cursor in no directory,
+      // which is a chat that cannot answer at all.
+      expect(adsmVersionMeets('0.7.8', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.9', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -57,7 +62,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.8');
+      expect(kRequiredAdsmVersion, '0.7.9');
     });
   });
 }
