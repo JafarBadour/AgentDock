@@ -8,6 +8,10 @@ import 'package:markdown/markdown.dart' as md;
 import '../../app/app_theme.dart';
 import 'message_body.dart';
 
+/// Builds the widget for `![alt](src)`, or null when [src] is not something
+/// the app can show — the renderer then falls back to the alt text.
+typedef ChatImageBuilder = Widget? Function(String src, String alt);
+
 /// Markdown for chat bubbles, built for scrolling.
 ///
 /// gpt_markdown re-ran a cascade of regexes per block on every first build
@@ -22,11 +26,16 @@ class ChatMarkdown extends StatefulWidget {
     this.style,
     this.dense = false,
     this.mentionTap,
+    this.imageBuilder,
   });
 
   final String text;
   final TextStyle? style;
   final bool dense;
+
+  /// Renders an image the agent referenced. Null leaves `![alt](src)` as its
+  /// alt text, which is what every caller outside a chat bubble wants.
+  final ChatImageBuilder? imageBuilder;
 
   /// Tap handler for a project path (inline code or relative link), or null
   /// when [raw] is not a file mention. Null disables mention chips entirely.
@@ -65,6 +74,7 @@ class _ChatMarkdownState extends State<ChatMarkdown> {
       base: base ?? const TextStyle(),
       dense: widget.dense,
       mentionTap: widget.mentionTap,
+      imageBuilder: widget.imageBuilder,
       taps: _taps,
     );
     return r.column(r.blocks(nodes));
@@ -130,6 +140,7 @@ class _Renderer {
     required this.base,
     required this.dense,
     required this.mentionTap,
+    required this.imageBuilder,
     required this.taps,
   });
 
@@ -137,6 +148,7 @@ class _Renderer {
   final TextStyle base;
   final bool dense;
   final VoidCallback? Function(String raw)? mentionTap;
+  final ChatImageBuilder? imageBuilder;
   final List<GestureRecognizer> taps;
 
   ColorScheme get scheme => theme.colorScheme;
@@ -187,10 +199,61 @@ class _Renderer {
   Widget _paragraph(List<InlineSpan> spans, TextStyle style) =>
       Text.rich(TextSpan(children: spans, style: style));
 
+  /// A paragraph that holds `![alt](src)` images, as text and pictures in the
+  /// order they were written — or null when there is nothing to show, so the
+  /// ordinary single-[Text.rich] path (what the scroll budget assumes) stands.
+  ///
+  /// Only images that are direct children of the paragraph are lifted out. One
+  /// nested inside a link or emphasis keeps its alt text rather than having
+  /// the surrounding span silently dropped around it.
+  Widget? _paragraphImages(md.Element e, TextStyle style) {
+    final build = imageBuilder;
+    if (build == null) return null;
+    final children = e.children;
+    if (children == null) return null;
+
+    final parts = <Widget>[];
+    final pending = <md.Node>[];
+    var found = false;
+
+    void flushText() {
+      if (pending.isEmpty) return;
+      final spans = inlines(pending, style);
+      pending.clear();
+      if (spans.isEmpty) return;
+      // Whitespace-only runs around a picture are layout, not content.
+      final text = spans
+          .map((s) => s.toPlainText(includeSemanticsLabels: false))
+          .join();
+      if (text.trim().isEmpty) return;
+      parts.add(_paragraph(spans, style));
+    }
+
+    for (final n in children) {
+      if (n is md.Element && n.tag == 'img') {
+        final src = n.attributes['src'] ?? '';
+        final widget = build(src, n.attributes['alt'] ?? '');
+        if (widget != null) {
+          flushText();
+          parts.add(widget);
+          found = true;
+          continue;
+        }
+      }
+      pending.add(n);
+    }
+    if (!found) return null;
+    flushText();
+    if (parts.isEmpty) return null;
+    return column(parts);
+  }
+
   Widget? block(md.Element e, {TextStyle? style}) {
     final s = style ?? base;
     switch (e.tag) {
       case 'p':
+        final withImages = _paragraphImages(e, s);
+        if (withImages != null) return withImages;
         final spans = inlines(e.children, s);
         return spans.isEmpty ? null : _paragraph(spans, s);
       case 'h1' || 'h2' || 'h3' || 'h4' || 'h5' || 'h6':

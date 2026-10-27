@@ -2692,6 +2692,31 @@ exit 1
         : home;
   }
 
+  /// Absolute path for one an agent wrote: `~` against the host's home,
+  /// anything relative against [rootPath].
+  ///
+  /// Shared by the file-mention sheet and inline chat images so a path the
+  /// agent printed cannot resolve one way when tapped and another when shown.
+  Future<String> resolveAgentPath(
+    Host host,
+    String path, {
+    required String rootPath,
+  }) async {
+    var out = path;
+    if (out.startsWith('~')) {
+      final home = await remoteHomeDirectory(host);
+      out = out == '~'
+          ? home
+          : joinRemotePath(
+              home,
+              out.substring(out.startsWith('~/') ? 2 : 1),
+            );
+    } else if (!remote_path.isAbsoluteRemotePath(out)) {
+      out = joinRemotePath(rootPath, out);
+    }
+    return normalizeRemotePath(out);
+  }
+
   /// Stat one remote path, or null when it does not exist.
   ///
   /// Used before offering to view or download a file the agent mentioned, so

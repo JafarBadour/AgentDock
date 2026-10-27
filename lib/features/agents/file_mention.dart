@@ -5,7 +5,6 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../app/providers.dart';
 import '../../data/models/host.dart';
-import '../../data/models/remote_path.dart';
 import '../../data/secure/safe_log.dart';
 import '../../services/file_kind.dart';
 import '../../services/ssh_service.dart';
@@ -303,18 +302,11 @@ class _FileMentionSheetState extends State<_FileMentionSheet> {
     final ssh = _ssh(context);
     var path = widget.mention.path;
     try {
-      if (path.startsWith('~')) {
-        final home = await ssh.remoteHomeDirectory(widget.host);
-        path = path == '~'
-            ? home
-            : SshService.joinRemotePath(
-                home,
-                path.substring(path.startsWith('~/') ? 2 : 1),
-              );
-      } else if (!isAbsoluteRemotePath(path)) {
-        path = SshService.joinRemotePath(widget.rootPath, path);
-      }
-      path = SshService.normalizeRemotePath(path);
+      path = await ssh.resolveAgentPath(
+        widget.host,
+        path,
+        rootPath: widget.rootPath,
+      );
       final entry = await ssh.statRemoteFile(widget.host, path);
       if (!mounted) return;
       setState(() {

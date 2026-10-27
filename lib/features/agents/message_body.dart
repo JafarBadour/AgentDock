@@ -5,6 +5,7 @@ import 'package:markdown/markdown.dart' as md;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../services/file_kind.dart';
+import 'chat_image.dart';
 import 'chat_markdown.dart';
 import 'file_mention.dart';
 import 'rich_copy.dart';
@@ -424,6 +425,20 @@ class _MessageBodyState extends State<MessageBody> {
     );
   }
 
+  /// The picture for `![alt](src)`, or null when the app cannot show that
+  /// source — an `http` URL, a non-image path, or a bubble with no host
+  /// behind it, all of which fall back to the alt text.
+  Widget? _image(BuildContext context, String src, String alt, TextStyle? base) {
+    final trimmed = src.trim();
+    if (!canShowChatImage(trimmed)) return null;
+    // A remote path needs a host; a data URI carries its own bytes.
+    if (!trimmed.startsWith('data:') &&
+        FileMentionScope.maybeOf(context) == null) {
+      return null;
+    }
+    return ChatImage(src: trimmed, alt: alt, style: base);
+  }
+
   Widget _buildMarkdown(
     BuildContext context,
     String text,
@@ -435,6 +450,7 @@ class _MessageBodyState extends State<MessageBody> {
       style: base,
       dense: widget.dense,
       mentionTap: mentions ? (raw) => _mentionTap(context, raw) : null,
+      imageBuilder: (src, alt) => _image(context, src, alt, base),
     );
   }
 }

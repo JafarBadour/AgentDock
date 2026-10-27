@@ -27,6 +27,7 @@ import '../services/chat_connect_coordinator.dart';
 import '../services/skill_deploy_service.dart';
 import '../services/schedule_runner.dart';
 import '../services/schedule_sync_service.dart';
+import '../services/remote_image_cache.dart';
 import '../services/ssh_service.dart';
 import '../services/ssh_socks_service.dart';
 import '../services/transcript_budget.dart';
@@ -87,6 +88,11 @@ final sshServiceProvider = Provider<SshService>((ref) {
   ref.onDispose(service.dispose);
   return service;
 });
+
+/// Local copies of images agents referenced, for inline chat previews.
+final remoteImageCacheProvider = Provider<RemoteImageCache>(
+  (ref) => RemoteImageCache.of(ref.watch(sshServiceProvider)),
+);
 
 final sshSocksServiceProvider = ChangeNotifierProvider<SshSocksService>((ref) {
   final service = SshSocksService(
