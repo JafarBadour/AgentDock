@@ -139,7 +139,9 @@ class TranscriptStoreTest(unittest.TestCase):
         )
         msgs = self.transcript.list_messages(self.chat_id)
         self.assertEqual(len(msgs), 1)
-        self.assertEqual(msgs[0]["created_at"], "2026-01-01T10:00:00Z")
+        # Same instant, canonical spelling: the store now normalises every
+        # incoming shape to UTC so the rows stay comparable to each other.
+        self.assertEqual(msgs[0]["created_at"], "2026-01-01T10:00:00+00:00")
 
     def test_upsert_skips_shorter_body(self) -> None:
         self.transcript.append_message(

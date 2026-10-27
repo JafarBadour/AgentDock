@@ -36,13 +36,47 @@ def now_iso() -> str:
 _now_iso = now_iso
 
 
+def sort_instant(created: Any) -> datetime:
+    """When a message actually happened, for ordering.
+
+    Transcripts carry three shapes of `created_at` at once: UTC with `Z` from
+    the app, UTC with `+00:00` from here, and naive local time from the app's
+    own `DateTime.now()`. Sorting those as strings put every UTC-stamped
+    message a whole timezone behind the naive ones, so on a CET host the
+    agent's reply sorted an hour into the past and landed over a hundred rows
+    below the tool output of its own turn — the answer never appeared at the
+    bottom of the chat.
+
+    A naive stamp has lost the offset it was written with; reading it as local
+    time is the best guess left, and is what makes the two populations line up.
+    """
+    text = str(created or "").strip()
+    if not text:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone(timezone.utc)
+
+
+def _sort_key(row: dict[str, Any]) -> tuple[datetime, str]:
+    return (sort_instant(row.get("created_at")), str(row.get("id")))
+
+
 def _normalize(row: dict[str, Any], chat_id: str) -> Optional[dict[str, Any]]:
     msg_id = str(row.get("id") or "").strip()
     role = str(row.get("role") or "").strip()
     content = row.get("content")
     if not msg_id or not role or content is None:
         return None
-    created = str(row.get("created_at") or row.get("createdAt") or _now_iso())
+    # Canonical UTC on the way in, so the store stops accumulating shapes
+    # that only a parser can compare.
+    created = sort_instant(
+        row.get("created_at") or row.get("createdAt") or _now_iso()
+    ).isoformat()
     return {
         "id": msg_id,
         "chat_id": str(row.get("chat_id") or row.get("chatId") or chat_id),
@@ -78,7 +112,7 @@ def list_messages(chat_id: str) -> list[dict[str, Any]]:
     except OSError:
         return []
     out = list(by_id.values())
-    out.sort(key=lambda m: (str(m.get("created_at") or ""), str(m.get("id"))))
+    out.sort(key=_sort_key)
     return out
 
 
@@ -223,10 +257,7 @@ def upsert_messages(chat_id: str, messages: list[dict[str, Any]]) -> int:
         # Still rewrite if file was corrupt/empty but we had rows — cheap path.
         pass
     path = messages_path(chat_id)
-    ordered = sorted(
-        existing.values(),
-        key=lambda m: (str(m.get("created_at") or ""), str(m.get("id"))),
-    )
+    ordered = sorted(existing.values(), key=_sort_key)
     tmp = path.with_suffix(".jsonl.tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         for row in ordered:
