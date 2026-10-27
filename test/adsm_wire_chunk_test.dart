@@ -51,7 +51,12 @@ void main() {
       // 0.7.8 can still relaunch a Claude agent as Cursor in no directory,
       // which is a chat that cannot answer at all.
       expect(adsmVersionMeets('0.7.8', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.9', kRequiredAdsmVersion), isTrue);
+      // 0.7.10 restores an agent's `binary` and falls back to `repo_path`
+      // for its `cwd`, so a worker the idle reaper stopped can revive. A host
+      // left on 0.7.9 answers every prompt to such a chat with "FIFO not
+      // attached", which the user sees as the chat disconnecting.
+      expect(adsmVersionMeets('0.7.9', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.10', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -62,7 +67,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.9');
+      expect(kRequiredAdsmVersion, '0.7.10');
     });
   });
 }

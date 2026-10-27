@@ -51,6 +51,22 @@ class EnsureIdentityTest(unittest.TestCase):
         with self._record({"cwd": "/a", "repo_path": "/b"}):
             self.assertEqual("/a", self.daemon._recorded_cwd("archon"))
 
+    def test_binary_falls_back_to_the_recorded_one(self) -> None:
+        # The launch script ends in `exec stdbuf -oL -eL <binary>`, so an
+        # empty binary exec's the empty string and the agent dies at once.
+        with self._record({"binary": "/home/u/.local/bin/claude-code-acp"}):
+            self.assertEqual(
+                "/home/u/.local/bin/claude-code-acp",
+                self.daemon._recorded_binary("archon"),
+            )
+
+    def test_a_record_with_a_null_binary_has_no_opinion(self) -> None:
+        # Records written by older builds carry an explicit null here, and
+        # `_patch_agent_record` only writes truthy values, so the null is
+        # permanent until a caller states the binary again.
+        with self._record({"binary": None, "provider": "claude"}):
+            self.assertIsNone(self.daemon._recorded_binary("archon"))
+
     def test_a_corrupt_record_is_not_fatal(self) -> None:
         class _Bad:
             def exists(self) -> bool:

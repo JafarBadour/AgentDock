@@ -631,10 +631,13 @@ class ArchonRelayService {
     return out;
   }
 
-  /// True when the host refused because no worker exists for the chat yet.
+  /// True when the host refused because no worker exists for the chat yet,
+  /// or because the one it has lost the fields it needs to launch.
   bool _needsWorker(Object error) {
     final text = '$error'.toLowerCase();
-    return text.contains('unknown chatid') || text.contains('agents.ensure');
+    return text.contains('unknown chatid') ||
+        text.contains('agents.ensure') ||
+        text.contains('fifo not attached');
   }
 
   Future<void> _release(Host host, ArchonRelayChannel channel) async {

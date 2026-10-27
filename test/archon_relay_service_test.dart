@@ -527,6 +527,38 @@ void main() {
     expect(prepared.map((e) => (e.$1.id, e.$2.id)), [('b', 'chat-b')]);
   });
 
+  test('restarts a worker whose FIFO is cold, then delivers once', () async {
+    // An idle-stopped worker still exists, so the host does not say "unknown
+    // chatId" — it says the FIFO is not attached and asks for the chat to be
+    // reopened. Only an ensure can restate cwd/binary, and the relay holds
+    // them, so this must recover rather than surface as a failed delivery.
+    final hostB = _FakeChannel();
+    channels['b'] = hostB;
+    var attempts = 0;
+    hostB.handlers['session.prompt'] = (_) async {
+      if (++attempts == 1) {
+        throw StateError(
+          'FIFO not attached: FIFO not attached — reopen this chat to '
+          'reconnect the agent',
+        );
+      }
+      return {'accepted': true};
+    };
+    await startRelay();
+    archonChannel.push(
+      _request('relay-7', 'prompt', {
+        'hostId': 'b',
+        'chatId': 'chat-b',
+        'text': 'wake up',
+      }),
+    );
+
+    final answer = await reply();
+    expect(answer['ok'], isTrue);
+    expect(attempts, 2);
+    expect(prepared.map((e) => (e.$1.id, e.$2.id)), [('b', 'chat-b')]);
+  });
+
   test('reports a prompt that cannot be delivered', () async {
     // b has no route at all, and nothing must be invented on its behalf.
     await startRelay();

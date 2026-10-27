@@ -614,7 +614,9 @@ class Worker:
         if not isinstance(data, dict):
             return
         if not self.cwd:
-            self.cwd = str(data.get("cwd") or "")
+            # `repo_path` is the placement's own record and outlives a `cwd`
+            # that some earlier write left null.
+            self.cwd = str(data.get("cwd") or data.get("repo_path") or "")
         if not self.binary:
             self.binary = str(data.get("binary") or "")
         if not self.provider or self.provider == "cursor":

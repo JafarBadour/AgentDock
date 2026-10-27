@@ -180,6 +180,11 @@ class Daemon:
         value = self._read_agent_record(chat_id).get("provider")
         return value if isinstance(value, str) and value else None
 
+    def _recorded_binary(self, chat_id: str) -> Optional[str]:
+        """What it already launches. An empty binary exec's nothing at all."""
+        value = self._read_agent_record(chat_id).get("binary")
+        return value if isinstance(value, str) and value else None
+
     def _recorded_cwd(self, chat_id: str) -> Optional[str]:
         """Where it already runs. `repo_path` is the placement's own record."""
         rec = self._read_agent_record(chat_id)
@@ -517,6 +522,8 @@ class Daemon:
             provider = self._recorded_provider(chat_id) or "cursor"
         if not cwd:
             cwd = self._recorded_cwd(chat_id) or ""
+        if not binary:
+            binary = self._recorded_binary(chat_id) or ""
         snap = await w.ensure(
             cwd=cwd,
             binary=binary,

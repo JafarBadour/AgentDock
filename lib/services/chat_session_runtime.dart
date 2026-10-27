@@ -1680,8 +1680,15 @@ class ChatSessionRuntime extends ChangeNotifier {
               msg.contains('connection') ||
               msg.contains('socket') ||
               msg.contains('broken pipe');
-          if (msg.contains('unknown chatid') || msg.contains('agents.ensure')) {
+          if (msg.contains('unknown chatid') ||
+              msg.contains('agents.ensure') ||
+              msg.contains('fifo not attached')) {
             // Daemon lost this worker — reconnect runs agents.ensure again.
+            // "FIFO not attached" is the same situation wearing another name:
+            // the worker exists but its launch fields are gone, so it cannot
+            // reach the agent. Only an ensure can say what it was, and the
+            // app is holding those values — so recover instead of telling the
+            // user to reopen the chat by hand.
             if (!closed && sessionFactory != null) {
               closed = true;
               _scheduleReconnect(immediate: true);

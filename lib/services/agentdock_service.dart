@@ -230,6 +230,53 @@ class AgentDockRecord {
 }
 
 /// Sync agents + transcripts via `$HOME/.agentdock` on each SSH host.
+/// Shell to write an agent record **without** dropping the fields only the
+/// host knows about.
+///
+/// `agents.ensure` records how to launch an agent — `cwd`, `binary`,
+/// `permission_ask` — and the catalog push below carries none of them. While
+/// this wrote the file with `> path` every push erased them, and a record
+/// with no `binary` launches nothing at all: the worker exec'd the empty
+/// string, so the daemon answered every later prompt with "FIFO not
+/// attached" and the chat looked disconnected until it was reopened by hand.
+///
+/// Keys the app sends win; keys only the host has survive. Falls back to the
+/// plain overwrite when the host has no `python3` — it is the daemon's own
+/// interpreter, so in practice it is there.
+String agentRecordWriteCommand({
+  required String dir,
+  required String path,
+  required String json,
+}) {
+  const merge = r"""
+import json, os, sys
+tmp, dst = sys.argv[1], sys.argv[2]
+with open(tmp) as f:
+    new = json.load(f)
+old = {}
+if os.path.exists(dst):
+    try:
+        with open(dst) as f:
+            old = json.load(f)
+    except Exception:
+        old = {}
+if not isinstance(old, dict):
+    old = {}
+merged = dict(old)
+merged.update(new)
+with open(tmp, "w") as f:
+    json.dump(merged, f, indent=2)
+os.replace(tmp, dst)
+""";
+  final q = SshService.shellQuote;
+  final tmp = '$path.new';
+  final payload = base64Encode(utf8.encode(json));
+  return 'mkdir -p ${q(dir)} && '
+      'printf %s ${q(payload)} | base64 -d > ${q(tmp)} && '
+      '{ python3 -c ${q(merge)} ${q(tmp)} ${q(path)} '
+      '|| mv ${q(tmp)} ${q(path)}; }';
+}
+
 class AgentDockService {
   AgentDockService(this._ssh, this._db);
 
@@ -412,8 +459,11 @@ class AgentDockService {
       if (hostOwnsTranscript?.call(chatId) ?? false) {
         await _ssh.exec(
           host,
-          'mkdir -p ${q('$root/agents')} && '
-          'printf %s ${q(base64Encode(utf8.encode(agentJson)))} | base64 -d > ${q(agentPath)}',
+          agentRecordWriteCommand(
+            dir: '$root/agents',
+            path: agentPath,
+            json: agentJson,
+          ),
           timeout: const Duration(seconds: 60),
         );
         // The file moves under us now; re-verify from scratch next time.
@@ -494,7 +544,11 @@ class AgentDockService {
       // streams over stdin so its size is unbounded (see [SshService.exec]).
       final commands = <String>[
         'mkdir -p ${q('$root/agents')} ${q('$root/messages')}',
-        'printf %s ${q(base64Encode(utf8.encode(agentJson)))} | base64 -d > ${q(agentPath)}',
+        agentRecordWriteCommand(
+          dir: '$root/agents',
+          path: agentPath,
+          json: agentJson,
+        ),
         if (payload != null)
           appendSafely ? 'cat >> ${q(messagePath)}' : 'cat > ${q(messagePath)}',
       ];
@@ -547,9 +601,7 @@ class AgentDockService {
     await _ssh.exec(
       host,
       'rm -f ${q('$root/deleted/${chat.id}.json')} && '
-      'mkdir -p ${q('$root/agents')} && '
-      'printf %s ${q(base64Encode(utf8.encode(payload)))} | base64 -d > '
-      '${q('$root/agents/${chat.id}.json')}',
+      '${agentRecordWriteCommand(dir: '$root/agents', path: '$root/agents/${chat.id}.json', json: payload)}',
     );
   }
 
