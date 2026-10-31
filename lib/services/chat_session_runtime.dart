@@ -18,6 +18,7 @@ import '../data/models/thought_message.dart';
 import '../data/models/tool_call_state.dart';
 import '../data/models/turn_stats_message.dart';
 import '../data/secure/safe_log.dart';
+import 'agent_recovery.dart';
 import 'adsm_client.dart';
 import 'agent_session.dart';
 import 'cursor_acp_service.dart';
@@ -1680,15 +1681,11 @@ class ChatSessionRuntime extends ChangeNotifier {
               msg.contains('connection') ||
               msg.contains('socket') ||
               msg.contains('broken pipe');
-          if (msg.contains('unknown chatid') ||
-              msg.contains('agents.ensure') ||
-              msg.contains('fifo not attached')) {
-            // Daemon lost this worker — reconnect runs agents.ensure again.
-            // "FIFO not attached" is the same situation wearing another name:
-            // the worker exists but its launch fields are gone, so it cannot
-            // reach the agent. Only an ensure can say what it was, and the
-            // app is holding those values — so recover instead of telling the
-            // user to reopen the chat by hand.
+          if (agentNeedsReensure(e)) {
+            // The worker cannot be reached — reconnect runs agents.ensure
+            // again, restating what the app is already holding. See
+            // [kNeedsEnsureMarkers] for why each of these means the same
+            // thing; an unrecognised one reaches the UI as a dead chat.
             if (!closed && sessionFactory != null) {
               closed = true;
               _scheduleReconnect(immediate: true);

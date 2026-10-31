@@ -12,6 +12,7 @@ import '../data/models/host.dart';
 import '../data/models/repo.dart';
 import '../data/secure/safe_log.dart';
 import 'adsm_client.dart';
+import 'agent_recovery.dart';
 
 /// The slice of [AdsmClient] the relay uses.
 ///
@@ -631,14 +632,9 @@ class ArchonRelayService {
     return out;
   }
 
-  /// True when the host refused because no worker exists for the chat yet,
-  /// or because the one it has lost the fields it needs to launch.
-  bool _needsWorker(Object error) {
-    final text = '$error'.toLowerCase();
-    return text.contains('unknown chatid') ||
-        text.contains('agents.ensure') ||
-        text.contains('fifo not attached');
-  }
+  /// True when the host refused because the worker cannot be reached — no
+  /// worker at all, or one that lost its transport or session.
+  bool _needsWorker(Object error) => agentNeedsReensure(error);
 
   Future<void> _release(Host host, ArchonRelayChannel channel) async {
     final close = _close;
