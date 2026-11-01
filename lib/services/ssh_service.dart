@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/local/app_database.dart';
 import '../data/models/host.dart';
+import 'agent_log.dart';
 import '../data/models/remote_path.dart' as remote_path;
 import '../data/secure/safe_log.dart';
 import '../data/secure/secure_store.dart';
@@ -376,6 +377,58 @@ exit 0
       return HostSystemMetrics(error: '$e');
     }
   }
+
+  /// The tail of the host's `adsm.log`, for "why did my agent disconnect?".
+  ///
+  /// Read as a file rather than through an RPC on purpose: the daemon is
+  /// often the thing that died, and this still has to work then. It also
+  /// means a host on an older ADSM can be read without upgrading it first.
+  Future<AgentLogSnapshot> fetchAgentLog(
+    Host host, {
+    int lines = 500,
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final n = lines.clamp(1, 5000);
+    try {
+      final out = await exec(host, _agentLogScript(n), timeout: timeout);
+      return AgentLogSnapshot.parse(out);
+    } on TimeoutException {
+      return AgentLogSnapshot(
+        text: 'Timed out reading the log on ${host.displayLabel}.',
+      );
+    } catch (e) {
+      SafeLog.d('agent log fetch failed', e);
+      return AgentLogSnapshot(
+        text: 'Could not read the log on ${host.displayLabel}: $e',
+      );
+    }
+  }
+
+  /// Python rather than `tail`, so This PC behaves like a Linux box — ADSM
+  /// needs python on the host anyway.
+  static String _agentLogScript(int lines) =>
+      _agentLogTemplate.replaceAll('__LINES__', '$lines');
+
+  static const _agentLogTemplate = r'''
+set +e
+python3 - <<'ADSMLOG'
+import collections, os
+path = os.path.join(os.path.expanduser("~"), ".agentdock", "adsm.log")
+try:
+    # The last write dates the last line, which is what lets the app put a
+    # time on a log from a daemon too old to stamp its own lines.
+    print("#adsm-log-mtime %d" % int(os.path.getmtime(path)))
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        tail = collections.deque(fh, maxlen=__LINES__)
+except FileNotFoundError:
+    print("(no adsm.log on this host yet)")
+except Exception as e:
+    print("(could not read adsm.log: %s)" % e)
+else:
+    for line in tail:
+        print(line.rstrip("\n"))
+ADSMLOG
+''';
 
   static const _hostMetricsScript = r'''
 set +e
@@ -2115,6 +2168,7 @@ exit 0
     '__main__.py',
     'paths.py',
     'protocol.py',
+    'diag.py',
     'worker.py',
     'daemon.py',
     'cli.py',

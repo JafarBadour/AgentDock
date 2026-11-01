@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from . import paths, protocol
+from . import diag, paths, protocol
 from . import process_hygiene
 from . import images as images_util
 from . import transcript as transcript_store
@@ -1241,10 +1241,9 @@ class Worker:
             )
             if killed:
                 # Best-effort log into the session journal via stderr of daemon.
-                print(
+                diag.log(
                     f"ADSM reap: killed {killed} stale claude child(ren) "
-                    f"for {self.chat_id}",
-                    flush=True,
+                    f"for {self.chat_id}"
                 )
         except Exception:  # noqa: BLE001
             pass

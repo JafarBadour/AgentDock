@@ -56,7 +56,10 @@ void main() {
       // left on 0.7.9 answers every prompt to such a chat with "FIFO not
       // attached", which the user sees as the chat disconnecting.
       expect(adsmVersionMeets('0.7.9', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.10', kRequiredAdsmVersion), isTrue);
+      // 0.7.11 timestamps the daemon log. Without it "View logs" can say
+      // what stopped an agent but never when, which is most of the question.
+      expect(adsmVersionMeets('0.7.10', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.11', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -67,7 +70,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.10');
+      expect(kRequiredAdsmVersion, '0.7.11');
     });
   });
 }

@@ -12,6 +12,7 @@ import '../../data/secure/safe_log.dart';
 import '../../features/connect/claude_login_sheet.dart';
 import '../../features/connect/codex_login_sheet.dart';
 import '../../services/adsm_client.dart';
+import 'agent_log_screen.dart';
 import '../../services/ssh_service.dart';
 
 /// Three dots that rise and fade in sequence while the agent is producing a
@@ -654,6 +655,14 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
     }
   }
 
+  Future<void> _viewLogs() async {
+    final host = widget.session.host;
+    final chatId = widget.session.chatId;
+    Navigator.pop(context);
+    if (!mounted) return;
+    await AgentLogScreen.open(context, host: host, chatId: chatId);
+  }
+
   Future<void> _stopAdsm() async {
     if (_stopping) return;
     final host = widget.session.host;
@@ -940,6 +949,21 @@ class _AdsmHealthSheetState extends ConsumerState<AdsmHealthSheet> {
                 ),
               ),
             ],
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: busy ? null : _viewLogs,
+              icon: const Icon(Icons.article_outlined),
+              label: const Text('View logs'),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                'What the host wrote — including why this agent last stopped.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
               onPressed: busy ? null : _stopAdsm,

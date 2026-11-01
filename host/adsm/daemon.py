@@ -9,7 +9,7 @@ import signal
 import sys
 from typing import Any, Optional
 
-from . import paths, protocol, scheduler
+from . import diag, paths, protocol, scheduler
 from . import process_hygiene
 from . import transport
 from . import transcript as transcript_store
@@ -97,7 +97,7 @@ class Daemon:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                print(f"ADSM maintenance error: {e}", flush=True)
+                diag.log(f"ADSM maintenance error: {e}")
 
     async def _run_maintenance(self) -> None:
         import time
@@ -111,10 +111,9 @@ class Daemon:
                     process_hygiene.reap_claude_children_for_tmux, tmux
                 )
                 if killed:
-                    print(
+                    diag.log(
                         f"ADSM maintenance: reaped {killed} stale claude "
-                        f"process(es) for {chat_id}",
-                        flush=True,
+                        f"process(es) for {chat_id}"
                     )
             except Exception:  # noqa: BLE001
                 pass
@@ -138,14 +137,13 @@ class Daemon:
             if idle_for < _IDLE_STOP_SECONDS:
                 continue
             try:
-                print(
+                diag.log(
                     f"ADSM maintenance: stopping idle worker {chat_id} "
-                    f"(idle {int(idle_for)}s)",
-                    flush=True,
+                    f"(idle {int(idle_for)}s)"
                 )
                 await w.stop(delete_files=False)
             except Exception as e:  # noqa: BLE001
-                print(f"ADSM idle stop failed {chat_id}: {e}", flush=True)
+                diag.log(f"ADSM idle stop failed {chat_id}: {e}")
 
         # 3) Bound in-memory event logs.
         for chat_id, log in list(self._event_log.items()):
@@ -938,7 +936,7 @@ async def run_serve() -> None:
         # Windows) waited on [stop] forever as an orphan with no endpoint.
         if not task.cancelled() and task.exception() is not None:
             print(
-                f"ADSM serve failed: {task.exception()!r}",
+                f"{diag.stamp()} ADSM serve failed: {task.exception()!r}",
                 file=sys.stderr,
                 flush=True,
             )
