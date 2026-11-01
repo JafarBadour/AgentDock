@@ -94,6 +94,12 @@ class ChatSessionRuntime extends ChangeNotifier {
   final AppDatabase _db;
   final void Function(String chatId)? onLocalChange;
 
+  /// Ids the host already holds, for reconciling the outbound queue.
+  ///
+  /// Normally read from the ADSM session's transcript; injectable so the
+  /// reconcile can be driven without a host on the other end.
+  Future<Set<String>> Function()? hostMessageIdsProbe;
+
   /// Fired after a successful [replaceSession] so owners can bump UI state.
   final void Function(String chatId)? onTransportReady;
 
@@ -779,6 +785,76 @@ class ChatSessionRuntime extends ChangeNotifier {
     _notifyUi(immediate: true);
   }
 
+  /// Drop queued messages the host has already recorded.
+  ///
+  /// `prompt()` on the host writes the user turn to its transcript and acks
+  /// *before* the long ACP call, so a bridge that dies around the ack leaves
+  /// the app believing a delivered message never landed. It gets requeued,
+  /// and the next reconnect sends it again — which reads as the agent
+  /// starting work on its own, out of nowhere.
+  ///
+  /// Both sides key the turn on the same id, so the host's transcript is a
+  /// definitive answer to "did you already get this?". A failed check returns
+  /// 0 rather than blocking delivery: resending is recoverable, losing a
+  /// message is not.
+  Future<int> reconcileOutboundQueue() async {
+    if (outboundQueue.isEmpty || _disposed) return 0;
+    final probe = hostMessageIdsProbe;
+    if (probe != null) {
+      try {
+        return await _dropLanded(await probe());
+      } catch (e) {
+        SafeLog.d('outbound reconcile probe failed', e);
+        return 0;
+      }
+    }
+    final session = _session;
+    if (session is! AdsmSession) return 0;
+    Set<String> hostIds;
+    try {
+      var known = session.hostTranscript;
+      if (known.isEmpty) {
+        known = await session.pullTranscript(
+          limit: 200,
+          maxBytes: kTranscriptChunkBytes,
+        );
+      }
+      hostIds = {for (final m in known) m.id};
+    } catch (e) {
+      SafeLog.d('outbound reconcile pull failed', e);
+      return 0;
+    }
+    return _dropLanded(hostIds);
+  }
+
+  /// Remove everything in [hostIds] from the queue; returns how many went.
+  Future<int> _dropLanded(Set<String> hostIds) async {
+    if (hostIds.isEmpty) return 0;
+    final landed = outboundQueue.where((m) => hostIds.contains(m.id)).toList();
+    if (landed.isEmpty) return 0;
+    SafeLog.d(
+      'dropping ${landed.length} queued message(s) the host already has '
+      'for $chatId',
+    );
+    outboundQueue.removeWhere((m) => hostIds.contains(m.id));
+    if (outboundQueue.isEmpty) {
+      _needsRedelivery = false;
+      deliveryError = null;
+    }
+    await _persistOutboundQueue();
+    notifyListeners();
+    return landed.length;
+  }
+
+  /// Reconcile first, then send whatever genuinely never landed.
+  void _resumeOutboundAfterReconcile() {
+    unawaited(() async {
+      await reconcileOutboundQueue();
+      if (_disposed || closed) return;
+      resumeOutboundQueue();
+    }());
+  }
+
   /// True when a queued prompt is waiting and nothing is in the way.
   ///
   /// The host refuses a prompt while a turn is running, so a message sent
@@ -903,7 +979,7 @@ class ChatSessionRuntime extends ChangeNotifier {
               unawaited(_finalizeStaleTools(reason: 'reconnect-daemon-$st'));
             }
             notifyListeners();
-            if (!closed) resumeOutboundQueue();
+            if (!closed) _resumeOutboundAfterReconcile();
           } else if (st == 'running' ||
               st == 'waiting_permission' ||
               st == 'starting') {
@@ -924,7 +1000,7 @@ class ChatSessionRuntime extends ChangeNotifier {
     onTransportReady?.call(chatId);
     // Pick up anything that was waiting while the socket was down.
     if (!remoteTurnActive && !promptInFlight) {
-      resumeOutboundQueue();
+      _resumeOutboundAfterReconcile();
       unawaited(recoverTrailingUserPromptIfStuck());
     }
   }

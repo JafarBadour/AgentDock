@@ -215,6 +215,111 @@ void main() {
     await runtime.disposeRuntime();
   });
 
+  group('reconciling against what the host already has', () {
+    // The host records a user turn and acks before the long ACP call, so a
+    // bridge that dies around the ack makes the app requeue a message that
+    // landed. Resending it re-prompts the agent on the next reconnect, which
+    // reads as the agent starting work on its own. Observed for real: id
+    // 9f971f0c… sat queued while the host transcript already held it.
+    test('a message the host already has is dropped, not resent', () async {
+      final db = await _dbWithChat();
+      await db.setOutboundQueue('chat', [_queued()]);
+      final session = _RecordingSession();
+      final runtime = ChatSessionRuntime(
+        chatId: 'chat',
+        session: session,
+        db: db,
+      )..hostMessageIdsProbe = () async => {'queued-1'};
+      await runtime.restoreOutboundQueue();
+
+      final dropped = await runtime.reconcileOutboundQueue();
+
+      expect(dropped, 1);
+      expect(runtime.outboundQueue, isEmpty);
+      expect(await db.getOutboundQueue('chat'), isEmpty);
+      expect(session.prompts, isEmpty, reason: 'must not be sent again');
+
+      await runtime.disposeRuntime();
+    });
+
+    test('a message the host never saw is kept and still delivers', () async {
+      final db = await _dbWithChat();
+      await db.setOutboundQueue('chat', [_queued()]);
+      final session = _RecordingSession();
+      final runtime = ChatSessionRuntime(
+        chatId: 'chat',
+        session: session,
+        db: db,
+      )..hostMessageIdsProbe = () async => {'something-else'};
+      await runtime.restoreOutboundQueue();
+
+      expect(await runtime.reconcileOutboundQueue(), 0);
+      expect(runtime.outboundQueue, hasLength(1));
+
+      runtime.retryPendingOutbound();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(session.prompts, ['did u finish?']);
+
+      await runtime.disposeRuntime();
+    });
+
+    test('a failed probe keeps the message rather than losing it', () async {
+      // Resending is recoverable; dropping a message the host never got is not.
+      final db = await _dbWithChat();
+      await db.setOutboundQueue('chat', [_queued()]);
+      final session = _RecordingSession();
+      final runtime = ChatSessionRuntime(
+        chatId: 'chat',
+        session: session,
+        db: db,
+      )..hostMessageIdsProbe = () async => throw StateError('bridge down');
+      await runtime.restoreOutboundQueue();
+
+      expect(await runtime.reconcileOutboundQueue(), 0);
+      expect(runtime.outboundQueue, hasLength(1));
+
+      await runtime.disposeRuntime();
+    });
+
+    test('an empty host transcript drops nothing', () async {
+      // A host that answers "I have no messages" is not evidence of delivery.
+      final db = await _dbWithChat();
+      await db.setOutboundQueue('chat', [_queued()]);
+      final session = _RecordingSession();
+      final runtime = ChatSessionRuntime(
+        chatId: 'chat',
+        session: session,
+        db: db,
+      )..hostMessageIdsProbe = () async => <String>{};
+      await runtime.restoreOutboundQueue();
+
+      expect(await runtime.reconcileOutboundQueue(), 0);
+      expect(runtime.outboundQueue, hasLength(1));
+
+      await runtime.disposeRuntime();
+    });
+
+    test('reconciling an empty queue asks the host nothing', () async {
+      final db = await _dbWithChat();
+      final session = _RecordingSession();
+      var asked = 0;
+      final runtime = ChatSessionRuntime(
+        chatId: 'chat',
+        session: session,
+        db: db,
+      )..hostMessageIdsProbe = () async {
+        asked++;
+        return <String>{};
+      };
+      await runtime.restoreOutboundQueue();
+
+      expect(await runtime.reconcileOutboundQueue(), 0);
+      expect(asked, 0);
+
+      await runtime.disposeRuntime();
+    });
+  });
+
   test('an empty queue is a no-op', () async {
     final db = await _dbWithChat();
     final session = _RecordingSession();
