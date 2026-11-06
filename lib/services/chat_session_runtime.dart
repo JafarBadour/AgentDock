@@ -227,6 +227,34 @@ class ChatSessionRuntime extends ChangeNotifier {
       !reconnecting &&
       (sendingToHost || promptInFlight || remoteTurnActive || hasActiveTools);
 
+  /// The host stopped this agent and said so — almost always the 15-minute
+  /// idle reaper.
+  ///
+  /// Without this the chat read as `live` while the agent was gone: `dead`
+  /// was handled in the same branch as `idle` ("the turn finished"), which
+  /// clears the busy chrome, and the only thing left for the status line to
+  /// say was that the SSH bridge is still open. The bridge being up says
+  /// nothing about the agent. The host even sends a reason; it was dropped
+  /// because the label only renders while streaming.
+  bool hostStopped = false;
+
+  /// What the host said when it stopped the agent, for the status line.
+  String? hostStoppedReason;
+
+  void _noteHostStopped(String? reason) {
+    hostStopped = true;
+    if (reason != null && reason.trim().isNotEmpty) {
+      hostStoppedReason = reason.trim();
+    }
+  }
+
+  /// Any sign of life clears it — a prompt, a tool, a running status.
+  void _clearHostStopped() {
+    if (!hostStopped && hostStoppedReason == null) return;
+    hostStopped = false;
+    hostStoppedReason = null;
+  }
+
   /// Live code churn from edit/write tools since local midnight.
   CodeChangeStats get codeDelta =>
       CodeChangeStats.fromTools(_toolsSinceStartOfLocalDay());
@@ -967,6 +995,11 @@ class ChatSessionRuntime extends ChangeNotifier {
         session.refreshDaemonStatus(forceEmit: true).then((hostStatus) {
           if (_disposed) return;
           final st = (hostStatus ?? '').toLowerCase();
+          if (st == 'dead') {
+            _noteHostStopped(null);
+          } else if (st.isNotEmpty) {
+            _clearHostStopped();
+          }
           if (st == 'idle' || st == 'dead' || st == 'error' || st.isEmpty) {
             remoteTurnActive = false;
             promptInFlight = false;
@@ -1780,6 +1813,7 @@ class ChatSessionRuntime extends ChangeNotifier {
       activityLabel = 'Thinking';
       promptInFlight = true;
       remoteTurnActive = true;
+      _clearHostStopped();
       _noteHostActivity();
       notifyListeners();
 
@@ -2304,6 +2338,9 @@ class ChatSessionRuntime extends ChangeNotifier {
         notifyListeners();
       case AcpUpdateKind.activity:
         final label = update.text.trim();
+        // The host explains an idle stop through an activity label right
+        // after the status. Keep it; it is the best wording we have.
+        if (hostStopped && label.isNotEmpty) hostStoppedReason = label;
         activityLabel = label.isEmpty ? null : label;
         if (activityLabel != null) {
           if (sendingToHost && activityLabel != 'Sending to host…') {
@@ -2325,6 +2362,14 @@ class ChatSessionRuntime extends ChangeNotifier {
         _notifyUi(immediate: true);
       case AcpUpdateKind.daemonStatus:
         final st = update.text.trim().toLowerCase();
+        if (st == 'dead') {
+          // Not the same as idle: idle means the turn finished, dead means
+          // the agent is gone. Collapsing them is what made the chat claim
+          // "live" while nothing was running.
+          _noteHostStopped(null);
+        } else {
+          _clearHostStopped();
+        }
         if (st == 'idle' || st == 'dead' || st == 'error') {
           // Host is done — even if some tool rows never got a terminal status.
           _clearHostBusyWatchdog();

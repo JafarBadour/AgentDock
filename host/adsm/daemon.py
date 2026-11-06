@@ -19,7 +19,20 @@ from .worker import Worker, agent_alive
 # Idle workers (tmux + Claude/Cursor) are stopped after this many seconds so
 # hosts like the Switzerland bastion do not keep multi‑hundred‑MB agent
 # processes warm forever. ACP session ids stay on disk for resume.
+# How long a worker may sit idle before the host frees it.
+#
+# The reaper exists for hosts where agents accumulate: a shared login node
+# had 26 orphaned agent processes, the oldest 111 days. But "idle" is a poor
+# proxy for "abandoned" when someone has the chat open in front of them —
+# reading output, waiting on a job, thinking — and having it stopped out from
+# under them is what reads as the agent dying on its own.
+#
+# So the window depends on whether any device is still attached. A chat
+# nobody is watching keeps the short window; one with a live subscriber gets
+# a long one. Subscriptions are dropped when the socket closes, so this
+# reverts by itself the moment the app goes away.
 _IDLE_STOP_SECONDS = 15 * 60
+_IDLE_STOP_SECONDS_ATTACHED = 2 * 60 * 60
 _MAINTENANCE_EVERY = 60
 # Stream chunks are fanned out live but must not accumulate in RAM.
 _EVENT_LOG_SKIP_KINDS = frozenset({"text", "thought", "activity", "chat_changed"})
@@ -134,12 +147,14 @@ class Daemon:
             ):
                 continue
             idle_for = now - getattr(w, "last_activity", now)
-            if idle_for < _IDLE_STOP_SECONDS:
+            limit = self._idle_limit_for(chat_id)
+            if idle_for < limit:
                 continue
             try:
                 diag.log(
                     f"ADSM maintenance: stopping idle worker {chat_id} "
-                    f"(idle {int(idle_for)}s)"
+                    f"(idle {int(idle_for)}s, limit {limit}s, "
+                    f"watchers {self._watchers(chat_id)})"
                 )
                 await w.stop(delete_files=False)
             except Exception as e:  # noqa: BLE001
@@ -162,6 +177,16 @@ class Daemon:
                 # Empty string clears a sticky lastError after recovery.
                 w.last_error = error or None
         await self._patch_agent_record(chat_id, status=status, error=error)
+
+    def _watchers(self, chat_id: str) -> int:
+        """Devices subscribed to this chat right now."""
+        return len(self._subscribers.get(chat_id) or ())
+
+    def _idle_limit_for(self, chat_id: str) -> int:
+        """Seconds this chat may idle before the host frees it."""
+        if self._watchers(chat_id):
+            return _IDLE_STOP_SECONDS_ATTACHED
+        return _IDLE_STOP_SECONDS
 
     def _read_agent_record(self, chat_id: str) -> dict[str, Any]:
         path = paths.agent_record_path(chat_id)

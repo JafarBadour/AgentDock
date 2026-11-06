@@ -105,8 +105,10 @@ class AgentLogLine {
 final _stamp = RegExp(
   r'^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+',
 );
+// 0.7.12 appends ", limit Ns, watchers N" — do not require the closing
+// paren, or a newer host's lines stop being recognised as idle stops.
 final _idleStop = RegExp(
-  r'stopping idle worker (\S+)\s+\(idle (\d+)s\)',
+  r'stopping idle worker (\S+)\s+\(idle (\d+)s',
   caseSensitive: false,
 );
 final _idleStopFailed = RegExp(r'idle stop failed (\S+)', caseSensitive: false);

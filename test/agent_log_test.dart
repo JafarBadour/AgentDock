@@ -61,6 +61,19 @@ void main() {
       expect(fail.every((l) => l.chatId == null), isTrue);
     });
 
+    test('the 0.7.12 line shape still reads as an idle stop', () {
+      // The host now appends ", limit Ns, watchers N". A parser that
+      // required the closing paren would quietly stop recognising these,
+      // and "why did my agent stop?" would go back to having no answer.
+      final lines = parseAgentLog(
+        '2026-11-05T01:00:00+00:00 ADSM maintenance: stopping idle worker '
+        'chat-z (idle 905s, limit 900s, watchers 0)',
+      );
+      expect(lines.single.kind, AgentLogKind.idleStop);
+      expect(lines.single.chatId, 'chat-z');
+      expect(lines.single.idleSeconds, 905);
+    });
+
     test('blank lines are dropped, order is kept', () {
       final lines = parseAgentLog('a\n\n\nb\n');
       expect(lines.map((l) => l.raw), ['a', 'b']);

@@ -59,7 +59,10 @@ void main() {
       // 0.7.11 timestamps the daemon log. Without it "View logs" can say
       // what stopped an agent but never when, which is most of the question.
       expect(adsmVersionMeets('0.7.10', kRequiredAdsmVersion), isFalse);
-      expect(adsmVersionMeets('0.7.11', kRequiredAdsmVersion), isTrue);
+      // 0.7.12 leaves a chat alone while a device is watching it, instead
+      // of reaping everything at a flat 15 minutes.
+      expect(adsmVersionMeets('0.7.11', kRequiredAdsmVersion), isFalse);
+      expect(adsmVersionMeets('0.7.12', kRequiredAdsmVersion), isTrue);
     });
 
     test('wire chunks gate at 0.4.2', () {
@@ -70,7 +73,7 @@ void main() {
     });
 
     test('required version matches protocol bump', () {
-      expect(kRequiredAdsmVersion, '0.7.11');
+      expect(kRequiredAdsmVersion, '0.7.12');
     });
   });
 }

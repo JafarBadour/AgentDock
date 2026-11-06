@@ -536,6 +536,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     ];
     final isPolling = pollingTools.isNotEmpty;
     final activityLabel = runtime?.activityLabel;
+    final hostStopped = runtime?.hostStopped ?? false;
     return switch (true) {
       _ when reconnecting => ' · reconnecting…',
       _ when remoteRunning && !connected => ' · running on host',
@@ -549,6 +550,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         ' · working · ${activeToolEntries.first.displayTitle}',
       _ when streaming && activeTools > 1 => ' · working · $activeTools tools',
       _ when streaming => ' · Thinking',
+      // Before `live`: the bridge being open says nothing about the agent,
+      // and saying "live" when the host has stopped it is how a reaped agent
+      // used to disappear without a word.
+      _ when hostStopped => ' · paused · send to resume',
       _ when connected && _resumedInPlace => ' · live · resumed',
       _ when connected => ' · live',
       _ => '',
