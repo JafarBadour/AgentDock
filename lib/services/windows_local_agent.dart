@@ -165,18 +165,29 @@ class WindowsLocalAgent {
     try {
       final r = await runAdsm(['status'], timeout: const Duration(seconds: 15));
       if (r.exitCode != 0) return null;
-      for (final line in (r.stdout as String).split('\n')) {
-        final t = line.trim();
-        if (!t.startsWith('{')) continue;
+      return versionFromStatus(r.stdout as String);
+    } catch (e) {
+      SafeLog.d('local ADSM status failed', e);
+    }
+    return null;
+  }
+
+  /// The daemon version in `adsm status` output, or null when it is not
+  /// running. Windows PCs reached over SSH answer the same way.
+  static String? versionFromStatus(String stdout) {
+    for (final line in stdout.split('\n')) {
+      final t = line.trim();
+      if (!t.startsWith('{')) continue;
+      try {
         final msg = jsonDecode(t);
         if (msg is! Map) continue;
         final result = msg['result'];
         if (result is Map && result['version'] != null) {
           return result['version'].toString();
         }
+      } on FormatException {
+        continue;
       }
-    } catch (e) {
-      SafeLog.d('local ADSM status failed', e);
     }
     return null;
   }

@@ -60,6 +60,15 @@ bool isLocalFolderPathForThisOs(String path, {bool? windows}) {
       : !isDrivePath && path.trim().startsWith('/');
 }
 
+/// [path] as a native Windows process can open it: Git Bash spells drive
+/// paths `/c/Users/me`, CreateProcess wants `C:/Users/me`. Anything that is
+/// not a Git Bash drive path comes back unchanged.
+String windowsPathFromMsys(String path) {
+  final m = RegExp(r'^/([A-Za-z])(/|$)').firstMatch(path.trim());
+  if (m == null) return path;
+  return '${m[1]!.toUpperCase()}:/${path.trim().substring(m.end)}';
+}
+
 /// Shell used for local commands on This Mac/PC.
 ///
 /// On Windows a bare `bash` resolves through System32 before PATH, which is

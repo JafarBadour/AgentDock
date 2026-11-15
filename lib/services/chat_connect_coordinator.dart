@@ -16,6 +16,7 @@ import 'adsm_client.dart';
 import 'agent_session.dart';
 import 'claude_remote_auth.dart';
 import 'codex_remote_auth.dart';
+import 'local_host_bootstrap.dart';
 import 'ssh_service.dart';
 
 /// What a chat's bring-up is doing right now, for whatever screen is looking.
@@ -770,12 +771,18 @@ Future<AgentSession> Function() buildSessionFactory({
 
     status('Starting agent…');
 
+    // A Windows PC over SSH lists its folders the Git Bash way (`/c/…`), but
+    // its daemon starts agents natively and cannot open that.
+    final agentCwd = await ssh.isWindowsRemote(host)
+        ? windowsPathFromMsys(cwd)
+        : cwd;
+
     return AdsmSession.start(
       ssh: ssh,
       secureStore: secureStore,
       bridgePool: bridgePool,
       host: host,
-      cwd: cwd,
+      cwd: agentCwd,
       binary: binary,
       chatId: chatId,
       provider: provider,

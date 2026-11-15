@@ -810,6 +810,8 @@ exit 0
 
   /// Drop a host's pooled connection (used when a health check fails).
   void invalidate(String hostId) {
+    // An edited host may now point somewhere else entirely.
+    _windowsRemote.remove(hostId);
     final entry = _pool.remove(hostId);
     try {
       entry?.client?.close();
@@ -1029,7 +1031,7 @@ exit 0
     void Function(String status)? onProgress,
   }) async {
     // Windows agents are daemon-owned processes, not tmux sessions.
-    if (_isWindowsLocal(host)) return;
+    if (_isWindowsLocal(host) || await isWindowsRemote(host)) return;
     onProgress?.call('Checking tmux…');
     var tmux = await _resolveTmuxPathOnHost(host);
     if (tmux != null) return;
@@ -1144,11 +1146,11 @@ exit 1
       onProgress?.call('Cursor CLI ready');
       return cached;
     }
-    if (_isWindowsLocal(host)) {
+    if (_isWindowsLocal(host) || await isWindowsRemote(host)) {
       throw MissingToolException(
         'Cursor CLI',
-        'Cursor agents on This PC are not supported on Windows yet. '
-            'Use Claude or Codex here, or run Cursor on a remote host.',
+        'Cursor agents are not supported on Windows PCs yet. '
+            'Use Claude or Codex there, or run Cursor on a Linux or Mac host.',
       );
     }
 
@@ -1380,6 +1382,16 @@ test -x "$HOME/.local/bin/claude-code-acp"
         onProgress: onProgress,
       );
     }
+    if (await isWindowsRemote(host)) {
+      return _ensureWindowsRemoteNpmAgent(
+        host,
+        cacheKey: 'claude',
+        label: 'Claude ACP',
+        shimNames: const ['claude-agent-acp', 'claude-code-acp'],
+        package: '@agentclientprotocol/claude-agent-acp',
+        onProgress: onProgress,
+      );
+    }
 
     onProgress?.call('Looking for Claude ACP…');
     var path = await _resolveClaudeAcpPathOnHost(host);
@@ -1548,6 +1560,16 @@ test -x "$HOME/.local/bin/codex-acp"
         onProgress: onProgress,
       );
     }
+    if (await isWindowsRemote(host)) {
+      return _ensureWindowsRemoteNpmAgent(
+        host,
+        cacheKey: 'codex',
+        label: 'Codex ACP',
+        shimNames: const ['codex-acp'],
+        package: '@agentclientprotocol/codex-acp',
+        onProgress: onProgress,
+      );
+    }
 
     onProgress?.call('Looking for Codex ACP…');
     var path = await _resolveCodexAcpPathOnHost(host);
@@ -1683,6 +1705,156 @@ test -x "$HOME/.local/bin/codex-acp"
     return path;
   }
 
+  /// Where npm put an agent's Windows shim (`__NAMES__` are the candidate
+  /// names), as a native path. The daemon
+  /// starts agents with CreateProcess, which can run `C:\…\x.cmd` but not
+  /// the `/c/…/x` shell script that `command -v` finds in Git Bash.
+  static const _windowsNpmShimLookup = r'''
+for n in __NAMES__; do
+  f="$APPDATA/npm/$n.cmd"
+  if [ -f "$f" ]; then cygpath -w "$f"; exit 0; fi
+done
+for n in __NAMES__; do
+  w="$(where.exe "$n" 2>/dev/null | tr -d '\r' | grep -iE '\.(cmd|exe|bat)$' | head -n 1)"
+  if [ -n "$w" ]; then printf '%s\n' "$w"; exit 0; fi
+done
+exit 0
+''';
+
+  /// [_ensureWindowsNpmAgent] for a Windows PC reached over SSH.
+  Future<String> _ensureWindowsRemoteNpmAgent(
+    Host host, {
+    required String cacheKey,
+    required String label,
+    required List<String> shimNames,
+    required String package,
+    void Function(String status)? onProgress,
+  }) async {
+    onProgress?.call('Looking for $label…');
+    final lookup = _windowsNpmShimLookup.replaceAll(
+      '__NAMES__',
+      shimNames.map(shellQuote).join(' '),
+    );
+    Future<String?> find() async {
+      final out = await exec(
+        host,
+        'sh -c ${shellQuote(lookup)}',
+        timeout: const Duration(seconds: 20),
+      );
+      final path = out.trim().split('\n').last.trim();
+      return path.isEmpty ? null : path;
+    }
+
+    var path = await find();
+    if (path == null) {
+      onProgress?.call('Installing $label on ${host.displayLabel}…');
+      try {
+        await exec(
+          host,
+          'npm install -g ${shellQuote(package)}',
+          timeout: const Duration(minutes: 8),
+        );
+      } catch (e) {
+        SafeLog.d('npm install of $package on ${host.displayLabel} failed', e);
+      }
+      path = await find();
+    }
+    if (path == null) {
+      throw MissingToolException(
+        label,
+        '${shimNames.first} is not installed on ${host.displayLabel}. On that '
+        'PC, install Node.js 20+ and run `npm install -g $package`, then '
+        'reconnect.',
+      );
+    }
+    _cacheToolPath('$cacheKey:${host.id}', path);
+    onProgress?.call('$label ready');
+    return path;
+  }
+
+  /// Windows ADSM listens on a token-protected loopback port, not the Unix
+  /// socket the Linux probe looks for, and Git Bash has no `pkill` for the
+  /// Linux restart. `agentdock-adsm` itself knows the port, so ask it.
+  static const _adsmStatusWindows = r'''
+export PATH="$HOME/.local/bin:$PATH"
+agentdock-adsm status 2>/dev/null
+''';
+
+  static const _adsmRestartScriptWindows = r'''
+set -e
+chmod +x "$HOME/.local/bin/agentdock-adsm"
+export PATH="$HOME/.local/bin:$PATH"
+agentdock-adsm stop >/dev/null 2>&1 || true
+if ! agentdock-adsm ensure-running; then
+  echo "ADSM_START_FAILED" >&2
+  tail -n 25 "$HOME/.agentdock/adsm.log" >&2 2>/dev/null || true
+  exit 1
+fi
+''';
+
+  Future<String?> _windowsRemoteAdsmVersion(Host host) async {
+    try {
+      final out = await exec(
+        host,
+        _adsmStatusWindows,
+        timeout: const Duration(seconds: 20),
+      );
+      return WindowsLocalAgent.versionFromStatus(out);
+    } catch (e) {
+      SafeLog.d('ADSM status on ${host.displayLabel} failed', e);
+      return null;
+    }
+  }
+
+  /// [_ensureAdsmWindowsLocal] for a Windows PC reached over SSH.
+  Future<void> _ensureAdsmWindowsRemote(
+    Host host, {
+    void Function(String status)? onProgress,
+    required bool allowUpgrade,
+  }) async {
+    onProgress?.call('Checking ADSM…');
+    var running = await _windowsRemoteAdsmVersion(host);
+    if (running == null) {
+      onProgress?.call('Starting ADSM…');
+      try {
+        await exec(
+          host,
+          'export PATH="\$HOME/.local/bin:\$PATH"; agentdock-adsm ensure-running',
+          timeout: const Duration(seconds: 30),
+        );
+      } catch (e) {
+        SafeLog.d('ADSM ensure-running on ${host.displayLabel} failed', e);
+      }
+      running = await _windowsRemoteAdsmVersion(host);
+    }
+    if (running != null &&
+        (adsmVersionMeets(running, kRequiredAdsmVersion) || !allowUpgrade)) {
+      _markAdsmReady(host.id, running);
+      onProgress?.call('ADSM ready');
+      return;
+    }
+    final client = await connect(host);
+    final push = await _pushBundledAdsm(
+      client,
+      hostId: host.id,
+      onProgress: onProgress,
+      restartScript: _adsmRestartScriptWindows,
+    );
+    final version = await _windowsRemoteAdsmVersion(host);
+    if (push != _BundledAdsmPush.ok ||
+        version == null ||
+        !adsmVersionMeets(version, kRequiredAdsmVersion)) {
+      throw MissingToolException(
+        'ADSM',
+        'ADSM v$kRequiredAdsmVersion did not come up on ${host.displayLabel} '
+            '(running: ${version ?? 'none'}). On that PC, see '
+            '%USERPROFILE%\\.agentdock\\adsm.log.',
+      );
+    }
+    _markAdsmReady(host.id, version);
+    onProgress?.call('ADSM v$version ready');
+  }
+
   /// Windows This PC: install bundled ADSM and run it with Python directly.
   Future<void> _ensureAdsmWindowsLocal(
     Host host, {
@@ -1724,6 +1896,13 @@ test -x "$HOME/.local/bin/codex-acp"
   }) async {
     if (_isWindowsLocal(host)) {
       return _ensureAdsmWindowsLocal(
+        host,
+        onProgress: onProgress,
+        allowUpgrade: allowUpgrade,
+      );
+    }
+    if (await isWindowsRemote(host)) {
+      return _ensureAdsmWindowsRemote(
         host,
         onProgress: onProgress,
         allowUpgrade: allowUpgrade,
@@ -2317,6 +2496,7 @@ fi
     SSHClient client, {
     required String hostId,
     void Function(String status)? onProgress,
+    String restartScript = _adsmRestartScript,
   }) async {
     onProgress?.call('Uploading ADSM v$kRequiredAdsmVersion from this app…');
     late final Map<String, Uint8List> payloads;
@@ -2333,6 +2513,7 @@ fi
         client,
         hostId: hostId,
         payloads: payloads,
+        restartScript: restartScript,
       );
       onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
       return _BundledAdsmPush.ok;
@@ -2342,7 +2523,12 @@ fi
     }
 
     try {
-      await _pushBundledAdsmViaSftp(client, hostId: hostId, payloads: payloads);
+      await _pushBundledAdsmViaSftp(
+        client,
+        hostId: hostId,
+        payloads: payloads,
+        restartScript: restartScript,
+      );
       onProgress?.call('ADSM v$kRequiredAdsmVersion uploaded');
       return _BundledAdsmPush.ok;
     } catch (e) {
@@ -2393,6 +2579,7 @@ fi
     SSHClient client, {
     required String hostId,
     required Map<String, Uint8List> payloads,
+    String restartScript = _adsmRestartScript,
   }) async {
     final buf = StringBuffer()
       ..writeln('set -euo pipefail')
@@ -2413,7 +2600,7 @@ fi
       ..writeln(_archonWrapper.trimRight())
       ..writeln('ARCHON_WRAP')
       ..writeln('chmod +x "\$BIN/archon"')
-      ..writeln(_adsmRestartScript);
+      ..writeln(restartScript);
     await _runScriptViaStdin(
       client,
       hostId: hostId,
@@ -2426,6 +2613,7 @@ fi
     SSHClient client, {
     required String hostId,
     required Map<String, Uint8List> payloads,
+    String restartScript = _adsmRestartScript,
   }) async {
     final homeOut = await _run(
       client,
@@ -2498,7 +2686,7 @@ fi
 
     await _run(
       client,
-      _adsmRestartScript,
+      restartScript,
       hostId: hostId,
       timeout: const Duration(seconds: 45),
     );
@@ -2870,6 +3058,40 @@ exit 1
 
   /// This PC on Windows: no tmux or bash scripts; see [WindowsLocalAgent].
   bool _isWindowsLocal(Host host) => Platform.isWindows && _preferLocalFs(host);
+
+  /// What [isWindowsRemote] found, by host id.
+  final Map<String, bool> _windowsRemote = {};
+
+  /// A Windows PC reached over SSH — another device's view of a This PC
+  /// install, often through a bastion. Its agents run under the same native
+  /// ADSM as This PC on Windows, so tmux, the Unix socket, `pkill` and
+  /// POSIX paths are all wrong for it too. Its sshd must use Git Bash as the
+  /// default shell, which is what every remote script here assumes.
+  Future<bool> isWindowsRemote(Host host) async {
+    if (_preferLocalFs(host)) return false;
+    final known = _windowsRemote[host.id];
+    if (known != null) return known;
+    try {
+      final out = await exec(
+        host,
+        'uname -s',
+        timeout: const Duration(seconds: 15),
+      );
+      return _windowsRemote[host.id] = isWindowsUname(out);
+    } catch (e) {
+      // Not cached: a dropped connection says nothing about the OS.
+      SafeLog.d('uname probe failed on ${host.displayLabel}', e);
+      return false;
+    }
+  }
+
+  /// Whether `uname -s` came from Git Bash, MSYS2 or Cygwin on Windows.
+  static bool isWindowsUname(String out) {
+    final t = out.trim().toUpperCase();
+    return t.startsWith('MINGW') ||
+        t.startsWith('MSYS') ||
+        t.startsWith('CYGWIN');
+  }
 
   Future<RemoteFileListing> _listLocalEntries(String path) async {
     final normalized = normalizeRemotePath(path.replaceAll(r'\', '/'));
