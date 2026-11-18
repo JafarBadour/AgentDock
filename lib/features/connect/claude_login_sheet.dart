@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -102,6 +103,17 @@ class _ClaudeLoginSheetState extends ConsumerState<ClaudeLoginSheet> {
     }
   }
 
+  Future<void> _copyUrl() async {
+    final url = _loginUrl;
+    if (url == null) return;
+    await Clipboard.setData(ClipboardData(text: url));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Login link copied.')),
+      );
+    }
+  }
+
   Future<void> _submitCode() async {
     final session = _session;
     if (session == null) return;
@@ -178,6 +190,14 @@ class _ClaudeLoginSheetState extends ConsumerState<ClaudeLoginSheet> {
                 _loginUrl!,
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.primary,
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _copyUrl,
+                  icon: const Icon(Icons.copy, size: 16),
+                  label: const Text('Copy link'),
                 ),
               ),
             ],

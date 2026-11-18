@@ -19,4 +19,22 @@ Paste code here if prompted:
       'https://claude.ai/oauth/authorize?client_id=abc&state=xyz',
     );
   });
+
+  test('parseLoginUrl returns one copy of an OSC 8 hyperlink', () {
+    const url = 'https://claude.ai/oauth/authorize?client_id=abc&state=xyz';
+    expect(
+      ClaudeRemoteAuthSession.parseLoginUrl(
+        'Browse to \x1b]8;;$url\x07$url\x1b]8;;\x07\nPaste code here:\n',
+      ),
+      url,
+    );
+  });
+
+  test('parseLoginUrl returns one copy when the frame is redrawn', () {
+    const url = 'https://claude.ai/oauth/authorize?client_id=abc&state=xyz';
+    expect(
+      ClaudeRemoteAuthSession.parseLoginUrl('$url\x1b[2K\x1b[1A$url\n'),
+      url,
+    );
+  });
 }

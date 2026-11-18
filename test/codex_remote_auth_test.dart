@@ -32,6 +32,16 @@ void main() {
     expect(CodexRemoteAuthSession.parseUserCode(noisy), 'QXGT-9ANR6');
   });
 
+  test('parseLoginUrl returns one copy of a hyperlinked URL', () {
+    const url = 'https://auth.openai.com/codex/device';
+    expect(
+      CodexRemoteAuthSession.parseLoginUrl(
+        '   \x1b]8;;$url\x07$url\x1b]8;;\x07\r\n',
+      ),
+      url,
+    );
+  });
+
   test('parseLoginUrl ignores unrelated links', () {
     expect(
       CodexRemoteAuthSession.parseLoginUrl(

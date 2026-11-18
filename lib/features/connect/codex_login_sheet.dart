@@ -121,6 +121,17 @@ class _CodexLoginSheetState extends ConsumerState<CodexLoginSheet> {
     }
   }
 
+  Future<void> _copyUrl() async {
+    final url = _loginUrl;
+    if (url == null) return;
+    await Clipboard.setData(ClipboardData(text: url));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Login link copied.')),
+      );
+    }
+  }
+
   Future<void> _copyCode() async {
     final code = _userCode;
     if (code == null) return;
@@ -218,6 +229,14 @@ class _CodexLoginSheetState extends ConsumerState<CodexLoginSheet> {
                 _loginUrl!,
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.primary,
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _copyUrl,
+                  icon: const Icon(Icons.copy, size: 16),
+                  label: const Text('Copy link'),
                 ),
               ),
             ],

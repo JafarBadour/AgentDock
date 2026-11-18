@@ -4,6 +4,7 @@ import 'dart:convert';
 import '../data/models/host.dart';
 import '../data/secure/safe_log.dart';
 import 'login_shell.dart';
+import 'pty_text.dart' as pty;
 import 'ssh_service.dart';
 
 enum CodexLoginPhase {
@@ -91,14 +92,13 @@ class CodexRemoteAuthSession {
   static bool isDeviceAuthDisabledOutput(String buffer) =>
       _deviceAuthDisabledRe.hasMatch(stripAnsi(buffer));
 
-  static String stripAnsi(String text) =>
-      text.replaceAll(RegExp(r'\x1B\[[0-9;?]*[ -/]*[@-~]'), '');
+  static String stripAnsi(String text) => pty.stripAnsi(text);
 
   /// First OpenAI device-auth URL in captured PTY output.
   static String? parseLoginUrl(String buffer) {
     final plain = stripAnsi(buffer);
     for (final match in _urlRe.allMatches(plain)) {
-      final url = match.group(0)!.trim();
+      final url = pty.dedupeGluedUrl(match.group(0)!.trim());
       if (url.contains('openai.com') || url.contains('chatgpt.com')) {
         return url;
       }
