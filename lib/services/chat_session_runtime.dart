@@ -82,6 +82,21 @@ class ChatSessionRuntime extends ChangeNotifier {
   static const maxReconnectAttempts = 10;
   static const _maxBackoff = Duration(seconds: 30);
 
+  /// How long a new bridge must survive before it counts as a good one.
+  ///
+  /// The attempt counter used to reset the moment a session attached, which
+  /// is before anything is known about it. A bridge that died seconds later
+  /// therefore reconnected from attempt zero every time: the backoff stayed
+  /// at its first step and `maxReconnectAttempts` was never reached, so the
+  /// loop ran unbounded and silent. One host showed 16 jump-host logins in
+  /// 14 minutes, tightening to one every ten seconds.
+  ///
+  /// Connecting is not succeeding. Staying connected is.
+  /// Overridable so a test can watch the credit land without waiting a
+  /// minute of wall clock.
+  @visibleForTesting
+  static Duration stableAfter = const Duration(seconds: 60);
+
   /// Runtime/UI memory is a live tail, not the transcript archive. SQLite and
   /// the host remain authoritative for older history.
   ///
@@ -348,6 +363,9 @@ class ChatSessionRuntime extends ChangeNotifier {
   bool reconnecting = false;
   int reconnectAttempts = 0;
   Timer? _retryTimer;
+
+  /// Fires once a bridge has held for [stableAfter], clearing the backoff.
+  Timer? _stabilityTimer;
 
   /// Clears stale "working" after reconnect when the host already went idle
   /// while we were away (we miss that `turnComplete` in the journal gap).
@@ -977,7 +995,11 @@ class ChatSessionRuntime extends ChangeNotifier {
     closed = false;
     lastError = null;
     reconnecting = false;
-    reconnectAttempts = 0;
+    // Do NOT clear reconnectAttempts here — attaching is not the same as
+    // holding. It is cleared once this bridge has lasted [stableAfter], so
+    // a flapping host keeps escalating its backoff and eventually says so
+    // instead of looping in silence.
+    _armStabilityTimer();
     // A reconnect must not inherit a hung prompt chain from the dead socket.
     _breakPromptChain();
     // Drop sticky "working / Exploring" from the dead bridge immediately.
@@ -1229,6 +1251,19 @@ class ChatSessionRuntime extends ChangeNotifier {
     }
   }
 
+  /// Credit the bridge only after it has actually held.
+  void _armStabilityTimer() {
+    _stabilityTimer?.cancel();
+    _stabilityTimer = Timer(stableAfter, () {
+      _stabilityTimer = null;
+      if (_disposed || closed) return;
+      if (reconnectAttempts != 0) {
+        SafeLog.d('bridge for $chatId held — clearing reconnect backoff');
+      }
+      reconnectAttempts = 0;
+    });
+  }
+
   Duration _backoffFor(int attempt) {
     final seconds = min(1 << attempt, _maxBackoff.inSeconds);
     // Jitter keeps several chats on the same host from retrying in lockstep.
@@ -1238,6 +1273,9 @@ class ChatSessionRuntime extends ChangeNotifier {
 
   void _scheduleReconnect({bool immediate = false}) {
     if (_disposed || _suspended) return;
+    // The bridge is down, so it never earned its reset.
+    _stabilityTimer?.cancel();
+    _stabilityTimer = null;
     if (!(shouldAutoReconnect?.call() ?? true)) {
       reconnecting = false;
       return;
@@ -3060,6 +3098,8 @@ class ChatSessionRuntime extends ChangeNotifier {
     _disposed = true;
     _retryTimer?.cancel();
     _retryTimer = null;
+    _stabilityTimer?.cancel();
+    _stabilityTimer = null;
     _uiNotifyCoalesce?.cancel();
     _uiNotifyCoalesce = null;
     _clearHostBusyWatchdog();
