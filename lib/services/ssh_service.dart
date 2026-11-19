@@ -548,6 +548,13 @@ exit 0
 
   static const _toolPathPrefsKey = 'ssh_tool_path_cache_v1';
 
+  /// A saved Claude path that may be the deprecated `claude-code-acp`.
+  /// Lookups used to try that name first, so a host with both adapters kept
+  /// the old one — and its model list, with no newer models — for good.
+  /// Dropping it costs one fresh lookup, which now prefers the current one.
+  static bool isStaleClaudeAdapterPath(String key, String path) =>
+      key.startsWith('claude:') && path.trim().endsWith('/claude-code-acp');
+
   /// Load Cursor/Claude/Codex absolute paths saved from prior connects.
   Future<void> loadPersistedCaches() async {
     try {
@@ -559,6 +566,7 @@ exit 0
       for (final e in decoded.entries) {
         final v = e.value;
         if (e.key is String && v is String && v.isNotEmpty) {
+          if (isStaleClaudeAdapterPath(e.key as String, v)) continue;
           _toolPathCache[e.key as String] = v;
         }
       }
@@ -2776,21 +2784,24 @@ curl -fsSL ${shellQuote(url)} | bash
     const script = r'''
 set +e
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+# claude-agent-acp before claude-code-acp, everywhere: the second name is
+# also the deprecated @zed-industries adapter, whose frozen model list has
+# no newer models. A host with both installed must not land on it.
 for p in \
-  "$HOME/.local/bin/claude-code-acp" \
   "$HOME/.local/bin/claude-agent-acp" \
-  "$HOME/.npm-global/bin/claude-code-acp" \
+  "$HOME/.local/bin/claude-code-acp" \
   "$HOME/.npm-global/bin/claude-agent-acp" \
-  /usr/local/bin/claude-code-acp \
-  /usr/local/bin/claude-agent-acp; do
+  "$HOME/.npm-global/bin/claude-code-acp" \
+  /usr/local/bin/claude-agent-acp \
+  /usr/local/bin/claude-code-acp; do
   if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
 done
-for p in "$HOME"/.nvm/versions/node/*/bin/claude-code-acp \
-         "$HOME"/.nvm/versions/node/*/bin/claude-agent-acp; do
+for p in "$HOME"/.nvm/versions/node/*/bin/claude-agent-acp \
+         "$HOME"/.nvm/versions/node/*/bin/claude-code-acp; do
   if [ -x "$p" ]; then printf %s "$p"; exit 0; fi
 done
-command -v claude-code-acp 2>/dev/null && exit 0
 command -v claude-agent-acp 2>/dev/null && exit 0
+command -v claude-code-acp 2>/dev/null && exit 0
 exit 1
 ''';
     try {
